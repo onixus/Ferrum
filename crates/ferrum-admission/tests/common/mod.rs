@@ -21,6 +21,7 @@ pub fn encode_cluster(spec: &ClusterSecurityPolicySpec) -> Vec<u8> {
     )
 }
 
+#[allow(dead_code)]
 pub fn encode_namespaced(spec: &SecurityPolicySpec) -> Vec<u8> {
     encode(
         spec.mode,

@@ -75,6 +75,8 @@ pub struct AdmissionSubject {
     pub added_capabilities: Vec<String>,
     pub wildcard_rbac: bool,
     pub cluster_admin_bind: bool,
+    /// Empty keeps CLI subject behaviour (all rule families). Webhook sets GVK kind.
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +223,23 @@ fn program_applies(
     if !subject.policy_namespace.is_empty() && subject.namespace != subject.policy_namespace {
         return Ok(false);
     }
+    // Cluster/namespace/SA labels are not on the admitted object. An empty
+    // map means the webhook never saw them — fail closed, do not skip policy.
+    require_labels_if_selected(
+        &program.selector.cluster_selector,
+        &subject.cluster_labels,
+        "cluster",
+    )?;
+    require_labels_if_selected(
+        &program.selector.namespace_selector,
+        &subject.namespace_labels,
+        "namespace",
+    )?;
+    require_labels_if_selected(
+        &program.selector.service_account_selector,
+        &subject.service_account_labels,
+        "serviceAccount",
+    )?;
     Ok(
         label_selector_matches(&program.selector.cluster_selector, &subject.cluster_labels)?
             && label_selector_matches(
@@ -236,6 +255,23 @@ fn program_applies(
                 &subject.service_account_labels,
             )?,
     )
+}
+
+fn selector_nonempty(selector: &LabelSelector) -> bool {
+    !selector.match_labels.is_empty() || !selector.match_expressions.is_empty()
+}
+
+fn require_labels_if_selected(
+    selector: &LabelSelector,
+    labels: &BTreeMap<String, String>,
+    what: &str,
+) -> Result<(), FerrumError> {
+    if selector_nonempty(selector) && labels.is_empty() {
+        return Err(FerrumError::Integrity(format!(
+            "{what} selector is set but {what} labels are missing; fail closed"
+        )));
+    }
+    Ok(())
 }
 
 fn label_selector_matches(
@@ -289,7 +325,12 @@ fn collect_hits(program: &AdmissionProgram, subject: &AdmissionSubject) -> Vec<P
         hits.push(PendingHit { rule, reason });
     };
 
-    if program.supply.deny_unsigned || program.supply.require_signed {
+    let kind = subject.kind.as_str();
+    let check_workload = kind.is_empty() || kind == "Pod";
+    let check_role = kind.is_empty() || kind == "Role" || kind == "ClusterRole";
+    let check_bind = kind.is_empty() || kind == "RoleBinding" || kind == "ClusterRoleBinding";
+
+    if check_workload && (program.supply.deny_unsigned || program.supply.require_signed) {
         if program.supply.trust_roots.is_empty() {
             add(
                 RULE_UNSIGNED,
@@ -306,85 +347,87 @@ fn collect_hits(program: &AdmissionProgram, subject: &AdmissionSubject) -> Vec<P
         }
     }
 
-    if program.supply.deny_latest_tag && image_is_latest(&subject.image) {
-        add(RULE_LATEST_TAG, "image tag latest".into());
-    }
-
-    if program.selector.image.require_digest && parse_image(&subject.image).digest.is_none() {
-        add(RULE_REQUIRE_DIGEST, "image digest required".into());
-    }
-
-    if !program.selector.image.registries_allow.is_empty() {
-        let registry = parse_image(&subject.image).registry;
-        if !program
-            .selector
-            .image
-            .registries_allow
-            .iter()
-            .any(|allow| allow == &registry)
-        {
-            add(
-                RULE_REGISTRY_ALLOW,
-                format!("image registry {registry} is not in registriesAllow"),
-            );
-        }
-    }
-
     // PSS constraints are OR'd with explicit deny. Privileged/Custom add none.
     let deny = &program.admit.deny;
     let pss = program.admit.pss;
     let baseline = matches!(pss, PssProfile::Baseline | PssProfile::Restricted);
     let restricted = pss == PssProfile::Restricted;
 
-    if (deny.privileged || baseline) && subject.privileged {
-        add(RULE_PRIVILEGED, "privileged container".into());
+    if check_workload {
+        if program.supply.deny_latest_tag && image_is_latest(&subject.image) {
+            add(RULE_LATEST_TAG, "image tag latest".into());
+        }
+
+        if program.selector.image.require_digest && parse_image(&subject.image).digest.is_none() {
+            add(RULE_REQUIRE_DIGEST, "image digest required".into());
+        }
+
+        if !program.selector.image.registries_allow.is_empty() {
+            let registry = parse_image(&subject.image).registry;
+            if !program
+                .selector
+                .image
+                .registries_allow
+                .iter()
+                .any(|allow| allow == &registry)
+            {
+                add(
+                    RULE_REGISTRY_ALLOW,
+                    format!("image registry {registry} is not in registriesAllow"),
+                );
+            }
+        }
+
+        if (deny.privileged || baseline) && subject.privileged {
+            add(RULE_PRIVILEGED, "privileged container".into());
+        }
+        if (deny.host_pid || baseline) && subject.host_pid {
+            add(RULE_HOST_PID, "hostPID".into());
+        }
+        if (deny.host_ipc || baseline) && subject.host_ipc {
+            add(RULE_HOST_IPC, "hostIPC".into());
+        }
+        if (deny.host_network || baseline) && subject.host_network {
+            add(RULE_HOST_NETWORK, "hostNetwork".into());
+        }
+        if (deny.host_path || baseline) && subject.host_path {
+            add(RULE_HOST_PATH, "hostPath".into());
+        }
+        if (deny.allow_privilege_escalation || restricted) && subject.allow_privilege_escalation {
+            add(
+                RULE_ALLOW_PRIVILEGE_ESCALATION,
+                "allowPrivilegeEscalation".into(),
+            );
+        }
+        if (deny.run_as_root || restricted) && subject.run_as_root {
+            add(RULE_RUN_AS_ROOT, "runAsRoot".into());
+        }
+
+        let matched: Vec<&String> = subject
+            .added_capabilities
+            .iter()
+            .filter(|cap| {
+                pss_forbids_added_capability(pss, cap)
+                    || deny.added_capabilities.iter().any(|d| d == *cap)
+            })
+            .collect();
+        if !matched.is_empty() {
+            let list = matched
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            add(
+                RULE_ADDED_CAPABILITIES,
+                format!("added capabilities denied: {list}"),
+            );
+        }
     }
-    if (deny.host_pid || baseline) && subject.host_pid {
-        add(RULE_HOST_PID, "hostPID".into());
-    }
-    if (deny.host_ipc || baseline) && subject.host_ipc {
-        add(RULE_HOST_IPC, "hostIPC".into());
-    }
-    if (deny.host_network || baseline) && subject.host_network {
-        add(RULE_HOST_NETWORK, "hostNetwork".into());
-    }
-    if (deny.host_path || baseline) && subject.host_path {
-        add(RULE_HOST_PATH, "hostPath".into());
-    }
-    if (deny.allow_privilege_escalation || restricted) && subject.allow_privilege_escalation {
-        add(
-            RULE_ALLOW_PRIVILEGE_ESCALATION,
-            "allowPrivilegeEscalation".into(),
-        );
-    }
-    if (deny.run_as_root || restricted) && subject.run_as_root {
-        add(RULE_RUN_AS_ROOT, "runAsRoot".into());
-    }
-    if deny.wildcards_rbac && subject.wildcard_rbac {
+    if check_role && deny.wildcards_rbac && subject.wildcard_rbac {
         add(RULE_WILDCARDS_RBAC, "wildcard RBAC".into());
     }
-    if deny.cluster_admin_bind && subject.cluster_admin_bind {
+    if check_bind && deny.cluster_admin_bind && subject.cluster_admin_bind {
         add(RULE_CLUSTER_ADMIN_BIND, "cluster-admin bind".into());
-    }
-
-    let matched: Vec<&String> = subject
-        .added_capabilities
-        .iter()
-        .filter(|cap| {
-            pss_forbids_added_capability(pss, cap)
-                || deny.added_capabilities.iter().any(|d| d == *cap)
-        })
-        .collect();
-    if !matched.is_empty() {
-        let list = matched
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        add(
-            RULE_ADDED_CAPABILITIES,
-            format!("added capabilities denied: {list}"),
-        );
     }
 
     hits
@@ -659,6 +702,38 @@ mod tests {
         let decision = admit(&program, &signed_subject(), &[], now());
         assert!(decision.allowed);
         assert_eq!(decision.patches, vec![Patch::DropAllCapabilities]);
+    }
+
+    #[test]
+    fn namespace_selector_without_labels_fail_closed() {
+        let mut program = pss_program(PssProfile::Restricted, PolicyMode::Enforce);
+        program
+            .selector
+            .namespace_selector
+            .match_labels
+            .insert("ferrum.io/zone".into(), "pci".into());
+        let decision = admit(&program, &signed_subject(), &[], now());
+        assert!(!decision.allowed);
+        assert!(decision.fail_closed);
+    }
+
+    #[test]
+    fn namespace_selector_mismatch_does_not_apply() {
+        let mut program = pss_program(PssProfile::Restricted, PolicyMode::Enforce);
+        program
+            .selector
+            .namespace_selector
+            .match_labels
+            .insert("ferrum.io/zone".into(), "pci".into());
+        let mut subject = signed_subject();
+        subject
+            .namespace_labels
+            .insert("ferrum.io/zone".into(), "public".into());
+        subject.privileged = true;
+        let decision = admit(&program, &subject, &[], now());
+        assert!(decision.allowed);
+        assert!(!decision.fail_closed);
+        assert!(decision.rule_ids.is_empty());
     }
 
     #[test]

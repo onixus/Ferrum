@@ -7,13 +7,20 @@
 #![deny(unsafe_code)]
 
 mod bundle;
+mod encoding;
 mod eval;
 mod program;
+mod review;
+mod server;
+mod subject;
 
 use chrono::{DateTime, Utc};
 use ferrum_api::PolicyExceptionSpec;
 
-pub use bundle::{load_digest, load_signed};
+pub use bundle::{
+    encode_fsig, load_bundle, load_digest, load_signed, parse_trust_root, SIGNED_FORMAT,
+    SIGNED_MAGIC,
+};
 pub use eval::{
     admit, AdmissionDecision, AdmissionSubject, Patch, RULE_ADDED_CAPABILITIES,
     RULE_ALLOW_PRIVILEGE_ESCALATION, RULE_CLUSTER_ADMIN_BIND, RULE_HOST_IPC, RULE_HOST_NETWORK,
@@ -22,6 +29,9 @@ pub use eval::{
 };
 pub use ferrum_ids::Digest;
 pub use program::{parse_program, AdmissionProgram, ADMISSION_ABI, ADMISSION_MAGIC};
+pub use review::{handle_review_bytes, ReviewConfig, ReviewReply};
+pub use server::{load_tls_config, serve, WebhookState};
+pub use subject::{subject_from_object, IMAGE_SIGNATURES_ANNOTATION, IMAGE_SIGNATURE_ANNOTATION};
 
 /// Parse `fadm` and evaluate. Invalid or missing program → deny (fail closed).
 pub fn admit_bytes(
