@@ -358,7 +358,6 @@ mod tests {
                     name: "org-cosign".into(),
                     keyless_issuer_allow: vec!["https://token.actions.githubusercontent.com".into()],
                     public_keys: vec![],
-                    ..Default::default()
                 }],
                 ..Default::default()
             },
