@@ -1,0 +1,15 @@
+apiVersion: ferrum.io/v1
+kind: PolicyException
+metadata:
+  name: forever-waiver
+  namespace: payments
+spec:
+  ticket: JIRA-18421
+  requestedBy: platform-sre
+  approvedBy: ib-architect
+  reason: temporary debug sidecar after incident
+  fourEyes: true
+  target:
+    namespace: payments
+    policies: [prod-restricted]
+    rules: [no-shell]

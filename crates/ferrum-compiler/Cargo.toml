@@ -10,5 +10,10 @@ description = "Offline compile. Forbidden: kube client, network, webhook hot pat
 [dependencies]
 ferrum-api.workspace = true
 ferrum-common.workspace = true
+ferrum-crypto.workspace = true
 ferrum-ids.workspace = true
 ferrum-policy.workspace = true
+ferrum-wasm-abi.workspace = true
+
+[dev-dependencies]
+serde_yaml.workspace = true

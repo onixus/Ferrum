@@ -23,6 +23,9 @@ spec:
       - name: org-cosign
         keylessIssuerAllow:
           - https://token.actions.githubusercontent.com
+        # fixture only, not a prod key
+        publicKeys:
+          - "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   admit:
     failurePolicy: Fail
     pss: restricted

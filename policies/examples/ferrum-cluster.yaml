@@ -1,0 +1,8 @@
+apiVersion: ferrum.io/v1
+kind: FerrumCluster
+metadata:
+  name: prod-eu-1
+spec:
+  kubeconfigSecretRef: ferrum-cluster-prod-eu-1
+  labels:
+    ferrum.io/zone: pci

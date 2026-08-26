@@ -8,4 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 ferrum-common.workspace = true
+ferrum-crypto.workspace = true
+ferrum-ebpf-progs.workspace = true
 ferrum-ids.workspace = true
+ferrum-k8smeta.workspace = true

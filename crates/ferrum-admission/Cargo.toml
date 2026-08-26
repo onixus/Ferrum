@@ -8,8 +8,16 @@ rust-version.workspace = true
 description = "Webhook. Forbidden: ferrum-compiler, aya, outbound net on hot path."
 
 [dependencies]
+chrono.workspace = true
 ferrum-api.workspace = true
 ferrum-common.workspace = true
 ferrum-crypto.workspace = true
+ferrum-ids.workspace = true
 ferrum-policy.workspace = true
 ferrum-wasm-host.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+ferrum-compiler.workspace = true
+serde_yaml.workspace = true

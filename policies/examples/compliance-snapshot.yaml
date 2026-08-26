@@ -1,0 +1,9 @@
+apiVersion: ferrum.io/v1
+kind: ComplianceSnapshot
+metadata:
+  name: mvp-1
+spec:
+  frameworks:
+    - CIS-5.1
+    - CIS-5.2
+    - PSS-restricted

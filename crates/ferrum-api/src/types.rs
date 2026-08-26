@@ -95,12 +95,15 @@ pub struct SupplySpec {
     pub trust_roots: Vec<TrustRoot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TrustRoot {
     pub name: String,
     #[serde(default)]
     pub keyless_issuer_allow: Vec<String>,
+    /// Hex-encoded 32-byte Ed25519 public keys. Keyless issuer list is not verifying material.
+    #[serde(default)]
+    pub public_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -279,6 +282,9 @@ pub struct PolicyExceptionSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ExceptionTarget {
+    /// Empty = cluster-scoped. Namespaced exception must set this.
+    #[serde(default)]
+    pub namespace: String,
     #[serde(default)]
     pub policies: Vec<String>,
     #[serde(default)]
@@ -425,13 +431,48 @@ macro_rules! resource {
     };
 }
 
-resource!(ClusterSecurityPolicy, "ClusterSecurityPolicy", ClusterSecurityPolicySpec, PolicyStatus);
-resource!(SecurityPolicy, "SecurityPolicy", SecurityPolicySpec, PolicyStatus);
-resource!(PolicyException, "PolicyException", PolicyExceptionSpec, PolicyExceptionStatus);
-resource!(PolicyLibrary, "PolicyLibrary", PolicyLibrarySpec, PolicyLibraryStatus);
-resource!(RuntimeProfile, "RuntimeProfile", RuntimeProfileSpec, RuntimeProfileStatus);
-resource!(FerrumCluster, "FerrumCluster", FerrumClusterSpec, FerrumClusterStatus);
-resource!(ComplianceSnapshot, "ComplianceSnapshot", ComplianceSnapshotSpec, ComplianceSnapshotStatus);
+resource!(
+    ClusterSecurityPolicy,
+    "ClusterSecurityPolicy",
+    ClusterSecurityPolicySpec,
+    PolicyStatus
+);
+resource!(
+    SecurityPolicy,
+    "SecurityPolicy",
+    SecurityPolicySpec,
+    PolicyStatus
+);
+resource!(
+    PolicyException,
+    "PolicyException",
+    PolicyExceptionSpec,
+    PolicyExceptionStatus
+);
+resource!(
+    PolicyLibrary,
+    "PolicyLibrary",
+    PolicyLibrarySpec,
+    PolicyLibraryStatus
+);
+resource!(
+    RuntimeProfile,
+    "RuntimeProfile",
+    RuntimeProfileSpec,
+    RuntimeProfileStatus
+);
+resource!(
+    FerrumCluster,
+    "FerrumCluster",
+    FerrumClusterSpec,
+    FerrumClusterStatus
+);
+resource!(
+    ComplianceSnapshot,
+    "ComplianceSnapshot",
+    ComplianceSnapshotSpec,
+    ComplianceSnapshotStatus
+);
 
 #[cfg(test)]
 mod tests {
@@ -458,12 +499,62 @@ runtime:
         containerOnly: true
       action: kill
 "#;
-        let spec: ClusterSecurityPolicySpec =
-            serde_yaml::from_str(yaml).expect("spec must parse");
+        let spec: ClusterSecurityPolicySpec = serde_yaml::from_str(yaml).expect("spec must parse");
         assert_eq!(spec.mode, PolicyMode::Enforce);
         assert!(spec.admit.deny.privileged);
         assert!(spec.admit.deny.host_pid);
         assert_eq!(spec.runtime.rules[0].action, RuntimeAction::Kill);
         assert_eq!(spec.runtime.rules[0].match_on.comm_in, vec!["sh", "bash"]);
+    }
+
+    #[test]
+    fn prod_restricted_example_matches_crd() {
+        let yaml = include_str!("../../../policies/examples/prod-restricted.yaml");
+        let obj: ClusterSecurityPolicy = serde_yaml::from_str(yaml).expect("example yaml");
+        assert_eq!(obj.api_version, "ferrum.io/v1");
+        assert_eq!(obj.kind, "ClusterSecurityPolicy");
+        assert_eq!(obj.metadata.name, "prod-restricted");
+        assert_eq!(obj.spec.mode, PolicyMode::Audit);
+        assert!(obj.spec.supply.require_signed);
+        assert!(obj.spec.supply.deny_unsigned);
+        assert_eq!(obj.spec.supply.trust_roots[0].name, "org-cosign");
+        assert_eq!(
+            obj.spec.supply.trust_roots[0].public_keys[0].len(),
+            64,
+            "fixture Ed25519 public key is 32-byte hex"
+        );
+        assert_eq!(obj.spec.admit.failure_policy, FailurePolicy::Fail);
+        assert_eq!(obj.spec.admit.pss, PssProfile::Restricted);
+        assert!(obj.spec.admit.deny.privileged);
+        assert!(obj.spec.admit.deny.host_pid);
+        assert!(obj.spec.admit.deny.cluster_admin_bind);
+        assert_eq!(obj.spec.runtime.rules[0].id, "no-shell");
+        assert_eq!(obj.spec.runtime.rules[0].action, RuntimeAction::Kill);
+        assert_eq!(
+            obj.spec.runtime.rules[1].match_on.path_suffix,
+            vec!["docker.sock", "containerd.sock", "crio.sock"]
+        );
+    }
+
+    #[test]
+    fn exception_examples_match_crd() {
+        let ok: PolicyException =
+            serde_yaml::from_str(include_str!("../../../policies/examples/exception-ok.yaml"))
+                .expect("exception-ok");
+        assert_eq!(ok.kind, "PolicyException");
+        assert_eq!(ok.spec.ticket, "JIRA-18421");
+        assert_eq!(ok.spec.target.namespace, "payments");
+        assert_eq!(ok.spec.target.policies, vec!["prod-restricted"]);
+        assert_eq!(ok.spec.target.rules, vec!["no-shell"]);
+        assert!(ok.spec.four_eyes);
+
+        let bad: PolicyException = serde_yaml::from_str(include_str!(
+            "../../../policies/examples/exception-bad-no-ticket.yaml"
+        ))
+        .expect("exception-bad-no-ticket");
+        assert!(bad.spec.ticket.is_empty());
+        assert_eq!(bad.spec.reason, "asap");
+        assert!(bad.spec.approved_by.is_empty());
+        assert!(bad.spec.four_eyes);
     }
 }

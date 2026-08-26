@@ -1,0 +1,9 @@
+apiVersion: ferrum.io/v1
+kind: PolicyLibrary
+metadata:
+  name: org-signed-lib
+spec:
+  source: oci://registry.internal.example/ferrum/policy-lib:v1
+  digest: "8253ce6ea4260821d86f49a49487bd5f032c763a9d63499d8dea0a3f7e3fabd2"
+  minAgentAbi: 1
+  minAdmissionAbi: 1

@@ -12,6 +12,12 @@ ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ebpf.workspace = true
 ferrum-export.workspace = true
+ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
 ferrum-proto.workspace = true
 ferrum-wasm-host.workspace = true
+
+[dev-dependencies]
+ferrum-api.workspace = true
+ferrum-compiler.workspace = true
+serde_yaml.workspace = true

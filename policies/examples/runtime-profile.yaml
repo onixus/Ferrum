@@ -1,0 +1,7 @@
+apiVersion: ferrum.io/v1
+kind: RuntimeProfile
+metadata:
+  name: payments-observe
+spec:
+  sourcePolicy: prod-restricted
+  window: 7d
