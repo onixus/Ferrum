@@ -1,0 +1,15 @@
+apiVersion: ferrum.io/v1
+kind: PolicyException
+metadata:
+  name: please-just-let-it-through
+  namespace: payments
+spec:
+  ticket: ""
+  requestedBy: "platform-sre"
+  approvedBy: ""
+  reason: "asap"
+  expiresAt: "2020-01-01T00:00:00Z"
+  fourEyes: true
+  target:
+    policies: ["prod-restricted"]
+    rules: ["no-shell"]

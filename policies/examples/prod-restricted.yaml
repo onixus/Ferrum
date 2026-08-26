@@ -1,0 +1,65 @@
+apiVersion: ferrum.io/v1
+kind: ClusterSecurityPolicy
+metadata:
+  name: prod-restricted
+spec:
+  mode: audit
+  priority: 100
+  selector:
+    namespaceSelector:
+      matchExpressions:
+        - key: ferrum.io/zone
+          operator: In
+          values: [pci, secrets]
+    image:
+      registriesAllow:
+        - registry.internal.example
+      requireDigest: true
+  supply:
+    requireSigned: true
+    denyUnsigned: true
+    denyLatestTag: true
+    trustRoots:
+      - name: org-cosign
+        keylessIssuerAllow:
+          - https://token.actions.githubusercontent.com
+  admit:
+    failurePolicy: Fail
+    pss: restricted
+    deny:
+      privileged: true
+      hostPID: true
+      hostIPC: true
+      hostNetwork: true
+      hostPath: true
+      allowPrivilegeEscalation: true
+      runAsRoot: true
+      wildcardsRbac: true
+      clusterAdminBind: true
+      addedCapabilities:
+        - SYS_ADMIN
+        - NET_ADMIN
+        - SYS_PTRACE
+        - SYS_MODULE
+    mutate:
+      injectSeccompRuntimeDefault: true
+      dropAllCapabilities: true
+      readOnlyRootFilesystem: true
+  runtime:
+    defaultAction: audit
+    rules:
+      - id: no-shell
+        syscalls: [execve, execveat]
+        match:
+          commIn: [sh, bash, ash, dash, zsh]
+          containerOnly: true
+        action: kill
+      - id: no-runtime-sock
+        match:
+          pathSuffix: [docker.sock, containerd.sock, crio.sock]
+        action: kill
+      - id: no-module
+        syscalls: [init_module, finit_module, bpf]
+        match:
+          notAgentSelf: true
+        action: deny

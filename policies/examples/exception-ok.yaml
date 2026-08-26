@@ -1,0 +1,15 @@
+apiVersion: ferrum.io/v1
+kind: PolicyException
+metadata:
+  name: debug-sidecar
+  namespace: payments
+spec:
+  ticket: JIRA-18421
+  requestedBy: platform-sre
+  approvedBy: ib-architect
+  reason: temporary debug sidecar after incident
+  expiresAt: "2026-09-09T18:00:00Z"
+  fourEyes: true
+  target:
+    policies: [prod-restricted]
+    rules: [no-shell]
