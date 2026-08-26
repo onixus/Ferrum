@@ -1,0 +1,15 @@
+[package]
+name = "ferrum-admission"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Webhook. Forbidden: ferrum-compiler, aya, outbound net on hot path."
+
+[dependencies]
+ferrum-api.workspace = true
+ferrum-common.workspace = true
+ferrum-crypto.workspace = true
+ferrum-policy.workspace = true
+ferrum-wasm-host.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "ferrum-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferrum-api.workspace = true
+ferrum-compiler.workspace = true
+ferrum-crypto.workspace = true

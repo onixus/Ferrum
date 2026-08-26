@@ -1,0 +1,17 @@
+[package]
+name = "ferrum-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Only BPF carrier. Forbidden: ferrum-compiler, cluster-admin SA."
+
+[dependencies]
+ferrum-common.workspace = true
+ferrum-crypto.workspace = true
+ferrum-ebpf.workspace = true
+ferrum-export.workspace = true
+ferrum-k8smeta.workspace = true
+ferrum-proto.workspace = true
+ferrum-wasm-host.workspace = true
