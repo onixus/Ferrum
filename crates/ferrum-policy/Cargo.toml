@@ -1,0 +1,17 @@
+[package]
+name = "ferrum-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Инварианты политик. Сети и kube::Client здесь быть не должно."
+
+[dependencies]
+chrono.workspace = true
+ferrum-api.workspace = true
+ferrum-common.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_yaml.workspace = true
