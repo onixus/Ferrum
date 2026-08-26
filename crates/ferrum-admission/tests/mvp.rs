@@ -5,8 +5,8 @@ mod common;
 use chrono::{DateTime, Days, TimeZone, Utc};
 use ferrum_admission::{
     admit, admit_bytes, admit_digest, admit_signed, parse_program, AdmissionSubject, Patch,
-    ADMISSION_ABI, RULE_ADDED_CAPABILITIES, RULE_CLUSTER_ADMIN_BIND, RULE_HOST_PID,
-    RULE_LATEST_TAG, RULE_PRIVILEGED, RULE_UNSIGNED,
+    ADMISSION_ABI, RULE_ADDED_CAPABILITIES, RULE_CLUSTER_ADMIN_BIND, RULE_HOST_PATH, RULE_HOST_PID,
+    RULE_LATEST_TAG, RULE_PRIVILEGED, RULE_RUN_AS_ROOT, RULE_UNSIGNED,
 };
 use ferrum_api::{
     AdmitDeny, AdmitMutate, AdmitSpec, ClusterSecurityPolicy, ClusterSecurityPolicySpec,
@@ -98,6 +98,25 @@ fn compliant() -> AdmissionSubject {
         policy_name: "prod-restricted".into(),
         image: "registry.internal.example/app@sha256:abc".into(),
         image_signed: true,
+        ..Default::default()
+    }
+}
+
+fn pss_empty_deny(pss: PssProfile, mode: PolicyMode) -> ClusterSecurityPolicySpec {
+    ClusterSecurityPolicySpec {
+        mode,
+        supply: SupplySpec {
+            require_signed: true,
+            deny_unsigned: true,
+            trust_roots: trust_roots(),
+            ..Default::default()
+        },
+        admit: AdmitSpec {
+            failure_policy: FailurePolicy::Fail,
+            pss,
+            deny: AdmitDeny::default(),
+            mutate: AdmitMutate::default(),
+        },
         ..Default::default()
     }
 }
@@ -487,6 +506,123 @@ fn parser_reads_public_keys_after_keyless_issuers() {
         parsed.supply.trust_roots[0].public_keys,
         vec![FIXTURE_ED25519_PK]
     );
+}
+
+#[test]
+fn pss_restricted_empty_deny_privileged() {
+    let program = compile(pss_empty_deny(PssProfile::Restricted, PolicyMode::Enforce));
+    let mut subject = compliant();
+    subject.privileged = true;
+    let decision = admit_bytes(&program, &subject, &[], now());
+    assert!(!decision.allowed);
+    assert!(!decision.fail_closed);
+    assert!(decision.rule_ids.iter().any(|r| r == RULE_PRIVILEGED));
+}
+
+#[test]
+fn pss_restricted_empty_deny_run_as_root() {
+    let program = compile(pss_empty_deny(PssProfile::Restricted, PolicyMode::Enforce));
+    let mut subject = compliant();
+    subject.run_as_root = true;
+    let decision = admit_bytes(&program, &subject, &[], now());
+    assert!(!decision.allowed);
+    assert!(decision.rule_ids.iter().any(|r| r == RULE_RUN_AS_ROOT));
+}
+
+#[test]
+fn pss_restricted_empty_deny_host_path() {
+    let program = compile(pss_empty_deny(PssProfile::Restricted, PolicyMode::Enforce));
+    let mut subject = compliant();
+    subject.host_path = true;
+    let decision = admit_bytes(&program, &subject, &[], now());
+    assert!(!decision.allowed);
+    assert!(decision.rule_ids.iter().any(|r| r == RULE_HOST_PATH));
+}
+
+#[test]
+fn pss_restricted_empty_deny_capabilities() {
+    let program = compile(pss_empty_deny(PssProfile::Restricted, PolicyMode::Enforce));
+    let mut sys_admin = compliant();
+    sys_admin.added_capabilities = vec!["SYS_ADMIN".into()];
+    let denied = admit_bytes(&program, &sys_admin, &[], now());
+    assert!(!denied.allowed);
+    assert!(denied.rule_ids.iter().any(|r| r == RULE_ADDED_CAPABILITIES));
+
+    let mut net_bind = compliant();
+    net_bind.added_capabilities = vec!["NET_BIND_SERVICE".into()];
+    let allowed = admit_bytes(&program, &net_bind, &[], now());
+    assert!(allowed.allowed);
+    assert!(!allowed.fail_closed);
+    assert!(allowed.rule_ids.is_empty());
+    assert_eq!(
+        allowed.patches,
+        vec![
+            Patch::InjectSeccompRuntimeDefault,
+            Patch::DropAllCapabilities,
+            Patch::ReadOnlyRootFilesystem,
+        ]
+    );
+}
+
+#[test]
+fn pss_baseline_empty_deny_host_pid_and_host_path() {
+    let program = compile(pss_empty_deny(PssProfile::Baseline, PolicyMode::Enforce));
+    let mut host_pid = compliant();
+    host_pid.host_pid = true;
+    let denied = admit_bytes(&program, &host_pid, &[], now());
+    assert!(!denied.allowed);
+    assert!(denied.rule_ids.iter().any(|r| r == RULE_HOST_PID));
+
+    let mut host_path = compliant();
+    host_path.host_path = true;
+    let denied_path = admit_bytes(&program, &host_path, &[], now());
+    assert!(!denied_path.allowed);
+    assert!(denied_path.rule_ids.iter().any(|r| r == RULE_HOST_PATH));
+    assert!(denied_path.patches.is_empty());
+}
+
+#[test]
+fn pss_baseline_empty_deny_capabilities() {
+    let program = compile(pss_empty_deny(PssProfile::Baseline, PolicyMode::Enforce));
+    let mut sys_admin = compliant();
+    sys_admin.added_capabilities = vec!["SYS_ADMIN".into()];
+    let denied = admit_bytes(&program, &sys_admin, &[], now());
+    assert!(!denied.allowed);
+    assert!(denied.rule_ids.iter().any(|r| r == RULE_ADDED_CAPABILITIES));
+
+    let mut chown = compliant();
+    chown.added_capabilities = vec!["CHOWN".into()];
+    let allowed = admit_bytes(&program, &chown, &[], now());
+    assert!(allowed.allowed);
+    assert!(allowed.rule_ids.is_empty());
+    assert!(allowed.patches.is_empty());
+}
+
+#[test]
+fn pss_privileged_empty_deny_allows_privileged() {
+    let program = compile(pss_empty_deny(PssProfile::Privileged, PolicyMode::Enforce));
+    let mut subject = compliant();
+    subject.privileged = true;
+    let decision = admit_bytes(&program, &subject, &[], now());
+    assert!(decision.allowed);
+    assert!(decision.rule_ids.is_empty());
+}
+
+#[test]
+fn pss_restricted_observe_and_audit_do_not_fail_request() {
+    for mode in [PolicyMode::Observe, PolicyMode::Audit] {
+        let program = compile(pss_empty_deny(PssProfile::Restricted, mode));
+        let mut subject = compliant();
+        subject.privileged = true;
+        let decision = admit_bytes(&program, &subject, &[], now());
+        assert!(decision.allowed, "mode={mode:?}");
+        assert!(!decision.fail_closed, "mode={mode:?}");
+        assert!(
+            decision.rule_ids.iter().any(|r| r == RULE_PRIVILEGED),
+            "mode={mode:?}"
+        );
+        assert!(decision.patches.is_empty(), "mode={mode:?}");
+    }
 }
 
 #[test]

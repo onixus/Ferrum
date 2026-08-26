@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use ferrum_api::{
-    FailurePolicy, LabelSelector, PolicyExceptionSpec, PolicyMode, RuntimeAction, SupplySpec,
+    FailurePolicy, LabelSelector, PolicyExceptionSpec, PolicyMode, PssProfile, RuntimeAction,
+    SupplySpec,
 };
 use ferrum_common::FerrumError;
 use ferrum_policy::{evaluate, exception_applies, RuleHit};
@@ -26,6 +27,26 @@ pub const RULE_UNSIGNED: &str = "unsigned";
 pub const RULE_LATEST_TAG: &str = "latestTag";
 pub const RULE_REQUIRE_DIGEST: &str = "requireDigest";
 pub const RULE_REGISTRY_ALLOW: &str = "registryAllow";
+
+/// Restricted PSS may add only this capability (drop ALL otherwise).
+const PSS_RESTRICTED_ALLOWED_CAP: &str = "NET_BIND_SERVICE";
+
+/// Kubernetes PSS baseline default add-capabilities allow-list.
+const PSS_BASELINE_ALLOWED_CAPS: &[&str] = &[
+    "AUDIT_WRITE",
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "MKNOD",
+    "NET_BIND_SERVICE",
+    "SETFCAP",
+    "SETGID",
+    "SETPCAP",
+    "SETUID",
+    "SYS_CHROOT",
+];
 
 /// Simplified Pod / RBAC view. Callers must fill this from the admission review;
 /// this crate does not talk to the API server or registries.
@@ -309,29 +330,34 @@ fn collect_hits(program: &AdmissionProgram, subject: &AdmissionSubject) -> Vec<P
         }
     }
 
+    // PSS constraints are OR'd with explicit deny. Privileged/Custom add none.
     let deny = &program.admit.deny;
-    if deny.privileged && subject.privileged {
+    let pss = program.admit.pss;
+    let baseline = matches!(pss, PssProfile::Baseline | PssProfile::Restricted);
+    let restricted = pss == PssProfile::Restricted;
+
+    if (deny.privileged || baseline) && subject.privileged {
         add(RULE_PRIVILEGED, "privileged container".into());
     }
-    if deny.host_pid && subject.host_pid {
+    if (deny.host_pid || baseline) && subject.host_pid {
         add(RULE_HOST_PID, "hostPID".into());
     }
-    if deny.host_ipc && subject.host_ipc {
+    if (deny.host_ipc || baseline) && subject.host_ipc {
         add(RULE_HOST_IPC, "hostIPC".into());
     }
-    if deny.host_network && subject.host_network {
+    if (deny.host_network || baseline) && subject.host_network {
         add(RULE_HOST_NETWORK, "hostNetwork".into());
     }
-    if deny.host_path && subject.host_path {
+    if (deny.host_path || baseline) && subject.host_path {
         add(RULE_HOST_PATH, "hostPath".into());
     }
-    if deny.allow_privilege_escalation && subject.allow_privilege_escalation {
+    if (deny.allow_privilege_escalation || restricted) && subject.allow_privilege_escalation {
         add(
             RULE_ALLOW_PRIVILEGE_ESCALATION,
             "allowPrivilegeEscalation".into(),
         );
     }
-    if deny.run_as_root && subject.run_as_root {
+    if (deny.run_as_root || restricted) && subject.run_as_root {
         add(RULE_RUN_AS_ROOT, "runAsRoot".into());
     }
     if deny.wildcards_rbac && subject.wildcard_rbac {
@@ -340,23 +366,25 @@ fn collect_hits(program: &AdmissionProgram, subject: &AdmissionSubject) -> Vec<P
     if deny.cluster_admin_bind && subject.cluster_admin_bind {
         add(RULE_CLUSTER_ADMIN_BIND, "cluster-admin bind".into());
     }
-    if !deny.added_capabilities.is_empty() {
-        let matched: Vec<&String> = subject
-            .added_capabilities
+
+    let matched: Vec<&String> = subject
+        .added_capabilities
+        .iter()
+        .filter(|cap| {
+            pss_forbids_added_capability(pss, cap)
+                || deny.added_capabilities.iter().any(|d| d == *cap)
+        })
+        .collect();
+    if !matched.is_empty() {
+        let list = matched
             .iter()
-            .filter(|cap| deny.added_capabilities.iter().any(|d| d == *cap))
-            .collect();
-        if !matched.is_empty() {
-            let list = matched
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            add(
-                RULE_ADDED_CAPABILITIES,
-                format!("added capabilities denied: {list}"),
-            );
-        }
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        add(
+            RULE_ADDED_CAPABILITIES,
+            format!("added capabilities denied: {list}"),
+        );
     }
 
     hits
@@ -369,15 +397,25 @@ fn has_verifying_public_keys(supply: &SupplySpec) -> bool {
         .any(|root| root.public_keys.iter().any(|key| !key.trim().is_empty()))
 }
 
+fn pss_forbids_added_capability(pss: PssProfile, cap: &str) -> bool {
+    match pss {
+        PssProfile::Restricted => cap != PSS_RESTRICTED_ALLOWED_CAP,
+        PssProfile::Baseline => !PSS_BASELINE_ALLOWED_CAPS.contains(&cap),
+        PssProfile::Privileged | PssProfile::Custom => false,
+    }
+}
+
 fn mutations(program: &AdmissionProgram) -> Vec<Patch> {
+    let pss_mutate =
+        program.mode == PolicyMode::Enforce && program.admit.pss == PssProfile::Restricted;
     let mut patches = Vec::new();
-    if program.admit.mutate.inject_seccomp_runtime_default {
+    if program.admit.mutate.inject_seccomp_runtime_default || pss_mutate {
         patches.push(Patch::InjectSeccompRuntimeDefault);
     }
-    if program.admit.mutate.drop_all_capabilities {
+    if program.admit.mutate.drop_all_capabilities || pss_mutate {
         patches.push(Patch::DropAllCapabilities);
     }
-    if program.admit.mutate.read_only_root_filesystem {
+    if program.admit.mutate.read_only_root_filesystem || pss_mutate {
         patches.push(Patch::ReadOnlyRootFilesystem);
     }
     patches
@@ -432,6 +470,196 @@ fn image_is_latest(image: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use ferrum_api::{AdmitDeny, AdmitSpec, PolicySelector, TrustRoot};
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap()
+    }
+
+    fn signed_subject() -> AdmissionSubject {
+        AdmissionSubject {
+            policy_name: "pss".into(),
+            image: "registry.internal.example/app@sha256:abc".into(),
+            image_signed: true,
+            ..Default::default()
+        }
+    }
+
+    fn pss_program(pss: PssProfile, mode: PolicyMode) -> AdmissionProgram {
+        AdmissionProgram {
+            abi: crate::ADMISSION_ABI,
+            mode,
+            disabled: false,
+            priority: 0,
+            supply: SupplySpec {
+                require_signed: true,
+                deny_unsigned: true,
+                trust_roots: vec![TrustRoot {
+                    name: "org".into(),
+                    public_keys: vec!["k".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            admit: AdmitSpec {
+                failure_policy: FailurePolicy::Fail,
+                pss,
+                deny: AdmitDeny::default(),
+                ..Default::default()
+            },
+            selector: PolicySelector::default(),
+        }
+    }
+
+    #[test]
+    fn pss_restricted_empty_deny_privileged() {
+        let mut subject = signed_subject();
+        subject.privileged = true;
+        let decision = admit(
+            &pss_program(PssProfile::Restricted, PolicyMode::Enforce),
+            &subject,
+            &[],
+            now(),
+        );
+        assert!(!decision.allowed);
+        assert!(!decision.fail_closed);
+        assert!(decision.rule_ids.iter().any(|r| r == RULE_PRIVILEGED));
+    }
+
+    #[test]
+    fn pss_restricted_empty_deny_run_as_root_and_host_path() {
+        let program = pss_program(PssProfile::Restricted, PolicyMode::Enforce);
+        let mut root = signed_subject();
+        root.run_as_root = true;
+        let denied_root = admit(&program, &root, &[], now());
+        assert!(!denied_root.allowed);
+        assert!(denied_root.rule_ids.iter().any(|r| r == RULE_RUN_AS_ROOT));
+
+        let mut host_path = signed_subject();
+        host_path.host_path = true;
+        let denied_path = admit(&program, &host_path, &[], now());
+        assert!(!denied_path.allowed);
+        assert!(denied_path.rule_ids.iter().any(|r| r == RULE_HOST_PATH));
+    }
+
+    #[test]
+    fn pss_restricted_empty_deny_capabilities() {
+        let program = pss_program(PssProfile::Restricted, PolicyMode::Enforce);
+        let mut sys_admin = signed_subject();
+        sys_admin.added_capabilities = vec!["SYS_ADMIN".into()];
+        let denied = admit(&program, &sys_admin, &[], now());
+        assert!(!denied.allowed);
+        assert!(denied.rule_ids.iter().any(|r| r == RULE_ADDED_CAPABILITIES));
+
+        let mut net_bind = signed_subject();
+        net_bind.added_capabilities = vec!["NET_BIND_SERVICE".into()];
+        let allowed = admit(&program, &net_bind, &[], now());
+        assert!(allowed.allowed);
+        assert!(allowed.rule_ids.is_empty());
+        assert_eq!(
+            allowed.patches,
+            vec![
+                Patch::InjectSeccompRuntimeDefault,
+                Patch::DropAllCapabilities,
+                Patch::ReadOnlyRootFilesystem,
+            ]
+        );
+    }
+
+    #[test]
+    fn pss_restricted_explicit_deny_ors_net_bind_service() {
+        let mut program = pss_program(PssProfile::Restricted, PolicyMode::Enforce);
+        program.admit.deny.added_capabilities = vec!["NET_BIND_SERVICE".into()];
+        let mut subject = signed_subject();
+        subject.added_capabilities = vec!["NET_BIND_SERVICE".into()];
+        let decision = admit(&program, &subject, &[], now());
+        assert!(!decision.allowed);
+        assert!(decision
+            .rule_ids
+            .iter()
+            .any(|r| r == RULE_ADDED_CAPABILITIES));
+    }
+
+    #[test]
+    fn pss_baseline_empty_deny_host_pid_and_host_path() {
+        let program = pss_program(PssProfile::Baseline, PolicyMode::Enforce);
+        let mut host_pid = signed_subject();
+        host_pid.host_pid = true;
+        let denied = admit(&program, &host_pid, &[], now());
+        assert!(!denied.allowed);
+        assert!(denied.rule_ids.iter().any(|r| r == RULE_HOST_PID));
+
+        let mut host_path = signed_subject();
+        host_path.host_path = true;
+        let denied_path = admit(&program, &host_path, &[], now());
+        assert!(!denied_path.allowed);
+        assert!(denied_path.rule_ids.iter().any(|r| r == RULE_HOST_PATH));
+        assert!(denied_path.patches.is_empty());
+    }
+
+    #[test]
+    fn pss_baseline_empty_deny_capabilities() {
+        let program = pss_program(PssProfile::Baseline, PolicyMode::Enforce);
+        let mut sys_admin = signed_subject();
+        sys_admin.added_capabilities = vec!["SYS_ADMIN".into()];
+        let denied = admit(&program, &sys_admin, &[], now());
+        assert!(!denied.allowed);
+        assert!(denied.rule_ids.iter().any(|r| r == RULE_ADDED_CAPABILITIES));
+
+        let mut chown = signed_subject();
+        chown.added_capabilities = vec!["CHOWN".into()];
+        let allowed = admit(&program, &chown, &[], now());
+        assert!(allowed.allowed);
+        assert!(allowed.rule_ids.is_empty());
+        assert!(allowed.patches.is_empty());
+    }
+
+    #[test]
+    fn pss_privileged_and_custom_empty_deny_add_nothing() {
+        let mut subject = signed_subject();
+        subject.privileged = true;
+        subject.host_pid = true;
+        subject.host_path = true;
+        subject.run_as_root = true;
+        subject.added_capabilities = vec!["SYS_ADMIN".into()];
+        for pss in [PssProfile::Privileged, PssProfile::Custom] {
+            let decision = admit(&pss_program(pss, PolicyMode::Enforce), &subject, &[], now());
+            assert!(decision.allowed, "pss={pss:?}");
+            assert!(decision.rule_ids.is_empty(), "pss={pss:?}");
+            assert!(decision.patches.is_empty(), "pss={pss:?}");
+        }
+    }
+
+    #[test]
+    fn pss_restricted_observe_and_audit_do_not_fail_request() {
+        let mut subject = signed_subject();
+        subject.privileged = true;
+        for mode in [PolicyMode::Observe, PolicyMode::Audit] {
+            let decision = admit(
+                &pss_program(PssProfile::Restricted, mode),
+                &subject,
+                &[],
+                now(),
+            );
+            assert!(decision.allowed, "mode={mode:?}");
+            assert!(!decision.fail_closed, "mode={mode:?}");
+            assert!(
+                decision.rule_ids.iter().any(|r| r == RULE_PRIVILEGED),
+                "mode={mode:?}"
+            );
+            assert!(decision.patches.is_empty(), "mode={mode:?}");
+        }
+    }
+
+    #[test]
+    fn pss_restricted_observe_applies_only_explicit_mutate() {
+        let mut program = pss_program(PssProfile::Restricted, PolicyMode::Observe);
+        program.admit.mutate.drop_all_capabilities = true;
+        let decision = admit(&program, &signed_subject(), &[], now());
+        assert!(decision.allowed);
+        assert_eq!(decision.patches, vec![Patch::DropAllCapabilities]);
+    }
 
     #[test]
     fn parse_image_registry_tag_digest() {

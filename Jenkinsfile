@@ -67,10 +67,15 @@ pipeline {
                     cargo run -p ferrum-cli --quiet -- validate policies/examples/runtime-profile.yaml
                     cargo run -p ferrum-cli --quiet -- validate policies/examples/ferrum-cluster.yaml
                     cargo run -p ferrum-cli --quiet -- validate policies/examples/compliance-snapshot.yaml
-                    if cargo run -p ferrum-cli --quiet -- validate policies/examples/exception-bad-no-ticket.yaml; then
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- validate policies/examples/exception-bad-no-ticket.yaml >/tmp/ferrum-bad-exception.out 2>/tmp/ferrum-bad-exception.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
                         echo "exception-bad-no-ticket.yaml must fail validation" >&2
                         exit 1
                     fi
+                    echo "ok: exception-bad-no-ticket.yaml rejected"
                 '''
             }
         }
