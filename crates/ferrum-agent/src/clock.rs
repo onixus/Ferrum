@@ -22,6 +22,11 @@ pub const MAX_EXCEPTION_DAYS: u64 = 90;
 
 const OBSERVED_TIME: &str = "observed-time";
 
+/// How far ahead of the wall clock any anchor may ever push the floor. A floor
+/// in the future expires every live waiver at once and never comes back, so
+/// both the signed anchor and the on-disk `observed-time` are capped by it.
+const MAX_ANCHOR_SKEW_SECS: i64 = 300;
+
 /// Persist granularity. Writing on every event would put a file write on the
 /// decision path; a coarse floor is still a floor.
 const PERSIST_STEP_SECS: i64 = 60;
@@ -59,8 +64,17 @@ impl MonotonicFloor {
     /// Read `observed-time` from `dir` if present; an unreadable or malformed
     /// file leaves the floor at its minimum rather than failing the agent.
     pub fn with_dir(dir: impl Into<PathBuf>) -> Self {
+        Self::with_dir_at(dir, Utc::now())
+    }
+
+    /// Same, with the wall reading injected: `observed-time` is written by
+    /// whoever is root on the node, so a value ahead of the wall clock is
+    /// discarded here instead of becoming a permanent future floor.
+    pub fn with_dir_at(dir: impl Into<PathBuf>, wall: DateTime<Utc>) -> Self {
         let dir = dir.into();
-        let stored = read_observed(&dir).unwrap_or(DateTime::<Utc>::MIN_UTC);
+        let stored = read_observed(&dir)
+            .filter(|t| *t <= ceiling(wall))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
         Self {
             dir: Some(dir),
             state: Mutex::new(FloorState {
@@ -82,13 +96,22 @@ impl MonotonicFloor {
     /// Signed lower bound: a live exception cannot be more than 90 days from
     /// now, so its `expiresAt` minus 90 days is a time the node has passed.
     pub fn anchor_from_exceptions(&self, specs: &[PolicyExceptionSpec]) {
+        self.anchor_from_exceptions_at(specs, Utc::now());
+    }
+
+    /// The anchor is only as good as the invariant behind it, so a spec that
+    /// does not pass `validate_exception` (TTL over 90 days above all) does not
+    /// anchor anything, and the result is capped just above the wall reading.
+    pub fn anchor_from_exceptions_at(&self, specs: &[PolicyExceptionSpec], wall: DateTime<Utc>) {
         let anchor = specs
             .iter()
+            .filter(|spec| ferrum_policy::validate_exception(spec).is_ok())
             .filter_map(|spec| {
                 spec.expires_at
                     .checked_sub_days(Days::new(MAX_EXCEPTION_DAYS))
             })
-            .max();
+            .max()
+            .map(|anchor| anchor.min(ceiling(wall)));
         if let Some(anchor) = anchor {
             let mut state = self.lock();
             if anchor > state.floor {
@@ -135,6 +158,12 @@ impl MonotonicFloor {
     fn lock(&self) -> std::sync::MutexGuard<'_, FloorState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+fn ceiling(wall: DateTime<Utc>) -> DateTime<Utc> {
+    chrono::Duration::try_seconds(MAX_ANCHOR_SKEW_SECS)
+        .and_then(|skew| wall.checked_add_signed(skew))
+        .unwrap_or(wall)
 }
 
 fn read_observed(dir: &Path) -> Option<DateTime<Utc>> {
@@ -223,16 +252,7 @@ mod tests {
     fn signed_exceptions_anchor_the_floor_without_the_file() {
         let clock = MonotonicFloor::new();
         let now = Utc::now();
-        let spec = PolicyExceptionSpec {
-            ticket: "JIRA-1".into(),
-            requested_by: "sre".into(),
-            approved_by: "sec".into(),
-            reason: "documented".into(),
-            expires_at: now + Days::new(10),
-            mode: Default::default(),
-            four_eyes: false,
-            target: Default::default(),
-        };
+        let spec = spec_expiring(now + Days::new(10));
         clock.anchor_from_exceptions(std::slice::from_ref(&spec));
         // expiresAt - 90d is a time the node has provably passed.
         let anchor = clock.floor();
@@ -241,5 +261,66 @@ mod tests {
         // A clock moved a year back cannot get under the signed anchor.
         assert_eq!(clock.now_from(now - Days::new(365)), anchor);
         assert_eq!(clock.clock_rollback_total(), 1);
+    }
+
+    /// A waiver with a ten-year TTL is not a waiver policy would accept, so it
+    /// anchors nothing: otherwise one spec pushes the floor years ahead and
+    /// every legitimate waiver on the node expires for good.
+    #[test]
+    fn an_invalid_ttl_cannot_push_the_floor_into_the_future() {
+        let clock = MonotonicFloor::new();
+        let now = Utc::now();
+        let far = spec_expiring(now + Days::new(3650));
+        clock.anchor_from_exceptions_at(std::slice::from_ref(&far), now);
+        assert_eq!(clock.floor(), DateTime::<Utc>::MIN_UTC);
+
+        // A live waiver still expires on its own terms.
+        let good = spec_expiring(now + Days::new(10));
+        clock.anchor_from_exceptions_at(&[far, good], now);
+        assert!(clock.floor() <= now, "{}", clock.floor());
+        assert!(clock.floor() > now - Days::new(81));
+        assert_eq!(clock.now_from(now), now);
+        assert_eq!(clock.clock_rollback_total(), 0);
+    }
+
+    #[test]
+    fn observed_time_from_the_future_is_ignored() {
+        let dir = temp_dir("future-observed");
+        let now = Utc::now();
+        std::fs::write(
+            dir.join(OBSERVED_TIME),
+            (now + Days::new(3650)).to_rfc3339().as_bytes(),
+        )
+        .expect("observed-time");
+        let clock = MonotonicFloor::with_dir_at(&dir, now);
+        assert_eq!(clock.floor(), DateTime::<Utc>::MIN_UTC);
+        // The real reading is accepted, and a rollback under it is still caught.
+        assert_eq!(clock.now_from(now), now);
+        assert_eq!(clock.now_from(now - Days::new(1)), now);
+        assert_eq!(clock.clock_rollback_total(), 1);
+
+        std::fs::write(dir.join(OBSERVED_TIME), b"not a timestamp").expect("garbage");
+        assert_eq!(
+            MonotonicFloor::with_dir_at(&dir, now).floor(),
+            DateTime::<Utc>::MIN_UTC
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn spec_expiring(expires_at: DateTime<Utc>) -> PolicyExceptionSpec {
+        PolicyExceptionSpec {
+            ticket: "JIRA-1".into(),
+            requested_by: "sre".into(),
+            approved_by: "sec".into(),
+            reason: "documented".into(),
+            expires_at,
+            mode: Default::default(),
+            four_eyes: false,
+            target: ferrum_api::ExceptionTarget {
+                namespace: "prod".into(),
+                policies: vec!["prod-restricted".into()],
+                rules: vec!["no-shell".into()],
+            },
+        }
     }
 }
