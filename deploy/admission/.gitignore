@@ -3,3 +3,7 @@
 validatingwebhookconfiguration.yaml
 *.secret.yaml
 ca.crt
+# The CA private key, and anything else shaped like a key. It can issue a leaf
+# the applied ValidatingWebhookConfiguration trusts, i.e. a forged webhook.
+ca.key
+*.key

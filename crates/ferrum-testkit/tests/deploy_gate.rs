@@ -310,6 +310,7 @@ mod deploy_tree {
             template: None,
             ca_cert: None,
             ca_key: None,
+            webhook_config: None,
         })
         .expect("issue webhook PKI");
 
@@ -317,6 +318,15 @@ mod deploy_tree {
         // accept it, not just the template it came from.
         std::fs::remove_file(admission.join(WEBHOOK_TEMPLATE_FILE)).unwrap();
         assert!(admission.join(WEBHOOK_RENDERED_FILE).is_file());
+
+        // Issuance leaves the CA key in the tree, and the lint says so until it
+        // is moved out. That is the whole point of the rule: the tree it lands
+        // in is the one that gets committed.
+        let ca_key = admission.join(gen_pki::CA_KEY_FILE);
+        let err = lint_deploy_dir(&root).expect_err("ca.key in the tree must fail the lint");
+        assert!(err.to_string().contains("violated"), "{err}");
+        std::fs::remove_file(ca_key).unwrap();
+
         let result = lint_deploy_dir(&root);
         std::fs::remove_dir_all(&root).ok();
         result.expect("the rendered tree must pass the lint");

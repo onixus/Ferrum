@@ -38,6 +38,7 @@ const UNNEEDED_HOST_PID: &str = "FD019";
 const WEBHOOK_CA_BUNDLE: &str = "FD020";
 const WEBHOOK_TLS_SECRET: &str = "FD021";
 const WEBHOOK_PKI_MISMATCH: &str = "FD022";
+const PRIVATE_KEY_IN_TREE: &str = "FD023";
 
 /// The token a webhook template carries instead of a certificate. Committing a
 /// real CA is not an option, so the applied file is produced by
@@ -117,6 +118,7 @@ fn collect_findings(dir: &Path) -> Result<(Vec<Finding>, usize)> {
     check_webhook_tls(&docs, &mut findings);
     check_webhook_pki(&docs, &mut findings);
     check_crd_catalog(dir, &mut findings);
+    check_private_key_material(dir, &mut findings);
     Ok((findings, docs.len()))
 }
 
@@ -153,6 +155,65 @@ fn load_docs(dir: &Path) -> Result<Vec<Doc>> {
     Ok(docs)
 }
 
+/// `gen-webhook-pki` writes `ca.key` into this tree, and one `.gitignore` entry
+/// is all that stands between it and a commit. Whoever holds that key can issue
+/// a leaf the applied ValidatingWebhookConfiguration trusts — a forged
+/// admission webhook — so a PEM private key anywhere under the deploy tree is a
+/// finding regardless of the file's name or extension.
+fn check_private_key_material(dir: &Path, findings: &mut Vec<Finding>) {
+    let mut files = Vec::new();
+    if collect_any_files(dir, &mut files).is_err() {
+        return;
+    }
+    files.sort();
+    for path in files {
+        // Lossy, not read_to_string: a binary blob next to the manifests must
+        // not let a PEM block hide behind one invalid byte.
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Some(label) = pem_private_key_label(&String::from_utf8_lossy(&bytes)) else {
+            continue;
+        };
+        findings.push(Finding {
+            code: PRIVATE_KEY_IN_TREE,
+            file: path.display().to_string(),
+            msg: format!(
+                "carries a PEM '{label}' block. Private key material does not belong in a \
+                 directory that gets committed; move it out of the tree and keep it offline"
+            ),
+        });
+    }
+}
+
+/// The label of the first `-----BEGIN ... PRIVATE KEY-----` line, if any.
+fn pem_private_key_label(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let label = line
+            .trim()
+            .strip_prefix("-----BEGIN ")?
+            .strip_suffix("-----")?
+            .trim();
+        label.ends_with("PRIVATE KEY").then(|| label.to_string())
+    })
+}
+
+/// Every file under `dir`, whatever its extension: `collect_files` sees only
+/// YAML, and a private key is not a manifest.
+fn collect_any_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = fs::read_dir(dir).with_context(|| format!("read directory {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_any_files(&path, out)?;
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     let entries = fs::read_dir(dir).with_context(|| format!("read directory {}", dir.display()))?;
     for entry in entries {
@@ -172,6 +233,13 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 fn kind(doc: &Doc) -> &str {
     doc.value.get("kind").and_then(Value::as_str).unwrap_or("")
+}
+
+fn doc_namespace(doc: &Doc) -> Option<&str> {
+    doc.value
+        .get("metadata")
+        .and_then(|m| m.get("namespace"))
+        .and_then(Value::as_str)
 }
 
 fn name(doc: &Doc) -> &str {
@@ -714,18 +782,21 @@ fn check_webhook_pki(docs: &[Doc], findings: &mut Vec<Finding>) {
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("<unnamed>");
-            let Some(service) = webhook
-                .get("clientConfig")
-                .and_then(|c| c.get("service"))
+            let client_service = webhook.get("clientConfig").and_then(|c| c.get("service"));
+            let Some(service) = client_service
                 .and_then(|s| s.get("name"))
                 .and_then(Value::as_str)
             else {
                 continue;
             };
+            let service_ns = client_service
+                .and_then(|s| s.get("namespace"))
+                .and_then(Value::as_str);
             let secret = format!("{service}{WEBHOOK_TLS_SECRET_SUFFIX}");
             // No issued material in this tree: the install has not reached the
             // issuance step yet, and FD020/FD021 already cover the manifests.
-            let Some((secret_file, leaf)) = tls_secret_certificate(docs, &secret) else {
+            let Some((secret_file, leaf)) = tls_secret_certificate(docs, &secret, service_ns)
+            else {
                 continue;
             };
             let mut fail = |msg: String| {
@@ -784,16 +855,27 @@ fn ca_bundle_pem(webhook: &Value) -> Option<String> {
     String::from_utf8(ferrum_crypto::x509::base64_decode(value).ok()?).ok()
 }
 
-/// `tls.crt` of the `kubernetes.io/tls` Secret named `secret`, with the file it
-/// came from.
+/// `tls.crt` of the `kubernetes.io/tls` Secret named `secret` in `namespace`,
+/// with the file it came from.
+///
+/// A tree holding two installations has two Secrets of that name, and the
+/// webhook is served by the one in its own Service's namespace. A Secret that
+/// declares no namespace still matches: it is applied into whichever namespace
+/// `kubectl` is pointed at, and skipping it would turn a real mismatch into a
+/// silent pass.
 fn tls_secret_certificate<'a>(
     docs: &'a [Doc],
     secret: &str,
+    namespace: Option<&str>,
 ) -> Option<(&'a str, Result<String, String>)> {
     let doc = docs.iter().find(|d| {
         kind(d) == "Secret"
             && name(d) == secret
             && d.value.get("type").and_then(Value::as_str) == Some("kubernetes.io/tls")
+            && match (namespace, doc_namespace(d)) {
+                (Some(want), Some(have)) => want == have,
+                _ => true,
+            }
     })?;
     let raw = doc
         .value
@@ -1037,6 +1119,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_private_key_in_the_tree_is_a_finding() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-private-key");
+        assert_eq!(
+            codes,
+            [PRIVATE_KEY_IN_TREE]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// The key `gen-webhook-pki` writes is what the ignore rules have to cover;
+    /// the lint only catches it once it is already on disk.
+    #[test]
+    fn the_deploy_ignore_rules_cover_the_ca_key() {
+        let raw = fs::read_to_string(repo_path("deploy/admission/.gitignore"))
+            .expect("deploy/admission/.gitignore");
+        let rules: BTreeSet<&str> = raw
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        for rule in [crate::gen_pki::CA_KEY_FILE, "*.key"] {
+            assert!(rules.contains(rule), "{rule} is not ignored: {rules:?}");
+        }
+    }
+
     /// The committed tree holds the template, never a rendered configuration.
     #[test]
     fn the_template_keeps_the_placeholder_and_nothing_else() {
@@ -1113,6 +1223,59 @@ mod tests {
             value: serde_yaml::from_str(yaml).unwrap(),
         })
         .collect()
+    }
+
+    fn doc_from(yaml: &str) -> Doc {
+        Doc {
+            file: "issued.yaml".into(),
+            base: true,
+            template: false,
+            value: serde_yaml::from_str(yaml).unwrap(),
+        }
+    }
+
+    fn webhook_doc(namespace: &str, ca_pem: &str) -> Doc {
+        let bundle = ferrum_crypto::x509::base64_encode(ca_pem.as_bytes());
+        doc_from(&format!(
+            "kind: ValidatingWebhookConfiguration\nwebhooks:\n  - name: policy.ferrum.io\n    \
+             clientConfig:\n      service:\n        name: ferrum-admission\n        \
+             namespace: {namespace}\n      caBundle: {bundle}\n"
+        ))
+    }
+
+    fn secret_doc(namespace: &str, leaf_pem: &str) -> Doc {
+        let crt = ferrum_crypto::x509::base64_encode(leaf_pem.as_bytes());
+        doc_from(&format!(
+            "kind: Secret\nmetadata:\n  name: ferrum-admission-tls\n  namespace: {namespace}\n\
+             type: kubernetes.io/tls\ndata:\n  tls.crt: {crt}\n"
+        ))
+    }
+
+    /// Two installations in one tree. The webhook is served by the Secret in
+    /// its own Service's namespace; comparing its caBundle against the other
+    /// one's leaf reports a mismatch that does not exist.
+    #[test]
+    fn the_secret_is_matched_in_the_webhook_service_namespace() {
+        let (ca, leaf) = issued(365);
+        let (other_ca, other_leaf) = issued(365);
+        let docs = vec![
+            secret_doc("staging", &other_leaf),
+            secret_doc("ferrum", &leaf),
+            webhook_doc("ferrum", &ca),
+        ];
+        let findings = pki_findings(&docs);
+        assert!(
+            findings.is_empty(),
+            "{}",
+            findings.first().map(|f| f.msg.clone()).unwrap_or_default()
+        );
+        // The other installation is still checked, against its own Secret.
+        let swapped = vec![
+            secret_doc("staging", &leaf),
+            secret_doc("ferrum", &leaf),
+            webhook_doc("staging", &other_ca),
+        ];
+        assert_eq!(pki_findings(&swapped).len(), 1);
     }
 
     fn pki_findings(docs: &[Doc]) -> Vec<Finding> {
