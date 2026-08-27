@@ -153,6 +153,7 @@ pub fn parse_febp(spec: &[u8]) -> Result<EbpfSpec> {
     }
     r.finish()?;
     reject_kill_all(&rules)?;
+    reject_unobservable_syscalls(&rules)?;
     Ok(EbpfSpec {
         abi,
         mode,
@@ -162,6 +163,35 @@ pub fn parse_febp(spec: &[u8]) -> Result<EbpfSpec> {
         selector,
         rules,
     })
+}
+
+fn trim_syscall(name: String) -> String {
+    if name.trim().len() == name.len() {
+        name
+    } else {
+        name.trim().to_string()
+    }
+}
+
+/// Load-path copy of the compiler's "the datapath never observes this" gate,
+/// alongside `reject_kill_all`. The encoder is a plain library call, so a FEBP
+/// can reach this loader without passing through the compiler's checks at all;
+/// a rule naming an unhooked syscall is dead weight in a signed bundle, and
+/// the loader is the last place that can say so.
+fn reject_unobservable_syscalls(rules: &[Rule]) -> Result<()> {
+    for rule in rules {
+        for syscall in &rule.syscalls {
+            if !ferrum_ids::is_datapath_syscall(syscall.as_str()) {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': syscall '{syscall}' is not hooked by the datapath; the rule can \
+                     never fire. Observed: {}",
+                    rule.id,
+                    ferrum_ids::DATAPATH_SYSCALLS.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reject_kill_all(rules: &[Rule]) -> Result<()> {
@@ -241,7 +271,13 @@ fn decode_label_selector(r: &mut Reader<'_>) -> Result<LabelSelector> {
 fn decode_rule(r: &mut Reader<'_>) -> Result<Rule> {
     Ok(Rule {
         id: r.str()?,
-        syscalls: r.str_list()?,
+        // The one normalization point for syscall names. Validator and
+        // compiler compare `trim()`ed names against DATAPATH_SYSCALLS, so a
+        // name that reached the wire with surrounding whitespace (YAML
+        // `[" execve"]`, a trailing CR) passed both gates; if the matcher
+        // then compared it raw it would never fire. Comm and paths are NOT
+        // trimmed: whitespace there is part of the value.
+        syscalls: r.str_list()?.into_iter().map(trim_syscall).collect(),
         action: Action::from_u8(r.u8()?)?,
         comm_in: r.str_list()?,
         container_only: r.bool()?,
