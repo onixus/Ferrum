@@ -277,14 +277,26 @@ mod client {
     use std::net::TcpStream;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     pub const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
     /// The apiserver certificate carries this SAN; the Service IP we dial does
     /// not have to be in it, so verification uses the name, not the address.
     const DEFAULT_SERVER_NAME: &str = "kubernetes.default.svc";
     const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
+    /// A header line longer than this, or more than [`MAX_HEADER_LINES`] of
+    /// them, is an unhealthy or hostile apiserver trying to grow our heap:
+    /// refuse instead of buffering.
+    const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+    const MAX_HEADER_LINES: usize = 100;
+    /// Relist body ceiling. A node's PodList is orders of magnitude smaller;
+    /// anything past this is not a list we are willing to hold in memory.
+    const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
     const RECONNECT_BACKOFF: Duration = Duration::from_secs(2);
+    const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+    /// A cycle that streamed at least this long was a healthy connection, so
+    /// the next reconnect starts from the base delay again.
+    const HEALTHY_STREAM: Duration = Duration::from_secs(60);
 
     #[derive(Debug, Clone)]
     pub struct ApiserverConfig {
@@ -501,42 +513,91 @@ mod client {
             }
         }
 
-        /// List, watch, reconnect forever. 410 relists instead of resuming.
-        pub fn run(&self) -> ! {
+        /// One relist plus watch streams until the connection ends or the
+        /// resourceVersion expires. Returning is normal; the caller backs off.
+        fn cycle(&self) -> Result<()> {
+            let mut rv = self.relist()?;
             loop {
-                let mut rv = match self.relist() {
-                    Ok(rv) => rv,
-                    Err(err) => {
-                        eprintln!("ferrum-k8smeta: pod relist failed: {err}");
-                        std::thread::sleep(RECONNECT_BACKOFF);
-                        continue;
-                    }
-                };
-                loop {
-                    match self.watch_once(&rv) {
-                        Ok(WatchOutcome::MustRelist) => break,
-                        Ok(_) => {
-                            rv = self
-                                .cache
-                                .read()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .resource_version()
-                                .to_string();
-                            if rv.is_empty() {
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("ferrum-k8smeta: pod watch dropped: {err}");
-                            std::thread::sleep(RECONNECT_BACKOFF);
-                            break;
+                match self.watch_once(&rv)? {
+                    WatchOutcome::MustRelist => return Ok(()),
+                    _ => {
+                        rv = self
+                            .cache
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .resource_version()
+                            .to_string();
+                        if rv.is_empty() {
+                            return Ok(());
                         }
                     }
                 }
             }
         }
+
+        /// List, watch, reconnect forever. 410 relists instead of resuming.
+        pub fn run(&self) -> ! {
+            watch_loop(|| self.cycle(), std::thread::sleep, None);
+            unreachable!("watch_loop without a budget never returns")
+        }
     }
 
+    /// Reconnect delay: doubles up to [`MAX_RECONNECT_BACKOFF`] so an apiserver
+    /// that closes every connection at once cannot turn us into a busy loop.
+    struct Backoff {
+        next: Duration,
+    }
+
+    impl Backoff {
+        fn new() -> Self {
+            Self {
+                next: RECONNECT_BACKOFF,
+            }
+        }
+
+        fn take(&mut self) -> Duration {
+            let now = self.next;
+            self.next = (now * 2).min(MAX_RECONNECT_BACKOFF);
+            now
+        }
+
+        fn reset(&mut self) {
+            self.next = RECONNECT_BACKOFF;
+        }
+    }
+
+    /// Drives `cycle`, sleeping between every iteration — including the ones
+    /// that returned `Ok`, because an apiserver that answers with an immediate
+    /// EOF would otherwise spin here. `budget` bounds the iteration count for
+    /// tests; production passes `None` and never returns.
+    fn watch_loop<C, S>(mut cycle: C, mut sleep: S, budget: Option<usize>)
+    where
+        C: FnMut() -> Result<()>,
+        S: FnMut(Duration),
+    {
+        let mut backoff = Backoff::new();
+        let mut left = budget;
+        loop {
+            let started = Instant::now();
+            if let Err(err) = cycle() {
+                eprintln!("ferrum-k8smeta: pod watch cycle failed: {err}");
+            }
+            // A connection that streamed for a while was healthy, whatever
+            // ended it; only repeated short cycles are worth backing off from.
+            if started.elapsed() >= HEALTHY_STREAM {
+                backoff.reset();
+            }
+            sleep(backoff.take());
+            if let Some(left) = left.as_mut() {
+                *left -= 1;
+                if *left == 0 {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
     struct Head {
         status: u16,
         chunked: bool,
@@ -548,7 +609,14 @@ mod client {
         let mut chunked = false;
         let mut content_length = None;
         let mut first = true;
+        let mut seen = 0usize;
         loop {
+            seen += 1;
+            if seen > MAX_HEADER_LINES {
+                return Err(FerrumError::Degraded(format!(
+                    "apiserver sent more than {MAX_HEADER_LINES} header lines"
+                )));
+            }
             let mut line = String::new();
             let n = read_text_line(reader, &mut line)
                 .map_err(|e| FerrumError::Degraded(format!("apiserver response: {e}")))?;
@@ -660,6 +728,9 @@ mod client {
     }
 
     fn read_body<R: BufRead>(reader: &mut R, head: &Head, out: &mut Vec<u8>) -> Result<()> {
+        if head.content_length.is_some_and(|len| len > MAX_BODY_BYTES) {
+            return Err(body_too_large());
+        }
         let mut body = BodyReader::new(reader, head);
         let mut buf = [0u8; 8192];
         loop {
@@ -669,13 +740,32 @@ mod client {
             if n == 0 {
                 return Ok(());
             }
+            if out.len() + n > MAX_BODY_BYTES {
+                return Err(body_too_large());
+            }
             out.extend_from_slice(&buf[..n]);
         }
     }
 
+    fn body_too_large() -> FerrumError {
+        FerrumError::Degraded(format!(
+            "apiserver body exceeds {MAX_BODY_BYTES} bytes; refusing to buffer it"
+        ))
+    }
+
+    /// Bounded `read_until`. Used for status/header lines and for chunk-size
+    /// lines: all of them are short by construction, and an unbounded read here
+    /// lets the peer choose our allocation size.
     fn read_text_line<R: BufRead>(reader: &mut R, out: &mut String) -> io::Result<usize> {
         let mut raw = Vec::new();
-        let n = reader.read_until(b'\n', &mut raw)?;
+        let limit = MAX_HEADER_LINE_BYTES as u64 + 1;
+        let n = reader.take(limit).read_until(b'\n', &mut raw)?;
+        if n > MAX_HEADER_LINE_BYTES || (n > 0 && raw.last() != Some(&b'\n')) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("header line exceeds {MAX_HEADER_LINE_BYTES} bytes"),
+            ));
+        }
         out.push_str(&String::from_utf8_lossy(&raw));
         Ok(n)
     }
@@ -713,5 +803,153 @@ mod client {
             }
         }
         out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::cell::RefCell;
+
+        fn head_of(raw: &[u8]) -> Result<Head> {
+            read_head(&mut io::Cursor::new(raw.to_vec()))
+        }
+
+        fn degraded_text(err: FerrumError) -> String {
+            match err {
+                FerrumError::Degraded(msg) => msg,
+                other => panic!("expected Degraded, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn ordinary_head_still_parses() {
+            let head = head_of(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .expect("head");
+            assert_eq!(head.status, 200);
+            assert_eq!(head.content_length, Some(7));
+            assert!(head.chunked);
+        }
+
+        #[test]
+        fn giant_header_line_is_degraded_not_buffered() {
+            let mut raw = b"HTTP/1.1 200 OK\r\nX-Flood: ".to_vec();
+            raw.extend(std::iter::repeat(b'A').take(MAX_HEADER_LINE_BYTES * 4));
+            raw.extend_from_slice(b"\r\n\r\n");
+            let msg = degraded_text(head_of(&raw).expect_err("must refuse"));
+            assert!(msg.contains("header line exceeds"), "{msg}");
+        }
+
+        #[test]
+        fn giant_status_line_is_degraded() {
+            let mut raw = b"HTTP/1.1 200 ".to_vec();
+            raw.extend(std::iter::repeat(b'X').take(MAX_HEADER_LINE_BYTES + 1));
+            raw.extend_from_slice(b"\r\n\r\n");
+            let msg = degraded_text(head_of(&raw).expect_err("must refuse"));
+            assert!(msg.contains("header line exceeds"), "{msg}");
+        }
+
+        #[test]
+        fn endless_header_count_is_degraded() {
+            let mut raw = b"HTTP/1.1 200 OK\r\n".to_vec();
+            for i in 0..MAX_HEADER_LINES * 2 {
+                raw.extend_from_slice(format!("X-Pad-{i}: v\r\n").as_bytes());
+            }
+            raw.extend_from_slice(b"\r\n");
+            let msg = degraded_text(head_of(&raw).expect_err("must refuse"));
+            assert!(msg.contains("header lines"), "{msg}");
+        }
+
+        #[test]
+        fn body_past_the_ceiling_is_degraded() {
+            // Chunked, so the peer never has to declare the total up front.
+            let chunk = vec![b'x'; 1 << 20];
+            let mut raw = Vec::new();
+            for _ in 0..(MAX_BODY_BYTES / chunk.len()) + 2 {
+                raw.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+                raw.extend_from_slice(&chunk);
+                raw.extend_from_slice(b"\r\n");
+            }
+            let head = Head {
+                status: 200,
+                chunked: true,
+                content_length: None,
+            };
+            let mut out = Vec::new();
+            let err =
+                read_body(&mut io::Cursor::new(raw), &head, &mut out).expect_err("must refuse");
+            assert!(
+                degraded_text(err).contains("exceeds"),
+                "message names the cap"
+            );
+            assert!(out.len() <= MAX_BODY_BYTES, "buffer stayed under the cap");
+        }
+
+        #[test]
+        fn declared_content_length_past_the_ceiling_is_refused_before_reading() {
+            let head = Head {
+                status: 200,
+                chunked: false,
+                content_length: Some(MAX_BODY_BYTES + 1),
+            };
+            let mut out = Vec::new();
+            let err = read_body(&mut io::Cursor::new(Vec::new()), &head, &mut out)
+                .expect_err("must refuse");
+            assert!(degraded_text(err).contains("exceeds"));
+            assert!(out.is_empty());
+        }
+
+        #[test]
+        fn small_body_still_reads() {
+            let head = Head {
+                status: 200,
+                chunked: false,
+                content_length: Some(5),
+            };
+            let mut out = Vec::new();
+            read_body(&mut io::Cursor::new(b"hello".to_vec()), &head, &mut out).expect("body");
+            assert_eq!(out, b"hello");
+        }
+
+        #[test]
+        fn immediate_eof_still_sleeps_between_cycles() {
+            let slept: RefCell<Vec<Duration>> = RefCell::new(Vec::new());
+            // Every cycle returns Ok instantly, the EOF-on-connect case.
+            watch_loop(|| Ok(()), |d| slept.borrow_mut().push(d), Some(4));
+            let slept = slept.into_inner();
+            assert_eq!(slept.len(), 4, "one sleep per iteration, Ok included");
+            assert!(slept.iter().all(|d| *d >= RECONNECT_BACKOFF));
+        }
+
+        #[test]
+        fn backoff_grows_and_is_capped() {
+            let slept: RefCell<Vec<Duration>> = RefCell::new(Vec::new());
+            watch_loop(
+                || Err(FerrumError::Degraded("connect refused".into())),
+                |d| slept.borrow_mut().push(d),
+                Some(8),
+            );
+            let slept = slept.into_inner();
+            assert_eq!(slept[0], RECONNECT_BACKOFF);
+            assert_eq!(slept[1], RECONNECT_BACKOFF * 2);
+            assert_eq!(slept[2], RECONNECT_BACKOFF * 4);
+            assert!(
+                slept.windows(2).all(|w| w[1] >= w[0]),
+                "delay never shrinks while cycles keep failing"
+            );
+            assert_eq!(*slept.last().expect("delays"), MAX_RECONNECT_BACKOFF);
+            assert!(slept.iter().all(|d| *d <= MAX_RECONNECT_BACKOFF));
+        }
+
+        #[test]
+        fn a_long_healthy_cycle_resets_the_backoff() {
+            let mut backoff = Backoff::new();
+            assert_eq!(backoff.take(), RECONNECT_BACKOFF);
+            assert_eq!(backoff.take(), RECONNECT_BACKOFF * 2);
+            backoff.reset();
+            assert_eq!(backoff.take(), RECONNECT_BACKOFF);
+            assert!(HEALTHY_STREAM > MAX_RECONNECT_BACKOFF);
+        }
     }
 }
