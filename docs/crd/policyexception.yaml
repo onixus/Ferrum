@@ -1,0 +1,95 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: policyexceptions.ferrum.io
+spec:
+  group: ferrum.io
+  names:
+    kind: PolicyException
+    listKind: PolicyExceptionList
+    plural: policyexceptions
+    singular: policyexception
+    shortNames:
+      - polex
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Ticket
+          type: string
+          jsonPath: .spec.ticket
+        - name: RequestedBy
+          type: string
+          jsonPath: .spec.requestedBy
+        - name: Expires
+          type: string
+          jsonPath: .spec.expiresAt
+        - name: Active
+          type: boolean
+          jsonPath: .status.active
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [ticket, requestedBy, reason, expiresAt]
+              x-kubernetes-validations:
+                - rule: "self.expiresAt > now()"
+                  message: "expiresAt already in the past"
+                - rule: "self.expiresAt <= now() + duration('2160h')"
+                  message: "expiresAt more than 90 days from now"
+                - rule: "!has(self.fourEyes) || !self.fourEyes || (has(self.approvedBy) && size(self.approvedBy) > 0)"
+                  message: "fourEyes=true requires approvedBy"
+                - rule: "has(self.target) && size(self.target.policies) > 0 && size(self.target.rules) > 0"
+                  message: "target.policies and target.rules are required"
+              properties:
+                ticket:
+                  type: string
+                  minLength: 1
+                requestedBy:
+                  type: string
+                  minLength: 1
+                approvedBy:
+                  type: string
+                reason:
+                  type: string
+                  minLength: 1
+                expiresAt:
+                  type: string
+                  format: date-time
+                mode:
+                  type: string
+                  enum: [observe, audit, enforce]
+                fourEyes:
+                  type: boolean
+                target:
+                  type: object
+                  required: [policies, rules]
+                  properties:
+                    namespace:
+                      type: string
+                    policies:
+                      type: array
+                      minItems: 1
+                      items:
+                        type: string
+                        minLength: 1
+                    rules:
+                      type: array
+                      minItems: 1
+                      items:
+                        type: string
+                        minLength: 1
+            status:
+              type: object
+              properties:
+                active:
+                  type: boolean
+                message:
+                  type: string

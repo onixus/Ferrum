@@ -1,11 +1,24 @@
-//! Control plane: offline compile + sign + rollout accounting.
-//! No datapath, no CAP_BPF, no live kube client.
+//! Control plane: compile + sign + rollout. `reconcile` is kube-free.
+//! Live watch is opt-in via `run`. No datapath, no CAP_BPF.
 
 #![deny(unsafe_code)]
 
+mod apply;
 mod bundle;
+mod key;
+mod watch;
 
+pub use apply::{
+    bundle_secret, plan_apply, secret_name, status_patch, ApplyPlan, DEFAULT_NAMESPACE,
+};
 pub use bundle::{verify_signed_bundle, SignedBundle, SIGNED_FORMAT, SIGNED_MAGIC};
+pub use key::{
+    hex_decode, hex_encode, load_seed, load_seed_file, parse_public_key_hex, parse_seed_bytes,
+    parse_seed_hex, SEED_ENV, SEED_FILE_ENV,
+};
+pub use watch::{
+    cluster_security_policy_gvk, cluster_security_policy_resource, observe_policy, run_watch,
+};
 
 use bundle::parse_framb_abis;
 use ferrum_api::{
@@ -150,6 +163,25 @@ pub fn runtime_profile_status(_profile: &RuntimeProfileSpec) -> RuntimeProfileSt
     }
 }
 
+/// ClusterSecurityPolicy fields read from a DynamicObject. Not a kube type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedPolicy {
+    pub name: String,
+    pub generation: i64,
+    pub resource_version: String,
+    pub spec: ClusterSecurityPolicySpec,
+}
+
+/// Live-watch inputs. Cluster list is CLI/static — kubeconfigSecretRef is never opened.
+#[derive(Debug, Clone)]
+pub struct WatchConfig {
+    pub namespace: String,
+    pub secret_key: Vec<u8>,
+    pub trust_root: Vec<u8>,
+    pub library: Option<PolicyLibrarySpec>,
+    pub clusters: Vec<ClusterAbi>,
+}
+
 pub struct ReconcileInput<'a> {
     pub spec: &'a ClusterSecurityPolicySpec,
     pub observed_generation: i64,
@@ -175,7 +207,7 @@ pub enum ReconcileOutcome {
     Failed(PolicyStatus),
 }
 
-/// Compile+sign and account rollout. Does not watch a cluster.
+/// Compile+sign and account rollout. Does not use a kube client.
 pub fn reconcile(input: ReconcileInput<'_>) -> ReconcileOutcome {
     match compile_and_sign(input.spec, input.secret_key) {
         Ok(bundle) => {
@@ -545,5 +577,28 @@ runtime:
             }
             other => panic!("expected Integrity, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cargo_lock_has_no_kube_derive() {
+        let crate_toml = include_str!("../Cargo.toml");
+        assert!(
+            !crate_toml.contains("kube-derive"),
+            "ferrum-controller must not depend on kube-derive"
+        );
+        assert!(
+            !crate_toml.contains("\"derive\""),
+            "kube derive feature must stay off"
+        );
+        let lock = include_str!("../../../Cargo.lock");
+        assert!(
+            !lock.contains("name = \"kube-derive\""),
+            "Cargo.lock must not include kube-derive"
+        );
+        let api_toml = include_str!("../../ferrum-api/Cargo.toml");
+        assert!(
+            !api_toml.contains("kube-derive"),
+            "ferrum-api must not depend on kube-derive"
+        );
     }
 }

@@ -1,11 +1,14 @@
-//! Offline compile+sign. Does not watch a cluster.
+//! Offline compile+sign is the default. `run` watches a cluster.
 
-use ferrum_api::{ClusterSecurityPolicy, ClusterSecurityPolicySpec};
-use ferrum_controller::{compile_and_sign, compile_status_ok};
+use ferrum_api::{ClusterSecurityPolicy, ClusterSecurityPolicySpec, PolicyLibrarySpec};
+use ferrum_controller::{
+    compile_and_sign, compile_status_ok, hex_encode, load_seed, parse_public_key_hex,
+    parse_seed_hex, run_watch, ClusterAbi, WatchConfig, DEFAULT_NAMESPACE,
+};
 use ferrum_crypto::ED25519_SECRET_KEY_LEN;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
 fn main() {
@@ -22,6 +25,15 @@ fn run() -> Result<(), String> {
         println!("{}", usage());
         return Ok(());
     }
+    if policy_arg == "run" {
+        let cfg = parse_run(args)?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        return rt.block_on(run_watch(cfg)).map_err(|e| e.to_string());
+    }
+
     let key_hex = args.next().ok_or_else(usage)?;
     let out_path = args.next();
     if args.next().is_some() {
@@ -29,7 +41,14 @@ fn run() -> Result<(), String> {
     }
 
     let spec = load_spec(Path::new(&policy_arg))?;
-    let secret = parse_seed(&key_hex)?;
+    let secret = parse_seed_hex(&key_hex).map_err(|e| e.to_string())?;
+    if secret.len() != ED25519_SECRET_KEY_LEN {
+        return Err(format!(
+            "Ed25519 seed must be {} bytes, got {}",
+            ED25519_SECRET_KEY_LEN,
+            secret.len()
+        ));
+    }
     let bundle = compile_and_sign(&spec, &secret).map_err(|e| e.to_string())?;
     let status = compile_status_ok(&bundle);
 
@@ -48,6 +67,118 @@ fn run() -> Result<(), String> {
         println!("wrote: {path}");
     }
     Ok(())
+}
+
+struct RunOpts {
+    seed_file: Option<PathBuf>,
+    namespace: String,
+    clusters: Vec<ClusterAbi>,
+    min_agent_abi: u32,
+    min_admission_abi: u32,
+    trust_root: Option<String>,
+}
+
+fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> {
+    let mut opts = RunOpts {
+        seed_file: None,
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        clusters: Vec::new(),
+        min_agent_abi: 0,
+        min_admission_abi: 0,
+        trust_root: None,
+    };
+    let mut it = args;
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => return Err(usage()),
+            "--seed-file" => {
+                opts.seed_file = Some(PathBuf::from(require_val("--seed-file", it.next())?));
+            }
+            "--namespace" => {
+                opts.namespace = require_val("--namespace", it.next())?;
+            }
+            "--cluster" => {
+                opts.clusters
+                    .push(parse_cluster(&require_val("--cluster", it.next())?)?);
+            }
+            "--min-agent-abi" => {
+                opts.min_agent_abi = parse_u32(
+                    "--min-agent-abi",
+                    &require_val("--min-agent-abi", it.next())?,
+                )?;
+            }
+            "--min-admission-abi" => {
+                opts.min_admission_abi = parse_u32(
+                    "--min-admission-abi",
+                    &require_val("--min-admission-abi", it.next())?,
+                )?;
+            }
+            "--trust-root" => {
+                opts.trust_root = Some(require_val("--trust-root", it.next())?);
+            }
+            other => return Err(format!("unknown flag {other}\n{}", usage())),
+        }
+    }
+    if opts.namespace.trim().is_empty() {
+        return Err("--namespace must not be empty".into());
+    }
+    let secret_key = load_seed(opts.seed_file.as_deref()).map_err(|e| e.to_string())?;
+    let trust_root = match opts.trust_root {
+        Some(hex) => parse_public_key_hex(&hex).map_err(|e| e.to_string())?,
+        None => ferrum_crypto::public_key_from_secret(&secret_key).map_err(|e| e.to_string())?,
+    };
+    let library = if opts.min_agent_abi == 0 && opts.min_admission_abi == 0 {
+        None
+    } else {
+        Some(PolicyLibrarySpec {
+            source: "cli".into(),
+            digest: String::new(),
+            min_agent_abi: opts.min_agent_abi,
+            min_admission_abi: opts.min_admission_abi,
+        })
+    };
+    Ok(WatchConfig {
+        namespace: opts.namespace,
+        secret_key,
+        trust_root,
+        library,
+        clusters: opts.clusters,
+    })
+}
+
+fn parse_cluster(spec: &str) -> Result<ClusterAbi, String> {
+    let mut parts = spec.split(':');
+    let name = parts
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "--cluster expected name:agentAbi:admissionAbi".to_string())?;
+    let agent = parts
+        .next()
+        .ok_or_else(|| format!("--cluster {spec}: missing agentAbi"))?;
+    let admission = parts
+        .next()
+        .ok_or_else(|| format!("--cluster {spec}: missing admissionAbi"))?;
+    if parts.next().is_some() {
+        return Err(format!(
+            "--cluster {spec}: expected name:agentAbi:admissionAbi"
+        ));
+    }
+    Ok(ClusterAbi {
+        name: name.to_string(),
+        agent_abi: parse_u32("--cluster agentAbi", agent)?,
+        admission_abi: parse_u32("--cluster admissionAbi", admission)?,
+    })
+}
+
+fn parse_u32(flag: &str, raw: &str) -> Result<u32, String> {
+    raw.parse::<u32>()
+        .map_err(|_| format!("{flag}: expected u32, got {raw}"))
+}
+
+fn require_val(flag: &str, val: Option<String>) -> Result<String, String> {
+    val.filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn load_spec(path: &Path) -> Result<ClusterSecurityPolicySpec, String> {
@@ -81,55 +212,6 @@ fn yaml_kind(raw: &str) -> Result<String, String> {
     }
 }
 
-fn parse_seed(hex: &str) -> Result<Vec<u8>, String> {
-    let bytes = hex_decode(hex)?;
-    if bytes.len() != ED25519_SECRET_KEY_LEN {
-        return Err(format!(
-            "Ed25519 seed must be {} bytes ({} hex chars), got {}",
-            ED25519_SECRET_KEY_LEN,
-            ED25519_SECRET_KEY_LEN * 2,
-            bytes.len()
-        ));
-    }
-    Ok(bytes)
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
-        return Err("hex seed has odd length".into());
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = hex_nibble(bytes[i])?;
-        let lo = hex_nibble(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Ok(out)
-}
-
-fn hex_nibble(b: u8) -> Result<u8, String> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err("hex seed contains a non-hex character".into()),
-    }
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
 fn usage() -> String {
-    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]".into()
+    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--cluster name:agentAbi:admissionAbi]...".into()
 }
