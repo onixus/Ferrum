@@ -244,6 +244,28 @@ mod tests {
         assert!(SyscallArch::host().is_some());
     }
 
+    /// The decode table is one of the three places the datapath's syscall set
+    /// is written down. It must cover exactly what `DATAPATH_SYSCALLS` claims
+    /// for that arch: a name it cannot produce is a rule that never fires, a
+    /// name it produces but the list omits is a rule nobody can validate.
+    #[test]
+    fn decode_table_matches_datapath_syscalls_per_arch() {
+        // Every hooked nr on both arches is well under this bound.
+        const NR_MAX: u32 = 1024;
+        for (arch, arch_name) in [
+            (SyscallArch::X86_64, "x86_64"),
+            (SyscallArch::Aarch64, "aarch64"),
+        ] {
+            let mut decoded: Vec<&str> = (0..NR_MAX)
+                .filter_map(|nr| syscall_name(arch, nr))
+                .collect();
+            decoded.sort_unstable();
+            decoded.dedup();
+            let want = ferrum_ids::datapath_syscalls_for_arch(arch_name);
+            assert_eq!(decoded, want, "decode table drifted on {arch_name}");
+        }
+    }
+
     #[test]
     fn flags_and_nul_trim() {
         let mut event = sample();

@@ -7,6 +7,7 @@ mod eval;
 mod event;
 mod kernel;
 mod loader;
+mod prefilter;
 mod spec;
 
 pub use envelope::{extract_febp, BUNDLE_FORMAT, BUNDLE_MAGIC};
@@ -22,11 +23,12 @@ pub use ferrum_ebpf_progs::{
     Event, CGROUPS_MAX_ENTRIES, COMM_LEN, EVENTS_DROPPED_TOTAL, EVENT_FLAG_AGENT_SELF,
     EVENT_FLAG_CONTAINER, MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
 };
-pub use ferrum_ids::AGENT_ABI;
+pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
 pub use kernel::{plan_cgroup_sync, CgroupSyncPlan, SyncStats};
 #[cfg(feature = "attach")]
 pub use kernel::{KernelHandle, RingReader};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
+pub use prefilter::{prefilter_image, PrefilterImage, PATH_BEARING_SYSCALLS};
 pub use spec::{
     parse_febp, Action, EbpfSpec, ImageSelector, LabelRequirement, LabelSelector, Mode,
     PolicySelector, Rule, EBPF_MAGIC,
@@ -75,6 +77,25 @@ mod tests {
 
     fn digest_of(bytes: &[u8]) -> Digest {
         ferrum_crypto::bundle_digest(bytes)
+    }
+
+    /// Third copy of the datapath's syscall set: what is attached. A hook here
+    /// with no entry in `DATAPATH_SYSCALLS` is a syscall no rule may name; an
+    /// entry there with no hook is a rule that validates and never fires.
+    #[test]
+    fn tracepoints_match_datapath_syscalls() {
+        let mut hooked: Vec<&str> = TRACEPOINTS
+            .iter()
+            .map(|(_, category, name)| {
+                assert_eq!(*category, "syscalls");
+                name.strip_prefix("sys_enter_")
+                    .expect("tracepoint name is sys_enter_<syscall>")
+            })
+            .collect();
+        hooked.sort_unstable();
+        let mut want = ferrum_ids::DATAPATH_SYSCALLS.to_vec();
+        want.sort_unstable();
+        assert_eq!(hooked, want, "TRACEPOINTS drifted from DATAPATH_SYSCALLS");
     }
 
     struct Writer(Vec<u8>);
