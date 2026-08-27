@@ -29,6 +29,9 @@ impl Mode {
     }
 }
 
+/// `Deny` and `Isolate` are decided by this plane and executed by neither.
+/// The validator and the CRDs refuse them; [`parse_febp_with`] deliberately
+/// does not, and says why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Action {
@@ -152,6 +155,43 @@ pub fn parse_febp(spec: &[u8]) -> Result<EbpfSpec> {
 /// reason for each dropped rule; empty under [`DeadRules::Reject`], which
 /// fails instead. Nothing else is relaxed: a malformed, ABI-mismatched or
 /// kill-all spec is still refused whole.
+///
+/// # The one gate that is deliberately not here: `action`
+///
+/// `ferrum_policy::validate_rule_action` and the CEL copy on both
+/// SecurityPolicy CRDs refuse a runtime `deny` / `isolate`, because the
+/// runtime plane executes allow / audit / kill and nothing else. This loader
+/// does not, on either path, and that is a decision rather than the same
+/// omission the syscall gate above was written to close. Three reasons, and
+/// all three have to hold:
+///
+/// 1. It is not a dead rule. An unhooked syscall or an over-long `comm`
+///    produces no record at all, which is what makes it droppable. A `deny`
+///    rule matches: `ferrum-agent` exports the event with `executed=false`
+///    and `REFUSE_DENY_NOT_ENFORCEABLE` (`REFUSE_ISOLATE` for the other), and
+///    counts it in `respond_refused_total`. The gap is on the record, per
+///    event, by name — nothing is silently downgraded to a verdict nobody
+///    carried out. That premise is the whole justification, so it is held by
+///    a gate: `a_pre_gate_deny_bundle_loads_and_every_match_is_recorded` in
+///    `ferrum-testkit/tests/replay.rs`.
+/// 2. Refusing it buys nothing against the threat model. Only a bundle signed
+///    by the pinned trust root gets this far, and whoever can sign one can
+///    write `action: allow` instead — no loader gate can catch that. The
+///    action gate is a drift gate for policy authors, and it belongs where the
+///    author is: at validation and at admission, where refusal costs the
+///    operator nothing because the previous policy keeps running.
+/// 3. Refusing it costs the fleet. The bundles that carry a runtime `deny`
+///    are the ones an older controller signs — the shipped example carried
+///    exactly one until cycle 7 — so a newer agent refusing them whole stops
+///    that node taking any update at all from a control plane that is still
+///    serving every other agent correctly. That is cycle 6's "agent upgrade +
+///    control plane down = zero enforcement", moved onto the live path, and
+///    [`DeadRules::Drop`] cannot soften it: dropping a matching rule silently
+///    substitutes `defaultAction` for a verdict the operator wrote.
+///
+/// If any of the three stops holding — in particular if a `deny` match ever
+/// becomes indistinguishable from an audit one — the gate belongs here after
+/// all, and this note goes with it.
 pub fn parse_febp_with(spec: &[u8], dead: DeadRules) -> Result<(EbpfSpec, Vec<String>)> {
     let mut r = Reader::new(spec);
     r.expect_magic(&EBPF_MAGIC)?;

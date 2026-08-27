@@ -6,6 +6,7 @@
 //! acceptance file is the gate this harness is measured against, so it stays
 //! untouched.
 
+pub mod febp;
 pub mod wire;
 
 use ferrum_agent::{encode_fsig, Agent, AgentConfig, AgentRole, Responder, TargetCheck};

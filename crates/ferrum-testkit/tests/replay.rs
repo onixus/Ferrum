@@ -10,10 +10,10 @@ mod common;
 
 use common::wire::{syscall_nr, RecordBuilder};
 use common::{
-    killed_tgids, replay_agent, respond_agent, signed_bundle_mutated, temp_lkg, wire_reaction,
-    CGROUP_PAYMENTS, TGID_WORKLOAD,
+    febp, killed_tgids, replay_agent, respond_agent, signed_bundle_mutated, temp_lkg,
+    wire_reaction, CGROUP_PAYMENTS, TGID_WORKLOAD,
 };
-use ferrum_agent::{pump_records, PumpStats};
+use ferrum_agent::{pump_records, PumpStats, REFUSE_DENY_NOT_ENFORCEABLE};
 use ferrum_api::RuntimeAction;
 use ferrum_ebpf::{SyscallArch, EVENT_WIRE_LEN, SYSCALL_UNKNOWN};
 use ferrum_export::MemorySink;
@@ -364,6 +364,56 @@ fn agent_self_bpf_is_neither_denied_nor_signalled() {
             "the comm alone must not exempt: this verdict is the rule's, not the default's"
         );
         assert_eq!(split.respond_kill_total(), 0);
+        assert!(killed_tgids(&killed).is_empty());
+    }
+}
+
+/// F5: the live load path accepts a bundle carrying a runtime action the
+/// validator and both CRDs refuse, and that is deliberate —
+/// `ferrum_ebpf::parse_febp_with` argues it in full. The argument rests on one
+/// property of the agent: such a rule is not silently downgraded, every match
+/// is exported as an unexecuted decision naming why. This holds that property,
+/// through the real load path, from recorded bytes. If the loader is ever made
+/// to refuse instead, this gate and that note are deleted together.
+#[test]
+fn a_pre_gate_deny_bundle_loads_and_every_match_is_recorded() {
+    for arch in ARCHES {
+        let (fsig, digest) = febp::signed_pre_gate_deny_bundle();
+        let mut agent = respond_agent(None);
+        let applied = agent
+            .apply_fsig(&fsig, Some(&digest))
+            .expect("a signed pre-gate bundle installs on the live path");
+        assert_eq!(applied, digest);
+        let killed = wire_reaction(&mut agent);
+
+        let sink = MemorySink::new();
+        let before = agent.respond_refused_total();
+        let stats = pump_records(&agent, arch, vec![bpf_call("loader").build(arch)], &sink);
+        assert_eq!(stats.handled, 1, "{}", arch.as_str());
+
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].rule.as_str(), "no-module");
+        assert_eq!(
+            events[0].action, "deny",
+            "the verdict the signed bundle carries, not one substituted for it"
+        );
+        assert!(
+            !events[0].executed,
+            "nothing was carried out: {:?}",
+            events[0].respond_error
+        );
+        assert_eq!(
+            events[0].respond_error.as_deref(),
+            Some(REFUSE_DENY_NOT_ENFORCEABLE),
+            "a deny match must name why it was not enforced, or the loader hole is silent"
+        );
+        assert_eq!(
+            agent.respond_refused_total(),
+            before + 1,
+            "an unexecutable verdict must be countable at the node, not only per record"
+        );
+        assert_eq!(agent.respond_kill_total(), 0);
         assert!(killed_tgids(&killed).is_empty());
     }
 }
