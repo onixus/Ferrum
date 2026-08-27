@@ -900,11 +900,18 @@ impl Agent {
                 id
             }
             Err(_) => {
-                // A miss is not "this cgroup is not a container": a namespaced
-                // selector cannot match an unknown identity, so `decide`
-                // answers Allow and a container_only kill rule silently does
-                // not fire. Nothing else moves on this path, so count it here.
-                self.record_identity_unknown(Instant::now());
+                // Only when the kernel says otherwise. Host processes (kubelet,
+                // containerd, sshd) stream openat all day, their cgroups are
+                // not pods and never will be, and the datapath already clears
+                // EVENT_FLAG_CONTAINER for them: counting those would pin the
+                // node to Degraded forever and drown every other signal. A miss
+                // on a record the datapath *did* flag as a container is the
+                // real gap: a namespaced selector cannot match an unknown
+                // identity, so `decide` answers Allow and a container_only kill
+                // rule silently does not fire.
+                if meta.in_container {
+                    self.record_identity_unknown(Instant::now());
+                }
                 WorkloadIdentity::unknown()
             }
         };

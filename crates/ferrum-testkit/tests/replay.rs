@@ -337,6 +337,33 @@ fn a_cgroup_missing_from_the_index_is_counted_and_degrades() {
     }
 }
 
+/// The mirror case, and the reason the counter is gated: a host process the
+/// datapath did not flag as a container misses the index by design. Counting
+/// it would pin every real node to Degraded — kubelet and containerd stream
+/// openat continuously — and drown the signals that mean something.
+#[test]
+fn a_host_process_missing_from_the_index_is_not_a_degradation() {
+    const CGROUP_HOST: u64 = 9_191_919;
+    for arch in ARCHES {
+        let (agent, _killed) = replay_agent(None);
+        assert!(agent.lookup_cgroup(CGROUP_HOST).is_err());
+        let sink = MemorySink::new();
+        let record = shell_exec("execve", "sh")
+            .cgroup(CGROUP_HOST)
+            .in_container(false)
+            .build(arch);
+        let before = agent.identity_unknown_total();
+        pump_records(&agent, arch, vec![record], &sink);
+        assert_eq!(
+            agent.identity_unknown_total(),
+            before,
+            "a host-process miss is legitimate on {}",
+            arch.as_str()
+        );
+        assert!(!agent.identity_unknown_recent(), "{}", arch.as_str());
+    }
+}
+
 /// The decode table and the event source disagreeing is not a decodable
 /// event: enforce matching can no longer be trusted, so the agent is Degraded.
 /// The record is still exported, and the loop keeps going.
