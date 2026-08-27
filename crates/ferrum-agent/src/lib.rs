@@ -1188,7 +1188,7 @@ mod tests {
             ring_record(59, "sh", "/bin/sh", EVENT_FLAG_CONTAINER, 7),
             ring_record(257, "app", "/var/run/docker.sock", EVENT_FLAG_CONTAINER, 7),
         ];
-        let stats = pump_records(&agent, SyscallArch::X86_64, &records, &sink);
+        let stats = pump_records(&agent, SyscallArch::X86_64, records, &sink);
         assert_eq!(
             stats,
             PumpStats {
@@ -1218,7 +1218,7 @@ mod tests {
             vec![0u8; 5],
             Vec::new(),
         ];
-        let stats = pump_records(&agent, SyscallArch::X86_64, &records, &sink);
+        let stats = pump_records(&agent, SyscallArch::X86_64, records, &sink);
         assert_eq!(
             stats,
             PumpStats {
