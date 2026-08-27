@@ -9,12 +9,15 @@ mod key;
 mod watch;
 
 pub use apply::{
-    bundle_secret, bundle_secret_named, exceptions_json, exceptions_secret_patch,
+    bundle_secret, bundle_secret_named, exceptions_fsig, exceptions_json, exceptions_secret_patch,
     namespaced_secret_name, persist_exceptions, plan_apply, plan_apply_named,
     plan_apply_namespaced, secret_name, status_patch, ApplyPlan, DEFAULT_NAMESPACE,
-    EXCEPTIONS_JSON_KEY,
+    EXCEPTIONS_FSIG_KEY, EXCEPTIONS_JSON_KEY,
 };
-pub use bundle::{verify_signed_bundle, SignedBundle, SIGNED_FORMAT, SIGNED_MAGIC};
+pub use bundle::{
+    decode_fsig_envelope, encode_fsig_envelope, verify_fsig_envelope, verify_signed_bundle,
+    SignedBundle, SIGNED_FORMAT, SIGNED_MAGIC,
+};
 pub use key::{
     hex_decode, hex_encode, load_seed, load_seed_file, parse_public_key_hex, parse_seed_bytes,
     parse_seed_hex, SEED_ENV, SEED_FILE_ENV,
@@ -308,7 +311,7 @@ pub fn reconcile_namespaced(input: NamespacedReconcileInput<'_>) -> ReconcileOut
 pub struct ExceptionReconcile {
     pub status: PolicyExceptionStatus,
     /// Present only for exceptions that pass ferrum-policy invariants;
-    /// only these are serialized into `exceptions.json`.
+    /// only these are signed into `exceptions.fsig`.
     pub live: Option<PolicyExceptionSpec>,
 }
 
