@@ -48,6 +48,36 @@ pub const DATAPATH_SYSCALLS: &[&str] = &[
     "openat",
 ];
 
+/// Longest `comm` a rule may name. The kernel copies at most
+/// `TASK_COMM_LEN` bytes including the NUL, so a longer literal describes a
+/// string `bpf_get_current_comm()` can never produce: the rule compiles,
+/// signs, loads and never fires.
+pub const COMM_MATCH_MAX: usize = 15;
+
+/// Longest path fragment a rule may name. The datapath path buffer is
+/// `PATH_LEN` bytes including the NUL; a longer literal cannot be contained
+/// in, prefixed by, or suffixed to anything the datapath reports.
+pub const PATH_MATCH_MAX: usize = 255;
+
+/// First `comm` literal the kernel buffer cannot hold. Byte length, not chars:
+/// the kernel copies bytes.
+pub fn unobservable_comm<S: AsRef<str>>(named: &[S]) -> Option<(&str, usize)> {
+    first_over_limit(named, COMM_MATCH_MAX)
+}
+
+/// First path fragment longer than the datapath path buffer can carry.
+pub fn unobservable_path_pattern<S: AsRef<str>>(named: &[S]) -> Option<(&str, usize)> {
+    first_over_limit(named, PATH_MATCH_MAX)
+}
+
+fn first_over_limit<S: AsRef<str>>(named: &[S], limit: usize) -> Option<(&str, usize)> {
+    named
+        .iter()
+        .map(|s| s.as_ref())
+        .find(|s| s.len() > limit)
+        .map(|s| (s, s.len()))
+}
+
 /// A datapath syscall only some architectures have. A rule naming one is
 /// enforced on `arches` and dead everywhere else, while the signed bundle is
 /// one artifact for the whole cluster.
@@ -166,6 +196,62 @@ mod tests {
         assert_eq!(uncovered_equivalent_syscall(&["open", "openat"]), None);
         assert_eq!(uncovered_equivalent_syscall(&["execve"]), None);
         assert_eq!(uncovered_equivalent_syscall::<&str>(&[]), None);
+    }
+
+    #[test]
+    fn match_bounds_are_the_kernel_buffers_minus_the_nul() {
+        for (what, bound) in [("comm", COMM_MATCH_MAX), ("path", PATH_MATCH_MAX)] {
+            assert!(bound > 0, "{what} bound must leave room for a predicate");
+            // One byte shorter than the buffer: the NUL is the only byte lost.
+            assert!(bound < usize::MAX, "{what}");
+        }
+        assert_eq!(
+            [COMM_MATCH_MAX, PATH_MATCH_MAX]
+                .iter()
+                .copied()
+                .max()
+                .expect("two bounds"),
+            PATH_MATCH_MAX,
+            "a path fragment can be longer than a comm"
+        );
+    }
+
+    #[test]
+    fn a_predicate_one_byte_over_the_bound_is_unobservable() {
+        assert_eq!(unobservable_comm(&["", "sh"]), None);
+        let exact = "x".repeat(COMM_MATCH_MAX);
+        assert_eq!(unobservable_comm(&[exact.clone()]), None);
+        let over = "x".repeat(COMM_MATCH_MAX + 1);
+        assert_eq!(
+            unobservable_comm(&[exact.clone(), over.clone()]),
+            Some((over.as_str(), COMM_MATCH_MAX + 1))
+        );
+        assert_eq!(
+            unobservable_comm(&["kubectl-exec-helper"]),
+            Some(("kubectl-exec-helper", 19))
+        );
+
+        assert_eq!(unobservable_path_pattern::<&str>(&[]), None);
+        let exact = "p".repeat(PATH_MATCH_MAX);
+        assert_eq!(unobservable_path_pattern(&[exact.clone()]), None);
+        let over = "p".repeat(PATH_MATCH_MAX + 1);
+        assert_eq!(
+            unobservable_path_pattern(&[over.clone()]),
+            Some((over.as_str(), PATH_MATCH_MAX + 1))
+        );
+    }
+
+    #[test]
+    fn bounds_are_counted_in_bytes_not_chars() {
+        // 8 chars, 16 bytes: the kernel buffer holds bytes, so this comm is
+        // one byte past what `bpf_get_current_comm` can ever report.
+        let multibyte = "\u{00e9}".repeat(8);
+        assert_eq!(multibyte.chars().count(), 8);
+        assert_eq!(multibyte.len(), 16);
+        assert_eq!(
+            unobservable_comm(&[multibyte.clone()]),
+            Some((multibyte.as_str(), 16))
+        );
     }
 
     #[test]

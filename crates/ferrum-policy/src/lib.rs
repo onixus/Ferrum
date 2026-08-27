@@ -175,6 +175,33 @@ pub fn validate_rule_syscalls(rule_id: &str, syscalls: &[String]) -> Result<()> 
     Ok(())
 }
 
+/// Тот же инвариант «правило может сработать», но для предикатов, а не для
+/// syscall'ов: ядро отдаёт `comm` не длиннее TASK_COMM_LEN с NUL, а путь — не
+/// длиннее буфера датапаса. Литерал длиннее границы компилируется, подписывается
+/// и не совпадает никогда.
+pub fn validate_rule_predicates(
+    rule_id: &str,
+    comm_in: &[String],
+    path_prefix: &[String],
+    path_suffix: &[String],
+) -> Result<()> {
+    if let Some((comm, len)) = ferrum_ids::unobservable_comm(comm_in) {
+        return Err(FerrumError::Validation(format!(
+            "rule '{rule_id}': comm '{comm}' длиной {len} байт, ядро отдаёт не больше {} — правило не может совпасть никогда",
+            ferrum_ids::COMM_MATCH_MAX
+        )));
+    }
+    for (field, patterns) in [("pathPrefix", path_prefix), ("pathSuffix", path_suffix)] {
+        if let Some((pattern, len)) = ferrum_ids::unobservable_path_pattern(patterns) {
+            return Err(FerrumError::Validation(format!(
+                "rule '{rule_id}': {field} '{pattern}' длиной {len} байт, датапас несёт не больше {} — правило не может совпасть никогда",
+                ferrum_ids::PATH_MATCH_MAX
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Why naming one spelling of an operation and not the other breaks
 /// enforcement. Both directions are holes, but of opposite kinds: the missing
 /// form either lets the call through on the arches that serve it, or the named
@@ -217,6 +244,12 @@ fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
             )));
         }
         validate_rule_syscalls(&rule.id, &rule.syscalls)?;
+        validate_rule_predicates(
+            &rule.id,
+            &rule.match_on.comm_in,
+            &rule.match_on.path_prefix,
+            &rule.match_on.path_suffix,
+        )?;
         if matches!(rule.action, RuntimeAction::Kill | RuntimeAction::Isolate)
             && rule.match_on.comm_in.is_empty()
             && rule.match_on.path_prefix.is_empty()
@@ -395,6 +428,77 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn predicate_rule_spec(m: RuntimeMatch) -> ClusterSecurityPolicySpec {
+        ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                rules: vec![RuntimeRule {
+                    id: "probe".into(),
+                    syscalls: vec![],
+                    match_on: m,
+                    action: RuntimeAction::Deny,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Same class of defect as an unhooked syscall: `comm` is capped at
+    /// TASK_COMM_LEN in the kernel and the path buffer is finite, so a longer
+    /// literal is a rule that validates, signs, loads and never matches.
+    #[test]
+    fn a_predicate_the_kernel_cannot_report_is_rejected() {
+        let over_comm = "kubectl-exec-helper".to_string();
+        assert!(over_comm.len() > ferrum_ids::COMM_MATCH_MAX);
+        let err = validate_cluster_policy(&predicate_rule_spec(RuntimeMatch {
+            comm_in: vec![over_comm.clone()],
+            ..Default::default()
+        }))
+        .expect_err("19-byte comm is unobservable");
+        let msg = err.to_string();
+        assert!(msg.contains("probe"), "{msg}");
+        assert!(msg.contains(&over_comm), "{msg}");
+        // Names the length and the bound, not just "invalid".
+        assert!(msg.contains("19"), "{msg}");
+        assert!(
+            msg.contains(&ferrum_ids::COMM_MATCH_MAX.to_string()),
+            "{msg}"
+        );
+
+        let over_path = "p".repeat(ferrum_ids::PATH_MATCH_MAX + 1);
+        for m in [
+            RuntimeMatch {
+                path_prefix: vec![over_path.clone()],
+                ..Default::default()
+            },
+            RuntimeMatch {
+                path_suffix: vec![over_path.clone()],
+                ..Default::default()
+            },
+        ] {
+            let msg = validate_cluster_policy(&predicate_rule_spec(m))
+                .expect_err("oversize path pattern")
+                .to_string();
+            assert!(
+                msg.contains(&(ferrum_ids::PATH_MATCH_MAX + 1).to_string()),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&ferrum_ids::PATH_MATCH_MAX.to_string()),
+                "{msg}"
+            );
+        }
+
+        // At the bound, and empty, both stay valid.
+        validate_cluster_policy(&predicate_rule_spec(RuntimeMatch {
+            comm_in: vec!["x".repeat(ferrum_ids::COMM_MATCH_MAX)],
+            path_prefix: vec!["p".repeat(ferrum_ids::PATH_MATCH_MAX)],
+            path_suffix: vec!["s".repeat(ferrum_ids::PATH_MATCH_MAX)],
+            ..Default::default()
+        }))
+        .expect("a predicate the buffers can hold is valid");
     }
 
     #[test]

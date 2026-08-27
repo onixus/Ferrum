@@ -154,6 +154,7 @@ pub fn parse_febp(spec: &[u8]) -> Result<EbpfSpec> {
     r.finish()?;
     reject_kill_all(&rules)?;
     reject_unobservable_syscalls(&rules)?;
+    reject_unobservable_predicates(&rules)?;
     Ok(EbpfSpec {
         abi,
         mode,
@@ -187,6 +188,35 @@ fn reject_unobservable_syscalls(rules: &[Rule]) -> Result<()> {
                      never fire. Observed: {}",
                     rule.id,
                     ferrum_ids::DATAPATH_SYSCALLS.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Same load-path role as `reject_unobservable_syscalls`, for the other half of
+/// what a rule can name. A `comm` longer than the kernel's TASK_COMM_LEN, or a
+/// path fragment longer than the datapath path buffer, cannot appear in any
+/// record: the rule is dead. A bundle signed by an older compiler that had no
+/// such gate must not load quietly into a newer agent.
+fn reject_unobservable_predicates(rules: &[Rule]) -> Result<()> {
+    for rule in rules {
+        if let Some((comm, len)) = ferrum_ids::unobservable_comm(&rule.comm_in) {
+            return Err(FerrumError::Compile(format!(
+                "rule '{}': comm '{comm}' is {len} bytes, the kernel reports at most {}; \
+                 the rule can never match",
+                rule.id,
+                ferrum_ids::COMM_MATCH_MAX
+            )));
+        }
+        for patterns in [&rule.path_prefix, &rule.path_suffix] {
+            if let Some((pattern, len)) = ferrum_ids::unobservable_path_pattern(patterns) {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': path pattern '{pattern}' is {len} bytes, the datapath path \
+                     buffer carries at most {}; the rule can never match",
+                    rule.id,
+                    ferrum_ids::PATH_MATCH_MAX
                 )));
             }
         }

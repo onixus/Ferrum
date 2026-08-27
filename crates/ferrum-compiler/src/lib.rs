@@ -51,6 +51,7 @@ fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
         ));
     }
     reject_unobservable_syscalls(&fx)?;
+    reject_unobservable_predicates(&fx)?;
     let admission_program = encode::encode_admission(&fx)?;
     let ebpf_spec = encode::encode_ebpf(&fx)?;
     let wasm = ferrum_wasm_abi::placeholder_module().to_vec();
@@ -94,6 +95,35 @@ fn reject_unobservable_syscalls(fx: &Effects<'_>) -> Result<()> {
                 "rule '{}': syscall '{listed}' named without '{missing}'; they are one kernel operation and {arches} serves both, so one signed bundle for the whole cluster must name both or the other form walks past the rule",
                 rule.id
             )));
+        }
+    }
+    Ok(())
+}
+
+/// The other half of "a rule that can never fire", for what a rule matches on
+/// rather than which syscall it names. `comm` is capped by the kernel at
+/// TASK_COMM_LEN and the path buffer is finite, so a longer literal is dead
+/// weight the moment it is signed.
+fn reject_unobservable_predicates(fx: &Effects<'_>) -> Result<()> {
+    for rule in &fx.runtime.rules {
+        if let Some((comm, len)) = ferrum_ids::unobservable_comm(&rule.match_on.comm_in) {
+            return Err(FerrumError::Compile(format!(
+                "rule '{}': comm '{comm}' is {len} bytes; the kernel reports at most {}, so the rule can never match",
+                rule.id,
+                ferrum_ids::COMM_MATCH_MAX
+            )));
+        }
+        for (field, patterns) in [
+            ("pathPrefix", &rule.match_on.path_prefix),
+            ("pathSuffix", &rule.match_on.path_suffix),
+        ] {
+            if let Some((pattern, len)) = ferrum_ids::unobservable_path_pattern(patterns) {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': {field} '{pattern}' is {len} bytes; the datapath path buffer carries at most {}, so the rule can never match",
+                    rule.id,
+                    ferrum_ids::PATH_MATCH_MAX
+                )));
+            }
         }
     }
     Ok(())
@@ -381,6 +411,68 @@ mod tests {
             ..Default::default()
         };
         assert_validation_no_bundle(compile_namespaced_policy(&spec));
+    }
+
+    /// The compiler is the second gate on the same invariant the validator
+    /// checks: a bundle can be produced by anything that calls the compiler, so
+    /// a predicate no record can carry must not reach a signed artifact.
+    #[test]
+    fn an_unobservable_predicate_does_not_compile() {
+        let over_comm = "kubectl-exec-helper".to_string();
+        let over_path = "p".repeat(ferrum_ids::PATH_MATCH_MAX + 1);
+        let cases = [
+            (
+                RuntimeMatch {
+                    comm_in: vec![over_comm.clone()],
+                    ..Default::default()
+                },
+                over_comm.clone(),
+                ferrum_ids::COMM_MATCH_MAX,
+            ),
+            (
+                RuntimeMatch {
+                    path_prefix: vec![over_path.clone()],
+                    ..Default::default()
+                },
+                over_path.clone(),
+                ferrum_ids::PATH_MATCH_MAX,
+            ),
+            (
+                RuntimeMatch {
+                    path_suffix: vec![over_path.clone()],
+                    ..Default::default()
+                },
+                over_path.clone(),
+                ferrum_ids::PATH_MATCH_MAX,
+            ),
+        ];
+        for (match_on, literal, bound) in cases {
+            let spec = ClusterSecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    rules: vec![RuntimeRule {
+                        id: "too-long".into(),
+                        syscalls: vec![],
+                        match_on,
+                        action: RuntimeAction::Deny,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // The validator refuses first; the compiler's own gate has to hold
+            // on its own, so assert it directly as well.
+            assert!(compile_cluster_policy(&spec).is_err());
+            let fx = Effects::from(&spec);
+            match reject_unobservable_predicates(&fx) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("too-long"), "{msg}");
+                    // The message names the length and the bound.
+                    assert!(msg.contains(&literal.len().to_string()), "{msg}");
+                    assert!(msg.contains(&bound.to_string()), "{msg}");
+                }
+                other => panic!("expected Compile, got {other:?}"),
+            }
+        }
     }
 
     #[test]
