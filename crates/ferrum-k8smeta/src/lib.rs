@@ -5,6 +5,17 @@
 use ferrum_common::{FerrumError, Result};
 use std::collections::{BTreeMap, HashMap};
 
+pub mod cgroupfs;
+pub mod index;
+pub mod resolver;
+pub mod source;
+pub mod watch;
+
+pub use cgroupfs::{scan, CgroupEntry, CgroupFs, StdCgroupFs, DEFAULT_CGROUP_ROOT};
+pub use index::SharedCgroupIndex;
+pub use resolver::{CgroupResolver, RefreshStats};
+pub use source::{ContainerRecord, PodCache, PodMetadataSource, PodRecord};
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkloadIdentity {
     pub namespace: String,
