@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::bundle::{
     exceptions_file_path, load_source_with_digest, read_exceptions_path, read_source_path,
-    source_snapshot_dir, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY,
+    source_snapshot_dir, verify_exceptions_fsig, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY,
 };
 use crate::program::AdmissionProgram;
 use crate::review::ReviewConfig;
@@ -23,11 +23,13 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Verified program plus pinned trust-root. Bundle reload never fail-opens;
-/// the exception list is hot-swappable TTL'd data, re-scoped by eval per request.
+/// the exception list is a signed `exceptions.fsig` verified against the same
+/// pin, hot-swappable, and re-scoped by eval per request.
 pub struct WebhookState {
     program: RwLock<AdmissionProgram>,
     trust_root: Vec<u8>,
     exceptions: RwLock<Vec<PolicyExceptionSpec>>,
+    exceptions_resets: std::sync::atomic::AtomicU64,
     config: ReviewConfig,
 }
 
@@ -42,6 +44,7 @@ impl WebhookState {
             program: RwLock::new(program),
             trust_root,
             exceptions: RwLock::new(exceptions),
+            exceptions_resets: std::sync::atomic::AtomicU64::new(0),
             config,
         }
     }
@@ -66,25 +69,46 @@ impl WebhookState {
         *self.exceptions.write().unwrap_or_else(|e| e.into_inner()) = list;
     }
 
-    /// Parse a PolicyExceptionSpec JSON array (controller `exceptions.json`).
-    /// Garbage keeps the previous list: the bundle is fail-closed, but a broken
-    /// exception file must not flip decisions either way.
+    /// How many times a broken/unverifiable exception source reset the list.
+    pub fn exceptions_resets(&self) -> u64 {
+        self.exceptions_resets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reset_exceptions(&self, err: FerrumError) -> FerrumError {
+        self.exceptions_resets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.set_exceptions(Vec::new());
+        err
+    }
+
+    /// Verify a controller `exceptions.fsig` against the pinned trust root,
+    /// then parse the signed JSON array. Unsigned plain JSON, a foreign key,
+    /// a tampered payload, or garbage RESETS the list to empty (counted,
+    /// returned as Err): a Secret writer without the signing key must not be
+    /// able to keep — or forge — a live exception.
     pub fn try_reload_exceptions(&self, bytes: &[u8]) -> ferrum_common::Result<usize> {
-        let list: Vec<PolicyExceptionSpec> = serde_json::from_slice(bytes)
-            .map_err(|e| FerrumError::Validation(format!("exceptions.json: {e}")))?;
+        let payload = verify_exceptions_fsig(bytes, &self.trust_root)
+            .map_err(|e| self.reset_exceptions(e))?;
+        let list: Vec<PolicyExceptionSpec> = serde_json::from_slice(&payload).map_err(|e| {
+            self.reset_exceptions(FerrumError::Validation(format!(
+                "exceptions.fsig payload: {e}"
+            )))
+        })?;
         let n = list.len();
         self.set_exceptions(list);
         Ok(n)
     }
 
-    /// Missing file = empty list; unreadable or garbage = keep previous (Err).
+    /// Missing file = empty list; unreadable or unverifiable = reset to empty (Err).
     pub fn try_reload_exceptions_path(&self, path: &Path) -> ferrum_common::Result<usize> {
-        match read_exceptions_path(path)? {
-            Some(bytes) => self.try_reload_exceptions(&bytes),
-            None => {
+        match read_exceptions_path(path) {
+            Ok(Some(bytes)) => self.try_reload_exceptions(&bytes),
+            Ok(None) => {
                 self.set_exceptions(Vec::new());
                 Ok(0)
             }
+            Err(err) => Err(self.reset_exceptions(err)),
         }
     }
 
@@ -309,8 +333,8 @@ fn poll_loop(path: PathBuf, interval: Duration, state: Arc<WebhookState>) {
     }
 }
 
-/// Watch the `--exceptions` mount (dir with `exceptions.json`, or the file
-/// itself). File gone = swap to empty; garbage = keep the previous list.
+/// Watch the `--exceptions` mount (dir with `exceptions.fsig`, or the file
+/// itself). File gone = swap to empty; unverifiable = reset to empty.
 pub fn poll_exceptions_file(
     path: impl Into<PathBuf>,
     interval: Duration,
@@ -342,7 +366,9 @@ fn poll_exceptions_loop(path: PathBuf, interval: Duration, state: Arc<WebhookSta
                 stamp = Some(next);
                 if let Err(err) = state.try_reload_exceptions_path(&path) {
                     eprintln!(
-                        "ferrum-admission: exceptions reload failed, keeping previous list: {err}"
+                        "ferrum-admission: exceptions reload failed, list reset to empty \
+                         (resets_total={}): {err}",
+                        state.exceptions_resets()
                     );
                 }
             }
