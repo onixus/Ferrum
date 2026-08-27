@@ -221,6 +221,9 @@ impl Agent {
         };
         fs::create_dir_all(dir)
             .map_err(|e| FerrumError::Degraded(format!("create LKG dir: {e}")))?;
+        if lkg_digest_on_disk(dir).as_deref() == Some(digest.as_str()) {
+            return Ok(());
+        }
         let snap_name = format!(
             "..snap-{}-{}-{}",
             std::process::id(),
@@ -235,7 +238,6 @@ impl Agent {
             let _ = fs::remove_dir_all(&snap);
             return Err(err);
         }
-        let prev = fs::read_link(dir.join(KUBELET_DATA_DIR)).ok();
         if let Err(err) = atomic_symlink(dir, KUBELET_DATA_DIR, &snap_name) {
             let _ = fs::remove_dir_all(&snap);
             return Err(err);
@@ -250,16 +252,7 @@ impl Agent {
             BUNDLE_DIGEST_KEY,
             &format!("{KUBELET_DATA_DIR}/{BUNDLE_DIGEST_KEY}"),
         )?;
-        if let Some(prev) = prev {
-            let prev_path = if prev.is_absolute() {
-                prev
-            } else {
-                dir.join(prev)
-            };
-            if prev_path != snap {
-                let _ = fs::remove_dir_all(prev_path);
-            }
-        }
+        remove_stale_snaps(dir, &snap_name);
         Ok(())
     }
 
@@ -338,6 +331,32 @@ fn lkg_present(dir: &Path) -> bool {
     dir.join(BUNDLE_FSIG_KEY).exists()
         || dir.join(BUNDLE_DIGEST_KEY).exists()
         || dir.join(KUBELET_DATA_DIR).exists()
+}
+
+fn lkg_digest_on_disk(dir: &Path) -> Option<String> {
+    let snap = source::source_snapshot_dir(dir)?;
+    let bytes = fs::read(snap.join(BUNDLE_DIGEST_KEY)).ok()?;
+    let hex = std::str::from_utf8(&bytes).ok()?.trim();
+    if hex.is_empty() {
+        None
+    } else {
+        Some(hex.to_string())
+    }
+}
+
+fn remove_stale_snaps(dir: &Path, keep_name: &str) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for ent in rd.filter_map(|e| e.ok()) {
+        let name = ent.file_name();
+        let Some(n) = name.to_str() else {
+            continue;
+        };
+        if n.starts_with("..snap-") && n != keep_name {
+            let _ = fs::remove_dir_all(ent.path());
+        }
+    }
 }
 
 fn write_snap(snap: &Path, fsig: &[u8], digest: &Digest) -> Result<()> {
@@ -1063,6 +1082,8 @@ mod tests {
                 ..Default::default()
             });
             load_signed(&mut agent, &raw);
+            load_signed(&mut agent, &raw);
+            assert_eq!(snap_count(&dir), 1);
             assert!(agent.using_last_known_good());
             assert!(dir.join(KUBELET_DATA_DIR).exists());
             assert!(dir.join(BUNDLE_FSIG_KEY).exists());
