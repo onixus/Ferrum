@@ -4,9 +4,10 @@ use ferrum_common::FerrumError;
 use ferrum_k8smeta::cgroupfs::{scan, CgroupFs, StdCgroupFs};
 use ferrum_k8smeta::source::{PodCache, PodMetadataSource};
 use ferrum_k8smeta::watch::{
-    apply_watch_event, apply_watch_stream, parse_pod_list, parse_watch_event, PodWatchEvent,
-    WatchOutcome,
+    apply_watch_event, apply_watch_stream, parse_labels_list, parse_pod_list, parse_watch_event,
+    PodWatchEvent, WatchOutcome,
 };
+use ferrum_k8smeta::{apply_labels_stream, PodRecord};
 use ferrum_k8smeta::{CgroupResolver, SharedCgroupIndex};
 use std::collections::HashMap;
 use std::io;
@@ -72,6 +73,29 @@ impl CgroupFs for FakeCgroupFs {
             .copied()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such path"))
     }
+}
+
+/// Pod list plus the two label lists, the way the three watches leave the
+/// cache once every relist has completed.
+fn labelled_cache() -> PodCache {
+    let mut cache = list_into_cache();
+    let ns = std::fs::read(fixture("namespaces-list.json")).expect("ns fixture");
+    let (ns_rv, namespaces) = parse_labels_list("NamespaceList", &ns).expect("parse ns list");
+    assert_eq!(ns_rv, "2001");
+    cache.namespaces_mut().replace_all(namespaces);
+    cache.namespaces_mut().set_resource_version(ns_rv);
+
+    let sa = std::fs::read(fixture("serviceaccounts-list.json")).expect("sa fixture");
+    let (sa_rv, accounts) = parse_labels_list("ServiceAccountList", &sa).expect("parse sa list");
+    cache.service_accounts_mut().replace_all(accounts);
+    cache.service_accounts_mut().set_resource_version(sa_rv);
+    cache
+}
+
+fn pod_named<'a>(pods: &'a [PodRecord], name: &str) -> &'a PodRecord {
+    pods.iter()
+        .find(|p| p.name == name)
+        .unwrap_or_else(|| panic!("no pod {name} in snapshot"))
 }
 
 fn list_into_cache() -> PodCache {
@@ -301,4 +325,130 @@ fn modified_updates_metadata_and_foreign_added_is_ignored() {
         "a pod scheduled elsewhere must never enter this node's cache"
     );
     assert!(cache.get("feedface-0000-1111-2222-333344445555").is_none());
+}
+
+#[test]
+fn cgroup_resolves_to_namespace_and_service_account_labels() {
+    let fs = FakeCgroupFs::load("cgroup-systemd.paths");
+    let cache = labelled_cache();
+    let resolver = CgroupResolver::new(SharedCgroupIndex::new());
+    assert_eq!(
+        resolver
+            .refresh(&fs, Path::new("/fixture"), &cache)
+            .expect("refresh")
+            .resolved,
+        2
+    );
+    let app_inode = fs.inode_of(
+        "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod3f8a1b2c_4d5e_6f70_8192_a3b4c5d6e7f8.slice/cri-containerd-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope",
+    );
+    let app = resolver.index().lookup_cgroup(app_inode).expect("app");
+    assert_eq!(
+        app.namespace_labels
+            .get("ferrum.io/zone")
+            .map(String::as_str),
+        Some("pci")
+    );
+    assert_eq!(
+        app.service_account_labels
+            .get("ferrum.io/tier")
+            .map(String::as_str),
+        Some("frontend"),
+        "prod/web-sa labels, not dev/web-sa"
+    );
+    assert_eq!(cache.labels_unknown_total(), 0);
+}
+
+#[test]
+fn deleted_namespace_drops_its_labels_from_every_pod() {
+    let mut cache = labelled_cache();
+    assert!(!pod_named(&cache.snapshot().expect("snapshot"), "web-0")
+        .namespace_labels
+        .is_empty());
+
+    let stream = std::fs::read(fixture("namespace-watch.jsonl")).expect("ns watch fixture");
+    apply_labels_stream(cache.namespaces_mut(), &stream).expect("apply ns stream");
+    assert_eq!(cache.namespaces().resource_version(), "2004");
+
+    let pods = cache.snapshot().expect("snapshot");
+    let web = pod_named(&pods, "web-0");
+    assert!(
+        web.namespace_labels.is_empty(),
+        "a deleted namespace must not leave stale labels behind"
+    );
+    assert_eq!(
+        cache.labels_unknown_total(),
+        1,
+        "the miss is counted, not silently allowed"
+    );
+    // The ServiceAccount is untouched by a namespace DELETE.
+    assert_eq!(
+        web.service_account_labels
+            .get("ferrum.io/tier")
+            .map(String::as_str),
+        Some("frontend")
+    );
+}
+
+#[test]
+fn service_account_labels_do_not_leak_between_namespaces() {
+    let mut cache = labelled_cache();
+    // Same pod, moved to the namespace that has a same-named ServiceAccount.
+    let mut moved = cache.get(WEB_UID).expect("web-0").clone();
+    moved.namespace = "dev".into();
+    cache.upsert(moved);
+
+    let pods = cache.snapshot().expect("snapshot");
+    let web = pod_named(&pods, "web-0");
+    assert_eq!(
+        web.service_account_labels
+            .get("ferrum.io/tier")
+            .map(String::as_str),
+        Some("sandbox"),
+        "dev/web-sa must not inherit prod/web-sa labels"
+    );
+    assert_eq!(
+        web.namespace_labels
+            .get("ferrum.io/zone")
+            .map(String::as_str),
+        Some("public")
+    );
+}
+
+#[test]
+fn pod_in_an_unknown_namespace_gets_empty_labels_and_is_counted() {
+    let mut cache = labelled_cache();
+    let mut moved = cache.get(WEB_UID).expect("web-0").clone();
+    moved.namespace = "not-watched".into();
+    cache.upsert(moved);
+
+    let pods = cache.snapshot().expect("snapshot");
+    let web = pod_named(&pods, "web-0");
+    assert!(web.namespace_labels.is_empty());
+    assert!(web.service_account_labels.is_empty());
+    assert_eq!(
+        cache.labels_unknown_total(),
+        2,
+        "namespace and SA both miss"
+    );
+}
+
+#[test]
+fn expired_namespace_watch_demands_a_relist_and_keeps_labels() {
+    let mut cache = labelled_cache();
+    let stream = std::fs::read(fixture("namespace-watch-expired.jsonl")).expect("fixture");
+    let outcome = apply_labels_stream(cache.namespaces_mut(), &stream).expect("apply");
+    assert_eq!(outcome, WatchOutcome::MustRelist);
+    assert_eq!(cache.namespaces().len(), 2);
+    assert!(cache.namespaces().is_warm());
+}
+
+#[test]
+fn a_cold_label_cache_is_not_the_same_as_an_unlabelled_cluster() {
+    let cache = list_into_cache();
+    assert!(!cache.namespaces().is_warm());
+    assert!(!cache.service_accounts().is_warm());
+    let pods = cache.snapshot().expect("snapshot");
+    assert!(pod_named(&pods, "web-0").namespace_labels.is_empty());
+    assert_eq!(cache.labels_unknown_total(), 2);
 }

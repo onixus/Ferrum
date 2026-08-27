@@ -7,12 +7,16 @@ use std::collections::{BTreeMap, HashMap};
 
 pub mod cgroupfs;
 pub mod index;
+pub mod labels;
 pub mod resolver;
 pub mod source;
 pub mod watch;
 
 pub use cgroupfs::{scan, CgroupEntry, CgroupFs, StdCgroupFs, DEFAULT_CGROUP_ROOT};
 pub use index::SharedCgroupIndex;
+pub use labels::{
+    apply_labels_event, apply_labels_stream, label_key, LabelCache, LabelObject, LabelWatchEvent,
+};
 pub use resolver::{CgroupResolver, RefreshStats};
 pub use source::{ContainerRecord, PodCache, PodMetadataSource, PodRecord};
 

@@ -1,0 +1,3 @@
+{"type":"MODIFIED","object":{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"dev","resourceVersion":"2002","labels":{"kubernetes.io/metadata.name":"dev","ferrum.io/zone":"pci"}}}}
+{"type":"BOOKMARK","object":{"kind":"Namespace","apiVersion":"v1","metadata":{"resourceVersion":"2003"}}}
+{"type":"DELETED","object":{"kind":"Namespace","apiVersion":"v1","metadata":{"name":"prod","resourceVersion":"2004","labels":{"kubernetes.io/metadata.name":"prod","ferrum.io/zone":"pci"}}}}
