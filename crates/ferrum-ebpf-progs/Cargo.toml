@@ -5,5 +5,15 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
+description = "eBPF datapath. Forbidden: tokio, kube, String on syscall path."
+
+[[bin]]
+name = "ferrum-ebpf-progs"
+path = "src/main.rs"
 
 [dependencies]
+
+# Compiled only for bpfel/bpfeb targets (nightly + build-std). The stable-1.75
+# host build never builds aya-ebpf, so the default workspace build stays offline.
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf = { version = "=0.1.1", default-features = false }
