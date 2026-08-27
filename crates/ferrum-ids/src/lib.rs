@@ -57,6 +57,11 @@ pub const COMM_MATCH_MAX: usize = 15;
 /// Longest path fragment a rule may name. The datapath path buffer is
 /// `PATH_LEN` bytes including the NUL; a longer literal cannot be contained
 /// in, prefixed by, or suffixed to anything the datapath reports.
+///
+/// That this and [`COMM_MATCH_MAX`] really are the datapath buffers minus the
+/// NUL is asserted in `ferrum-ebpf` (`match_bounds_track_the_datapath_buffers`),
+/// the one crate that sees both sides: buffer sizes travel down to
+/// `ferrum-ids`, never up, so this crate cannot check itself against them.
 pub const PATH_MATCH_MAX: usize = 255;
 
 /// First `comm` literal the kernel buffer cannot hold. Byte length, not chars:
@@ -196,24 +201,6 @@ mod tests {
         assert_eq!(uncovered_equivalent_syscall(&["open", "openat"]), None);
         assert_eq!(uncovered_equivalent_syscall(&["execve"]), None);
         assert_eq!(uncovered_equivalent_syscall::<&str>(&[]), None);
-    }
-
-    #[test]
-    fn match_bounds_are_the_kernel_buffers_minus_the_nul() {
-        for (what, bound) in [("comm", COMM_MATCH_MAX), ("path", PATH_MATCH_MAX)] {
-            assert!(bound > 0, "{what} bound must leave room for a predicate");
-            // One byte shorter than the buffer: the NUL is the only byte lost.
-            assert!(bound < usize::MAX, "{what}");
-        }
-        assert_eq!(
-            [COMM_MATCH_MAX, PATH_MATCH_MAX]
-                .iter()
-                .copied()
-                .max()
-                .expect("two bounds"),
-            PATH_MATCH_MAX,
-            "a path fragment can be longer than a comm"
-        );
     }
 
     #[test]
