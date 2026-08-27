@@ -267,9 +267,15 @@ async fn handle_exception_event(
     exceptions: &ExceptionSet,
     event: watcher::Event<DynamicObject>,
 ) -> Result<()> {
+    // Status patches must never block publication: the in-memory set is
+    // updated first, and a failed status write on one object cannot leave a
+    // revoked/narrowed exception live in the Secrets (that is fail-open).
+    let mut status_errors: Vec<String> = Vec::new();
     match event {
         watcher::Event::Applied(obj) => {
-            apply_exception_object(client, exceptions, &obj).await?;
+            if let Err(err) = apply_exception_object(client, exceptions, &obj).await {
+                status_errors.push(err.to_string());
+            }
         }
         watcher::Event::Deleted(obj) => {
             if let (Some(ns), Some(name)) = (
@@ -285,11 +291,21 @@ async fn handle_exception_event(
         watcher::Event::Restarted(objs) => {
             exceptions.lock().unwrap_or_else(|e| e.into_inner()).clear();
             for obj in &objs {
-                apply_exception_object(client, exceptions, obj).await?;
+                if let Err(err) = apply_exception_object(client, exceptions, obj).await {
+                    status_errors.push(err.to_string());
+                }
             }
         }
     }
-    persist_exceptions(client, &cfg.namespace, &snapshot_exceptions(exceptions)).await
+    persist_exceptions(client, &cfg.namespace, &snapshot_exceptions(exceptions)).await?;
+    if status_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(FerrumError::Degraded(format!(
+            "exception status patch: {}",
+            status_errors.join("; ")
+        )))
+    }
 }
 
 /// Status to record on the object plus the spec to serialize, if live.
@@ -472,13 +488,18 @@ async fn attach_exceptions(
     let Some(secret_name) = secret.metadata.name.as_deref() else {
         return Ok(());
     };
-    patch_secret_exceptions(
-        client,
-        &cfg.namespace,
-        secret_name,
-        &snapshot_exceptions(exceptions),
-    )
-    .await
+    let scoped = match secret
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(crate::apply::POLICY_LABEL_KEY))
+    {
+        Some(policy) => {
+            crate::apply::exceptions_for_policy(&snapshot_exceptions(exceptions), policy)
+        }
+        None => snapshot_exceptions(exceptions),
+    };
+    patch_secret_exceptions(client, &cfg.namespace, secret_name, &scoped).await
 }
 
 fn failed_outcome(generation: i64, err: &FerrumError) -> crate::ReconcileOutcome {
@@ -924,7 +945,7 @@ mod tests {
         let secret = plan.secret.expect("FSIG Secret");
         assert_eq!(
             secret.metadata.name.as_deref(),
-            Some("ferrum-bundle-prod-restricted-payments")
+            Some("ferrum-bundle-ns-payments-prod-restricted")
         );
         let fsig = &secret
             .data
