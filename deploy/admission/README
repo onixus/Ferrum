@@ -5,14 +5,20 @@ The webhook cannot be applied from this directory as it stands: the API server
 needs a caBundle, and the serving Secret does not exist yet. Both come from one
 offline command.
 
-1. Issue the PKI. Writes ferrum-admission-tls.secret.yaml (mode 0600),
-   ca.crt, and validatingwebhookconfiguration.yaml rendered from the template:
+1. Issue the PKI. Writes ferrum-admission-tls.secret.yaml (mode 0600), ca.crt,
+   ca.key (mode 0600), and validatingwebhookconfiguration.yaml rendered from
+   the template:
 
        ferrumctl gen-webhook-pki --service ferrum-admission --namespace ferrum \
            --days 365 --out-dir deploy/admission
 
-   It refuses to overwrite existing output. Neither the Secret nor the rendered
-   configuration belongs in git.
+   It refuses to overwrite existing output. Neither the Secret, the rendered
+   configuration, nor ca.key belongs in git. ca.key never reaches the cluster;
+   it is what step 4 rotates with, so keep it offline and keep it.
+
+   The CA is issued for the longest lifetime the rule allows (398 days),
+   whatever --days the serving certificate gets. That headroom is the only
+   reason the leaf can be rotated later without touching the caBundle.
 
 2. Apply the Secret, then the rest of this directory:
 
@@ -36,5 +42,38 @@ deployment.yaml passes --apiserver, so the image must be built with the
 the flag only if you accept that every policy carrying a namespace or
 ServiceAccount selector denies each Pod it selects.
 
-Rotation is not this command's job. Re-run step 1 into a clean directory before
-the certificate expires and re-apply steps 2 and 3.
+Rotation
+========
+
+4. Before the serving certificate expires, reissue only the leaf, under the CA
+   the cluster already trusts. The caBundle does not change, so the
+   ValidatingWebhookConfiguration from step 3 stays applied untouched — nothing
+   in the cluster is briefly without a webhook:
+
+       mkdir deploy/admission/rotated
+       ferrumctl gen-webhook-pki --service ferrum-admission --namespace ferrum \
+           --days 90 --out-dir deploy/admission/rotated \
+           --ca-cert deploy/admission/ca.crt --ca-key deploy/admission/ca.key
+
+       kubectl apply -f deploy/admission/rotated/ferrum-admission-tls.secret.yaml
+
+   The command writes the Secret and nothing else: no new CA, no re-rendered
+   configuration. It refuses if --days would outlive the CA (a leaf may not
+   outlive its issuer, and it reports how many days the CA has left), and it
+   refuses if a rendered configuration next to either directory carries a
+   different CA.
+
+   kubelet refreshes the mounted Secret in place, and the webhook re-reads
+   tls.crt/tls.key when it changes; no restart is needed. Material that does not
+   parse, has expired, or drops a Service name from the SAN is logged and does
+   not replace what is serving. The server refuses to start on an expired
+   certificate and logs from 30 days before notAfter
+   (serving_cert_expiring_total).
+
+   `ferrumctl lint-deploy <dir>` (FD022) checks a directory that holds both the
+   rendered configuration and the Secret: the caBundle must be the CA that
+   signed the leaf, and neither may be expired or inside that 30-day window.
+
+5. When the CA itself runs out, step 4 is not enough: re-run step 1 into a clean
+   directory and re-apply steps 2 and 3, in that order. Applying a new caBundle
+   before its Secret leaves the API server trusting an issuer nothing serves.
