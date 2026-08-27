@@ -129,6 +129,7 @@ impl Loader {
             None => Decision {
                 action: Action::Deny,
                 rule_id: None,
+                labels_unknown: false,
             },
         }
     }
@@ -139,6 +140,7 @@ impl Loader {
             None => Decision {
                 action: Action::Deny,
                 rule_id: None,
+                labels_unknown: false,
             },
         }
     }
