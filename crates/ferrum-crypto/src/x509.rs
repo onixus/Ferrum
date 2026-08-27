@@ -27,6 +27,12 @@ pub const MAX_SERVING_CERT_DAYS: u64 = 398;
 
 const DAY_SECS: u64 = 86_400;
 
+/// notBefore is backdated by this much. A node whose clock trails the issuing
+/// machine would otherwise reject a certificate issued seconds ago as
+/// not-yet-valid, and the webhook fails every handshake exactly when
+/// `failurePolicy: Fail` starts rejecting pods.
+const NOT_BEFORE_BACKDATE: Duration = Duration::from_secs(300);
+
 /// Self-signed issuer. `key_pem` is a PKCS#8 private key and is never written
 /// anywhere by this module.
 #[derive(Clone, Debug)]
@@ -63,7 +69,7 @@ pub fn issue_ca(common_name: &str, not_after: SystemTime) -> Result<CaMaterial> 
 
     let mut params = CertificateParams::default();
     params.alg = &PKCS_ECDSA_P256_SHA256;
-    params.not_before = SystemTime::now().into();
+    params.not_before = not_before().into();
     params.not_after = not_after.into();
     params.serial_number = Some(serial_for(common_name.as_bytes()));
     params.distinguished_name = ferrum_dn(common_name);
@@ -117,7 +123,7 @@ pub fn issue_serving_cert(
 
     let mut params = CertificateParams::default();
     params.alg = &PKCS_ECDSA_P256_SHA256;
-    params.not_before = SystemTime::now().into();
+    params.not_before = not_before().into();
     params.not_after = not_after.into();
     params.serial_number = Some(serial_for(dns_names.join(",").as_bytes()));
     params.distinguished_name = ferrum_dn(&dns_names[2]);
@@ -149,8 +155,9 @@ pub fn issue_serving_cert(
 }
 
 /// Check `serving` against `ca`: signed by that CA's key, issued by that CA's
-/// subject, CA:TRUE on the issuer and not on the leaf, and a DNS SAN that is
-/// exactly what `serving` claims to carry.
+/// subject, CA:TRUE on the issuer and not on the leaf, a validity window
+/// contained in the CA's own, `serverAuth` in the extended key usage, and a DNS
+/// SAN that is exactly what `serving` claims to carry.
 pub fn verify_chain(serving: &ServingMaterial, ca: &CaMaterial) -> Result<()> {
     let ca_der = single(pem_certificates(&ca.cert_pem)?, "CA")?;
     let leaf_der = single(pem_certificates(&serving.cert_pem)?, "serving certificate")?;
@@ -179,6 +186,38 @@ pub fn verify_chain(serving: &ServingMaterial, ca: &CaMaterial) -> Result<()> {
             leaf.issuer(),
             ca_cert.subject()
         )));
+    }
+
+    let ca_window = ca_cert.validity();
+    let leaf_window = leaf.validity();
+    if leaf_window.not_before.timestamp() < ca_window.not_before.timestamp()
+        || leaf_window.not_after.timestamp() > ca_window.not_after.timestamp()
+    {
+        return Err(FerrumError::Integrity(format!(
+            "serving certificate validity {} .. {} is not contained in the CA's {} .. {}",
+            leaf_window.not_before,
+            leaf_window.not_after,
+            ca_window.not_before,
+            ca_window.not_after
+        )));
+    }
+
+    // What the API server actually looks at when it dials the webhook.
+    let eku = leaf
+        .extended_key_usage()
+        .map_err(|e| FerrumError::Integrity(format!("unreadable extendedKeyUsage: {e}")))?;
+    match eku {
+        Some(eku) if eku.value.server_auth => {}
+        Some(_) => {
+            return Err(FerrumError::Integrity(
+                "serving certificate extendedKeyUsage does not include serverAuth".into(),
+            ))
+        }
+        None => {
+            return Err(FerrumError::Integrity(
+                "serving certificate has no extendedKeyUsage extension".into(),
+            ))
+        }
     }
 
     let san = dns_san(&leaf)?;
@@ -210,6 +249,12 @@ pub fn expires_within(cert_pem: &str, within: Duration) -> Result<bool> {
         .map_err(|_| FerrumError::Integrity("system clock is before the epoch".into()))?
         .as_secs() as i64;
     Ok(cert.validity().not_after.timestamp() <= now.saturating_add(within.as_secs() as i64))
+}
+
+fn not_before() -> SystemTime {
+    SystemTime::now()
+        .checked_sub(NOT_BEFORE_BACKDATE)
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn ferrum_dn(common_name: &str) -> DistinguishedName {
@@ -480,11 +525,93 @@ mod tests {
         issue_ca("ferrum-admission-ca", in_days(365)).expect("ca")
     }
 
+    /// CA and leaf share one `not_after`: the leaf window has to nest inside
+    /// the CA's, and two separate `in_days` calls can land a second apart.
+    fn issued(days: u64) -> (CaMaterial, ServingMaterial) {
+        let not_after = in_days(days);
+        let ca = issue_ca("ferrum-admission-ca", not_after).expect("ca");
+        let serving =
+            issue_serving_cert(&ca, "ferrum-admission", "ferrum", not_after).expect("serving cert");
+        (ca, serving)
+    }
+
+    /// A leaf the issuance path would never emit: same CA, same SAN, whatever
+    /// EKU the caller asks for.
+    fn leaf_with_eku(
+        ca: &CaMaterial,
+        eku: Vec<ExtendedKeyUsagePurpose>,
+        not_after: SystemTime,
+    ) -> ServingMaterial {
+        let dns_names = service_dns_names("ferrum-admission", "ferrum");
+        let mut params = CertificateParams::default();
+        params.alg = &PKCS_ECDSA_P256_SHA256;
+        params.not_before = not_before().into();
+        params.not_after = not_after.into();
+        params.distinguished_name = ferrum_dn(&dns_names[2]);
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.subject_alt_names = dns_names
+            .iter()
+            .map(|n| SanType::DnsName(n.clone()))
+            .collect();
+        params.extended_key_usages = eku;
+        let cert = Certificate::from_params(params).expect("leaf");
+        let issuer = load_ca(ca).expect("issuer");
+        ServingMaterial {
+            cert_pem: cert.serialize_pem_with_signer(&issuer).expect("leaf pem"),
+            key_pem: cert.serialize_private_key_pem(),
+            dns_names,
+        }
+    }
+
+    fn not_before_of(cert_pem: &str) -> i64 {
+        let der = single(pem_certificates(cert_pem).unwrap(), "cert").unwrap();
+        X509Certificate::from_der(&der)
+            .unwrap()
+            .1
+            .validity()
+            .not_before
+            .timestamp()
+    }
+
+    #[test]
+    fn not_before_is_backdated_against_clock_skew() {
+        let (ca, serving) = issued(30);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let backdate = NOT_BEFORE_BACKDATE.as_secs() as i64;
+        for pem in [&ca.cert_pem, &serving.cert_pem] {
+            let nb = not_before_of(pem);
+            assert!(nb <= now - backdate + 5, "notBefore {nb} is not backdated");
+            assert!(nb > now - backdate - 60, "notBefore {nb} is too far back");
+        }
+    }
+
+    #[test]
+    fn a_leaf_outliving_the_ca_does_not_verify() {
+        let ca = issue_ca("ferrum-admission-ca", in_days(30)).unwrap();
+        let err = issue_serving_cert(&ca, "ferrum-admission", "ferrum", in_days(90))
+            .expect_err("a leaf may not outlive its CA");
+        assert!(err.to_string().contains("contained"), "{err}");
+    }
+
+    #[test]
+    fn a_leaf_without_server_auth_does_not_verify() {
+        let not_after = in_days(30);
+        let ca = issue_ca("ferrum-admission-ca", not_after).unwrap();
+        let client_only = leaf_with_eku(&ca, vec![ExtendedKeyUsagePurpose::ClientAuth], not_after);
+        let err = verify_chain(&client_only, &ca).expect_err("clientAuth is not serverAuth");
+        assert!(err.to_string().contains("serverAuth"), "{err}");
+
+        let no_eku = leaf_with_eku(&ca, Vec::new(), not_after);
+        let err = verify_chain(&no_eku, &ca).expect_err("a leaf without EKU is not a serving cert");
+        assert!(err.to_string().contains("extendedKeyUsage"), "{err}");
+    }
+
     #[test]
     fn issued_chain_verifies() {
-        let ca = ca();
-        let serving = issue_serving_cert(&ca, "ferrum-admission", "ferrum", in_days(365))
-            .expect("serving cert");
+        let (ca, serving) = issued(365);
         verify_chain(&serving, &ca).expect("chain must verify");
         assert_eq!(
             serving.dns_names,
@@ -499,10 +626,8 @@ mod tests {
 
     #[test]
     fn a_foreign_ca_does_not_verify() {
-        let mine = ca();
+        let (_mine, serving) = issued(365);
         let other = issue_ca("someone-else", in_days(365)).expect("ca");
-        let serving = issue_serving_cert(&mine, "ferrum-admission", "ferrum", in_days(365))
-            .expect("serving cert");
         let err = verify_chain(&serving, &other).expect_err("foreign CA must not verify");
         assert!(matches!(err, FerrumError::Integrity(_)), "{err}");
     }
