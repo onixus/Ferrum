@@ -60,7 +60,8 @@ pub fn exception_applies(
     if spec.ticket.trim().is_empty() || spec.reason.trim().len() < MIN_REASON_LEN {
         return false;
     }
-    if spec.four_eyes && spec.approved_by.trim().is_empty() {
+    // approvedBy обязателен независимо от fourEyes; self-approve не считается.
+    if spec.approved_by.trim().is_empty() || spec.approved_by.trim() == spec.requested_by.trim() {
         return false;
     }
     if now >= spec.expires_at {

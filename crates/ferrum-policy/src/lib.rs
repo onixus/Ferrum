@@ -54,9 +54,15 @@ pub fn validate_exception(spec: &PolicyExceptionSpec) -> Result<()> {
             "reason короче восьми символов — это не обоснование, это статус в Slack".into(),
         ));
     }
-    if spec.four_eyes && spec.approved_by.trim().is_empty() {
+    // approvedBy обязателен всегда: fourEyes self-declared и не может быть рубильником.
+    if spec.approved_by.trim().is_empty() {
         return Err(FerrumError::Validation(
-            "fourEyes=true без approvedBy".into(),
+            "PolicyException.approvedBy пуст — waiver без второго согласующего не waiver".into(),
+        ));
+    }
+    if spec.approved_by.trim() == spec.requested_by.trim() {
+        return Err(FerrumError::Validation(
+            "requestedBy совпадает с approvedBy — self-approve запрещён".into(),
         ));
     }
     let now = Utc::now();
@@ -251,6 +257,47 @@ mod tests {
             target: ExceptionTarget::default(),
         };
         assert!(validate_exception(&spec).is_err());
+    }
+
+    #[test]
+    fn exception_empty_approved_by_rejected_even_without_four_eyes() {
+        let mut spec = live_exception(
+            "",
+            &["prod-restricted"],
+            &["no-shell"],
+            Utc::now() + Days::new(7),
+        );
+        spec.four_eyes = false;
+        spec.approved_by = "".into();
+        assert!(validate_exception(&spec).is_err());
+        spec.approved_by = "   ".into();
+        assert!(validate_exception(&spec).is_err());
+    }
+
+    #[test]
+    fn exception_self_approve_rejected() {
+        let mut spec = live_exception(
+            "",
+            &["prod-restricted"],
+            &["no-shell"],
+            Utc::now() + Days::new(7),
+        );
+        spec.requested_by = "sre".into();
+        spec.approved_by = "sre".into();
+        assert!(validate_exception(&spec).is_err());
+        spec.four_eyes = false;
+        assert!(validate_exception(&spec).is_err());
+    }
+
+    #[test]
+    fn exception_distinct_approver_ok() {
+        let spec = live_exception(
+            "",
+            &["prod-restricted"],
+            &["no-shell"],
+            Utc::now() + Days::new(7),
+        );
+        assert!(validate_exception(&spec).is_ok());
     }
 
     #[test]
@@ -637,6 +684,30 @@ mod tests {
                         policies: vec!["prod-restricted".into()],
                         rules: vec!["no-shell".into()],
                     },
+                }],
+                want: RuntimeAction::Deny,
+            },
+            Case {
+                name: "empty approvedBy with fourEyes=false is a no-op",
+                hits: vec![hit("prod-restricted", "no-shell", RuntimeAction::Kill)],
+                default_action: RuntimeAction::Allow,
+                exceptions: vec![{
+                    let mut ex = live_exception("", &["prod-restricted"], &["no-shell"], live);
+                    ex.four_eyes = false;
+                    ex.approved_by = "".into();
+                    ex
+                }],
+                want: RuntimeAction::Kill,
+            },
+            Case {
+                name: "self-approved exception is a no-op",
+                hits: vec![hit("prod-restricted", "no-shell", RuntimeAction::Deny)],
+                default_action: RuntimeAction::Allow,
+                exceptions: vec![{
+                    let mut ex = live_exception("", &["prod-restricted"], &["no-shell"], live);
+                    ex.requested_by = "sre".into();
+                    ex.approved_by = "sre".into();
+                    ex
                 }],
                 want: RuntimeAction::Deny,
             },
