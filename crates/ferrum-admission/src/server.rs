@@ -3,7 +3,6 @@
 use chrono::Utc;
 use ferrum_api::PolicyExceptionSpec;
 use ferrum_ids::Digest;
-use rustls::ServerConfig;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -17,6 +16,7 @@ use crate::bundle::{
 };
 use crate::program::AdmissionProgram;
 use crate::review::ReviewConfig;
+use crate::serving_cert::TlsSource;
 use ferrum_common::FerrumError;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -139,7 +139,7 @@ impl WebhookState {
 pub fn serve(
     listen: &str,
     state: Arc<WebhookState>,
-    tls: Option<Arc<ServerConfig>>,
+    tls: Option<Arc<TlsSource>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(listen)?;
     serve_listener(listener, state, tls)
@@ -149,7 +149,7 @@ pub fn serve(
 pub fn serve_listener(
     listener: TcpListener,
     state: Arc<WebhookState>,
-    tls: Option<Arc<ServerConfig>>,
+    tls: Option<Arc<TlsSource>>,
 ) -> io::Result<()> {
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -169,12 +169,14 @@ pub fn serve_listener(
 fn handle_connection(
     mut stream: TcpStream,
     state: &WebhookState,
-    tls: Option<Arc<ServerConfig>>,
+    tls: Option<Arc<TlsSource>>,
 ) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
     match tls {
-        Some(cfg) => {
-            let conn = rustls::ServerConnection::new(cfg)
+        // Read the config per connection: rotation swaps it, and a handshake
+        // already in flight keeps the certificate it started with.
+        Some(source) => {
+            let conn = rustls::ServerConnection::new(source.config())
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             let mut tls_stream = rustls::StreamOwned::new(conn, stream);
             serve_http(&mut tls_stream, state)
@@ -273,40 +275,6 @@ fn write_response<W: Write>(w: &mut W, status: u16, reason: &str, body: &[u8]) -
     w.flush()
 }
 
-/// Load PEM cert + PKCS8/RSA key for optional HTTPS.
-pub fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>, String> {
-    let cert_file = std::fs::File::open(cert_path).map_err(|e| format!("tls cert: {e}"))?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .map_err(|e| format!("tls cert parse: {e}"))?
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect::<Vec<_>>();
-    if certs.is_empty() {
-        return Err("tls cert file contains no certificates".into());
-    }
-    let key_file = std::fs::File::open(key_path).map_err(|e| format!("tls key: {e}"))?;
-    let mut key_reader = BufReader::new(key_file);
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
-        .map_err(|e| format!("tls key parse: {e}"))?;
-    if keys.is_empty() {
-        let key_file = std::fs::File::open(key_path).map_err(|e| format!("tls key: {e}"))?;
-        let mut key_reader = BufReader::new(key_file);
-        keys = rustls_pemfile::rsa_private_keys(&mut key_reader)
-            .map_err(|e| format!("tls key parse: {e}"))?;
-    }
-    let key = keys
-        .into_iter()
-        .next()
-        .ok_or_else(|| "tls key file contains no private key".to_string())?;
-    let cfg = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, rustls::PrivateKey(key))
-        .map_err(|e| format!("tls config: {e}"))?;
-    Ok(Arc::new(cfg))
-}
-
 /// Watch `path` (file, or directory containing `bundle.fsig` + `digest`) on a std thread.
 /// Uses mtime+len and follows kubelet `..data`; a vanished file keeps last-good.
 pub fn poll_bundle_file(path: impl Into<PathBuf>, interval: Duration, state: Arc<WebhookState>) {
@@ -377,7 +345,7 @@ fn poll_exceptions_loop(path: PathBuf, interval: Duration, state: Arc<WebhookSta
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
+pub(crate) struct FileStamp {
     mtime: SystemTime,
     len: u64,
 }
@@ -388,7 +356,7 @@ struct SourceStamp {
     digest: Option<FileStamp>,
 }
 
-fn stamp_one(path: &Path) -> Option<FileStamp> {
+pub(crate) fn stamp_one(path: &Path) -> Option<FileStamp> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.is_dir() {
         return None;

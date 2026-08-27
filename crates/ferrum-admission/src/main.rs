@@ -3,9 +3,9 @@
 #![deny(unsafe_code)]
 
 use ferrum_admission::{
-    admit_bytes, load_path, load_tls_config, parse_trust_root, poll_bundle_file,
-    poll_exceptions_file, serve_listener, verify_exceptions_fsig, AdmissionSubject, LabelSource,
-    ReviewConfig, StaticLabels, WebhookState,
+    admit_bytes, load_path, parse_trust_root, poll_bundle_file, poll_exceptions_file,
+    poll_serving_cert, serve_listener, verify_exceptions_fsig, AdmissionSubject, LabelSource,
+    ReviewConfig, StaticLabels, TlsSource, WebhookState,
 };
 use ferrum_api::PolicyExceptionSpec;
 use std::collections::BTreeMap;
@@ -150,8 +150,11 @@ fn cmd_serve(args: &[String]) {
     }
     let tls = match (flags.map.get("tls-cert"), flags.map.get("tls-key")) {
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
-            match load_tls_config(cert, key) {
-                Ok(cfg) => Some(cfg),
+            // An expired or unreadable serving certificate is a hard start
+            // failure: under failurePolicy: Fail a handshake the API server
+            // rejects stops Pod creation cluster-wide.
+            match TlsSource::load(cert, key) {
+                Ok(source) => Some(source),
                 Err(err) => {
                     eprintln!("error: tls: {err}");
                     exit(2);
@@ -191,6 +194,9 @@ fn cmd_serve(args: &[String]) {
     );
     if let Some(path) = exceptions_path {
         poll_exceptions_file(path, Duration::from_millis(reload_ms), Arc::clone(&state));
+    }
+    if let Some(source) = &tls {
+        poll_serving_cert(Arc::clone(source), Duration::from_millis(reload_ms));
     }
     if let Err(err) = serve_listener(listener, state, tls) {
         eprintln!("error: serve: {err}");
