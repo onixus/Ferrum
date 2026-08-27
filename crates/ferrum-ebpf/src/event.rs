@@ -106,6 +106,26 @@ pub fn decode_event(bytes: &[u8]) -> Result<Event> {
     Ok(event)
 }
 
+/// The ABI stamp a full-length record carries when it disagrees with this
+/// decoder's, `None` when the record is either the right build or not a
+/// full-length record at all.
+///
+/// `decode_event` refuses both a malformed record and a stamp mismatch as
+/// `Integrity`, and the two do not mean the same thing. A short or garbled
+/// record is one lost event. A stamp mismatch is proof, from the first record,
+/// that the attached ELF is not the build this decoder was compiled against,
+/// so *every* record it ever writes will be refused. The stamp lives in an
+/// instruction immediate, not in the ELF's map definitions, so this is the
+/// only place it can be observed; nothing here relaxes the refusal, it only
+/// reads the one field whose offset is fixed for every build of the record.
+pub fn abi_stamp_mismatch(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != EVENT_WIRE_LEN {
+        return None;
+    }
+    let abi = u16::from_ne_bytes(bytes[22..24].try_into().ok()?);
+    (abi != DATAPATH_ABI).then_some(abi)
+}
+
 /// Encode an `Event` in the ring record layout (tests, replay, fixtures).
 pub fn encode_event(event: &Event) -> Vec<u8> {
     let mut out = Vec::with_capacity(EVENT_WIRE_LEN);
@@ -233,6 +253,27 @@ mod tests {
         let mut long = wire.clone();
         long.push(0);
         assert!(decode_event(&long).is_err());
+    }
+
+    /// The classifier must answer for exactly the records `decode_event`
+    /// refuses on the stamp, and for no others: a short record is a lost
+    /// event, not proof of a wrong ELF.
+    #[test]
+    fn abi_stamp_mismatch_names_only_a_wrong_build() {
+        let wire = encode_event(&sample());
+        assert_eq!(abi_stamp_mismatch(&wire), None, "this build's own record");
+        assert_eq!(
+            abi_stamp_mismatch(&[]),
+            None,
+            "a short record is not a stamp"
+        );
+        assert_eq!(abi_stamp_mismatch(&wire[..EVENT_WIRE_LEN - 1]), None);
+        for stale in [0u16, DATAPATH_ABI - 1, DATAPATH_ABI + 1, u16::MAX] {
+            let mut wire = encode_event(&sample());
+            wire[22..24].copy_from_slice(&stale.to_ne_bytes());
+            assert_eq!(abi_stamp_mismatch(&wire), Some(stale));
+            assert!(decode_event(&wire).is_err(), "and it is still refused");
+        }
     }
 
     /// A datapath whose record layout drifted stamps something else. Its

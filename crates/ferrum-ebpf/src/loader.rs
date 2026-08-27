@@ -1,5 +1,5 @@
 use crate::envelope::extract_febp;
-use crate::eval::{decide, matched_action, Decision, SyscallEvent};
+use crate::eval::{decide_with, matched_action, Decision, SyscallEvent};
 use crate::spec::{parse_febp_with, Action, DeadRules, EbpfSpec};
 use ferrum_common::{FerrumError, Result};
 use ferrum_ids::Digest;
@@ -146,18 +146,31 @@ impl Loader {
                 rule_id: None,
                 labels_unknown: false,
                 path_unknown: false,
+                container_unknown: false,
             },
         }
     }
 
     pub fn decide(&self, event: &SyscallEvent<'_>, identity: &WorkloadIdentity) -> Decision {
+        self.decide_with(event, identity, false)
+    }
+
+    /// `decide`, told whether the carrier can prove this record's caller is
+    /// not a container. See `eval::matched_action_with`.
+    pub fn decide_with(
+        &self,
+        event: &SyscallEvent<'_>,
+        identity: &WorkloadIdentity,
+        container_unproven: bool,
+    ) -> Decision {
         match &self.last_good {
-            Some(loaded) => decide(&loaded.spec, event, identity),
+            Some(loaded) => decide_with(&loaded.spec, event, identity, container_unproven),
             None => Decision {
                 action: Action::Deny,
                 rule_id: None,
                 labels_unknown: false,
                 path_unknown: false,
+                container_unknown: false,
             },
         }
     }
