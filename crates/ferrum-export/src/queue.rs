@@ -145,6 +145,8 @@ mod tests {
             pid: n,
             tgid: n,
             executed: false,
+            labels_unknown: false,
+            path_unknown: false,
             respond_error: None,
             waiver: None,
         }

@@ -36,6 +36,17 @@ pub struct EnforcementEvent {
     /// Why the reaction did not run, when it did not.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub respond_error: Option<String>,
+    /// The selector was matched against labels nobody had observed yet: the
+    /// rules were applied fail-closed, so this record is an assertion about
+    /// the workload, not a resolved match.
+    #[serde(default)]
+    pub labels_unknown: bool,
+    /// A path predicate was accepted against a path the datapath could not
+    /// carry whole. Without this an investigation cannot tell a record whose
+    /// path was never observed from one that genuinely named the file: the
+    /// node counter for it is an aggregate and cannot be joined to a record.
+    #[serde(default)]
+    pub path_unknown: bool,
     /// Set only on waived events.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub waiver: Option<WaiverRef>,
@@ -79,6 +90,8 @@ mod tests {
                 pid: 0,
                 tgid: 0,
                 executed: false,
+                labels_unknown: false,
+                path_unknown: false,
                 respond_error: None,
                 waiver: None,
             },
@@ -96,6 +109,47 @@ mod tests {
         assert_eq!(back.event.waiver, None);
     }
 
+    /// Both flags are per-record: a reader of one event must be able to tell a
+    /// match taken on an unobserved path or unresolved labels from a proven
+    /// one. Records written before the fields existed still decode.
+    #[test]
+    fn unknown_flags_round_trip_and_default_on_legacy_records() {
+        let mut ev = EnforcementEvent {
+            policy: PolicyId::new("p"),
+            rule: RuleId::new("no-runtime-sock"),
+            action: "kill".into(),
+            image_digest: None,
+            pod: "web".into(),
+            namespace: "payments".into(),
+            comm: "curl".into(),
+            syscall: "openat".into(),
+            pid: 7,
+            tgid: 7,
+            executed: true,
+            respond_error: None,
+            labels_unknown: true,
+            path_unknown: true,
+            waiver: None,
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"labelsUnknown\":true"));
+        assert!(json.contains("\"pathUnknown\":true"));
+        let back: EnforcementEvent = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.labels_unknown);
+        assert!(back.path_unknown);
+
+        ev.labels_unknown = false;
+        ev.path_unknown = false;
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"pathUnknown\":false"));
+
+        let legacy = r#"{"policy":"p","rule":"r","action":"kill","imageDigest":null,
+            "pod":"w","namespace":"n","comm":"sh","syscall":"execve"}"#;
+        let back: EnforcementEvent = serde_json::from_str(legacy).expect("deserialize");
+        assert!(!back.labels_unknown);
+        assert!(!back.path_unknown);
+    }
+
     #[test]
     fn waiver_ref_camel_case_and_absent_field_decodes() {
         let ev = EnforcementEvent {
@@ -110,6 +164,8 @@ mod tests {
             pid: 7,
             tgid: 7,
             executed: false,
+            labels_unknown: false,
+            path_unknown: false,
             respond_error: None,
             waiver: Some(WaiverRef {
                 ticket: "JIRA-1".into(),

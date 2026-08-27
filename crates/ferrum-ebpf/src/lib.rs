@@ -509,6 +509,60 @@ mod tests {
         assert!(!d.path_unknown);
     }
 
+    /// The other half of the same flag. `bpf_probe_read_user_*` cannot fault
+    /// in a non-resident page, so a path string on one (mmap, or
+    /// `madvise(MADV_DONTNEED)` before the call) comes back `-EFAULT` while
+    /// the syscall itself succeeds: the buffer is empty, and a prefix rule
+    /// asked to decide on it would answer "no match" for every prefix there
+    /// is. Nothing is known about that path, so the rule applies and says so.
+    #[test]
+    fn an_unreadable_path_cannot_talk_a_prefix_rule_out_of_firing() {
+        let spec = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[RuleSpec {
+                id: "no-proc-poke",
+                syscalls: &["openat"],
+                action: Action::Deny,
+                comm_in: &[],
+                container_only: false,
+                path_prefix: &["/proc/"],
+                path_suffix: &[],
+                not_agent_self: false,
+            }],
+        );
+        let spec = parse_febp(&spec).expect("parse");
+        let mut unreadable = ev("openat", "app", "", true, false);
+        unreadable.path_truncated = true;
+        let d = matched_action(&spec, &unreadable);
+        assert_eq!(d.action, Action::Deny);
+        assert_eq!(d.rule_id.as_deref(), Some("no-proc-poke"));
+        assert!(d.path_unknown);
+
+        // Regression anchor: an empty path with no flag is an honest record
+        // from a syscall that carried no path, and must decide as before.
+        let honest = ev("openat", "app", "", true, false);
+        let d = matched_action(&spec, &honest);
+        assert_eq!(d.action, Action::Allow);
+        assert!(d.rule_id.is_none());
+        assert!(!d.path_unknown);
+    }
+
+    /// Same failure against the MVP bundle: the docker.sock rule names a
+    /// suffix, and an unreadable path must not silently take it out either.
+    #[test]
+    fn an_unreadable_path_still_kills_on_the_runtime_sock_rule() {
+        let spec = parse_febp(&mvp_enforce()).expect("parse");
+        let mut unreadable = ev("openat", "app", "", true, false);
+        unreadable.path_truncated = true;
+        let d = matched_action(&spec, &unreadable);
+        assert_eq!(d.action, Action::Kill);
+        assert_eq!(d.rule_id.as_deref(), Some("no-runtime-sock"));
+        assert!(d.path_unknown);
+    }
+
     #[test]
     fn bpf_not_agent_is_deny() {
         let spec = parse_febp(&mvp_enforce()).expect("parse");

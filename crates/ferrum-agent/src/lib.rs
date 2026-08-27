@@ -960,6 +960,11 @@ impl Agent {
             tgid: meta.tgid,
             executed,
             respond_error,
+            // Carried per record: the node counters for these are aggregates,
+            // and an investigation looking at one kill cannot tell an asserted
+            // match from a proven one without them.
+            labels_unknown: decision.labels_unknown,
+            path_unknown: decision.path_unknown,
             waiver,
         });
         if sink.export_writer_dead() {
@@ -2144,6 +2149,14 @@ mod tests {
         ferrum_ebpf::encode_event(&event)
     }
 
+    /// The nr the decode table itself uses, so a record is built for the same
+    /// syscall the evaluator will name, whatever the arch table says.
+    fn syscall_nr(arch: ferrum_ebpf::SyscallArch, name: &str) -> u32 {
+        (0..1024)
+            .find(|nr| ferrum_ebpf::syscall_name(arch, *nr) == Some(name))
+            .unwrap_or_else(|| panic!("no syscall nr for {name}"))
+    }
+
     #[test]
     fn pump_ring_records_round_trip() {
         use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER};
@@ -2222,6 +2235,7 @@ mod tests {
         use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED};
         let head = format!("/var/run/{}", "./".repeat(130));
         let head = &head[..255];
+        let openat = syscall_nr(SyscallArch::X86_64, "openat");
 
         let mut agent = Agent::new(cfg_respond());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
@@ -2229,15 +2243,16 @@ mod tests {
         agent.set_container_map_synced(1);
         let sink = MemorySink::new();
         let record = ring_record(
-            257,
+            openat,
             "app",
             head,
             EVENT_FLAG_CONTAINER | EVENT_FLAG_PATH_TRUNCATED,
             7,
         );
-        let stats = pump_records(&agent, SyscallArch::X86_64, [record.clone()], &sink);
+        let stats = pump_records(&agent, SyscallArch::X86_64, [record], &sink);
         assert_eq!(stats.handled, 1);
         assert_eq!(sink.events()[0].action, "kill");
+        assert!(sink.events()[0].path_unknown);
         assert_eq!(agent.path_truncated_total(), 1);
         assert!(agent.path_truncated_recent());
         assert!(agent.datapath_degraded());
@@ -2245,8 +2260,7 @@ mod tests {
 
         // Same bytes, flag cleared: the head is then the whole path, no suffix
         // matches, and the record is merely audited.
-        let mut honest = record;
-        honest[21] = EVENT_FLAG_CONTAINER;
+        let honest = ring_record(openat, "app", head, EVENT_FLAG_CONTAINER, 7);
         let mut clean = Agent::new(cfg_respond());
         load_signed(&mut clean, &encode_mvp(AGENT_ABI, Mode::Enforce));
         clean.insert_cgroup(7, identity("pod-a"));
@@ -2254,8 +2268,52 @@ mod tests {
         let quiet = MemorySink::new();
         pump_records(&clean, SyscallArch::X86_64, [honest], &quiet);
         assert_ne!(quiet.events()[0].action, "kill");
+        assert!(!quiet.events()[0].path_unknown);
         assert_eq!(clean.path_truncated_total(), 0);
         assert!(!clean.path_truncated_recent());
+    }
+
+    /// The other half of the same flag, end to end: the path pointer was in a
+    /// non-resident page, the helper returned -EFAULT, the buffer arrived
+    /// empty and the openat succeeded anyway. Every path predicate would
+    /// answer "no match" on those bytes, so the kill rule must still fire, the
+    /// record must say the path was never observed, and the node must degrade.
+    #[test]
+    fn an_unreadable_path_still_kills_and_degrades() {
+        use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED};
+        let openat = syscall_nr(SyscallArch::X86_64, "openat");
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+        let sink = MemorySink::new();
+        let record = ring_record(
+            openat,
+            "app",
+            "",
+            EVENT_FLAG_CONTAINER | EVENT_FLAG_PATH_TRUNCATED,
+            7,
+        );
+        let stats = pump_records(&agent, SyscallArch::X86_64, [record], &sink);
+        assert_eq!(stats.handled, 1);
+        assert_eq!(sink.events()[0].action, "kill");
+        assert!(sink.events()[0].path_unknown);
+        assert!(!sink.events()[0].labels_unknown);
+        assert_eq!(agent.path_truncated_total(), 1);
+        assert!(agent.is_degraded());
+
+        // Regression anchor: an empty path with no flag is a record from a
+        // syscall that carried none, and decides exactly as it did before.
+        let honest = ring_record(openat, "app", "", EVENT_FLAG_CONTAINER, 7);
+        let mut clean = Agent::new(cfg_respond());
+        load_signed(&mut clean, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        clean.insert_cgroup(7, identity("pod-a"));
+        clean.set_container_map_synced(1);
+        let quiet = MemorySink::new();
+        pump_records(&clean, SyscallArch::X86_64, [honest], &quiet);
+        assert_ne!(quiet.events()[0].action, "kill");
+        assert!(!quiet.events()[0].path_unknown);
+        assert_eq!(clean.path_truncated_total(), 0);
     }
 
     #[test]

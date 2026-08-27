@@ -328,6 +328,8 @@ mod tests {
             pid: 0,
             tgid: 0,
             executed: false,
+            labels_unknown: false,
+            path_unknown: false,
             respond_error: None,
             waiver: None,
         }

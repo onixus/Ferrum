@@ -107,11 +107,13 @@ mod progs {
             }
         }
         if let Some(offset) = path_arg {
-            // Both failures set one flag. A path longer than PATH_LEN leaves a
-            // valid-looking head in the buffer, and an unreadable pointer
-            // leaves it empty; either way the recorded bytes are not the
-            // argument, and userspace must not treat them as one. Straight-line
-            // code only — no extra branching on the pointer, no loops.
+            // Both failures set one flag: the buffer already distinguishes
+            // them. A path longer than PATH_LEN leaves a valid-looking head,
+            // and an unreadable pointer (the helper cannot fault in a
+            // non-resident page) leaves the buffer as `Event::new` left it —
+            // empty. Either way the recorded bytes are not the argument.
+            // Straight-line code only — no extra branching on the pointer, no
+            // loops.
             let read_ok = match unsafe { ctx.read_at::<*const u8>(offset) } {
                 Ok(ptr) => unsafe { bpf_probe_read_user_str_bytes(ptr, &mut event.path) }.is_ok(),
                 Err(_) => false,

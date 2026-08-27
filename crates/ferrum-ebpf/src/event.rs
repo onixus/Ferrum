@@ -168,6 +168,9 @@ mod tests {
     fn round_trip_event_to_syscall_event() {
         let event = sample();
         let wire = encode_event(&event);
+        // The record is an ABI: userspace and the bpf programs are built
+        // separately and only agree by size.
+        assert_eq!(EVENT_WIRE_LEN, 296);
         assert_eq!(wire.len(), EVENT_WIRE_LEN);
         let back = decode_event(&wire).expect("decode");
         assert_eq!(back.cgroup_id, event.cgroup_id);

@@ -9,8 +9,9 @@ pub struct SyscallEvent<'a> {
     pub in_container: bool,
     pub agent_self: bool,
     /// `path` is not the argument: the datapath buffer could not hold it, or
-    /// the pointer could not be read. What is present is a head, not a path,
-    /// so nothing about the tail is known.
+    /// the pointer could not be read. A non-empty `path` is then a head with
+    /// an unknown tail; an empty one means the argument was never read and
+    /// nothing about the path is known.
     pub path_truncated: bool,
 }
 
@@ -58,9 +59,10 @@ pub struct Decision {
     /// yet. The rules were applied anyway (fail closed), and the carrier must
     /// treat this as Degraded rather than as a clean decision.
     pub labels_unknown: bool,
-    /// A `path_suffix` predicate was accepted against a truncated path, so the
-    /// match is asserted, not proven. Same contract as `labels_unknown`: the
-    /// rules were applied, and the carrier must treat this as Degraded.
+    /// A path predicate was accepted against a path the datapath could not
+    /// carry whole, so the match is asserted, not proven. Same contract as
+    /// `labels_unknown`: the rules were applied, and the carrier must treat
+    /// this as Degraded.
     pub path_unknown: bool,
 }
 
@@ -252,17 +254,22 @@ fn cap_for_mode(mode: Mode, disabled: bool, action: Action) -> Action {
 }
 
 /// `None`: the rule does not apply. `Some(path_unknown)`: it applies, with
-/// `path_unknown` true when a `path_suffix` predicate was accepted on a
-/// truncated path instead of proven.
+/// `path_unknown` true when a path predicate was accepted against a path the
+/// datapath could not carry instead of proven.
 ///
-/// A truncated path is a head with an unknown tail, so `ends_with` is
-/// undecidable in both directions and the suffix predicate may not reject.
-/// That over-enforces: any process opening a path of PATH_LEN bytes or more
-/// falls under every suffix rule. Deliberate, and the same trade already made
-/// for `LabelsUnknown` — over-enforce with an explicit signal rather than
-/// under-enforce in silence. Downgrading the action to Audit on truncation is
-/// exactly the fail-open this closes, so it is not an option here.
-/// `path_prefix` is unaffected: only the tail was lost, the head is intact.
+/// The datapath sets one flag for two different failures, and the buffer tells
+/// them apart. A path longer than the buffer leaves a valid head with an
+/// unknown tail: `ends_with` is undecidable, so a `path_suffix` predicate may
+/// not reject, while `path_prefix` still decides on the head. A pointer the
+/// helper could not read (`-EFAULT`: `bpf_probe_read_user_*` does not fault in
+/// a non-resident page, and the syscall itself proceeds) leaves the buffer
+/// empty: nothing about the path is known, so neither predicate may reject.
+///
+/// Both cases over-enforce: every rule naming a path applies to a record whose
+/// path was not observed. Deliberate, and the same trade already made for
+/// `LabelsUnknown` — over-enforce with an explicit signal rather than
+/// under-enforce in silence. Downgrading the action to Audit on an unreadable
+/// path is exactly the fail-open this closes, so it is not an option here.
 fn rule_matches(rule: &Rule, event: &SyscallEvent<'_>) -> Option<bool> {
     if !rule.syscalls.is_empty() && !rule.syscalls.iter().any(|s| s.as_str() == event.syscall) {
         return None;
@@ -270,15 +277,22 @@ fn rule_matches(rule: &Rule, event: &SyscallEvent<'_>) -> Option<bool> {
     if !rule.comm_in.is_empty() && !rule.comm_in.iter().any(|c| c.as_str() == event.comm) {
         return None;
     }
-    if !rule.path_prefix.is_empty()
-        && !rule
+    // Flag set and buffer empty: the argument was never read, so not even the
+    // head is known.
+    let path_unreadable = event.path_truncated && event.path.is_empty();
+    let mut path_unknown = false;
+    if !rule.path_prefix.is_empty() {
+        let hit = rule
             .path_prefix
             .iter()
-            .any(|p| !p.is_empty() && event.path.starts_with(p.as_str()))
-    {
-        return None;
+            .any(|p| !p.is_empty() && event.path.starts_with(p.as_str()));
+        if !hit {
+            if !path_unreadable {
+                return None;
+            }
+            path_unknown = true;
+        }
     }
-    let mut path_unknown = false;
     if !rule.path_suffix.is_empty() {
         let hit = rule
             .path_suffix

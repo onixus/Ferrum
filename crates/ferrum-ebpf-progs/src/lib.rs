@@ -37,9 +37,11 @@ pub const PATH_LEN: usize = 256;
 pub const EVENT_FLAG_CONTAINER: u8 = 1 << 0;
 pub const EVENT_FLAG_AGENT_SELF: u8 = 1 << 1;
 /// The `path` buffer does not hold the whole argument: the string did not fit
-/// in `PATH_LEN`, or it could not be read at all. Both failures land here, so
-/// userspace can tell "no path" from "path not proven" — a truncated head is a
-/// valid-looking path that no suffix rule matches.
+/// in `PATH_LEN` (`-E2BIG`, head kept), or the pointer could not be read at
+/// all (`-EFAULT`, buffer left empty). One flag for both, because either way
+/// the bytes present are not the argument; userspace separates the two by
+/// whether the buffer is empty, and must not decide any path predicate against
+/// an empty one.
 pub const EVENT_FLAG_PATH_TRUNCATED: u8 = 1 << 2;
 
 /// Ring-buffer record. No `String`; fixed buffers only.
