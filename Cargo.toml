@@ -59,5 +59,9 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
+# PEM + webpki only, ring backend, no openssl-sys (deny.toml).
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"

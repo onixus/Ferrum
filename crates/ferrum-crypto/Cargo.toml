@@ -10,4 +10,11 @@ rust-version.workspace = true
 ed25519-compact.workspace = true
 ferrum-common.workspace = true
 ferrum-ids.workspace = true
+ring = "0.17"
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
