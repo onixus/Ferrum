@@ -12,7 +12,7 @@ mod source;
 use chrono::{DateTime, Utc};
 use ferrum_api::PolicyExceptionSpec;
 use ferrum_common::{FerrumError, Result};
-use ferrum_ebpf::{extract_febp, Action, Decision, EventMeta, Loader, SyscallEvent};
+use ferrum_ebpf::{extract_febp, Action, DeadRules, Decision, EventMeta, Loader, SyscallEvent};
 use ferrum_export::EventSink;
 use ferrum_ids::{Digest, PolicyId, RuleId};
 use ferrum_k8smeta::{PodMetadataSource, PodRecord, SharedCgroupIndex, WorkloadIdentity};
@@ -208,6 +208,12 @@ pub struct Agent {
     /// rather than on the argument, so the plane is not clean.
     path_truncated: AtomicU64,
     path_truncated_at: Mutex<Option<Instant>>,
+    /// Rules the last-known-good snapshot carried that no record can ever
+    /// match, dropped so the rest of the snapshot could be restored.
+    lkg_rules_dropped: AtomicU64,
+    /// The policy in force is a subset of the snapshot that was signed.
+    /// Cleared only by a bundle that installs whole.
+    lkg_partial: AtomicBool,
 }
 
 impl Agent {
@@ -259,6 +265,8 @@ impl Agent {
             ring_drop_at: Mutex::new(None),
             path_truncated: AtomicU64::new(0),
             path_truncated_at: Mutex::new(None),
+            lkg_rules_dropped: AtomicU64::new(0),
+            lkg_partial: AtomicBool::new(false),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -301,6 +309,10 @@ impl Agent {
             // answer "no match" for a reason that has nothing to do with the
             // policy. That is a missed enforcement, not an allow.
             || self.identity_unknown_recent()
+            // The node is enforcing less than the snapshot it restored. Not
+            // fail-open — the rules that were dropped can match no record —
+            // but the running policy is no longer the one that was signed.
+            || self.lkg_partial.load(Ordering::Relaxed)
             || self.container_flag_degraded()
             || self.respond_disabled_reason().is_some()
     }
@@ -751,7 +763,18 @@ impl Agent {
             }
         };
         // Install only: do not persist back over the snapshot being restored.
-        self.install_verified(&bytes, expected.as_ref()).map(|_| ())
+        //
+        // A snapshot on disk was signed by whatever compiler was current when
+        // it was written; an agent upgraded since then may carry a load gate
+        // that compiler did not have. Refusing the whole snapshot for a rule
+        // that can match no record would leave an upgraded node with no policy
+        // at all while the control plane is down, which is the fail-open this
+        // plane exists to avoid. So on this path only, such rules are dropped
+        // and counted, and the node stays Degraded until a bundle installs
+        // whole. Everything else — bad signature, ABI, kill-all, malformed —
+        // still refuses the snapshot outright.
+        self.install_verified_with(&bytes, expected.as_ref(), DeadRules::Drop)
+            .map(|_| ())
     }
 
     pub fn insert_cgroup(&self, inode: u64, identity: WorkloadIdentity) {
@@ -802,6 +825,15 @@ impl Agent {
         bytes: &[u8],
         expected_digest: Option<&Digest>,
     ) -> Result<Digest> {
+        self.install_verified_with(bytes, expected_digest, DeadRules::Reject)
+    }
+
+    fn install_verified_with(
+        &mut self,
+        bytes: &[u8],
+        expected_digest: Option<&Digest>,
+        dead: DeadRules,
+    ) -> Result<Digest> {
         let (raw, digest) = match load_source(bytes, &self.trust_root, expected_digest) {
             Ok(v) => v,
             Err(err) => {
@@ -813,8 +845,25 @@ impl Agent {
             self.loader.mark_degraded();
             return Err(err);
         }
-        self.loader.load_bundle(&digest, &raw)?;
+        let dropped = self.loader.load_bundle_with(&digest, &raw, dead)?;
+        if dropped.is_empty() {
+            self.lkg_partial.store(false, Ordering::Relaxed);
+        } else {
+            self.lkg_rules_dropped
+                .fetch_add(dropped.len() as u64, Ordering::Relaxed);
+            self.lkg_partial.store(true, Ordering::Relaxed);
+            for reason in &dropped {
+                eprintln!("ferrum-agent: last-known-good rule dropped: {reason}");
+            }
+        }
         Ok(digest)
+    }
+
+    /// Rules dropped while restoring last-known-good because no record can
+    /// match them. Non-zero means the running policy is a subset of the
+    /// snapshot that was signed.
+    pub fn lkg_rules_dropped_total(&self) -> u64 {
+        self.lkg_rules_dropped.load(Ordering::Relaxed)
     }
 
     fn persist_fsig(&self, fsig: &[u8], digest: &Digest) -> Result<()> {
@@ -2007,6 +2056,137 @@ mod tests {
                 .action,
             Action::Kill
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FEBP an older compiler could emit: the MVP rules plus one whose path
+    /// prefix is longer than the datapath buffer, so no record can carry it.
+    fn encode_mvp_with_unmatchable_rule() -> Vec<u8> {
+        let mut w = Writer::new();
+        w.put_magic(&EBPF_MAGIC);
+        w.put_u32(AGENT_ABI);
+        w.put_u8(Mode::Enforce.as_u8());
+        w.put_bool(false);
+        w.put_i32(0);
+        w.put_u8(Action::Audit.as_u8());
+        for _ in 0..4 {
+            put_empty_label_selector(&mut w);
+        }
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        let too_long = format!("/{}", "a".repeat(ferrum_ids::PATH_MATCH_MAX));
+        w.put_u16(4);
+        w.put_str("no-shell");
+        w.put_str_list(&["execve", "execveat"]);
+        w.put_u8(Action::Kill.as_u8());
+        w.put_str_list(&["sh", "bash", "ash", "dash", "zsh"]);
+        w.put_bool(true);
+        w.put_str_list(&[]);
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.put_str("no-runtime-sock");
+        w.put_str_list(&[]);
+        w.put_u8(Action::Kill.as_u8());
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.put_str_list(&[]);
+        w.put_str_list(&["docker.sock", "containerd.sock", "crio.sock"]);
+        w.put_bool(false);
+        w.put_str("no-module");
+        w.put_str_list(&["init_module", "finit_module", "bpf"]);
+        w.put_u8(Action::Deny.as_u8());
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.put_str_list(&[]);
+        w.put_str_list(&[]);
+        w.put_bool(true);
+        w.put_str("unmatchable");
+        w.put_str_list(&["openat"]);
+        w.put_u8(Action::Deny.as_u8());
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.put_str_list(&[too_long.as_str()]);
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.finish()
+    }
+
+    /// An LKG snapshot signed before this agent grew the "no record can carry
+    /// this predicate" load gate. Refusing it whole would leave an upgraded
+    /// node with no policy at all while the control plane is down — the
+    /// fail-open LKG exists to prevent — so the restore path drops the rule
+    /// (which can match nothing anyway), counts it, and stays Degraded. A new
+    /// bundle carrying the same rule is still refused whole: there the
+    /// operator has a compiler to fix and a running policy to keep.
+    #[test]
+    fn lkg_restore_drops_an_unmatchable_rule_instead_of_the_whole_snapshot() {
+        let raw = encode_mvp_with_unmatchable_rule();
+        let fsig = encode_fsig(&raw, &sign(&raw), &pk()).expect("fsig");
+
+        let mut fresh = Agent::new(cfg());
+        match fresh.apply_fsig(&fsig, None) {
+            Err(FerrumError::Compile(_)) => {}
+            other => panic!("expected Compile on the new-bundle path, got {other:?}"),
+        }
+        assert!(!fresh.using_last_known_good());
+
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("tmpdir");
+        fs::write(dir.join(BUNDLE_FSIG_KEY), &fsig).expect("write fsig");
+        fs::write(
+            dir.join(BUNDLE_DIGEST_KEY),
+            ferrum_crypto::bundle_digest(&raw).as_str(),
+        )
+        .expect("write digest");
+
+        let restored = Agent::new(AgentConfig {
+            trust_root: pk(),
+            lkg_dir: Some(dir.clone()),
+            role: AgentRole::Respond,
+            ..Default::default()
+        });
+        assert!(restored.using_last_known_good());
+        assert_eq!(restored.lkg_rules_dropped_total(), 1);
+        assert!(restored.is_degraded());
+        // The rules the node can enforce are still enforced.
+        assert_eq!(
+            restored
+                .matched_action(&ev("execve", "sh", "/bin/sh", true, false))
+                .action,
+            Action::Kill
+        );
+        assert_eq!(
+            restored
+                .matched_action(&ev("openat", "app", "/var/run/docker.sock", true, false))
+                .action,
+            Action::Kill
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same snapshot without the dead rule restores whole: nothing is
+    /// dropped and the partial-policy flag never latches.
+    #[test]
+    fn a_whole_lkg_snapshot_drops_nothing() {
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("tmpdir");
+        let raw = encode_mvp(AGENT_ABI, Mode::Enforce);
+        {
+            let mut agent = Agent::new(AgentConfig {
+                trust_root: pk(),
+                lkg_dir: Some(dir.clone()),
+                ..Default::default()
+            });
+            load_signed(&mut agent, &raw);
+            assert_eq!(agent.lkg_rules_dropped_total(), 0);
+        }
+        let restored = Agent::new(AgentConfig {
+            trust_root: pk(),
+            lkg_dir: Some(dir.clone()),
+            ..Default::default()
+        });
+        assert!(restored.using_last_known_good());
+        assert_eq!(restored.lkg_rules_dropped_total(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

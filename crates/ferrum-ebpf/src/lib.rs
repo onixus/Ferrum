@@ -31,8 +31,8 @@ pub use kernel::{KernelHandle, RingReader};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
 pub use prefilter::{prefilter_image, PrefilterImage, PATH_BEARING_SYSCALLS};
 pub use spec::{
-    parse_febp, Action, EbpfSpec, ImageSelector, LabelRequirement, LabelSelector, Mode,
-    PolicySelector, Rule, EBPF_MAGIC,
+    parse_febp, parse_febp_with, Action, DeadRules, EbpfSpec, ImageSelector, LabelRequirement,
+    LabelSelector, Mode, PolicySelector, Rule, EBPF_MAGIC,
 };
 
 use ferrum_common::Result;
@@ -348,6 +348,78 @@ mod tests {
         assert_eq!(MAP_EVENTS, "ferrum_events");
         assert_eq!(MAP_RULES, "ferrum_rules");
         assert_eq!(EVENTS_DROPPED_TOTAL, "events_dropped_total");
+    }
+
+    /// `DeadRules::Drop` relaxes exactly one thing. A rule that can match no
+    /// record is dropped so the rest of a last-known-good snapshot can still
+    /// be restored; a kill-all rule, a bad ABI and a malformed spec are still
+    /// refused whole, because dropping those would change what the node
+    /// enforces rather than only what it cannot.
+    #[test]
+    fn dropping_dead_rules_relaxes_nothing_else() {
+        let long = format!("/{}", "a".repeat(ferrum_ids::PATH_MATCH_MAX));
+        let spec = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[
+                RuleSpec {
+                    id: "unmatchable",
+                    syscalls: &["openat"],
+                    action: Action::Deny,
+                    comm_in: &[],
+                    container_only: false,
+                    path_prefix: &[long.as_str()],
+                    path_suffix: &[],
+                    not_agent_self: false,
+                },
+                RuleSpec {
+                    id: "no-proc-poke",
+                    syscalls: &["openat"],
+                    action: Action::Deny,
+                    comm_in: &[],
+                    container_only: false,
+                    path_prefix: &["/proc/"],
+                    path_suffix: &[],
+                    not_agent_self: false,
+                },
+            ],
+        );
+        assert_compile(parse_febp(&spec));
+        let (parsed, dropped) =
+            parse_febp_with(&spec, DeadRules::Drop).expect("the rest of the spec still loads");
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("unmatchable"));
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].id, "no-proc-poke");
+        assert_eq!(
+            matched_action(&parsed, &ev("openat", "app", "/proc/1/mem", true, false)).action,
+            Action::Deny
+        );
+
+        let kill_all = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[RuleSpec {
+                id: "kill-all",
+                syscalls: &[],
+                action: Action::Kill,
+                comm_in: &[],
+                container_only: false,
+                path_prefix: &[],
+                path_suffix: &[],
+                not_agent_self: false,
+            }],
+        );
+        assert_compile(parse_febp_with(&kill_all, DeadRules::Drop));
+        assert_degraded(parse_febp_with(
+            &encode(AGENT_ABI + 1, Mode::Enforce, false, Action::Allow, &[]),
+            DeadRules::Drop,
+        ));
+        assert_compile(parse_febp_with(b"XXXX", DeadRules::Drop));
     }
 
     #[test]

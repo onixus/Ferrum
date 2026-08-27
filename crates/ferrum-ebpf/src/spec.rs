@@ -130,9 +130,29 @@ pub struct EbpfSpec {
     pub rules: Vec<Rule>,
 }
 
+/// What to do with a rule no record can ever match (see `dead_rule_reason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadRules {
+    /// Refuse the whole spec. Every path that installs a *new* bundle: a dead
+    /// rule there is a compiler that let something through, and the operator
+    /// still has the previous policy running.
+    Reject,
+    /// Drop the rule, keep the rest. Restoring last-known-good only, where the
+    /// alternative is no policy at all on the node.
+    Drop,
+}
+
 /// Parse FEBP. ABI mismatch is `Degraded` (keep LKG). Truncation / bad magic
 /// is `Compile` (also keep LKG; do not apply).
 pub fn parse_febp(spec: &[u8]) -> Result<EbpfSpec> {
+    parse_febp_with(spec, DeadRules::Reject).map(|(spec, _)| spec)
+}
+
+/// Parse FEBP, choosing what happens to rules no record can match. Returns the
+/// reason for each dropped rule; empty under [`DeadRules::Reject`], which
+/// fails instead. Nothing else is relaxed: a malformed, ABI-mismatched or
+/// kill-all spec is still refused whole.
+pub fn parse_febp_with(spec: &[u8], dead: DeadRules) -> Result<(EbpfSpec, Vec<String>)> {
     let mut r = Reader::new(spec);
     r.expect_magic(&EBPF_MAGIC)?;
     let abi = r.u32()?;
@@ -153,17 +173,36 @@ pub fn parse_febp(spec: &[u8]) -> Result<EbpfSpec> {
     }
     r.finish()?;
     reject_kill_all(&rules)?;
-    reject_unobservable_syscalls(&rules)?;
-    reject_unobservable_predicates(&rules)?;
-    Ok(EbpfSpec {
-        abi,
-        mode,
-        disabled,
-        priority,
-        default_action,
-        selector,
-        rules,
-    })
+    let mut dropped = Vec::new();
+    match dead {
+        DeadRules::Reject => {
+            if let Some(reason) = rules.iter().find_map(dead_rule_reason) {
+                return Err(FerrumError::Compile(reason));
+            }
+        }
+        DeadRules::Drop => {
+            let mut kept = Vec::with_capacity(rules.len());
+            for rule in rules {
+                match dead_rule_reason(&rule) {
+                    Some(reason) => dropped.push(reason),
+                    None => kept.push(rule),
+                }
+            }
+            rules = kept;
+        }
+    }
+    Ok((
+        EbpfSpec {
+            abi,
+            mode,
+            disabled,
+            priority,
+            default_action,
+            selector,
+            rules,
+        },
+        dropped,
+    ))
 }
 
 fn trim_syscall(name: String) -> String {
@@ -174,54 +213,46 @@ fn trim_syscall(name: String) -> String {
     }
 }
 
-/// Load-path copy of the compiler's "the datapath never observes this" gate,
-/// alongside `reject_kill_all`. The encoder is a plain library call, so a FEBP
-/// can reach this loader without passing through the compiler's checks at all;
-/// a rule naming an unhooked syscall is dead weight in a signed bundle, and
-/// the loader is the last place that can say so.
-fn reject_unobservable_syscalls(rules: &[Rule]) -> Result<()> {
-    for rule in rules {
-        for syscall in &rule.syscalls {
-            if !ferrum_ids::is_datapath_syscall(syscall.as_str()) {
-                return Err(FerrumError::Compile(format!(
-                    "rule '{}': syscall '{syscall}' is not hooked by the datapath; the rule can \
-                     never fire. Observed: {}",
-                    rule.id,
-                    ferrum_ids::DATAPATH_SYSCALLS.join(", ")
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Same load-path role as `reject_unobservable_syscalls`, for the other half of
-/// what a rule can name. A `comm` longer than the kernel's TASK_COMM_LEN, or a
-/// path fragment longer than the datapath path buffer, cannot appear in any
-/// record: the rule is dead. A bundle signed by an older compiler that had no
-/// such gate must not load quietly into a newer agent.
-fn reject_unobservable_predicates(rules: &[Rule]) -> Result<()> {
-    for rule in rules {
-        if let Some((comm, len)) = ferrum_ids::unobservable_comm(&rule.comm_in) {
-            return Err(FerrumError::Compile(format!(
-                "rule '{}': comm '{comm}' is {len} bytes, the kernel reports at most {}; \
-                 the rule can never match",
+/// Why this rule can never fire, if it cannot. Load-path copy of the
+/// compiler's "the datapath never observes this" gates: the encoder is a plain
+/// library call, so a FEBP can reach this loader without passing through the
+/// compiler at all, and a bundle signed by an older compiler that had no such
+/// gate must not load quietly into a newer agent.
+///
+/// Every reason here is "dead weight", never "unsafe": an unhooked syscall
+/// produces no record, and a `comm` longer than TASK_COMM_LEN or a path
+/// fragment longer than the datapath path buffer appears in no record field.
+/// That is what makes [`DeadRules::Drop`] admissible on the restore path.
+fn dead_rule_reason(rule: &Rule) -> Option<String> {
+    for syscall in &rule.syscalls {
+        if !ferrum_ids::is_datapath_syscall(syscall.as_str()) {
+            return Some(format!(
+                "rule '{}': syscall '{syscall}' is not hooked by the datapath; the rule can \
+                 never fire. Observed: {}",
                 rule.id,
-                ferrum_ids::COMM_MATCH_MAX
-            )));
-        }
-        for patterns in [&rule.path_prefix, &rule.path_suffix] {
-            if let Some((pattern, len)) = ferrum_ids::unobservable_path_pattern(patterns) {
-                return Err(FerrumError::Compile(format!(
-                    "rule '{}': path pattern '{pattern}' is {len} bytes, the datapath path \
-                     buffer carries at most {}; the rule can never match",
-                    rule.id,
-                    ferrum_ids::PATH_MATCH_MAX
-                )));
-            }
+                ferrum_ids::DATAPATH_SYSCALLS.join(", ")
+            ));
         }
     }
-    Ok(())
+    if let Some((comm, len)) = ferrum_ids::unobservable_comm(&rule.comm_in) {
+        return Some(format!(
+            "rule '{}': comm '{comm}' is {len} bytes, the kernel reports at most {}; \
+             the rule can never match",
+            rule.id,
+            ferrum_ids::COMM_MATCH_MAX
+        ));
+    }
+    for patterns in [&rule.path_prefix, &rule.path_suffix] {
+        if let Some((pattern, len)) = ferrum_ids::unobservable_path_pattern(patterns) {
+            return Some(format!(
+                "rule '{}': path pattern '{pattern}' is {len} bytes, the datapath path \
+                 buffer carries at most {}; the rule can never match",
+                rule.id,
+                ferrum_ids::PATH_MATCH_MAX
+            ));
+        }
+    }
+    None
 }
 
 fn reject_kill_all(rules: &[Rule]) -> Result<()> {

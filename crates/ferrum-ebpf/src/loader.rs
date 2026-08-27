@@ -1,6 +1,6 @@
 use crate::envelope::extract_febp;
 use crate::eval::{decide, matched_action, Decision, SyscallEvent};
-use crate::spec::{parse_febp, Action, EbpfSpec};
+use crate::spec::{parse_febp_with, Action, DeadRules, EbpfSpec};
 use ferrum_common::{FerrumError, Result};
 use ferrum_ids::Digest;
 use ferrum_k8smeta::WorkloadIdentity;
@@ -86,6 +86,21 @@ impl Loader {
     ///
     /// Does not write disk. Does not attach kernel pins.
     pub fn load_bundle(&mut self, digest: &Digest, bytes: &[u8]) -> Result<()> {
+        self.load_bundle_with(digest, bytes, DeadRules::Reject)
+            .map(|_| ())
+    }
+
+    /// `load_bundle` with a say over rules no record can match. Only the
+    /// last-known-good restore path passes `DeadRules::Drop`, and only because
+    /// refusing the whole snapshot there leaves the node with no policy at
+    /// all. Returns the reason for each dropped rule; the caller must surface
+    /// them, since the node then enforces less than what was signed.
+    pub fn load_bundle_with(
+        &mut self,
+        digest: &Digest,
+        bytes: &[u8],
+        dead: DeadRules,
+    ) -> Result<Vec<String>> {
         if let Err(err) = ferrum_crypto::verify_bundle_digest(bytes, digest) {
             self.degraded = true;
             return Err(err);
@@ -97,15 +112,15 @@ impl Loader {
                 return Err(err);
             }
         };
-        match parse_febp(febp) {
-            Ok(parsed) => {
+        match parse_febp_with(febp, dead) {
+            Ok((parsed, dropped)) => {
                 self.last_good = Some(LoadedBundle {
                     digest: digest.clone(),
                     spec: parsed,
                     raw: bytes.to_vec(),
                 });
                 self.degraded = false;
-                Ok(())
+                Ok(dropped)
             }
             Err(err) => {
                 self.degraded = true;
