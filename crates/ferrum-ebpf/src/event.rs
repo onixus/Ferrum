@@ -2,11 +2,12 @@
 //!
 //! The wire format is the `#[repr(C)]` `Event` written by the bpf programs on
 //! the same machine, so integers use native endianness. Decoding is
-//! field-by-field (no unsafe transmute) and fails closed on any size mismatch.
+//! field-by-field (no unsafe transmute) and fails closed on any size mismatch
+//! or on any record whose layout stamp is not the one this build decodes.
 
 use crate::eval::{EventMeta, SyscallEvent};
 use ferrum_common::{FerrumError, Result};
-use ferrum_ebpf_progs::{Event, COMM_LEN, PATH_LEN};
+use ferrum_ebpf_progs::{Event, COMM_LEN, DATAPATH_ABI, PATH_LEN};
 
 /// Exact size of one ring record.
 pub const EVENT_WIRE_LEN: usize = core::mem::size_of::<Event>();
@@ -70,11 +71,24 @@ pub fn syscall_name(arch: SyscallArch, nr: u32) -> Option<&'static str> {
 
 /// Decode one ring record. Anything but exactly `EVENT_WIRE_LEN` bytes is
 /// Integrity: a partial record must never become a half-parsed event.
+///
+/// The length alone does not pin the layout — fields can move inside a
+/// same-size record — so the record's [`DATAPATH_ABI`] stamp is checked too. A
+/// record from a datapath that does not agree with this decoder field for
+/// field is refused, never decoded best effort: there is one ELF per image, so
+/// the answer to a mismatch is refuse, not adapt.
 pub fn decode_event(bytes: &[u8]) -> Result<Event> {
     if bytes.len() != EVENT_WIRE_LEN {
         return Err(FerrumError::Integrity(format!(
             "ring record must be {EVENT_WIRE_LEN} bytes, got {}",
             bytes.len()
+        )));
+    }
+    let abi = u16::from_ne_bytes(bytes[22..24].try_into().expect("2 bytes"));
+    if abi != DATAPATH_ABI {
+        return Err(FerrumError::Integrity(format!(
+            "ring record carries datapath ABI {abi:#06x}, this agent decodes {DATAPATH_ABI:#06x}: \
+             the attached eBPF ELF is not the build this agent was compiled against"
         )));
     }
     let mut event = Event::new();
@@ -219,6 +233,62 @@ mod tests {
         let mut long = wire.clone();
         long.push(0);
         assert!(decode_event(&long).is_err());
+    }
+
+    /// A datapath whose record layout drifted stamps something else. Its
+    /// records must not decode at all: a same-size layout with moved fields
+    /// decodes to a plausible-looking event with the wrong cgroup and tgid,
+    /// and nothing downstream can tell.
+    #[test]
+    fn stale_abi_stamp_is_integrity_not_a_decoded_event() {
+        let mut wire = encode_event(&sample());
+        for stale in [0u16, DATAPATH_ABI - 1, DATAPATH_ABI + 1, u16::MAX] {
+            wire[22..24].copy_from_slice(&stale.to_ne_bytes());
+            match decode_event(&wire) {
+                Err(FerrumError::Integrity(msg)) => {
+                    assert!(
+                        msg.contains(&format!("{stale:#06x}")),
+                        "message lost the record's ABI: {msg}"
+                    );
+                    assert!(
+                        msg.contains(&format!("{DATAPATH_ABI:#06x}")),
+                        "message lost the decoder's ABI: {msg}"
+                    );
+                }
+                other => panic!("expected Integrity, got {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    /// The stamp slot sits next to `flags`; a record shifted by two bytes, or
+    /// one an older datapath left as zero padding, must not read as valid.
+    #[test]
+    fn a_flags_byte_in_the_stamp_slot_is_not_a_valid_stamp() {
+        let mut wire = encode_event(&sample());
+        for flags in 0u8..=(EVENT_FLAG_CONTAINER | EVENT_FLAG_AGENT_SELF) {
+            wire[22..24].copy_from_slice(&u16::from(flags).to_ne_bytes());
+            assert!(
+                decode_event(&wire).is_err(),
+                "flags {flags} read as a stamp"
+            );
+            wire[22..24].copy_from_slice(&(u16::from(flags) << 8).to_ne_bytes());
+            assert!(
+                decode_event(&wire).is_err(),
+                "flags {flags} read as a stamp in the high byte"
+            );
+        }
+    }
+
+    /// The stamp travels with the record: an `Event::new()`-derived record
+    /// carries it without the producer knowing, and round-trips.
+    #[test]
+    fn current_abi_stamp_round_trips() {
+        let event = sample();
+        assert_eq!(event._pad, DATAPATH_ABI);
+        let back = decode_event(&encode_event(&event)).expect("decode");
+        assert_eq!(back._pad, DATAPATH_ABI);
+        assert_eq!(back.cgroup_id, event.cgroup_id);
+        assert_eq!(back.tgid, event.tgid);
     }
 
     #[test]
