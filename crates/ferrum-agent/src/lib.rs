@@ -14,12 +14,12 @@ use ferrum_k8smeta::{CgroupIndex, WorkloadIdentity};
 use ferrum_proto::EnforcementEvent;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-pub use pump::{pump_channel, pump_records, PumpStats};
+pub use pump::{pump_channel, pump_channel_host, pump_records, pump_records_host, PumpStats};
 pub use source::{
     decode_fsig, encode_fsig, extract_fsig, load_path, load_source, parse_trust_root,
     read_source_path, ExtractedFsig, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, KUBELET_DATA_DIR,
@@ -68,6 +68,12 @@ pub struct Agent {
     lkg_dir: Option<PathBuf>,
     trust_root: Vec<u8>,
     bundle_path: Option<PathBuf>,
+    decode_failed: AtomicU64,
+    unknown_syscalls: AtomicU64,
+    /// Set when the decode table and the event source disagree (unknown nr):
+    /// enforce rules can no longer be trusted to match, so the agent is
+    /// Degraded even though the loaded bundle itself is fine.
+    datapath_degraded: AtomicBool,
 }
 
 impl Agent {
@@ -84,6 +90,9 @@ impl Agent {
             lkg_dir: config.lkg_dir,
             trust_root: config.trust_root,
             bundle_path: config.bundle_path,
+            decode_failed: AtomicU64::new(0),
+            unknown_syscalls: AtomicU64::new(0),
+            datapath_degraded: AtomicBool::new(false),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -98,7 +107,10 @@ impl Agent {
     }
 
     pub fn is_degraded(&self) -> bool {
-        self.cp_down || self.loader.is_degraded() || !self.pins_attached()
+        self.cp_down
+            || self.loader.is_degraded()
+            || !self.pins_attached()
+            || self.datapath_degraded.load(Ordering::Relaxed)
     }
 
     pub fn pins_attached(&self) -> bool {
@@ -117,8 +129,32 @@ impl Agent {
         self.loader.events_dropped_total()
     }
 
+    /// In-kernel ring drops only (RFC-02 §C). Userspace decode failures go to
+    /// `record_decode_failure` so a burst of malformed records cannot pose as
+    /// ring-buffer pressure or vice versa.
     pub fn record_drop(&self, n: u64) {
         self.loader.record_drop(n);
+    }
+
+    pub fn records_decode_failed_total(&self) -> u64 {
+        self.decode_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn record_decode_failure(&self, n: u64) {
+        self.decode_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn unknown_syscall_total(&self) -> u64 {
+        self.unknown_syscalls.load(Ordering::Relaxed)
+    }
+
+    pub fn record_unknown_syscall(&self) {
+        self.unknown_syscalls.fetch_add(1, Ordering::Relaxed);
+        self.datapath_degraded.store(true, Ordering::Relaxed);
+    }
+
+    pub fn datapath_degraded(&self) -> bool {
+        self.datapath_degraded.load(Ordering::Relaxed)
     }
 
     /// CP down: keep LKG, never fail-open.
@@ -1193,7 +1229,8 @@ mod tests {
             stats,
             PumpStats {
                 handled: 2,
-                decode_failed: 0
+                decode_failed: 0,
+                unknown_syscall: 0
             }
         );
         let events = sink.events();
@@ -1218,19 +1255,26 @@ mod tests {
             vec![0u8; 5],
             Vec::new(),
         ];
+        assert!(!agent.datapath_degraded());
         let stats = pump_records(&agent, SyscallArch::X86_64, records, &sink);
         assert_eq!(
             stats,
             PumpStats {
-                handled: 1,
-                decode_failed: 2
+                handled: 0,
+                decode_failed: 2,
+                unknown_syscall: 1
             }
         );
-        // Unknown nr reaches the spec default action instead of a rule.
+        // The unknown nr is still exported for visibility, but the datapath is
+        // no longer trusted: the agent is Degraded, not silently auditing.
         assert_eq!(sink.events().len(), 1);
         assert_eq!(sink.events()[0].syscall, ferrum_ebpf::SYSCALL_UNKNOWN);
-        assert_eq!(sink.events()[0].action, "audit");
-        assert_eq!(agent.events_dropped_total(), 2);
+        assert!(agent.datapath_degraded());
+        assert!(agent.is_degraded());
+        assert_eq!(agent.unknown_syscall_total(), 1);
+        // Decode failures are not in-kernel ring drops.
+        assert_eq!(agent.events_dropped_total(), 0);
+        assert_eq!(agent.records_decode_failed_total(), 2);
     }
 
     #[test]
