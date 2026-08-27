@@ -48,11 +48,15 @@ fn main() {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
+    let policy_name = flags.map.get("policy-name").cloned().unwrap_or_default();
+
     let mut agent = Agent::new(AgentConfig {
         role,
         lkg_dir,
         trust_root,
         bundle_path: bundle_path.clone(),
+        exceptions: Vec::new(),
+        policy_name,
     });
 
     if let Err(err) = agent.restore_last_known_good() {
@@ -65,6 +69,9 @@ fn main() {
             if !agent.using_last_known_good() {
                 exit(2);
             }
+        }
+        if let Err(err) = agent.reload_exceptions_path(path) {
+            eprintln!("ferrum-agent: exceptions load failed, waivers dropped: {err}");
         }
     }
 
@@ -118,7 +125,7 @@ fn require_flag(flags: &Flags, name: &str) -> String {
     match flags.map.get(name) {
         Some(v) if !v.is_empty() => v.clone(),
         _ => die(
-            "usage: ferrum-agent --trust-root <32-byte-hex> [--bundle <fsig|dir>] [--lkg-dir <dir>] [--role observe|respond] [--reload-ms 1000]",
+            "usage: ferrum-agent --trust-root <32-byte-hex> [--bundle <fsig|dir>] [--lkg-dir <dir>] [--role observe|respond] [--policy-name <name>] [--reload-ms 1000]",
         ),
     }
 }

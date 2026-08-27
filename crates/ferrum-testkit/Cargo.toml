@@ -20,4 +20,6 @@ ferrum-agent = { path = "../ferrum-agent" }
 ferrum-compiler.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ebpf.workspace = true
+ferrum-export.workspace = true
 ferrum-ids.workspace = true
+ferrum-k8smeta.workspace = true

@@ -8,16 +8,20 @@ rust-version.workspace = true
 description = "Only BPF carrier. Forbidden: ferrum-compiler, cluster-admin SA."
 
 [dependencies]
+chrono.workspace = true
+ferrum-api.workspace = true
 ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ebpf.workspace = true
 ferrum-export.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+ferrum-policy.workspace = true
 ferrum-proto.workspace = true
 ferrum-wasm-host.workspace = true
+# Exceptions JSON is parsed only at reload time, never on the per-event path.
+serde_json.workspace = true
 
 [dev-dependencies]
-ferrum-api.workspace = true
 ferrum-compiler.workspace = true
 serde_yaml.workspace = true

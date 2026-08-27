@@ -6,12 +6,14 @@ use chrono::{DateTime, TimeZone, Utc};
 use ferrum_admission::{
     admit, load_bundle, AdmissionSubject, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED, RULE_UNSIGNED,
 };
-use ferrum_agent::{apply_role, encode_fsig, Agent, AgentConfig, AgentRole};
+use ferrum_agent::{apply_role, encode_fsig, Agent, AgentConfig, AgentRole, WAIVED_ACTION};
 use ferrum_api::{PolicyExceptionSpec, PolicyMode};
 use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
 use ferrum_crypto::{public_key_from_secret, sign_bundle};
 use ferrum_ebpf::{Action, SyscallEvent};
+use ferrum_export::MemorySink;
 use ferrum_ids::{Digest, ADMISSION_ABI, AGENT_ABI};
+use ferrum_k8smeta::WorkloadIdentity;
 use ferrum_testkit::{
     exception_ok, prod_restricted, try_exception_from_yaml, EXCEPTION_WITHOUT_TTL_YAML,
 };
@@ -71,7 +73,8 @@ fn respond_agent(lkg_dir: Option<PathBuf>) -> Agent {
         role: AgentRole::Respond,
         lkg_dir,
         trust_root: public_key_from_secret(&SK).expect("public key"),
-        bundle_path: None,
+        policy_name: "prod-restricted".into(),
+        ..Default::default()
     })
 }
 
@@ -209,6 +212,63 @@ fn docker_sock_access_is_killed() {
 
     let benign = agent.matched_action(&ev("openat", "curl", "/tmp/app.sock", false));
     assert_ne!(benign.action, Action::Kill);
+}
+
+/// Matches the prod-restricted selector (pci zone, pinned registry) in the
+/// namespace targeted by the `exception-ok` fixture.
+fn payments_identity() -> WorkloadIdentity {
+    let mut id = WorkloadIdentity {
+        namespace: "payments".into(),
+        pod: "web-1".into(),
+        container: "app".into(),
+        service_account: "web".into(),
+        ..Default::default()
+    };
+    id.namespace_labels
+        .insert("ferrum.io/zone".into(), "pci".into());
+    id.image = "registry.internal.example/app@sha256:abc".into();
+    id.image_digest = "sha256:abc".into();
+    id
+}
+
+#[test]
+fn docker_sock_kill_is_waived_only_in_scope() {
+    let mut agent = loaded_agent();
+    agent.insert_cgroup(7, payments_identity());
+    let mut other = payments_identity();
+    other.namespace = "checkout".into();
+    agent.insert_cgroup(8, other);
+
+    let mut waiver = exception_ok().spec;
+    waiver.target.rules = vec!["no-runtime-sock".into()];
+    let expires_at = waiver.expires_at;
+    agent.set_exceptions(vec![waiver]);
+
+    let sink = MemorySink::new();
+    let sock = ev("openat", "curl", "/var/run/docker.sock", false);
+
+    // In scope: kill demoted to audit, with a distinct audit-trail action.
+    let waived = agent.handle_event_at(7, &sock, &sink, now());
+    assert_eq!(waived.action, Action::Audit);
+    assert_eq!(waived.rule_id.as_deref(), Some("no-runtime-sock"));
+    assert_eq!(sink.events()[0].action, WAIVED_ACTION);
+    assert_eq!(sink.events()[0].namespace, "payments");
+
+    // Same rule outside the exception namespace: still kill.
+    let outside = agent.handle_event_at(8, &sock, &sink, now());
+    assert_eq!(outside.action, Action::Kill);
+    assert_eq!(sink.events()[1].action, "kill");
+
+    // The waiver does not outlive expiresAt.
+    let expired = agent.handle_event_at(7, &sock, &sink, expires_at + chrono::Days::new(1));
+    assert_eq!(expired.action, Action::Kill);
+
+    // Empty target.rules is no-match, not a policy-wide waiver.
+    let mut empty_rules = exception_ok().spec;
+    empty_rules.target.rules = Vec::new();
+    agent.set_exceptions(vec![empty_rules]);
+    let no_rules = agent.handle_event_at(7, &sock, &sink, now());
+    assert_eq!(no_rules.action, Action::Kill);
 }
 
 #[test]

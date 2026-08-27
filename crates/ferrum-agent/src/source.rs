@@ -28,6 +28,10 @@ pub const SIGNED_FORMAT: u32 = 1;
 pub const BUNDLE_FSIG_KEY: &str = "bundle.fsig";
 /// Controller Secret data key for SHA-256(raw) as UTF-8 hex bytes.
 pub const BUNDLE_DIGEST_KEY: &str = "digest";
+/// Controller Secret data key for the live PolicyException list (JSON array of
+/// PolicyExceptionSpec). Duplicated on purpose: this crate must not depend on
+/// ferrum-controller or ferrum-admission.
+pub const EXCEPTIONS_JSON_KEY: &str = "exceptions.json";
 /// kubelet projected-volume symlink to the current Secret snapshot directory.
 pub const KUBELET_DATA_DIR: &str = "..data";
 
@@ -107,6 +111,39 @@ pub fn read_source_path(path: &Path) -> Result<(Vec<u8>, Option<Digest>)> {
     let bytes = std::fs::read(path)
         .map_err(|err| FerrumError::Integrity(format!("read {}: {err}", path.display())))?;
     Ok((bytes, None))
+}
+
+/// `exceptions.json` next to whatever `--bundle` points at: a directory means
+/// the key inside the current kubelet `..data` snapshot (same snapshot as
+/// `bundle.fsig`), a Secret-mounted `bundle.fsig` means its snapshot sibling,
+/// any other file means a plain sibling file.
+pub(crate) fn exceptions_file_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        return snapshot_dir(path).join(EXCEPTIONS_JSON_KEY);
+    }
+    if is_secret_fsig_file(path) {
+        if let Some(parent) = path.parent() {
+            return snapshot_dir(parent).join(EXCEPTIONS_JSON_KEY);
+        }
+    }
+    match path.parent() {
+        Some(parent) => parent.join(EXCEPTIONS_JSON_KEY),
+        None => PathBuf::from(EXCEPTIONS_JSON_KEY),
+    }
+}
+
+/// `Ok(None)` = file absent = empty exception list (not an error, not deny-all).
+/// An unreadable file is `Err`; the caller drops waivers and counts it.
+pub fn read_exceptions_path(path: &Path) -> Result<Option<Vec<u8>>> {
+    let file = exceptions_file_path(path);
+    match std::fs::read(&file) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(FerrumError::Degraded(format!(
+            "read {}: {err}",
+            file.display()
+        ))),
+    }
 }
 
 /// Verify and extract whatever kubelet/file `--bundle` points at.
@@ -361,7 +398,7 @@ impl<'a> RawReader<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
+pub(crate) struct FileStamp {
     mtime: SystemTime,
     len: u64,
 }
@@ -381,6 +418,11 @@ fn stamp_one(path: &Path) -> Option<FileStamp> {
         mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         len: meta.len(),
     })
+}
+
+/// `None` = exceptions file absent (poll loop clears waivers, not an error).
+pub(crate) fn exceptions_stamp(path: &Path) -> Option<FileStamp> {
+    stamp_one(&exceptions_file_path(path))
 }
 
 /// Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
