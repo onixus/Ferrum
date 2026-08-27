@@ -191,6 +191,25 @@ pipeline {
                         exit 1
                     fi
                     echo "ok: runtime-unobservable-syscall.yaml rejected"
+
+                    # Half of the open/openat pair is enforcement that depends
+                    # on which node the workload lands on: dead on the arches
+                    # that lack the named form, bypassable on the ones serving
+                    # the other. One bundle ships to every node, so the gate
+                    # belongs here, not in a per-arch incident review.
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- validate policies/examples/runtime-arch-split-syscall.yaml >/tmp/ferrum-arch-split.out 2>/tmp/ferrum-arch-split.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "runtime-arch-split-syscall.yaml must fail validation" >&2
+                        exit 1
+                    fi
+                    if ! grep -q "open" /tmp/ferrum-arch-split.err /tmp/ferrum-arch-split.out; then
+                        echo "validation must name the missing companion syscall" >&2
+                        exit 1
+                    fi
+                    echo "ok: runtime-arch-split-syscall.yaml rejected"
                     cargo run -p ferrum-cli --quiet -- lint-deploy deploy
                     # The committed tree carries a webhook template, not an
                     # applicable configuration. Prove the issuance step closes

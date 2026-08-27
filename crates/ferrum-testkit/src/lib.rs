@@ -26,6 +26,8 @@ pub const COMPLIANCE_SNAPSHOT_YAML: &str =
 /// file so the gate cannot exist only in a unit test.
 pub const RUNTIME_UNOBSERVABLE_SYSCALL_YAML: &str =
     include_str!("../../../policies/examples/runtime-unobservable-syscall.yaml");
+pub const RUNTIME_ARCH_SPLIT_SYSCALL_YAML: &str =
+    include_str!("../../../policies/examples/runtime-arch-split-syscall.yaml");
 
 /// RFC §D: `expiresAt` is omitted on purpose so the API rejects the object.
 pub const EXCEPTION_WITHOUT_TTL_YAML: &str = include_str!("../fixtures/exception-without-ttl.yaml");
@@ -94,6 +96,10 @@ pub fn ferrum_cluster() -> FerrumCluster {
 
 pub fn runtime_unobservable_syscall() -> ClusterSecurityPolicy {
     cluster_policy_from_yaml(RUNTIME_UNOBSERVABLE_SYSCALL_YAML)
+}
+
+pub fn runtime_arch_split_syscall() -> ClusterSecurityPolicy {
+    cluster_policy_from_yaml(RUNTIME_ARCH_SPLIT_SYSCALL_YAML)
 }
 
 pub fn compliance_snapshot() -> ComplianceSnapshot {
@@ -386,6 +392,15 @@ mod tests {
         assert_eq!(obj.kind, "ClusterSecurityPolicy");
         let rule = &obj.spec.runtime.rules[0];
         assert_eq!(rule.syscalls, vec!["ptrace"]);
+        assert_eq!(rule.action, RuntimeAction::Kill);
+    }
+
+    #[test]
+    fn arch_split_fixture_decodes_and_names_only_openat() {
+        let obj = runtime_arch_split_syscall();
+        assert_eq!(obj.kind, "ClusterSecurityPolicy");
+        let rule = &obj.spec.runtime.rules[0];
+        assert_eq!(rule.syscalls, vec!["openat"], "half of the open/openat pair");
         assert_eq!(rule.action, RuntimeAction::Kill);
     }
 

@@ -216,7 +216,8 @@ mod tests {
         let mut both = rule("a", &["execve"], Action::Kill);
         both.container_only = true;
         both.not_agent_self = true;
-        let mut only_container = rule("b", &["openat"], Action::Kill);
+        // open/openat travel as a pair: a rule naming one alone no longer compiles.
+        let mut only_container = rule("b", &["open", "openat"], Action::Kill);
         only_container.container_only = true;
 
         let image = prefilter_image(&spec(Action::Allow, vec![both.clone()]));
