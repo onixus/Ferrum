@@ -23,6 +23,19 @@ pub struct EnforcementEvent {
     pub namespace: String,
     pub comm: String,
     pub syscall: String,
+    /// Structural identity of the process the record came from. Absent in
+    /// pre-reaction records, hence `default`.
+    #[serde(default)]
+    pub pid: u32,
+    #[serde(default)]
+    pub tgid: u32,
+    /// True only when the reaction for `action` actually ran (a signal was
+    /// delivered). Audit/observe records and every refusal stay false.
+    #[serde(default)]
+    pub executed: bool,
+    /// Why the reaction did not run, when it did not.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub respond_error: Option<String>,
     /// Set only on waived events.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub waiver: Option<WaiverRef>,
@@ -63,6 +76,10 @@ mod tests {
                 namespace: "prod".into(),
                 comm: "sh".into(),
                 syscall: "execve".into(),
+                pid: 0,
+                tgid: 0,
+                executed: false,
+                respond_error: None,
                 waiver: None,
             },
         };
@@ -90,6 +107,10 @@ mod tests {
             namespace: "payments".into(),
             comm: "curl".into(),
             syscall: "openat".into(),
+            pid: 7,
+            tgid: 7,
+            executed: false,
+            respond_error: None,
             waiver: Some(WaiverRef {
                 ticket: "JIRA-1".into(),
                 requested_by: "sre".into(),
@@ -107,5 +128,8 @@ mod tests {
             "pod":"w","namespace":"n","comm":"sh","syscall":"execve"}"#;
         let back: EnforcementEvent = serde_json::from_str(legacy).expect("deserialize");
         assert_eq!(back.waiver, None);
+        assert_eq!(back.tgid, 0);
+        assert!(!back.executed);
+        assert_eq!(back.respond_error, None);
     }
 }
