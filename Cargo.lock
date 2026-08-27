@@ -698,6 +698,7 @@ dependencies = [
  "chrono",
  "ferrum-api",
  "ferrum-common",
+ "ferrum-ids",
  "serde_yaml 0.8.26",
  "thiserror 1.0.58",
 ]

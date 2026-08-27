@@ -152,6 +152,39 @@ fn validate_admit(admit: &AdmitSpec) -> Result<()> {
     Ok(())
 }
 
+/// Инвариант «правило может сработать»: датапас хукает конечное множество
+/// syscall'ов, всё остальное — правило, которое валидируется, компилируется,
+/// подписывается и не срабатывает никогда. Симметрично «Kill/Isolate без
+/// match»: тот ловит слишком широкое правило, этот — слишком узкое.
+pub fn validate_rule_syscalls(rule_id: &str, syscalls: &[String]) -> Result<()> {
+    for syscall in syscalls {
+        let name = syscall.trim();
+        if !ferrum_ids::is_datapath_syscall(name) {
+            return Err(FerrumError::Validation(format!(
+                "rule '{rule_id}': syscall '{name}' — датапас его не наблюдает; правило не может сработать. Наблюдаемые: {}",
+                ferrum_ids::DATAPATH_SYSCALLS.join(", ")
+            )));
+        }
+    }
+    for restricted in ferrum_ids::ARCH_RESTRICTED_SYSCALLS {
+        if !syscalls.iter().any(|s| s.trim() == restricted.syscall) {
+            continue;
+        }
+        let Some(companion) = restricted.portable_companion else {
+            continue;
+        };
+        if syscalls.iter().any(|s| s.trim() == companion) {
+            continue;
+        }
+        return Err(FerrumError::Validation(format!(
+            "rule '{rule_id}': syscall '{}' есть только на {}; на aarch64 правило мертво — добавьте '{companion}'. Bundle один на кластер, второго сигнала не будет",
+            restricted.syscall,
+            restricted.arches.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
     if matches!(
         runtime.default_action,
@@ -172,6 +205,7 @@ fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
                 rule.id
             )));
         }
+        validate_rule_syscalls(&rule.id, &rule.syscalls)?;
         if matches!(rule.action, RuntimeAction::Kill | RuntimeAction::Isolate)
             && rule.match_on.comm_in.is_empty()
             && rule.match_on.path_prefix.is_empty()
@@ -332,6 +366,70 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_cluster_policy(&spec).is_err());
+    }
+
+    fn runtime_rule_spec(syscalls: &[&str], action: RuntimeAction) -> ClusterSecurityPolicySpec {
+        ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                rules: vec![RuntimeRule {
+                    id: "probe".into(),
+                    syscalls: syscalls.iter().map(|s| (*s).to_string()).collect(),
+                    match_on: RuntimeMatch {
+                        comm_in: vec!["gdb".into()],
+                        ..Default::default()
+                    },
+                    action,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn syscall_outside_the_datapath_is_rejected() {
+        for action in [
+            RuntimeAction::Kill,
+            RuntimeAction::Deny,
+            RuntimeAction::Audit,
+        ] {
+            let err = validate_cluster_policy(&runtime_rule_spec(&["ptrace"], action))
+                .expect_err("ptrace is not hooked");
+            let msg = err.to_string();
+            assert!(msg.contains("probe"), "{msg}");
+            assert!(msg.contains("ptrace"), "{msg}");
+            assert!(msg.contains("не наблюдает"), "{msg}");
+        }
+        // A rule that mixes one observable syscall with one unobservable one is
+        // still a rule that only half fires.
+        assert!(validate_cluster_policy(&runtime_rule_spec(
+            &["execve", "ptrace"],
+            RuntimeAction::Kill
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn every_datapath_syscall_is_accepted() {
+        for syscall in ferrum_ids::DATAPATH_SYSCALLS {
+            let names: Vec<&str> = match ferrum_ids::arch_restricted_syscall(syscall) {
+                Some(r) => vec![syscall, r.portable_companion.expect("companion")],
+                None => vec![syscall],
+            };
+            validate_cluster_policy(&runtime_rule_spec(&names, RuntimeAction::Kill))
+                .unwrap_or_else(|e| panic!("{syscall} must validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn open_without_openat_is_dead_on_aarch64() {
+        let err = validate_cluster_policy(&runtime_rule_spec(&["open"], RuntimeAction::Kill))
+            .expect_err("open alone is arch-split enforcement");
+        let msg = err.to_string();
+        assert!(msg.contains("aarch64"), "{msg}");
+        assert!(msg.contains("openat"), "{msg}");
+        validate_cluster_policy(&runtime_rule_spec(&["open", "openat"], RuntimeAction::Kill))
+            .expect("open+openat is portable");
     }
 
     #[test]

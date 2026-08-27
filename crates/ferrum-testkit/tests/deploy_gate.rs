@@ -11,7 +11,8 @@ use ferrum_api::{
 use ferrum_policy::{validate_cluster_policy, validate_exception, validate_namespaced_policy};
 use ferrum_testkit::{
     bpf_deny, cluster_admin_bind_deny, docker_sock_kill, exec_sh_kill, privileged_deny,
-    try_exception_from_yaml, unsigned_deny, EXCEPTION_WITHOUT_TTL_YAML,
+    runtime_unobservable_syscall, try_exception_from_yaml, unsigned_deny,
+    EXCEPTION_WITHOUT_TTL_YAML,
 };
 use serde_yaml::Value;
 
@@ -219,6 +220,35 @@ fn acceptance_fixtures_agree_with_the_invariant_copy() {
     ] {
         validate_cluster_policy(&spec).unwrap_or_else(|e| panic!("{name} must validate: {e}"));
     }
+
+    // §D `bpf()` not from the agent → deny. The row names an action this plane
+    // decides but cannot execute — a tracepoint fires after the syscall has
+    // run. That is why the agent exports REFUSE_DENY_NOT_ENFORCEABLE on every
+    // runtime Deny (asserted end to end in acceptance.rs), and why every
+    // syscall the row names must be one the datapath actually hooks: a rule
+    // that never fires would pass this drift gate silently.
+    let bpf = bpf_deny();
+    let rule = &bpf.runtime.rules[0];
+    assert_eq!(rule.action, RuntimeAction::Deny);
+    assert!(rule.match_on.not_agent_self);
+    for syscall in &rule.syscalls {
+        assert!(
+            ferrum_ids::is_datapath_syscall(syscall),
+            "§D bpf row names {syscall}, which the datapath does not observe"
+        );
+    }
+    assert!(rule.syscalls.iter().any(|s| s == "bpf"));
+}
+
+/// The gate the negative example proves in CI, kept here so it also fails a
+/// plain `cargo test`.
+#[test]
+fn a_rule_naming_an_unhooked_syscall_does_not_validate() {
+    let spec = runtime_unobservable_syscall().spec;
+    let err = validate_cluster_policy(&spec).expect_err("ptrace is not hooked");
+    let msg = err.to_string();
+    assert!(msg.contains("ptrace"), "{msg}");
+    assert!(msg.contains("no-debugger"), "{msg}");
 }
 
 /// The install tree is the fourth place an invariant is written down, and the

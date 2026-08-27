@@ -50,6 +50,7 @@ fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
             "runtime.defaultAction Kill/Isolate — это kill-all, не политика".into(),
         ));
     }
+    reject_unobservable_syscalls(&fx)?;
     let admission_program = encode::encode_admission(&fx)?;
     let ebpf_spec = encode::encode_ebpf(&fx)?;
     let wasm = ferrum_wasm_abi::placeholder_module().to_vec();
@@ -66,6 +67,41 @@ fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
         ebpf_spec,
         wasm,
     })
+}
+
+/// Second gate on the same invariant as `ferrum_policy::validate_rule_syscalls`.
+/// The validator is advisory — a bundle can be produced by anything that calls
+/// the compiler — so the encoder refuses to emit a rule the datapath can never
+/// observe. A signed bundle that cannot fire is worse than a rejected compile.
+fn reject_unobservable_syscalls(fx: &Effects<'_>) -> Result<()> {
+    for rule in &fx.runtime.rules {
+        for syscall in &rule.syscalls {
+            let name = syscall.trim();
+            if !ferrum_ids::is_datapath_syscall(name) {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': syscall '{name}' is not hooked by the datapath; the rule can never fire. Observed: {}",
+                    rule.id,
+                    ferrum_ids::DATAPATH_SYSCALLS.join(", ")
+                )));
+            }
+        }
+        for restricted in ferrum_ids::ARCH_RESTRICTED_SYSCALLS {
+            let Some(companion) = restricted.portable_companion else {
+                continue;
+            };
+            if rule.syscalls.iter().any(|s| s.trim() == restricted.syscall)
+                && !rule.syscalls.iter().any(|s| s.trim() == companion)
+            {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': syscall '{}' exists only on {}; one signed bundle serves the whole cluster, so add '{companion}' or the rule is dead on the other nodes",
+                    rule.id,
+                    restricted.syscall,
+                    restricted.arches.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Canonical bytes hashed into `CompiledBundle.digest`.
@@ -265,6 +301,51 @@ mod tests {
             ..Default::default()
         };
         assert_validation_no_bundle(compile_cluster_policy(&spec));
+    }
+
+    fn syscall_rule_spec(syscalls: &[&str]) -> ClusterSecurityPolicySpec {
+        ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                rules: vec![RuntimeRule {
+                    id: "probe".into(),
+                    syscalls: syscalls.iter().map(|s| (*s).to_string()).collect(),
+                    match_on: RuntimeMatch {
+                        comm_in: vec!["gdb".into()],
+                        ..Default::default()
+                    },
+                    action: RuntimeAction::Kill,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unobservable_syscall_does_not_compile() {
+        // The validator refuses first; the compiler's own gate has to hold on
+        // its own, so assert it directly as well.
+        assert!(compile_cluster_policy(&syscall_rule_spec(&["ptrace"])).is_err());
+        let spec = syscall_rule_spec(&["ptrace"]);
+        let fx = Effects::from(&spec);
+        match reject_unobservable_syscalls(&fx) {
+            Err(FerrumError::Compile(msg)) => {
+                assert!(msg.contains("probe") && msg.contains("ptrace"), "{msg}");
+            }
+            other => panic!("expected Compile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_without_openat_does_not_compile() {
+        assert!(compile_cluster_policy(&syscall_rule_spec(&["open"])).is_err());
+        let spec = syscall_rule_spec(&["open"]);
+        let fx = Effects::from(&spec);
+        match reject_unobservable_syscalls(&fx) {
+            Err(FerrumError::Compile(msg)) => assert!(msg.contains("openat"), "{msg}"),
+            other => panic!("expected Compile, got {other:?}"),
+        }
+        compile_cluster_policy(&syscall_rule_spec(&["open", "openat"])).expect("portable pair");
     }
 
     #[test]

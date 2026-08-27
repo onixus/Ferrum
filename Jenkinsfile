@@ -175,6 +175,22 @@ pipeline {
                         exit 1
                     fi
                     echo "ok: exception-bad-no-ticket.yaml rejected"
+                    # A rule naming a syscall the datapath does not hook is a
+                    # signed policy that can never fire. The validator has to
+                    # be the place that says so, not a post-incident review.
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- validate policies/examples/runtime-unobservable-syscall.yaml >/tmp/ferrum-bad-syscall.out 2>/tmp/ferrum-bad-syscall.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "runtime-unobservable-syscall.yaml must fail validation" >&2
+                        exit 1
+                    fi
+                    if ! grep -q ptrace /tmp/ferrum-bad-syscall.err /tmp/ferrum-bad-syscall.out; then
+                        echo "validation must name the offending syscall" >&2
+                        exit 1
+                    fi
+                    echo "ok: runtime-unobservable-syscall.yaml rejected"
                     cargo run -p ferrum-cli --quiet -- lint-deploy deploy
                     # The committed tree carries a webhook template, not an
                     # applicable configuration. Prove the issuance step closes

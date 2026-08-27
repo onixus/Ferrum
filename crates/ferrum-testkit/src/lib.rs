@@ -21,6 +21,11 @@ pub const FERRUM_CLUSTER_YAML: &str =
     include_str!("../../../policies/examples/ferrum-cluster.yaml");
 pub const COMPLIANCE_SNAPSHOT_YAML: &str =
     include_str!("../../../policies/examples/compliance-snapshot.yaml");
+/// Negative fixture: a runtime rule naming a syscall the datapath never hooks.
+/// It must fail validation; the CI stage runs `ferrumctl validate` on the same
+/// file so the gate cannot exist only in a unit test.
+pub const RUNTIME_UNOBSERVABLE_SYSCALL_YAML: &str =
+    include_str!("../../../policies/examples/runtime-unobservable-syscall.yaml");
 
 /// RFC §D: `expiresAt` is omitted on purpose so the API rejects the object.
 pub const EXCEPTION_WITHOUT_TTL_YAML: &str = include_str!("../fixtures/exception-without-ttl.yaml");
@@ -85,6 +90,10 @@ pub fn runtime_profile() -> RuntimeProfile {
 
 pub fn ferrum_cluster() -> FerrumCluster {
     ferrum_cluster_from_yaml(FERRUM_CLUSTER_YAML)
+}
+
+pub fn runtime_unobservable_syscall() -> ClusterSecurityPolicy {
+    cluster_policy_from_yaml(RUNTIME_UNOBSERVABLE_SYSCALL_YAML)
 }
 
 pub fn compliance_snapshot() -> ComplianceSnapshot {
@@ -369,6 +378,15 @@ mod tests {
         let prod = &prod_restricted().spec.runtime.rules[2];
         assert!(prod.syscalls.iter().any(|s| s == "bpf"));
         assert_eq!(prod.action, RuntimeAction::Deny);
+    }
+
+    #[test]
+    fn unobservable_syscall_fixture_decodes_and_names_ptrace() {
+        let obj = runtime_unobservable_syscall();
+        assert_eq!(obj.kind, "ClusterSecurityPolicy");
+        let rule = &obj.spec.runtime.rules[0];
+        assert_eq!(rule.syscalls, vec!["ptrace"]);
+        assert_eq!(rule.action, RuntimeAction::Kill);
     }
 
     #[test]

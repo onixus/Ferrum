@@ -11,6 +11,9 @@ description = "Инварианты политик. Сети и kube::Client з�
 chrono.workspace = true
 ferrum-api.workspace = true
 ferrum-common.workspace = true
+# Only for DATAPATH_SYSCALLS: the set of syscalls the agent can observe is an
+# invariant of the policy, not a datapath dependency. No aya, no ferrum-ebpf.
+ferrum-ids.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
