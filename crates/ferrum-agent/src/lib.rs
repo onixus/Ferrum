@@ -3,6 +3,8 @@
 
 #![deny(unsafe_code)]
 
+mod source;
+
 use ferrum_common::{FerrumError, Result};
 use ferrum_ebpf::{extract_febp, Action, Decision, Loader, SyscallEvent};
 use ferrum_export::EventSink;
@@ -11,10 +13,16 @@ use ferrum_k8smeta::{CgroupIndex, WorkloadIdentity};
 use ferrum_proto::EnforcementEvent;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-const LKG_RAW: &str = "lkg.raw";
-const LKG_SIG: &str = "lkg.sig";
-const LKG_PK: &str = "lkg.pk";
+static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+pub use source::{
+    decode_fsig, encode_fsig, extract_fsig, load_path, load_source, parse_trust_root,
+    read_source_path, ExtractedFsig, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, KUBELET_DATA_DIR,
+    SIGNED_FORMAT, SIGNED_MAGIC,
+};
 
 /// Observe is default. Kill/Isolate execute only when Respond is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -28,6 +36,16 @@ impl AgentRole {
     pub fn respond_enabled(self) -> bool {
         matches!(self, Self::Respond)
     }
+
+    pub fn parse_name(s: &str) -> Result<Self> {
+        match s {
+            "observe" => Ok(Self::Observe),
+            "respond" => Ok(Self::Respond),
+            other => Err(FerrumError::Validation(format!(
+                "unknown role {other}; expected observe or respond"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36,6 +54,8 @@ pub struct AgentConfig {
     pub lkg_dir: Option<PathBuf>,
     /// Pinned Ed25519 trust-root. Restore refuses unsigned FEBP without this.
     pub trust_root: Vec<u8>,
+    /// kubelet Secret mount, `bundle.fsig` file, or raw FSIG.
+    pub bundle_path: Option<PathBuf>,
 }
 
 pub struct Agent {
@@ -45,6 +65,7 @@ pub struct Agent {
     cp_down: bool,
     lkg_dir: Option<PathBuf>,
     trust_root: Vec<u8>,
+    bundle_path: Option<PathBuf>,
 }
 
 impl Agent {
@@ -60,6 +81,7 @@ impl Agent {
             cp_down: false,
             lkg_dir: config.lkg_dir,
             trust_root: config.trust_root,
+            bundle_path: config.bundle_path,
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -110,14 +132,16 @@ impl Agent {
         self.cp_down
     }
 
+    pub fn bundle_path(&self) -> Option<&Path> {
+        self.bundle_path.as_deref()
+    }
+
     pub fn restore_last_known_good(&mut self) -> Result<()> {
         let dir = match &self.lkg_dir {
             Some(dir) => dir.clone(),
             None => return Ok(()),
         };
-        let raw_path = dir.join(LKG_RAW);
-        let sig_path = dir.join(LKG_SIG);
-        if !raw_path.exists() && !sig_path.exists() {
+        if !lkg_present(&dir) {
             return Ok(());
         }
         if self.trust_root.is_empty() {
@@ -126,35 +150,15 @@ impl Agent {
                 "LKG present but no pinned trust-root; unsigned FEBP is not applied".into(),
             ));
         }
-        let raw = fs::read(&raw_path).map_err(|e| {
-            self.loader.mark_degraded();
-            FerrumError::Degraded(format!("read LKG raw: {e}"))
-        })?;
-        let sig = fs::read(&sig_path).map_err(|e| {
-            self.loader.mark_degraded();
-            FerrumError::Degraded(format!("read LKG signature: {e}"))
-        })?;
-        let pk_path = dir.join(LKG_PK);
-        if pk_path.exists() {
-            let stored_pk = fs::read(&pk_path).map_err(|e| {
-                self.loader.mark_degraded();
-                FerrumError::Degraded(format!("read LKG public key: {e}"))
-            })?;
-            if stored_pk != self.trust_root {
-                self.loader.mark_degraded();
-                return Err(FerrumError::Integrity(
-                    "LKG public key does not match pinned trust-root".into(),
-                ));
-            }
-        }
-        let digest = match ferrum_crypto::verify_bundle_signature(&raw, &sig, &self.trust_root) {
-            Ok(d) => d,
+        let (bytes, expected) = match read_source_path(&dir) {
+            Ok(v) => v,
             Err(err) => {
                 self.loader.mark_degraded();
                 return Err(err);
             }
         };
-        self.loader.load_bundle(&digest, &raw)
+        // Install only: do not persist back over the snapshot being restored.
+        self.install_verified(&bytes, expected.as_ref()).map(|_| ())
     }
 
     pub fn insert_cgroup(&mut self, inode: u64, identity: WorkloadIdentity) {
@@ -165,34 +169,97 @@ impl Agent {
         self.cgroups.lookup_cgroup(inode)
     }
 
-    /// Verify signature, then digest, then `load_bundle`. On failure the
-    /// previous spec remains. Empty signature is Integrity, never a fake Ok.
-    /// Persists the verified envelope + signature, not inner unsigned FEBP.
-    pub fn apply_bundle(&mut self, raw: &[u8], sig: &[u8], public_key: &[u8]) -> Result<Digest> {
-        let digest = ferrum_crypto::verify_bundle_signature(raw, sig, public_key)?;
-        ferrum_crypto::verify_bundle_digest(raw, &digest)?;
-        if let Err(err) = extract_febp(raw) {
-            self.loader.mark_degraded();
-            return Err(err);
-        }
-        self.loader.load_bundle(&digest, raw)?;
-        if let Err(err) = self.persist_signed(raw, sig, public_key) {
+    /// Verify FSIG with the pinned trust-root, then `load_bundle`. On failure the
+    /// previous spec remains and the agent is Degraded. Empty signature is
+    /// Integrity, never a fake Ok. Persists `bundle.fsig` + UTF-8 hex `digest`
+    /// as one snapshot.
+    pub fn apply_fsig(&mut self, bytes: &[u8], expected_digest: Option<&Digest>) -> Result<Digest> {
+        let digest = self.install_verified(bytes, expected_digest)?;
+        if let Err(err) = self.persist_fsig(bytes, &digest) {
             self.loader.mark_degraded();
             return Err(err);
         }
         Ok(digest)
     }
 
-    fn persist_signed(&self, raw: &[u8], sig: &[u8], public_key: &[u8]) -> Result<()> {
+    /// Load a file or directory mount. Directory `digest` mismatch does not swap.
+    pub fn apply_path(&mut self, path: &Path) -> Result<Digest> {
+        let (bytes, expected) = match read_source_path(path) {
+            Ok(v) => v,
+            Err(err) => {
+                self.loader.mark_degraded();
+                return Err(err);
+            }
+        };
+        self.apply_fsig(&bytes, expected.as_ref())
+    }
+
+    fn install_verified(
+        &mut self,
+        bytes: &[u8],
+        expected_digest: Option<&Digest>,
+    ) -> Result<Digest> {
+        let (raw, digest) = match load_source(bytes, &self.trust_root, expected_digest) {
+            Ok(v) => v,
+            Err(err) => {
+                self.loader.mark_degraded();
+                return Err(err);
+            }
+        };
+        if let Err(err) = extract_febp(&raw) {
+            self.loader.mark_degraded();
+            return Err(err);
+        }
+        self.loader.load_bundle(&digest, &raw)?;
+        Ok(digest)
+    }
+
+    fn persist_fsig(&self, fsig: &[u8], digest: &Digest) -> Result<()> {
         let dir = match &self.lkg_dir {
             Some(dir) => dir,
             None => return Ok(()),
         };
         fs::create_dir_all(dir)
             .map_err(|e| FerrumError::Degraded(format!("create LKG dir: {e}")))?;
-        atomic_write(&dir.join(LKG_RAW), raw)?;
-        atomic_write(&dir.join(LKG_SIG), sig)?;
-        atomic_write(&dir.join(LKG_PK), public_key)?;
+        let snap_name = format!(
+            "..snap-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            LKG_SNAP_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let snap = dir.join(&snap_name);
+        if let Err(err) = write_snap(&snap, fsig, digest) {
+            let _ = fs::remove_dir_all(&snap);
+            return Err(err);
+        }
+        let prev = fs::read_link(dir.join(KUBELET_DATA_DIR)).ok();
+        if let Err(err) = atomic_symlink(dir, KUBELET_DATA_DIR, &snap_name) {
+            let _ = fs::remove_dir_all(&snap);
+            return Err(err);
+        }
+        atomic_symlink(
+            dir,
+            BUNDLE_FSIG_KEY,
+            &format!("{KUBELET_DATA_DIR}/{BUNDLE_FSIG_KEY}"),
+        )?;
+        atomic_symlink(
+            dir,
+            BUNDLE_DIGEST_KEY,
+            &format!("{KUBELET_DATA_DIR}/{BUNDLE_DIGEST_KEY}"),
+        )?;
+        if let Some(prev) = prev {
+            let prev_path = if prev.is_absolute() {
+                prev
+            } else {
+                dir.join(prev)
+            };
+            if prev_path != snap {
+                let _ = fs::remove_dir_all(prev_path);
+            }
+        }
         Ok(())
     }
 
@@ -246,11 +313,63 @@ pub fn apply_role(role: AgentRole, action: Action) -> Action {
     }
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).map_err(|e| FerrumError::Degraded(format!("write LKG: {e}")))?;
-    fs::rename(&tmp, path).map_err(|e| FerrumError::Degraded(format!("rename LKG: {e}")))?;
+/// Watch `path` (file, or directory containing `bundle.fsig` + `digest`).
+/// Uses mtime+len and follows kubelet `..data`; a vanished file keeps last-good.
+pub fn poll_bundle(agent: &mut Agent, path: &Path, interval: Duration) -> ! {
+    // Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
+    // Start with no stamp so a rotation between first load and this thread is not skipped.
+    let mut stamp = None;
+    loop {
+        std::thread::sleep(interval);
+        let Some(next) = source::source_stamp(path) else {
+            continue;
+        };
+        if Some(next) == stamp {
+            continue;
+        }
+        stamp = Some(next);
+        if let Err(err) = agent.apply_path(path) {
+            eprintln!("ferrum-agent: bundle reload failed, keeping last-known-good: {err}");
+        }
+    }
+}
+
+fn lkg_present(dir: &Path) -> bool {
+    dir.join(BUNDLE_FSIG_KEY).exists()
+        || dir.join(BUNDLE_DIGEST_KEY).exists()
+        || dir.join(KUBELET_DATA_DIR).exists()
+}
+
+fn write_snap(snap: &Path, fsig: &[u8], digest: &Digest) -> Result<()> {
+    fs::create_dir_all(snap).map_err(|e| FerrumError::Degraded(format!("create LKG snap: {e}")))?;
+    fs::write(snap.join(BUNDLE_FSIG_KEY), fsig)
+        .map_err(|e| FerrumError::Degraded(format!("write LKG fsig: {e}")))?;
+    fs::write(snap.join(BUNDLE_DIGEST_KEY), digest.as_str().as_bytes())
+        .map_err(|e| FerrumError::Degraded(format!("write LKG digest: {e}")))?;
     Ok(())
+}
+
+fn atomic_symlink(dir: &Path, link_name: &str, target: &str) -> Result<()> {
+    let link = dir.join(link_name);
+    let tmp = dir.join(format!("{link_name}.tmp"));
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp)
+        .map_err(|e| FerrumError::Degraded(format!("symlink LKG {link_name}: {e}")))?;
+    fs::rename(&tmp, link)
+        .map_err(|e| FerrumError::Degraded(format!("rename LKG {link_name}: {e}")))?;
+    Ok(())
+}
+
+#[cfg(test)]
+impl Agent {
+    fn apply_bundle(&mut self, raw: &[u8], sig: &[u8], public_key: &[u8]) -> Result<Digest> {
+        let fsig = encode_fsig(raw, sig, public_key)?;
+        self.apply_fsig(&fsig, None)
+    }
+
+    fn policy_degraded(&self) -> bool {
+        self.loader.is_degraded()
+    }
 }
 
 #[cfg(test)]
@@ -261,12 +380,17 @@ mod tests {
     use ferrum_export::MemorySink;
     use ferrum_ids::AGENT_ABI;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     const SK: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
         0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
         0x7f, 0x60,
+    ];
+    const SK2: [u8; 32] = [
+        0x4c, 0xcd, 0x08, 0x9b, 0x28, 0xff, 0x96, 0xda, 0x9d, 0xb6, 0xc3, 0x46, 0xec, 0x11, 0x4e,
+        0x0f, 0x5b, 0x8a, 0x31, 0x9f, 0x35, 0xab, 0xa6, 0x24, 0xda, 0x8c, 0xf6, 0xed, 0x4f, 0xb8,
+        0xa6, 0xfb,
     ];
 
     struct Writer(Vec<u8>);
@@ -389,6 +513,21 @@ mod tests {
         ferrum_crypto::sign_bundle(raw, &SK).expect("sign")
     }
 
+    fn cfg() -> AgentConfig {
+        AgentConfig {
+            trust_root: pk(),
+            ..Default::default()
+        }
+    }
+
+    fn cfg_respond() -> AgentConfig {
+        AgentConfig {
+            role: AgentRole::Respond,
+            trust_root: pk(),
+            ..Default::default()
+        }
+    }
+
     fn load_signed(agent: &mut Agent, raw: &[u8]) -> Digest {
         agent.apply_bundle(raw, &sign(raw), &pk()).expect("apply")
     }
@@ -440,6 +579,21 @@ mod tests {
         ))
     }
 
+    fn snap_count(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .map(|n| n.starts_with("..snap-"))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     fn assert_integrity<T: std::fmt::Debug>(result: Result<T>) {
         match result {
             Err(FerrumError::Integrity(_)) => {}
@@ -454,6 +608,44 @@ mod tests {
         }
     }
 
+    fn compile_prod_restricted() -> (Vec<u8>, Digest) {
+        let yaml = include_str!("../../../policies/examples/prod-restricted.yaml");
+        let obj: ferrum_api::ClusterSecurityPolicy =
+            serde_yaml::from_str(yaml).expect("example yaml");
+        let compiled = ferrum_compiler::compile_cluster_policy(&obj.spec).expect("compile");
+        let material = ferrum_compiler::bundle_digest_material(
+            AGENT_ABI,
+            ferrum_ids::ADMISSION_ABI,
+            &compiled.admission_program,
+            &compiled.ebpf_spec,
+            &compiled.wasm,
+        )
+        .expect("material");
+        let digest = compiled.digest;
+        (material, digest)
+    }
+
+    fn assert_mvp_actions(agent: &Agent) {
+        assert_eq!(
+            agent
+                .matched_action(&ev("execve", "sh", "/bin/sh", true, false))
+                .action,
+            Action::Kill
+        );
+        assert_eq!(
+            agent
+                .matched_action(&ev("openat", "x", "/run/docker.sock", true, false))
+                .action,
+            Action::Kill
+        );
+        assert_eq!(
+            agent
+                .matched_action(&ev("bpf", "x", "", true, false))
+                .action,
+            Action::Deny
+        );
+    }
+
     #[test]
     fn default_role_is_observe() {
         let agent = Agent::new(AgentConfig::default());
@@ -464,11 +656,19 @@ mod tests {
         assert_eq!(apply_role(AgentRole::Observe, Action::Kill), Action::Audit);
         assert_eq!(apply_role(AgentRole::Respond, Action::Kill), Action::Kill);
         assert_eq!(apply_role(AgentRole::Observe, Action::Deny), Action::Deny);
+        assert_eq!(
+            AgentRole::parse_name("observe").unwrap(),
+            AgentRole::Observe
+        );
+        assert_eq!(
+            AgentRole::parse_name("respond").unwrap(),
+            AgentRole::Respond
+        );
     }
 
     #[test]
     fn unsigned_bundle_is_integrity_and_keeps_lkg() {
-        let mut agent = Agent::new(AgentConfig::default());
+        let mut agent = Agent::new(cfg());
         let good = encode_mvp(AGENT_ABI, Mode::Enforce);
         let digest = load_signed(&mut agent, &good);
         assert_eq!(
@@ -477,6 +677,10 @@ mod tests {
         );
 
         assert_integrity(agent.apply_bundle(&good, &[], &pk()));
+        assert_integrity(agent.apply_fsig(&good, None));
+        assert!(agent.is_degraded());
+        assert!(agent.policy_degraded());
+        assert!(agent.using_last_known_good());
         assert_eq!(
             agent.last_good_digest().map(|d| d.as_str()),
             Some(digest.as_str())
@@ -490,8 +694,26 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_integrity_empty_is_deny() {
+        let mut agent = Agent::new(cfg());
+        let good = encode_mvp(AGENT_ABI, Mode::Enforce);
+        assert_integrity(agent.apply_fsig(&good, None));
+        assert!(!agent.using_last_known_good());
+        assert_eq!(
+            agent
+                .handle_event(
+                    1,
+                    &ev("execve", "sh", "/bin/sh", true, false),
+                    &MemorySink::new()
+                )
+                .action,
+            Action::Deny
+        );
+    }
+
+    #[test]
     fn abi_mismatch_keeps_last_known_good() {
-        let mut agent = Agent::new(AgentConfig::default());
+        let mut agent = Agent::new(cfg());
         let good = encode_mvp(AGENT_ABI, Mode::Enforce);
         let digest = load_signed(&mut agent, &good);
 
@@ -512,7 +734,7 @@ mod tests {
 
     #[test]
     fn control_plane_down_keeps_lkg_not_allow() {
-        let mut agent = Agent::new(AgentConfig::default());
+        let mut agent = Agent::new(cfg());
         let good = encode_mvp(AGENT_ABI, Mode::Enforce);
         load_signed(&mut agent, &good);
         agent.set_role(AgentRole::Respond);
@@ -528,10 +750,7 @@ mod tests {
 
     #[test]
     fn mvp_execve_shell_kill_when_respond() {
-        let mut agent = Agent::new(AgentConfig {
-            role: AgentRole::Respond,
-            ..Default::default()
-        });
+        let mut agent = Agent::new(cfg_respond());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         let sink = MemorySink::new();
         let d = agent.handle_event(7, &ev("execve", "sh", "/bin/sh", true, false), &sink);
@@ -543,10 +762,7 @@ mod tests {
 
     #[test]
     fn mvp_docker_sock_kill_when_respond() {
-        let mut agent = Agent::new(AgentConfig {
-            role: AgentRole::Respond,
-            ..Default::default()
-        });
+        let mut agent = Agent::new(cfg_respond());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         let d = agent.handle_event(
             1,
@@ -559,7 +775,7 @@ mod tests {
 
     #[test]
     fn mvp_bpf_not_agent_deny() {
-        let mut agent = Agent::new(AgentConfig::default());
+        let mut agent = Agent::new(cfg());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         let d = agent.handle_event(
             1,
@@ -577,7 +793,7 @@ mod tests {
 
     #[test]
     fn observe_does_not_execute_kill() {
-        let mut agent = Agent::new(AgentConfig::default());
+        let mut agent = Agent::new(cfg());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         let d = agent.handle_event(
             1,
@@ -595,10 +811,7 @@ mod tests {
 
     #[test]
     fn cgroup_miss_does_not_spoof_pod() {
-        let mut agent = Agent::new(AgentConfig {
-            role: AgentRole::Respond,
-            ..Default::default()
-        });
+        let mut agent = Agent::new(cfg_respond());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         agent.insert_cgroup(10, identity("pod-a"));
         let sink = MemorySink::new();
@@ -614,7 +827,7 @@ mod tests {
 
     #[test]
     fn attach_pins_does_not_pretend() {
-        let mut agent = Agent::new(AgentConfig::default());
+        let mut agent = Agent::new(cfg());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         assert!(!agent.pins_attached());
         match agent.attach_pins() {
@@ -660,24 +873,106 @@ mod tests {
             &compiled.wasm,
         )
         .expect("material");
-        let mut agent = Agent::new(AgentConfig::default());
+        let mut agent = Agent::new(cfg());
         let digest = load_signed(&mut agent, &material);
         assert_eq!(digest, ferrum_crypto::bundle_digest(&material));
+        assert_mvp_actions(&agent);
+    }
+
+    #[test]
+    fn compiler_fsig_of_prod_restricted() {
+        let (material, compiled_digest) = compile_prod_restricted();
+        let fsig = encode_fsig(&material, &sign(&material), &pk()).expect("fsig");
+        let mut agent = Agent::new(cfg());
+        let digest = agent
+            .apply_fsig(&fsig, Some(&compiled_digest))
+            .expect("apply");
+        assert_eq!(digest, compiled_digest);
+        assert_mvp_actions(&agent);
+    }
+
+    #[test]
+    fn matching_dir_loads_mvp_actions() {
+        let good = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let fsig = encode_fsig(&good, &sign(&good), &pk()).expect("fsig");
+        let digest = ferrum_crypto::bundle_digest(&good);
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("tmpdir");
+        fs::write(dir.join(BUNDLE_FSIG_KEY), fsig).expect("bundle.fsig");
+        fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_str().as_bytes()).expect("digest");
+        let mut agent = Agent::new(cfg());
+        agent.apply_path(&dir).expect("dir load");
+        assert_mvp_actions(&agent);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn digest_mismatch_keeps_lkg() {
+        let mut agent = Agent::new(cfg());
+        let good = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let digest = load_signed(&mut agent, &good);
+        let fsig = encode_fsig(&good, &sign(&good), &pk()).expect("fsig");
+        assert_integrity(agent.apply_fsig(&fsig, Some(&Digest::new("00".repeat(32)))));
+        assert!(agent.is_degraded());
+        assert!(agent.policy_degraded());
+        assert!(agent.using_last_known_good());
         assert_eq!(
-            agent
-                .matched_action(&ev("execve", "sh", "/bin/sh", true, false))
-                .action,
-            Action::Kill
+            agent.last_good_digest().map(|d| d.as_str()),
+            Some(digest.as_str())
         );
+        assert_mvp_actions(&agent);
+
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("tmpdir");
+        fs::write(dir.join(BUNDLE_FSIG_KEY), fsig).expect("bundle.fsig");
+        fs::write(dir.join(BUNDLE_DIGEST_KEY), "00".repeat(32).as_bytes()).expect("digest");
+        assert_integrity(agent.apply_path(&dir));
         assert_eq!(
-            agent
-                .matched_action(&ev("openat", "x", "/run/docker.sock", true, false))
-                .action,
-            Action::Kill
+            agent.last_good_digest().map(|d| d.as_str()),
+            Some(digest.as_str())
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_digest_is_integrity() {
+        let good = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let fsig = encode_fsig(&good, &sign(&good), &pk()).expect("fsig");
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("tmpdir");
+        fs::write(dir.join(BUNDLE_FSIG_KEY), fsig).expect("bundle.fsig");
+        let mut agent = Agent::new(cfg());
+        assert_integrity(agent.apply_path(&dir));
+        assert!(!agent.using_last_known_good());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrong_pin_is_integrity() {
+        let mut agent = Agent::new(cfg());
+        let good = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let digest = load_signed(&mut agent, &good);
+        let other_pk = ferrum_crypto::public_key_from_secret(&SK2).expect("pk2");
+        let other_sig = ferrum_crypto::sign_bundle(&good, &SK2).expect("sig2");
+        assert_integrity(agent.apply_bundle(&good, &other_sig, &other_pk));
         assert_eq!(
-            agent
-                .matched_action(&ev("bpf", "x", "", true, false))
+            agent.last_good_digest().map(|d| d.as_str()),
+            Some(digest.as_str())
+        );
+
+        let mut empty = Agent::new(AgentConfig {
+            trust_root: other_pk,
+            ..Default::default()
+        });
+        assert_integrity(empty.apply_bundle(&good, &sign(&good), &pk()));
+        assert!(!empty.using_last_known_good());
+        assert_eq!(
+            empty
+                .handle_event(
+                    1,
+                    &ev("execve", "sh", "/bin/sh", true, false),
+                    &MemorySink::new()
+                )
                 .action,
             Action::Deny
         );
@@ -685,7 +980,7 @@ mod tests {
 
     #[test]
     fn frmb_abi_mismatch_keeps_lkg() {
-        let mut agent = Agent::new(AgentConfig::default());
+        let mut agent = Agent::new(cfg());
         let good = encode_mvp(AGENT_ABI, Mode::Enforce);
         let digest = load_signed(&mut agent, &good);
 
@@ -710,11 +1005,35 @@ mod tests {
     }
 
     #[test]
+    fn abi_too_new_is_degraded() {
+        let mut agent = Agent::new(cfg());
+        let good = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let digest = load_signed(&mut agent, &good);
+        let yaml = include_str!("../../../policies/examples/prod-restricted.yaml");
+        let obj: ferrum_api::ClusterSecurityPolicy =
+            serde_yaml::from_str(yaml).expect("example yaml");
+        let compiled = ferrum_compiler::compile_cluster_policy(&obj.spec).expect("compile");
+        let material = ferrum_compiler::bundle_digest_material(
+            AGENT_ABI.saturating_add(1),
+            ferrum_ids::ADMISSION_ABI,
+            &compiled.admission_program,
+            &compiled.ebpf_spec,
+            &compiled.wasm,
+        )
+        .expect("material");
+        let fsig = encode_fsig(&material, &sign(&material), &pk()).expect("fsig");
+        assert_degraded(agent.apply_fsig(&fsig, None));
+        assert!(agent.using_last_known_good());
+        assert_eq!(
+            agent.last_good_digest().map(|d| d.as_str()),
+            Some(digest.as_str())
+        );
+        assert_mvp_actions(&agent);
+    }
+
+    #[test]
     fn namespaced_selector_skips_unknown_cgroup() {
-        let mut agent = Agent::new(AgentConfig {
-            role: AgentRole::Respond,
-            ..Default::default()
-        });
+        let mut agent = Agent::new(cfg_respond());
         load_signed(&mut agent, &encode_prod_restricted_ebpf(AGENT_ABI));
         let unknown = agent.handle_event(
             99,
@@ -733,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_lkg_restore_requires_trust_root() {
+    fn signed_lkg_restore_from_dir() {
         let dir = temp_lkg();
         fs::create_dir_all(&dir).expect("tmpdir");
         let raw = encode_mvp(AGENT_ABI, Mode::Enforce);
@@ -745,15 +1064,23 @@ mod tests {
             });
             load_signed(&mut agent, &raw);
             assert!(agent.using_last_known_good());
-            assert!(dir.join("lkg.raw").exists());
-            assert!(dir.join("lkg.sig").exists());
+            assert!(dir.join(KUBELET_DATA_DIR).exists());
+            assert!(dir.join(BUNDLE_FSIG_KEY).exists());
+            assert!(dir.join(BUNDLE_DIGEST_KEY).exists());
+            assert!(!dir.join("lkg.raw").exists());
+            assert!(!dir.join("lkg.sig").exists());
+            assert!(!dir.join("lkg.pk").exists());
             assert!(!dir.join("lkg.febp").exists());
         }
+        let snaps_before = snap_count(&dir);
+        assert_eq!(snaps_before, 1);
         let restored = Agent::new(AgentConfig {
             trust_root: pk(),
             lkg_dir: Some(dir.clone()),
             role: AgentRole::Respond,
+            ..Default::default()
         });
+        assert_eq!(snap_count(&dir), snaps_before);
         assert!(restored.using_last_known_good());
         assert_eq!(
             restored
@@ -761,12 +1088,28 @@ mod tests {
                 .action,
             Action::Kill
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
-        let unsigned = Agent::new(AgentConfig {
+    #[test]
+    fn restore_without_pin_and_files_is_degraded() {
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("tmpdir");
+        let raw = encode_mvp(AGENT_ABI, Mode::Enforce);
+        {
+            let mut agent = Agent::new(AgentConfig {
+                trust_root: pk(),
+                lkg_dir: Some(dir.clone()),
+                ..Default::default()
+            });
+            load_signed(&mut agent, &raw);
+        }
+        let mut unsigned = Agent::new(AgentConfig {
             lkg_dir: Some(dir.clone()),
             ..Default::default()
         });
         assert!(!unsigned.using_last_known_good());
+        assert_degraded(unsigned.restore_last_known_good());
         assert_eq!(
             unsigned
                 .handle_event(
@@ -781,9 +1124,53 @@ mod tests {
     }
 
     #[test]
+    fn vanished_mount_keeps_lkg() {
+        let mut agent = Agent::new(cfg());
+        let good = encode_mvp(AGENT_ABI, Mode::Enforce);
+        load_signed(&mut agent, &good);
+        let missing = temp_lkg().join("gone");
+        assert_integrity(agent.apply_path(&missing));
+        assert!(agent.using_last_known_good());
+        assert_mvp_actions(&agent);
+    }
+
+    #[test]
     fn drops_surface() {
         let agent = Agent::new(AgentConfig::default());
         agent.record_drop(2);
         assert_eq!(agent.events_dropped_total(), 2);
+    }
+
+    #[test]
+    fn cargo_toml_forbids_hot_path_deps() {
+        let toml = include_str!("../Cargo.toml");
+        let deps = toml
+            .split("[dev-dependencies]")
+            .next()
+            .expect("split dev")
+            .split("[dependencies]")
+            .nth(1)
+            .expect("dependencies");
+        for forbidden in [
+            "kube",
+            "tokio",
+            "aya",
+            "serde_yaml",
+            "ferrum-compiler",
+            "ferrum-admission",
+            "ferrum-controller",
+        ] {
+            for line in deps.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+                    continue;
+                }
+                let name = line.split([' ', '=', '\t']).next().unwrap_or("").trim();
+                assert_ne!(
+                    name, forbidden,
+                    "{forbidden} must not appear in [dependencies]"
+                );
+            }
+        }
     }
 }
