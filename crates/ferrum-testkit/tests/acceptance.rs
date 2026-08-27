@@ -18,7 +18,8 @@ use ferrum_export::MemorySink;
 use ferrum_ids::{Digest, ADMISSION_ABI, AGENT_ABI};
 use ferrum_k8smeta::WorkloadIdentity;
 use ferrum_testkit::{
-    exception_ok, prod_restricted, try_exception_from_yaml, EXCEPTION_WITHOUT_TTL_YAML,
+    exception_ok, prod_restricted, try_exception_from_yaml, AcceptanceCase,
+    EXCEPTION_WITHOUT_TTL_YAML,
 };
 use std::path::PathBuf;
 
@@ -109,6 +110,48 @@ fn temp_lkg() -> PathBuf {
             .expect("time")
             .as_nanos()
     ))
+}
+
+/// Which test carries which §D case, checked against the shared case list
+/// rather than against prose. The entries are the real test functions, so a
+/// case whose test is renamed away stops compiling, and a case added to
+/// `AcceptanceCase` fails this gate until something here covers it. The
+/// functions are not called: `#[test]` already runs each exactly once.
+#[test]
+fn every_acceptance_case_has_a_test() {
+    let covered: [(AcceptanceCase, fn()); 8] = [
+        (AcceptanceCase::UnsignedDeny, unsigned_image_is_denied),
+        (AcceptanceCase::PrivilegedDeny, privileged_pod_is_denied),
+        (
+            AcceptanceCase::ClusterAdminBindDeny,
+            cluster_admin_bind_is_denied,
+        ),
+        (
+            AcceptanceCase::ExceptionWithoutTtlReject,
+            exception_without_ttl_is_rejected_and_scoped_exception_waives,
+        ),
+        (
+            AcceptanceCase::ExecShellKill,
+            exec_shell_in_container_is_killed,
+        ),
+        (AcceptanceCase::DockerSockKill, docker_sock_access_is_killed),
+        (
+            AcceptanceCase::BpfNotFromAgentDeny,
+            bpf_not_from_agent_is_denied,
+        ),
+        (
+            AcceptanceCase::ControlPlaneDownLkg,
+            cp_down_keeps_last_known_good_not_fail_open,
+        ),
+    ];
+    for case in AcceptanceCase::ALL {
+        assert_eq!(
+            covered.iter().filter(|(c, _)| c == case).count(),
+            1,
+            "no acceptance test registered for §D case: {}",
+            case.label()
+        );
+    }
 }
 
 #[test]

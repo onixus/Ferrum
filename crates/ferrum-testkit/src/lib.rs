@@ -118,6 +118,68 @@ fn decode<T: DeserializeOwned>(yaml: &str) -> T {
     serde_yaml::from_str(yaml).expect("fixture yaml")
 }
 
+/// Which plane decides a case. Nothing that never reaches the ring can be
+/// replayed, so the split is what lets the replay harness gate its own subset
+/// without hand-copying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptancePlane {
+    Admission,
+    Runtime,
+}
+
+/// Declares the §D case list once and derives everything from it. A variant
+/// that exists but is not in `ALL` is unrepresentable: both come from the same
+/// invocation, so a case cannot be added to the enum and forgotten by a gate.
+macro_rules! acceptance_cases {
+    ($($variant:ident => ($plane:ident, $label:literal),)+) => {
+        /// The RFC §D MVP-1 acceptance cases, as one source both the
+        /// acceptance suite and the replay harness gate themselves against.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum AcceptanceCase {
+            $($variant,)+
+        }
+
+        impl AcceptanceCase {
+            pub const ALL: &'static [AcceptanceCase] = &[$(AcceptanceCase::$variant,)+];
+
+            pub fn plane(self) -> AcceptancePlane {
+                match self {
+                    $(AcceptanceCase::$variant => AcceptancePlane::$plane,)+
+                }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(AcceptanceCase::$variant => $label,)+
+                }
+            }
+        }
+    };
+}
+
+acceptance_cases! {
+    UnsignedDeny => (Admission, "unsigned image -> deny"),
+    PrivilegedDeny => (Admission, "privileged -> deny"),
+    ClusterAdminBindDeny => (Admission, "cluster-admin bind -> deny"),
+    ExceptionWithoutTtlReject => (Admission, "exception without TTL -> API reject"),
+    ExecShellKill => (Runtime, "kubectl exec + /bin/sh -> kill"),
+    DockerSockKill => (Runtime, "docker.sock -> kill"),
+    BpfNotFromAgentDeny => (Runtime, "bpf() not from the agent -> deny"),
+    ControlPlaneDownLkg => (Runtime, "CP down -> last-known-good"),
+}
+
+impl AcceptanceCase {
+    /// The subset a ring record can carry, i.e. what the replay harness must
+    /// cover. The admission cases produce no record and cannot be replayed.
+    pub fn runtime() -> Vec<AcceptanceCase> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|c| c.plane() == AcceptancePlane::Runtime)
+            .collect()
+    }
+}
+
 fn fixture_trust_roots() -> Vec<TrustRoot> {
     vec![TrustRoot {
         name: "org-cosign".into(),
@@ -449,5 +511,18 @@ mod tests {
             let back: ClusterSecurityPolicySpec = serde_yaml::from_str(&yaml).expect("roundtrip");
             assert_eq!(spec, back);
         }
+    }
+
+    /// The case list is the gate both suites measure themselves against, so a
+    /// silent shrink here would weaken them without failing anything.
+    #[test]
+    fn the_rfc_d_case_list_is_the_eight_mvp_cases() {
+        assert_eq!(AcceptanceCase::ALL.len(), 8);
+        assert_eq!(AcceptanceCase::runtime().len(), 4);
+        let mut labels: Vec<&str> = AcceptanceCase::ALL.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "two cases share a label");
     }
 }

@@ -16,60 +16,37 @@ use common::{
 use ferrum_agent::{pump_records, PumpStats, REFUSE_DENY_NOT_ENFORCEABLE};
 use ferrum_ebpf::{SyscallArch, EVENT_WIRE_LEN, SYSCALL_UNKNOWN};
 use ferrum_export::MemorySink;
+use ferrum_testkit::AcceptanceCase;
 use std::path::PathBuf;
 
 const ARCHES: [SyscallArch; 2] = [SyscallArch::X86_64, SyscallArch::Aarch64];
 
-/// The RFC §D acceptance cases this plane decides. Admission's four cases are
-/// gated in `acceptance.rs`; nothing here can replay them, since they never
-/// produce a ring record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeCase {
-    ExecShellKill,
-    DockerSockKill,
-    BpfNotFromAgentDeny,
-    ControlPlaneDownLkg,
-}
-
-impl RuntimeCase {
-    const ALL: [RuntimeCase; 4] = [
-        RuntimeCase::ExecShellKill,
-        RuntimeCase::DockerSockKill,
-        RuntimeCase::BpfNotFromAgentDeny,
-        RuntimeCase::ControlPlaneDownLkg,
-    ];
-
-    fn label(self) -> &'static str {
-        match self {
-            RuntimeCase::ExecShellKill => "kubectl exec + /bin/sh -> kill",
-            RuntimeCase::DockerSockKill => "docker.sock -> kill",
-            RuntimeCase::BpfNotFromAgentDeny => "bpf() not from the agent -> deny",
-            RuntimeCase::ControlPlaneDownLkg => "CP down -> last-known-good",
-        }
-    }
-}
-
+/// The case list is `ferrum_testkit::AcceptanceCase`, shared with
+/// `acceptance.rs`, not a copy in this file: a §D case added to the RFC has to
+/// break this gate rather than slip past a hand-written array. Admission's
+/// four cases are gated only in `acceptance.rs`; nothing here can replay them,
+/// since they never produce a ring record.
 struct Scenario {
-    case: RuntimeCase,
+    case: AcceptanceCase,
     run: fn(SyscallArch),
 }
 
 fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
-            case: RuntimeCase::ExecShellKill,
+            case: AcceptanceCase::ExecShellKill,
             run: replay_exec_shell_kill,
         },
         Scenario {
-            case: RuntimeCase::DockerSockKill,
+            case: AcceptanceCase::DockerSockKill,
             run: replay_docker_sock_kill,
         },
         Scenario {
-            case: RuntimeCase::BpfNotFromAgentDeny,
+            case: AcceptanceCase::BpfNotFromAgentDeny,
             run: replay_bpf_not_from_agent_deny,
         },
         Scenario {
-            case: RuntimeCase::ControlPlaneDownLkg,
+            case: AcceptanceCase::ControlPlaneDownLkg,
             run: replay_control_plane_down_lkg,
         },
     ]
@@ -79,10 +56,11 @@ fn scenarios() -> Vec<Scenario> {
 /// a missing scenario looks exactly like a passing suite.
 #[test]
 fn every_runtime_acceptance_case_has_a_replay_scenario() {
-    let registered: Vec<RuntimeCase> = scenarios().into_iter().map(|s| s.case).collect();
-    for case in RuntimeCase::ALL {
+    let registered: Vec<AcceptanceCase> = scenarios().into_iter().map(|s| s.case).collect();
+    let expected = AcceptanceCase::runtime();
+    for case in &expected {
         assert_eq!(
-            registered.iter().filter(|c| **c == case).count(),
+            registered.iter().filter(|c| *c == case).count(),
             1,
             "no replay scenario registered for §D case: {}",
             case.label()
@@ -90,8 +68,8 @@ fn every_runtime_acceptance_case_has_a_replay_scenario() {
     }
     assert_eq!(
         registered.len(),
-        RuntimeCase::ALL.len(),
-        "a scenario names a case that is not in §D"
+        expected.len(),
+        "a scenario names a case that is not a §D runtime case"
     );
 }
 
@@ -274,6 +252,53 @@ fn replay_control_plane_down_lkg(arch: SyscallArch) {
     assert_eq!(killed_tgids(&killed_after), vec![TGID_WORKLOAD]);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A path longer than the datapath's buffer, through the real `encode_event`:
+/// the workload opened `/var/run/` + `./` * 130 + `docker.sock`, the buffer
+/// kept only the head, and `ends_with("docker.sock")` is false on what
+/// arrived. The builder sets the truncation flag the way the datapath does,
+/// from the length alone, so the kill rule still fires and the node goes
+/// Degraded.
+///
+/// The second half is the regression anchor: the same bytes with the flag
+/// cleared are a record the kernel cannot produce, and they are then
+/// indistinguishable from an honest short path — merely audited. That is the
+/// bypass the flag closes, so the pair must disagree.
+#[test]
+fn a_truncated_docker_sock_path_still_kills_and_degrades() {
+    let long = format!("/var/run/{}docker.sock", "./".repeat(130));
+    for arch in ARCHES {
+        let (agent, killed) = replay_agent(None);
+        assert!(!agent.datapath_degraded());
+        let sink = MemorySink::new();
+        let record = open_path("openat", &long).build(arch);
+        let stats = pump_records(&agent, arch, vec![record], &sink);
+        assert_eq!(stats.handled, 1, "{}", arch.as_str());
+
+        let events = sink.events();
+        assert_eq!(events[0].action, "kill", "{}", arch.as_str());
+        assert_eq!(events[0].rule.as_str(), "no-runtime-sock");
+        assert!(events[0].executed, "{:?}", events[0].respond_error);
+        assert_eq!(killed_tgids(&killed), vec![TGID_WORKLOAD]);
+        assert_eq!(agent.path_truncated_total(), 1);
+        assert!(agent.path_truncated_recent());
+        assert!(
+            agent.datapath_degraded(),
+            "a path the buffer could not hold is not a proven verdict"
+        );
+        assert!(agent.is_degraded());
+
+        let (clean, unharmed) = replay_agent(None);
+        let quiet = MemorySink::new();
+        let honest = open_path("openat", &long).path_truncated(false).build(arch);
+        pump_records(&clean, arch, vec![honest], &quiet);
+        assert_ne!(quiet.events()[0].action, "kill", "{}", arch.as_str());
+        assert!(killed_tgids(&unharmed).is_empty());
+        assert_eq!(clean.path_truncated_total(), 0);
+        assert!(!clean.path_truncated_recent());
+        assert!(!clean.datapath_degraded());
+    }
 }
 
 /// The flag, not the comm string, is what keeps the agent from acting on its
