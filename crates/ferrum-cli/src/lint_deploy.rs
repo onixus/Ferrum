@@ -29,6 +29,22 @@ const PRIVILEGE_ESCALATION: &str = "FD012";
 const CAPABILITIES_NOT_DROPPED: &str = "FD013";
 const MISSING_SERVICE_ACCOUNT: &str = "FD014";
 const MISSING_CRD: &str = "FD015";
+const UNRESOLVED_ROLE_REF: &str = "FD016";
+const AGGREGATED_ROLE: &str = "FD017";
+const RESPOND_WITHOUT_HOST_PID: &str = "FD018";
+const UNNEEDED_HOST_PID: &str = "FD019";
+
+/// roleRef targets that are not in this tree and that we still accept: the API
+/// server creates them itself, and both are narrow enough that binding one is
+/// not a grant this lint can improve on. `system:auth-delegator` only allows
+/// TokenReview/SubjectAccessReview; the reader Role only reads one ConfigMap in
+/// kube-system. Anything else unresolved is a finding — `admin`, `edit` and
+/// `system:*` are built-ins too, and binding them is exactly the overreach the
+/// rules below look for.
+const ALLOWED_EXTERNAL_ROLE_REFS: [&str; 2] = [
+    "ClusterRole/system:auth-delegator",
+    "Role/extension-apiserver-authentication-reader",
+];
 
 /// A hostPath that hands the node's container runtime or kubelet to the pod.
 /// This is the escape route FERRUM itself kills at runtime.
@@ -58,6 +74,19 @@ struct Doc {
 }
 
 pub fn lint_deploy_dir(dir: &Path) -> Result<()> {
+    let (findings, manifests) = collect_findings(dir)?;
+
+    if findings.is_empty() {
+        println!("ok: {} ({manifests} manifests)", dir.display());
+        return Ok(());
+    }
+    for f in &findings {
+        eprintln!("{} {}: {}", f.code, f.file, f.msg);
+    }
+    bail!("{} deploy invariant(s) violated", findings.len());
+}
+
+fn collect_findings(dir: &Path) -> Result<(Vec<Finding>, usize)> {
     let docs = load_docs(dir)?;
     if docs.is_empty() {
         bail!("{}: no YAML manifests found", dir.display());
@@ -70,15 +99,7 @@ pub fn lint_deploy_dir(dir: &Path) -> Result<()> {
     check_pod_templates(&docs, &mut findings);
     check_webhooks(&docs, &mut findings);
     check_crd_catalog(dir, &mut findings);
-
-    if findings.is_empty() {
-        println!("ok: {} ({} manifests)", dir.display(), docs.len());
-        return Ok(());
-    }
-    for f in &findings {
-        eprintln!("{} {}: {}", f.code, f.file, f.msg);
-    }
-    bail!("{} deploy invariant(s) violated", findings.len());
+    Ok((findings, docs.len()))
 }
 
 fn load_docs(dir: &Path) -> Result<Vec<Doc>> {
@@ -211,7 +232,18 @@ fn check_bindings(docs: &[Doc], roles: &BTreeMap<String, &Value>, findings: &mut
             if !subject.contains("observe") {
                 continue;
             }
-            let Some(role) = roles.get(&format!("{ref_kind}/{ref_name}")) else {
+            let key = format!("{ref_kind}/{ref_name}");
+            let Some(role) = roles.get(&key) else {
+                if !ALLOWED_EXTERNAL_ROLE_REFS.contains(&key.as_str()) {
+                    findings.push(Finding {
+                        code: UNRESOLVED_ROLE_REF,
+                        file: doc.file.clone(),
+                        msg: format!(
+                            "observe ServiceAccount '{subject}' is bound to {key}, which this tree \
+                             does not define; the grant cannot be checked, so it is not allowed"
+                        ),
+                    });
+                }
                 continue;
             };
             for rule in seq(role, "rules") {
@@ -249,6 +281,17 @@ fn check_wildcard_rules(docs: &[Doc], findings: &mut Vec<Finding>) {
         let k = kind(doc);
         if k != "Role" && k != "ClusterRole" {
             continue;
+        }
+        if doc.value.get("aggregationRule").is_some() {
+            findings.push(Finding {
+                code: AGGREGATED_ROLE,
+                file: doc.file.clone(),
+                msg: format!(
+                    "{k}/{} has an aggregationRule; the controller fills its rules from labelled \
+                     roles at runtime, so what this file grants is not what the cluster grants",
+                    name(doc)
+                ),
+            });
         }
         for rule in seq(&doc.value, "rules") {
             let verbs = str_list(rule, "verbs");
@@ -331,12 +374,60 @@ fn check_pod_templates(docs: &[Doc], findings: &mut Vec<Finding>) {
             }
         }
 
+        check_host_pid(doc, &owner, spec, findings);
+
         for key in ["initContainers", "containers"] {
             for container in seq(spec, key) {
                 check_container(doc, &owner, container, findings);
             }
         }
     }
+}
+
+/// `bpf_get_current_pid_tgid()` reports the tgid of the initial pid namespace.
+/// A responder that is not in that namespace would resolve the number against
+/// its own namespace and signal an unrelated process, so respond needs
+/// `hostPID: true` — and nothing else does, because host pid namespace also
+/// hands every other process on the node to whoever gets into this container.
+fn check_host_pid(doc: &Doc, owner: &str, spec: &Value, findings: &mut Vec<Finding>) {
+    let host_pid = spec.get("hostPID").and_then(Value::as_bool) == Some(true);
+    let respond = runs_respond(spec);
+    if respond && !host_pid {
+        findings.push(Finding {
+            code: RESPOND_WITHOUT_HOST_PID,
+            file: doc.file.clone(),
+            msg: format!(
+                "{owner} runs the agent with --role respond but not hostPID: true; kill would \
+                 address a pid in the container's own namespace, not the one the kernel reported"
+            ),
+        });
+    }
+    if !respond && host_pid {
+        findings.push(Finding {
+            code: UNNEEDED_HOST_PID,
+            file: doc.file.clone(),
+            msg: format!(
+                "{owner} sets hostPID: true without --role respond; that exposes every process on \
+                 the node for a capability this pod does not use"
+            ),
+        });
+    }
+}
+
+fn runs_respond(spec: &Value) -> bool {
+    seq(spec, "containers")
+        .iter()
+        .chain(seq(spec, "initContainers"))
+        .any(|c| {
+            let argv: Vec<String> = ["command", "args"]
+                .iter()
+                .flat_map(|key| str_list(c, key))
+                .collect();
+            argv.iter().any(|a| a == "--role=respond")
+                || argv
+                    .windows(2)
+                    .any(|w| w[0] == "--role" && w[1] == "respond")
+        })
 }
 
 fn check_container(doc: &Doc, owner: &str, container: &Value, findings: &mut Vec<Finding>) {
@@ -578,6 +669,91 @@ mod tests {
         let err = lint_deploy_dir(&repo_path("crates/ferrum-testkit/fixtures/deploy-bad"))
             .expect_err("deploy-bad/ must fail");
         assert!(err.to_string().contains("violated"), "{err}");
+    }
+
+    /// Each negative tree exists for one rule. Asserting the exact code keeps a
+    /// fixture from passing the gate on an unrelated finding.
+    fn codes_for(fixture: &str) -> BTreeSet<String> {
+        let (findings, _) = collect_findings(&repo_path(fixture)).expect("lint fixture");
+        assert!(!findings.is_empty(), "{fixture} produced no finding");
+        findings.iter().map(|f| f.code.to_string()).collect()
+    }
+
+    #[test]
+    fn unresolvable_role_ref_is_a_finding() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-roleref");
+        assert_eq!(
+            codes,
+            ["FD016"]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn aggregated_role_is_a_finding() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-aggregation");
+        assert_eq!(
+            codes,
+            ["FD017"]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn host_pid_must_match_the_role() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-hostpid");
+        assert_eq!(
+            codes,
+            ["FD018", "FD019"]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn allowlisted_external_role_ref_is_not_a_finding() {
+        let docs = vec![Doc {
+            file: "rbac.yaml".into(),
+            base: true,
+            value: serde_yaml::from_str(
+                r#"
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-agent-observe-auth
+roleRef:
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-agent-observe
+"#,
+            )
+            .unwrap(),
+        }];
+        let roles = collect_roles(&docs);
+        let mut findings = Vec::new();
+        check_bindings(&docs, &roles, &mut findings);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn respond_role_is_read_from_either_flag_spelling() {
+        for args in [r#"["--role", "respond"]"#, r#"["--role=respond"]"#] {
+            let spec: Value =
+                serde_yaml::from_str(&format!("containers:\n  - name: agent\n    args: {args}\n"))
+                    .unwrap();
+            assert!(runs_respond(&spec), "{args}");
+        }
+        let observe: Value = serde_yaml::from_str(
+            "containers:\n  - name: agent\n    args: [\"--role\", \"observe\"]\n",
+        )
+        .unwrap();
+        assert!(!runs_respond(&observe));
     }
 
     #[test]
