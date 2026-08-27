@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-controller
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-controller
+    app.kubernetes.io/part-of: ferrum
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-controller
+        app.kubernetes.io/part-of: ferrum
+    spec:
+      serviceAccountName: ferrum-controller
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: ghcr.io/ferrum/ferrum-controller:v0.1.0
+          args:
+            - run
+            - --seed-file
+            - /etc/ferrum/signing/seed
+            - --namespace
+            - ferrum
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: signing-key
+              mountPath: /etc/ferrum/signing
+              readOnly: true
+      volumes:
+        # The bundle signing key. Whoever reads this Secret can sign policy, so
+        # it is mounted nowhere else in this tree.
+        - name: signing-key
+          secret:
+            secretName: ferrum-signing-key
+            defaultMode: 0400

@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ferrum
+  labels:
+    kubernetes.io/metadata.name: ferrum
+    app.kubernetes.io/part-of: ferrum
+    # The webhook must never gate its own namespace: a cluster restart would
+    # deadlock on the admission Pod that has not started yet.
+    ferrum.io/webhook-exempt: "true"

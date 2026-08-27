@@ -1,0 +1,72 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-controller
+  labels:
+    app.kubernetes.io/part-of: ferrum
+rules:
+  - apiGroups: ["ferrum.io"]
+    resources:
+      - clustersecuritypolicies
+      - securitypolicies
+      - policyexceptions
+      - policylibraries
+      - runtimeprofiles
+      - ferrumclusters
+      - compliancesnapshots
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["ferrum.io"]
+    resources:
+      - clustersecuritypolicies/status
+      - securitypolicies/status
+      - policyexceptions/status
+      - policylibraries/status
+      - runtimeprofiles/status
+      - ferrumclusters/status
+      - compliancesnapshots/status
+    verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-controller
+  labels:
+    app.kubernetes.io/part-of: ferrum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-controller
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-controller
+    namespace: ferrum
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ferrum-controller-bundles
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/part-of: ferrum
+rules:
+  # Signed bundle Secrets live only here. Cluster-wide Secret access would make
+  # the controller a credential oracle for the whole cluster.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ferrum-controller-bundles
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/part-of: ferrum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ferrum-controller-bundles
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-controller
+    namespace: ferrum

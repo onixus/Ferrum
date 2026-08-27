@@ -1,0 +1,8 @@
+Pin path /sys/fs/bpf/ferrum is writable by root on the node. Protecting it
+requires BPF-LSM or an AppArmor profile applied on the node itself.
+These manifests do not provide that and cannot: root on the node is not a
+threat Kubernetes objects can fence off.
+
+Base install binds only ferrum-agent-observe. Respond stays inert until
+optional-respond.yaml is applied and the DaemonSet is switched to
+--role respond with serviceAccountName ferrum-agent-respond.
