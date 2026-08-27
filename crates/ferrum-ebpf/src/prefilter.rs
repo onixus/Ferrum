@@ -237,19 +237,42 @@ mod tests {
         assert!(!image.drop_agent_self);
     }
 
+    /// The rules of `policies/examples/prod-restricted.yaml`, hand-built
+    /// because this crate may not carry `serde_yaml`. `ferrum-testkit`'s
+    /// deploy gate derives the same image from the real compiled bundle, so
+    /// the copy cannot drift from the shipped policy unnoticed.
+    ///
+    /// The default action is the one deliberate departure: the shipped policy
+    /// defaults to `audit`, which on its own makes every event mandatory and
+    /// would answer the question before the rules are read. `Allow` here so
+    /// the image measures what the three rules alone require.
     #[test]
-    fn prod_restricted_shape_keeps_module_and_path_syscalls() {
-        let mut sock = rule("no-runtime-sock", &[], Action::Kill);
-        sock.path_suffix = vec!["docker.sock".into()];
+    fn prod_restricted_rules_keep_module_and_path_syscalls() {
         let mut shell = rule("no-shell", &["execve", "execveat"], Action::Kill);
+        shell.comm_in = ["sh", "bash", "ash", "dash", "zsh"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         shell.container_only = true;
+        let mut sock = rule("no-runtime-sock", &[], Action::Kill);
+        sock.path_suffix = ["docker.sock", "containerd.sock", "crio.sock"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        sock.container_only = true;
+        // audit, not deny: the runtime plane cannot un-run a syscall a
+        // tracepoint reports after it has already happened.
         let mut module = rule(
             "no-module",
             &["init_module", "finit_module", "bpf"],
-            Action::Deny,
+            Action::Audit,
         );
         module.not_agent_self = true;
         let image = prefilter_image(&spec(Action::Allow, vec![shell, sock, module]));
+        // The three rules between them still name every hooked syscall, and
+        // the flags stay off because `no-module` carries neither: this
+        // derivation cannot narrow the shipped policy at all. Narrowing needs
+        // a per-syscall image, which is not this cycle's work.
         assert_eq!(image.observed_syscalls(), DATAPATH_SYSCALLS.to_vec());
         assert!(!image.container_only);
         assert!(!image.drop_agent_self);
