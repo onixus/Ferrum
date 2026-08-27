@@ -28,5 +28,13 @@ offline command.
 
        kubectl apply -f deploy/admission/validatingwebhookconfiguration.yaml
 
+Build features
+==============
+
+deployment.yaml passes --apiserver, so the image must be built with the
+`apiserver` feature: without it the binary refuses that flag and exits. Drop
+the flag only if you accept that every policy carrying a namespace or
+ServiceAccount selector denies each Pod it selects.
+
 Rotation is not this command's job. Re-run step 1 into a clean directory before
 the certificate expires and re-apply steps 2 and 3.

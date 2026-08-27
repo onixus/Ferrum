@@ -51,6 +51,9 @@ spec:
             - /etc/ferrum/tls/tls.crt
             - --tls-key
             - /etc/ferrum/tls/tls.key
+            # Without this the namespace/SA label cache stays cold, and a
+            # policy carrying a namespaceSelector denies every Pod.
+            - --apiserver
           env:
             - name: FERRUM_TRUST_ROOT
               valueFrom:
