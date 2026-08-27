@@ -41,6 +41,10 @@ pub struct GenPkiArgs {
     /// Rotation: reuse this CA instead of issuing one. Both halves or neither.
     pub ca_cert: Option<PathBuf>,
     pub ca_key: Option<PathBuf>,
+    /// Rotation: the ValidatingWebhookConfiguration that is applied in the
+    /// cluster. Its caBundle is the only statement of which CA the cluster
+    /// trusts; without it `--ca-cert` means nothing more than "a CA".
+    pub webhook_config: Option<PathBuf>,
 }
 
 pub fn gen_webhook_pki(args: &GenPkiArgs) -> Result<()> {
@@ -83,9 +87,7 @@ pub fn gen_webhook_pki(args: &GenPkiArgs) -> Result<()> {
     // untouched. A rendered configuration that already trusts a different CA
     // would keep rejecting the new leaf, so refuse before writing anything.
     if rotating {
-        for dir in ca_dir(args).iter().chain(args.out_dir.iter()) {
-            rendered_ca_bundle_matches(dir, &ca_bundle)?;
-        }
+        require_applied_ca_bundle(args, &ca_bundle)?;
     }
 
     match &args.out_dir {
@@ -158,19 +160,51 @@ fn reusable_ca(cert_path: &Path, key_path: &Path, days: u64) -> Result<CaMateria
     Ok(ca)
 }
 
-/// A rendered configuration in `dir` must already trust `ca_bundle`; a missing
-/// file is not a finding, the operator may keep it elsewhere.
-fn rendered_ca_bundle_matches(dir: &Path, ca_bundle: &str) -> Result<()> {
-    let path = dir.join(WEBHOOK_RENDERED_FILE);
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return Ok(());
-    };
+/// Rotation is only safe against the CA the *cluster* trusts, and the applied
+/// ValidatingWebhookConfiguration is the only place that says which one that
+/// is. `--ca-cert` alone proves nothing: it names whatever CA file was passed.
+///
+/// The README rotates into an empty directory, so there is usually no rendered
+/// configuration lying next to either path — that case is refused rather than
+/// silently skipped, and `--webhook-config` is how the operator answers it.
+fn require_applied_ca_bundle(args: &GenPkiArgs, ca_bundle: &str) -> Result<()> {
+    if let Some(path) = &args.webhook_config {
+        return rendered_ca_bundle_matches(path, ca_bundle);
+    }
+    let mut checked = false;
+    for dir in ca_dir(args).iter().chain(args.out_dir.iter()) {
+        let path = dir.join(WEBHOOK_RENDERED_FILE);
+        if !path.is_file() {
+            continue;
+        }
+        rendered_ca_bundle_matches(&path, ca_bundle)?;
+        checked = true;
+    }
+    if !checked {
+        bail!(
+            "no applied ValidatingWebhookConfiguration to check --ca-cert against: pass \
+             --webhook-config <the {WEBHOOK_RENDERED_FILE} that is applied in the cluster>. \
+             Rotating a leaf under a CA the cluster does not trust leaves the API server \
+             rejecting every handshake, and with failurePolicy: Fail that stops Pod creation \
+             cluster-wide"
+        );
+    }
+    Ok(())
+}
+
+/// The rendered configuration at `path` must already trust `ca_bundle`.
+fn rendered_ca_bundle_matches(path: &Path, ca_bundle: &str) -> Result<()> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read applied webhook configuration {}", path.display()))?;
     let Some(current) = raw
         .lines()
         .find_map(|l| l.trim().strip_prefix("caBundle:"))
         .map(str::trim)
     else {
-        return Ok(());
+        bail!(
+            "{}: carries no caBundle, so it cannot say which CA the cluster trusts",
+            path.display()
+        );
     };
     if current != ca_bundle {
         bail!(
@@ -334,6 +368,7 @@ mod tests {
             template: None,
             ca_cert: None,
             ca_key: None,
+            webhook_config: None,
         }
     }
 
@@ -501,6 +536,73 @@ mod tests {
         assert!(err.to_string().contains("caBundle is not the CA"), "{err}");
         fs::remove_dir_all(&mine).ok();
         fs::remove_dir_all(&other).ok();
+    }
+
+    /// The README's own rotation goes into an empty directory. If nothing there
+    /// states which CA the cluster trusts, "rotate under the right CA" is not
+    /// checked at all — so the command has to say so instead of proceeding.
+    #[test]
+    fn rotation_without_an_applied_configuration_is_refused() {
+        let dir = temp_dir("rotate-no-config");
+        seed(&dir);
+        gen_webhook_pki(&args(Some(dir.clone()))).unwrap();
+        // The operator keeps the applied configuration elsewhere, as step 3
+        // applied it and step 1's output was moved out of the tree.
+        fs::remove_file(dir.join(WEBHOOK_RENDERED_FILE)).unwrap();
+
+        let out = dir.join("rotated");
+        fs::create_dir_all(&out).unwrap();
+        let err = gen_webhook_pki(&rotation_args(&dir, Some(out.clone()), 365))
+            .expect_err("an unchecked CA must not be rotated under");
+        assert!(err.to_string().contains("--webhook-config"), "{err}");
+        assert!(
+            !out.join("ferrum-admission-tls.secret.yaml").exists(),
+            "nothing may be written before the CA is checked"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_explicit_webhook_config_decides_which_ca_is_trusted() {
+        let mine = temp_dir("rotate-explicit-mine");
+        seed(&mine);
+        gen_webhook_pki(&args(Some(mine.clone()))).unwrap();
+        let other = temp_dir("rotate-explicit-other");
+        seed(&other);
+        gen_webhook_pki(&args(Some(other.clone()))).unwrap();
+        let applied = mine.join(WEBHOOK_RENDERED_FILE);
+
+        let out = mine.join("rotated");
+        fs::create_dir_all(&out).unwrap();
+        let mut ok = rotation_args(&mine, Some(out.clone()), 365);
+        ok.webhook_config = Some(applied.clone());
+        gen_webhook_pki(&ok).expect("the CA the applied configuration trusts");
+
+        let out2 = other.join("rotated");
+        fs::create_dir_all(&out2).unwrap();
+        let mut wrong = rotation_args(&other, Some(out2), 365);
+        wrong.webhook_config = Some(applied);
+        let err = gen_webhook_pki(&wrong).expect_err("a CA the cluster does not trust");
+        assert!(err.to_string().contains("caBundle is not the CA"), "{err}");
+        fs::remove_dir_all(&mine).ok();
+        fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn a_webhook_config_without_a_ca_bundle_is_refused() {
+        let dir = temp_dir("rotate-empty-config");
+        seed(&dir);
+        gen_webhook_pki(&args(Some(dir.clone()))).unwrap();
+        let applied = dir.join("applied.yaml");
+        fs::write(&applied, "kind: ValidatingWebhookConfiguration\n").unwrap();
+
+        let out = dir.join("rotated");
+        fs::create_dir_all(&out).unwrap();
+        let mut a = rotation_args(&dir, Some(out), 365);
+        a.webhook_config = Some(applied);
+        let err = gen_webhook_pki(&a).expect_err("a file with no caBundle answers nothing");
+        assert!(err.to_string().contains("carries no caBundle"), "{err}");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

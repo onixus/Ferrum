@@ -14,7 +14,12 @@ offline command.
 
    It refuses to overwrite existing output. Neither the Secret, the rendered
    configuration, nor ca.key belongs in git. ca.key never reaches the cluster;
-   it is what step 4 rotates with, so keep it offline and keep it.
+   it is what step 4 rotates with, so keep it offline and keep it. The
+   .gitignore in this directory covers all four, and `ferrumctl lint-deploy`
+   (FD023) fails on a PEM private key anywhere under the deploy tree — whoever
+   holds ca.key can issue a leaf the applied webhook trusts, i.e. forge this
+   webhook. Move ca.key out of the tree once step 2 is done; the lint keeps
+   failing while it is there.
 
    The CA is issued for the longest lifetime the rule allows (398 days),
    whatever --days the serving certificate gets. That headroom is the only
@@ -53,22 +58,41 @@ Rotation
        mkdir deploy/admission/rotated
        ferrumctl gen-webhook-pki --service ferrum-admission --namespace ferrum \
            --days 90 --out-dir deploy/admission/rotated \
-           --ca-cert deploy/admission/ca.crt --ca-key deploy/admission/ca.key
+           --ca-cert deploy/admission/ca.crt --ca-key deploy/admission/ca.key \
+           --webhook-config <the validatingwebhookconfiguration.yaml applied in step 3>
 
        kubectl apply -f deploy/admission/rotated/ferrum-admission-tls.secret.yaml
 
    The command writes the Secret and nothing else: no new CA, no re-rendered
    configuration. It refuses if --days would outlive the CA (a leaf may not
    outlive its issuer, and it reports how many days the CA has left), and it
-   refuses if a rendered configuration next to either directory carries a
-   different CA.
+   refuses if the applied configuration carries a different CA.
+
+   --webhook-config is what makes "the CA the cluster trusts" checkable:
+   --ca-cert on its own only names a file. It may be omitted when a rendered
+   configuration sits next to --ca-cert or --out-dir; when neither holds one —
+   which is the case for a fresh rotation directory — the command refuses
+   rather than issue a leaf under an unchecked CA.
 
    kubelet refreshes the mounted Secret in place, and the webhook re-reads
    tls.crt/tls.key when it changes; no restart is needed. Material that does not
-   parse, has expired, or drops a Service name from the SAN is logged and does
-   not replace what is serving. The server refuses to start on an expired
+   parse, has expired, drops a Service name from the SAN, or names a different
+   issuer than the certificate the process started with is logged and does not
+   replace what is serving. The server refuses to start on an expired
    certificate and logs from 30 days before notAfter
    (serving_cert_expiring_total).
+
+   The issuer check is a pin on the issuer name and key id, not chain
+   verification — the webhook cannot link a certificate parser. It is what
+   stops a Secret from some other installation being applied here: that leaf
+   parses and has not expired, and the API server, which trusts one caBundle,
+   would reject every handshake made with it. So step 5 — a new CA — needs the
+   webhook Pods restarted, not just the Secret replaced.
+
+   A swap onto material that is already inside the 30-day window, replacing
+   material that was not, is an old Secret being re-applied; the webhook undoes
+   it and keeps serving what it had (serving_cert_rollbacks_total). Rotate with
+   more than 30 days of --days.
 
    `ferrumctl lint-deploy <dir>` (FD022) checks a directory that holds both the
    rendered configuration and the Secret: the caBundle must be the CA that
