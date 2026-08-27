@@ -80,6 +80,9 @@ pub struct RotatingFileSink {
     keep_files: usize,
     ctx: SinkContext,
     state: Mutex<Option<OpenFile>>,
+    /// A failed write may leave a partial line in the file; the next write
+    /// must terminate it first so records never glue together.
+    torn: AtomicBool,
     dropped: AtomicU64,
 }
 
@@ -103,6 +106,7 @@ impl RotatingFileSink {
             keep_files,
             ctx,
             state: Mutex::new(None),
+            torn: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
         }
     }
@@ -128,10 +132,16 @@ impl RotatingFileSink {
     }
 
     fn open_active(&self) -> std::io::Result<OpenFile> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.active_path())?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Events carry pod/namespace/comm; nothing on the node but the
+            // agent (and root) should read them. Applies on create only.
+            opts.mode(0o600);
+        }
+        let file = opts.open(self.active_path())?;
         let len = file.metadata()?.len();
         Ok(OpenFile { file, len })
     }
@@ -162,6 +172,19 @@ impl RotatingFileSink {
         if guard.is_none() {
             *guard = Some(self.open_active()?);
         }
+        if self.torn.load(Ordering::Relaxed) {
+            let open = guard.as_mut().expect("opened above");
+            if open.len > 0 {
+                // Terminate the partial line a failed write left behind so the
+                // next record does not glue to it (one lost event stays one).
+                if let Err(e) = open.file.write_all(b"\n").and_then(|_| open.file.flush()) {
+                    *guard = None;
+                    return Err(e);
+                }
+                open.len += 1;
+            }
+            self.torn.store(false, Ordering::Relaxed);
+        }
         let needs_rotation = match guard.as_ref() {
             Some(open) => open.len > 0 && open.len + line.len() as u64 > self.max_bytes,
             None => false,
@@ -180,11 +203,22 @@ impl RotatingFileSink {
             Err(e) => {
                 // The file may hold a partial line; drop the handle so the
                 // next emit reopens and re-measures instead of appending to
-                // an unknown offset.
+                // an unknown offset, and remember to terminate the stub.
                 *guard = None;
+                self.torn.store(true, Ordering::Relaxed);
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl RotatingFileSink {
+    /// Reproduce the state a failed `write_all` leaves behind: closed handle,
+    /// torn flag set, partial line already in the file (written by the test).
+    fn simulate_failed_write(&self) {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.torn.store(true, Ordering::Relaxed);
     }
 }
 
@@ -214,6 +248,9 @@ impl EventSink for RotatingFileSink {
 pub struct EnvelopeWriterSink<W> {
     writer: Mutex<W>,
     ctx: SinkContext,
+    /// A failed write may leave a partial line on the stream; the next write
+    /// terminates it first so records never glue together.
+    torn: AtomicBool,
     dropped: AtomicU64,
 }
 
@@ -222,6 +259,7 @@ impl<W> EnvelopeWriterSink<W> {
         Self {
             writer: Mutex::new(writer),
             ctx,
+            torn: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
         }
     }
@@ -244,17 +282,24 @@ impl EnvelopeWriterSink<std::io::Stdout> {
 impl<W: Write> EventSink for EnvelopeWriterSink<W> {
     fn emit(&self, event: &EnforcementEvent) {
         let envelope = self.ctx.envelope(event);
-        let payload = match serde_json::to_vec(&envelope) {
+        let mut line = match serde_json::to_vec(&envelope) {
             Ok(bytes) => bytes,
             Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
+        line.push(b'\n');
+        if self.torn.load(Ordering::Relaxed) {
+            line.insert(0, b'\n');
+        }
         let mut w = self.lock_writer();
-        let wrote = w.write_all(&payload).and_then(|_| w.write_all(b"\n"));
-        if wrote.is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+        match w.write_all(&line) {
+            Ok(()) => self.torn.store(false, Ordering::Relaxed),
+            Err(_) => {
+                self.torn.store(true, Ordering::Relaxed);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -280,6 +325,7 @@ mod tests {
             namespace: "prod".into(),
             comm: "sh".into(),
             syscall: "execve".into(),
+            waiver: None,
         }
     }
 
@@ -391,6 +437,92 @@ mod tests {
             sink.emit(&sample());
         }
         assert_eq!(sink.events_dropped_total(), 3);
+    }
+
+    #[test]
+    fn torn_file_line_is_terminated_before_next_record() {
+        let dir = temp_dir("torn");
+        let sink = RotatingFileSink::new(&dir, 1 << 20, 2, ctx());
+        sink.emit(&sample());
+        // A failed write_all left half a record in the file.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("events.jsonl"))
+                .unwrap();
+            f.write_all(b"{\"policy\":\"p\",\"rul").unwrap();
+        }
+        sink.simulate_failed_write();
+        sink.emit(&sample());
+        let data = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let lines: Vec<&str> = data.lines().collect();
+        assert_eq!(lines.len(), 3, "{data:?}");
+        serde_json::from_str::<EventEnvelope>(lines[0]).expect("first record intact");
+        assert!(serde_json::from_str::<EventEnvelope>(lines[1]).is_err());
+        serde_json::from_str::<EventEnvelope>(lines[2]).expect("record after torn line intact");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_file_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("mode");
+        let sink = RotatingFileSink::new(&dir, 1 << 20, 2, ctx());
+        sink.emit(&sample());
+        let mode = std::fs::metadata(dir.join("events.jsonl"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// First `write_all` call fails after writing a prefix; later calls succeed.
+    struct FlakyWriter {
+        buf: Vec<u8>,
+        fail_next_after: Option<usize>,
+    }
+
+    impl Write for FlakyWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            match self.fail_next_after.take() {
+                Some(n) => {
+                    let n = n.min(data.len());
+                    self.buf.extend_from_slice(&data[..n]);
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, "flaky"))
+                }
+                None => {
+                    self.buf.extend_from_slice(data);
+                    Ok(data.len())
+                }
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn torn_writer_line_is_terminated_before_next_record() {
+        let sink = EnvelopeWriterSink::new(
+            FlakyWriter {
+                buf: Vec::new(),
+                fail_next_after: Some(17),
+            },
+            ctx(),
+        );
+        sink.emit(&sample());
+        assert_eq!(sink.events_dropped_total(), 1);
+        sink.emit(&sample());
+        assert_eq!(sink.events_dropped_total(), 1);
+        let buf = sink.lock_writer().buf.clone();
+        let text = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text:?}");
+        assert!(serde_json::from_str::<EventEnvelope>(lines[0]).is_err());
+        serde_json::from_str::<EventEnvelope>(lines[1]).expect("record after torn line intact");
     }
 
     #[test]

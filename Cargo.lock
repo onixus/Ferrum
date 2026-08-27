@@ -641,6 +641,7 @@ dependencies = [
  "ferrum-ids",
  "ferrum-k8smeta",
  "serde",
+ "serde_json",
  "serde_yaml 0.8.26",
 ]
 

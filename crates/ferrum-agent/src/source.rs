@@ -28,10 +28,13 @@ pub const SIGNED_FORMAT: u32 = 1;
 pub const BUNDLE_FSIG_KEY: &str = "bundle.fsig";
 /// Controller Secret data key for SHA-256(raw) as UTF-8 hex bytes.
 pub const BUNDLE_DIGEST_KEY: &str = "digest";
-/// Controller Secret data key for the live PolicyException list (JSON array of
-/// PolicyExceptionSpec). Duplicated on purpose: this crate must not depend on
-/// ferrum-controller or ferrum-admission.
-pub const EXCEPTIONS_JSON_KEY: &str = "exceptions.json";
+/// Controller Secret data key for the live PolicyException list: FSIG envelope
+/// (same format and signing key as `bundle.fsig`) whose payload is the JSON
+/// array of PolicyExceptionSpec. Duplicated on purpose: this crate must not
+/// depend on ferrum-controller or ferrum-admission.
+pub const EXCEPTIONS_FSIG_KEY: &str = "exceptions.fsig";
+/// Cap on the exceptions FSIG file; a bigger file is rejected before read.
+pub const MAX_EXCEPTIONS_BYTES: u64 = 2 * 1024 * 1024;
 /// kubelet projected-volume symlink to the current Secret snapshot directory.
 pub const KUBELET_DATA_DIR: &str = "..data";
 
@@ -113,30 +116,47 @@ pub fn read_source_path(path: &Path) -> Result<(Vec<u8>, Option<Digest>)> {
     Ok((bytes, None))
 }
 
-/// `exceptions.json` next to whatever `--bundle` points at: a directory means
+/// `exceptions.fsig` next to whatever `--bundle` points at: a directory means
 /// the key inside the current kubelet `..data` snapshot (same snapshot as
 /// `bundle.fsig`), a Secret-mounted `bundle.fsig` means its snapshot sibling,
 /// any other file means a plain sibling file.
 pub(crate) fn exceptions_file_path(path: &Path) -> PathBuf {
     if path.is_dir() {
-        return snapshot_dir(path).join(EXCEPTIONS_JSON_KEY);
+        return snapshot_dir(path).join(EXCEPTIONS_FSIG_KEY);
     }
     if is_secret_fsig_file(path) {
         if let Some(parent) = path.parent() {
-            return snapshot_dir(parent).join(EXCEPTIONS_JSON_KEY);
+            return snapshot_dir(parent).join(EXCEPTIONS_FSIG_KEY);
         }
     }
     match path.parent() {
-        Some(parent) => parent.join(EXCEPTIONS_JSON_KEY),
-        None => PathBuf::from(EXCEPTIONS_JSON_KEY),
+        Some(parent) => parent.join(EXCEPTIONS_FSIG_KEY),
+        None => PathBuf::from(EXCEPTIONS_FSIG_KEY),
     }
 }
 
 /// `Ok(None)` = file absent = empty exception list (not an error, not deny-all).
-/// An unreadable file is `Err`; the caller drops waivers and counts it.
+/// An unreadable or oversized file is `Err`; the caller drops waivers and counts it.
 pub fn read_exceptions_path(path: &Path) -> Result<Option<Vec<u8>>> {
     let file = exceptions_file_path(path);
+    match std::fs::metadata(&file) {
+        Ok(meta) if meta.len() > MAX_EXCEPTIONS_BYTES => {
+            return Err(FerrumError::Integrity(format!(
+                "{}: {} bytes exceeds the {MAX_EXCEPTIONS_BYTES}-byte exceptions cap",
+                file.display(),
+                meta.len()
+            )));
+        }
+        _ => {}
+    }
     match std::fs::read(&file) {
+        Ok(bytes) if bytes.len() as u64 > MAX_EXCEPTIONS_BYTES => {
+            Err(FerrumError::Integrity(format!(
+                "{}: {} bytes exceeds the {MAX_EXCEPTIONS_BYTES}-byte exceptions cap",
+                file.display(),
+                bytes.len()
+            )))
+        }
         Ok(bytes) => Ok(Some(bytes)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(FerrumError::Degraded(format!(
@@ -144,6 +164,26 @@ pub fn read_exceptions_path(path: &Path) -> Result<Option<Vec<u8>>> {
             file.display()
         ))),
     }
+}
+
+/// Verify an `exceptions.fsig` envelope against the caller pin and return the
+/// signed payload (JSON array bytes). Plain JSON, a foreign key, or a tampered
+/// payload is Integrity — the caller drops all waivers.
+pub fn load_exceptions_source(bytes: &[u8], trust_root: &[u8]) -> Result<Vec<u8>> {
+    pin_bytes(trust_root)?;
+    if !bytes.starts_with(&SIGNED_MAGIC) {
+        return Err(FerrumError::Integrity(
+            "exceptions are not a signed FSIG envelope; plain JSON is rejected".into(),
+        ));
+    }
+    let (public_key, signature, raw) = decode_fsig(bytes)?;
+    if public_key.as_slice() != trust_root {
+        return Err(FerrumError::Integrity(
+            "embedded exceptions FSIG public key does not match caller trust-root pin".into(),
+        ));
+    }
+    ferrum_crypto::verify_bundle_signature(&raw, &signature, trust_root)?;
+    Ok(raw)
 }
 
 /// Verify and extract whatever kubelet/file `--bundle` points at.

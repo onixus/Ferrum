@@ -125,6 +125,7 @@ mod tests {
             namespace: "prod".into(),
             comm: "sh".into(),
             syscall: "execve".into(),
+            waiver: None,
         }
     }
 

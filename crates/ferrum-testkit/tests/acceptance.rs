@@ -6,7 +6,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use ferrum_admission::{
     admit, load_bundle, AdmissionSubject, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED, RULE_UNSIGNED,
 };
-use ferrum_agent::{apply_role, encode_fsig, Agent, AgentConfig, AgentRole, WAIVED_ACTION};
+use ferrum_agent::{
+    apply_role, encode_fsig, Agent, AgentConfig, AgentRole, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY,
+    EXCEPTIONS_FSIG_KEY, WAIVED_ACTION,
+};
 use ferrum_api::{PolicyExceptionSpec, PolicyMode};
 use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
 use ferrum_crypto::{public_key_from_secret, sign_bundle};
@@ -247,17 +250,29 @@ fn docker_sock_kill_is_waived_only_in_scope() {
     let sink = MemorySink::new();
     let sock = ev("openat", "curl", "/var/run/docker.sock", false);
 
-    // In scope: kill demoted to audit, with a distinct audit-trail action.
+    // In scope: kill demoted to audit, with a distinct audit-trail action
+    // carrying the ticket that authorized it.
     let waived = agent.handle_event_at(7, &sock, &sink, now());
     assert_eq!(waived.action, Action::Audit);
     assert_eq!(waived.rule_id.as_deref(), Some("no-runtime-sock"));
     assert_eq!(sink.events()[0].action, WAIVED_ACTION);
     assert_eq!(sink.events()[0].namespace, "payments");
+    let exported = serde_json::to_string(&sink.events()[0]).expect("serialize");
+    assert!(exported.contains("\"ticket\":\"JIRA-18421\""), "{exported}");
+    assert!(
+        exported.contains("\"approvedBy\":\"ib-architect\""),
+        "{exported}"
+    );
+    assert_eq!(
+        sink.events()[0].waiver.as_ref().map(|w| w.ticket.as_str()),
+        Some("JIRA-18421")
+    );
 
-    // Same rule outside the exception namespace: still kill.
+    // Same rule outside the exception namespace: still kill, no waiver ref.
     let outside = agent.handle_event_at(8, &sock, &sink, now());
     assert_eq!(outside.action, Action::Kill);
     assert_eq!(sink.events()[1].action, "kill");
+    assert!(sink.events()[1].waiver.is_none());
 
     // The waiver does not outlive expiresAt.
     let expired = agent.handle_event_at(7, &sock, &sink, expires_at + chrono::Days::new(1));
@@ -269,6 +284,70 @@ fn docker_sock_kill_is_waived_only_in_scope() {
     agent.set_exceptions(vec![empty_rules]);
     let no_rules = agent.handle_event_at(7, &sock, &sink, now());
     assert_eq!(no_rules.action, Action::Kill);
+}
+
+#[test]
+fn only_signed_exceptions_are_accepted_from_the_mount() {
+    let dir = temp_lkg();
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let (fsig, digest, _) = signed_bundle();
+    std::fs::write(dir.join(BUNDLE_FSIG_KEY), &fsig).expect("bundle.fsig");
+    std::fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_str().as_bytes()).expect("digest");
+
+    let mut waiver = exception_ok().spec;
+    waiver.target.rules = vec!["no-runtime-sock".into()];
+    let json = serde_json::to_vec(&[waiver]).expect("encode");
+
+    // Plain JSON (the old exceptions.json contract, unsigned) never yields waivers.
+    std::fs::write(dir.join(EXCEPTIONS_FSIG_KEY), &json).expect("plain json");
+    let mut agent = respond_agent(None);
+    agent.apply_path(&dir).expect("bundle from mount");
+    agent
+        .reload_exceptions_path(&dir)
+        .expect_err("unsigned exceptions must be rejected");
+    assert_eq!(agent.exceptions_reload_failed_total(), 1);
+    agent.insert_cgroup(7, payments_identity());
+    let sock = ev("openat", "curl", "/var/run/docker.sock", false);
+    assert_eq!(
+        agent
+            .handle_event_at(7, &sock, &MemorySink::new(), now())
+            .action,
+        Action::Kill,
+        "no waiver without a signature"
+    );
+
+    // Same payload in an FSIG envelope under the pinned key: waiver applies.
+    let sig = sign_bundle(&json, &SK).expect("sign exceptions");
+    let pk = public_key_from_secret(&SK).expect("public key");
+    let sealed = encode_fsig(&json, &sig, &pk).expect("exceptions.fsig");
+    std::fs::write(dir.join(EXCEPTIONS_FSIG_KEY), &sealed).expect("exceptions.fsig");
+    assert_eq!(agent.reload_exceptions_path(&dir).expect("signed"), 1);
+    let sink = MemorySink::new();
+    let waived = agent.handle_event_at(7, &sock, &sink, now());
+    assert_eq!(waived.action, Action::Audit);
+    assert_eq!(sink.events()[0].action, WAIVED_ACTION);
+    assert_eq!(
+        sink.events()[0].waiver.as_ref().map(|w| w.ticket.as_str()),
+        Some("JIRA-18421")
+    );
+
+    // Tampered envelope drops every waiver: fail-closed back to kill.
+    let mut tampered = sealed;
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    std::fs::write(dir.join(EXCEPTIONS_FSIG_KEY), &tampered).expect("tampered");
+    agent
+        .reload_exceptions_path(&dir)
+        .expect_err("tampered exceptions must be rejected");
+    assert_eq!(agent.exceptions_reload_failed_total(), 2);
+    assert_eq!(
+        agent
+            .handle_event_at(7, &sock, &MemorySink::new(), now())
+            .action,
+        Action::Kill
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

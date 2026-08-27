@@ -13,7 +13,7 @@ use ferrum_ebpf::{extract_febp, Action, Decision, Loader, SyscallEvent};
 use ferrum_export::EventSink;
 use ferrum_ids::{Digest, PolicyId, RuleId};
 use ferrum_k8smeta::{CgroupIndex, WorkloadIdentity};
-use ferrum_proto::EnforcementEvent;
+use ferrum_proto::{EnforcementEvent, WaiverRef};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,14 +23,18 @@ static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub use pump::{pump_channel, pump_channel_host, pump_records, pump_records_host, PumpStats};
 pub use source::{
-    decode_fsig, encode_fsig, extract_fsig, load_path, load_source, parse_trust_root,
-    read_exceptions_path, read_source_path, ExtractedFsig, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY,
-    EXCEPTIONS_JSON_KEY, KUBELET_DATA_DIR, SIGNED_FORMAT, SIGNED_MAGIC,
+    decode_fsig, encode_fsig, extract_fsig, load_exceptions_source, load_path, load_source,
+    parse_trust_root, read_exceptions_path, read_source_path, ExtractedFsig, BUNDLE_DIGEST_KEY,
+    BUNDLE_FSIG_KEY, EXCEPTIONS_FSIG_KEY, KUBELET_DATA_DIR, MAX_EXCEPTIONS_BYTES, SIGNED_FORMAT,
+    SIGNED_MAGIC,
 };
 
 /// `EnforcementEvent.action` for a hit demoted by a live exception. Distinct
 /// from plain "audit" so the waiver leaves an audit trail.
 pub const WAIVED_ACTION: &str = "waived";
+
+/// Cap on the number of specs in one `exceptions.fsig` payload.
+pub const MAX_EXCEPTION_SPECS: usize = 4096;
 
 /// Observe is default. Kill/Isolate execute only when Respond is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -207,11 +211,13 @@ impl Agent {
         self.exceptions_reload_failed.load(Ordering::Relaxed)
     }
 
-    /// Parse a PolicyExceptionSpec JSON array (`exceptions.json`) into the live
-    /// table. Parsing happens only here, never on the per-event path. Garbage
+    /// Verify an `exceptions.fsig` envelope against the pinned trust-root,
+    /// then parse the signed JSON payload into the live table. Verification
+    /// and parsing happen only here, never on the per-event path. Plain JSON,
+    /// a foreign key, a tampered payload, garbage, or a spec-count overflow
     /// drops ALL waivers (fail-closed: never keep a stale list) and counts.
     pub fn try_reload_exceptions(&mut self, bytes: &[u8]) -> Result<usize> {
-        match serde_json::from_slice::<Vec<PolicyExceptionSpec>>(bytes) {
+        match self.verify_and_parse_exceptions(bytes) {
             Ok(list) => {
                 let n = list.len();
                 self.exceptions = list;
@@ -221,12 +227,25 @@ impl Agent {
                 self.exceptions.clear();
                 self.exceptions_reload_failed
                     .fetch_add(1, Ordering::Relaxed);
-                Err(FerrumError::Validation(format!("exceptions.json: {err}")))
+                Err(err)
             }
         }
     }
 
-    /// Reload `exceptions.json` from the same Secret mount as the bundle.
+    fn verify_and_parse_exceptions(&self, bytes: &[u8]) -> Result<Vec<PolicyExceptionSpec>> {
+        let raw = load_exceptions_source(bytes, &self.trust_root)?;
+        let list = serde_json::from_slice::<Vec<PolicyExceptionSpec>>(&raw)
+            .map_err(|e| FerrumError::Validation(format!("exceptions.fsig payload: {e}")))?;
+        if list.len() > MAX_EXCEPTION_SPECS {
+            return Err(FerrumError::Validation(format!(
+                "exceptions.fsig payload has {} specs, cap is {MAX_EXCEPTION_SPECS}",
+                list.len()
+            )));
+        }
+        Ok(list)
+    }
+
+    /// Reload `exceptions.fsig` from the same Secret mount as the bundle.
     /// Missing file = empty list; unreadable file drops waivers and counts.
     pub fn reload_exceptions_path(&mut self, path: &Path) -> Result<usize> {
         match read_exceptions_path(path) {
@@ -389,8 +408,15 @@ impl Agent {
             Err(_) => WorkloadIdentity::unknown(),
         };
         let mut decision = self.loader.decide(event, &identity);
-        let waived = self.waiver_applies(&decision, &identity, now);
-        if waived {
+        let waiver = self
+            .waiver_applies(&decision, &identity, now)
+            .map(|spec| WaiverRef {
+                ticket: spec.ticket.clone(),
+                requested_by: spec.requested_by.clone(),
+                approved_by: spec.approved_by.clone(),
+                expires_at: spec.expires_at,
+            });
+        if waiver.is_some() {
             decision.action = Action::Audit;
         }
         decision.action = apply_role(self.role, decision.action);
@@ -405,7 +431,7 @@ impl Agent {
         sink.emit(&EnforcementEvent {
             policy,
             rule,
-            action: if waived {
+            action: if waiver.is_some() {
                 WAIVED_ACTION.into()
             } else {
                 decision.action.as_str().into()
@@ -415,32 +441,32 @@ impl Agent {
             namespace: identity.namespace,
             comm: event.comm.into(),
             syscall: event.syscall.into(),
+            waiver,
         });
         decision
     }
 
     /// A live in-scope exception demotes only enforcing actions on a named
-    /// rule. Identity comes from the cgroup index, so `WorkloadIdentity::unknown()`
-    /// (empty namespace) can never satisfy a namespaced exception.
+    /// rule; the first match is the one recorded in the audit trail. Identity
+    /// comes from the cgroup index, so `WorkloadIdentity::unknown()` (empty
+    /// namespace) can never satisfy a namespaced exception.
     fn waiver_applies(
         &self,
         decision: &Decision,
         identity: &WorkloadIdentity,
         now: DateTime<Utc>,
-    ) -> bool {
+    ) -> Option<&PolicyExceptionSpec> {
         if self.policy_name.is_empty() {
-            return false;
+            return None;
         }
         if !matches!(
             decision.action,
             Action::Kill | Action::Isolate | Action::Deny
         ) {
-            return false;
+            return None;
         }
-        let Some(rule) = decision.rule_id.as_deref() else {
-            return false;
-        };
-        self.exceptions.iter().any(|spec| {
+        let rule = decision.rule_id.as_deref()?;
+        self.exceptions.iter().find(|spec| {
             ferrum_policy::exception_applies(
                 spec,
                 &identity.namespace,
@@ -466,9 +492,16 @@ pub fn apply_role(role: AgentRole, action: Action) -> Action {
 
 /// Watch `path` (file, or directory containing `bundle.fsig` + `digest`).
 /// Uses mtime+len and follows kubelet `..data`; a vanished bundle keeps
-/// last-good. The sibling `exceptions.json` rides the same interval; unlike
+/// last-good. The sibling `exceptions.fsig` rides the same interval; unlike
 /// the bundle, a vanished exceptions file clears waivers (TTL'd data, no LKG).
-pub fn poll_bundle(agent: &mut Agent, path: &Path, interval: Duration) -> ! {
+/// `export`, when present, tracks the agent's digest/degraded state so every
+/// exported envelope carries the state at emit time.
+pub fn poll_bundle(
+    agent: &mut Agent,
+    path: &Path,
+    interval: Duration,
+    export: Option<&ferrum_export::SinkContext>,
+) -> ! {
     // Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
     // Start with no stamp so a rotation between first load and this thread is not skipped.
     let mut stamp = None;
@@ -497,6 +530,10 @@ pub fn poll_bundle(agent: &mut Agent, path: &Path, interval: Duration) -> ! {
                     }
                 }
             }
+        }
+        if let Some(ctx) = export {
+            ctx.set_bundle_digest(agent.last_good_digest().cloned());
+            ctx.set_degraded(agent.is_degraded());
         }
     }
 }
@@ -1476,6 +1513,10 @@ mod tests {
         assert_eq!(d.action, Action::Audit);
         assert_eq!(d.rule_id.as_deref(), Some("no-runtime-sock"));
         assert_eq!(sink.events()[0].action, WAIVED_ACTION);
+        let waiver_ref = sink.events()[0].waiver.clone().expect("waiver audit trail");
+        assert_eq!(waiver_ref.ticket, "JIRA-1");
+        assert_eq!(waiver_ref.requested_by, "sre");
+        assert_eq!(waiver_ref.approved_by, "sec-arch");
 
         // Other rule of the same policy still kills.
         let shell = agent.handle_event_at(
@@ -1486,6 +1527,7 @@ mod tests {
         );
         assert_eq!(shell.action, Action::Kill);
         assert_eq!(sink.events()[1].action, "kill");
+        assert_eq!(sink.events()[1].waiver, None);
     }
 
     #[test]
@@ -1542,8 +1584,13 @@ mod tests {
         assert_eq!(sink.events()[0].action, "kill");
     }
 
+    fn exceptions_fsig(list: &[ferrum_api::PolicyExceptionSpec]) -> Vec<u8> {
+        let json = serde_json::to_vec(list).expect("encode");
+        encode_fsig(&json, &sign(&json), &pk()).expect("fsig")
+    }
+
     #[test]
-    fn garbage_exceptions_json_drops_all_waivers_and_counts() {
+    fn garbage_exceptions_fsig_drops_all_waivers_and_counts() {
         let mut agent = Agent::new(cfg_respond_named("p1"));
         agent.set_exceptions(vec![waiver("ns", "p1", &["no-runtime-sock"])]);
         assert_eq!(agent.exceptions().len(), 1);
@@ -1551,10 +1598,81 @@ mod tests {
         assert!(agent.exceptions().is_empty());
         assert_eq!(agent.exceptions_reload_failed_total(), 1);
 
+        // Signed envelope over garbage JSON: signature is fine, payload is not.
+        let garbage = encode_fsig(b"{not json", &sign(b"{not json"), &pk()).expect("fsig");
+        agent.set_exceptions(vec![waiver("ns", "p1", &["no-runtime-sock"])]);
+        assert!(agent.try_reload_exceptions(&garbage).is_err());
+        assert!(agent.exceptions().is_empty());
+        assert_eq!(agent.exceptions_reload_failed_total(), 2);
+
         let list = vec![waiver("ns", "p1", &["no-runtime-sock"])];
-        let bytes = serde_json::to_vec(&list).expect("encode");
-        assert_eq!(agent.try_reload_exceptions(&bytes).expect("reload"), 1);
+        let fsig = exceptions_fsig(&list);
+        assert_eq!(agent.try_reload_exceptions(&fsig).expect("reload"), 1);
         assert_eq!(agent.exceptions(), list.as_slice());
+    }
+
+    #[test]
+    fn unsigned_or_foreign_or_tampered_exceptions_drop_all_waivers() {
+        let mut agent = Agent::new(cfg_respond_named("p1"));
+        let list = vec![waiver("ns", "p1", &["no-runtime-sock"])];
+
+        // Plain JSON array (the old exceptions.json contract) is rejected.
+        agent.set_exceptions(list.clone());
+        assert!(agent
+            .try_reload_exceptions(&serde_json::to_vec(&list).expect("encode"))
+            .is_err());
+        assert!(agent.exceptions().is_empty());
+        assert_eq!(agent.exceptions_reload_failed_total(), 1);
+
+        // Envelope signed by a key other than the pinned trust-root.
+        let json = serde_json::to_vec(&list).expect("encode");
+        let pk2 = ferrum_crypto::public_key_from_secret(&SK2).expect("pk2");
+        let sig2 = ferrum_crypto::sign_bundle(&json, &SK2).expect("sig2");
+        let foreign = encode_fsig(&json, &sig2, &pk2).expect("fsig");
+        agent.set_exceptions(list.clone());
+        assert!(agent.try_reload_exceptions(&foreign).is_err());
+        assert!(agent.exceptions().is_empty());
+        assert_eq!(agent.exceptions_reload_failed_total(), 2);
+
+        // Tampered payload under the pinned key.
+        let mut tampered = exceptions_fsig(&list);
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        agent.set_exceptions(list);
+        assert!(agent.try_reload_exceptions(&tampered).is_err());
+        assert!(agent.exceptions().is_empty());
+        assert_eq!(agent.exceptions_reload_failed_total(), 3);
+    }
+
+    #[test]
+    fn exceptions_spec_count_over_cap_drops_all_waivers() {
+        let mut agent = Agent::new(cfg_respond_named("p1"));
+        let too_many: Vec<_> = (0..=MAX_EXCEPTION_SPECS)
+            .map(|_| waiver("ns", "p1", &["no-runtime-sock"]))
+            .collect();
+        agent.set_exceptions(vec![waiver("ns", "p1", &["no-runtime-sock"])]);
+        assert!(agent
+            .try_reload_exceptions(&exceptions_fsig(&too_many))
+            .is_err());
+        assert!(agent.exceptions().is_empty());
+        assert_eq!(agent.exceptions_reload_failed_total(), 1);
+    }
+
+    #[test]
+    fn oversized_exceptions_file_drops_all_waivers() {
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("tmpdir");
+        fs::write(
+            dir.join(EXCEPTIONS_FSIG_KEY),
+            vec![0u8; (MAX_EXCEPTIONS_BYTES + 1) as usize],
+        )
+        .expect("write");
+        let mut agent = Agent::new(cfg_respond_named("p1"));
+        agent.set_exceptions(vec![waiver("ns", "p1", &["no-runtime-sock"])]);
+        assert!(agent.reload_exceptions_path(&dir).is_err());
+        assert!(agent.exceptions().is_empty());
+        assert_eq!(agent.exceptions_reload_failed_total(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1567,20 +1685,16 @@ mod tests {
         assert!(agent.exceptions().is_empty());
         assert_eq!(agent.exceptions_reload_failed_total(), 0);
 
-        // kubelet layout: exceptions.json lives in the ..data snapshot.
+        // kubelet layout: exceptions.fsig lives in the ..data snapshot.
         let snap = dir.join("..snap1");
         fs::create_dir_all(&snap).expect("snap");
         let list = vec![waiver("ns", "p1", &["no-runtime-sock"])];
-        fs::write(
-            snap.join(EXCEPTIONS_JSON_KEY),
-            serde_json::to_vec(&list).expect("encode"),
-        )
-        .expect("write");
+        fs::write(snap.join(EXCEPTIONS_FSIG_KEY), exceptions_fsig(&list)).expect("write");
         std::os::unix::fs::symlink("..snap1", dir.join(KUBELET_DATA_DIR)).expect("..data");
         assert_eq!(agent.reload_exceptions_path(&dir).expect("reload"), 1);
         assert_eq!(agent.exceptions(), list.as_slice());
 
-        fs::write(snap.join(EXCEPTIONS_JSON_KEY), b"garbage").expect("overwrite");
+        fs::write(snap.join(EXCEPTIONS_FSIG_KEY), b"garbage").expect("overwrite");
         assert!(agent.reload_exceptions_path(&dir).is_err());
         assert!(agent.exceptions().is_empty());
         assert_eq!(agent.exceptions_reload_failed_total(), 1);

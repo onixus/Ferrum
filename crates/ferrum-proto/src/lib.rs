@@ -2,6 +2,16 @@ use chrono::{DateTime, Utc};
 use ferrum_ids::{Digest, PolicyId, RuleId};
 use serde::{Deserialize, Serialize};
 
+/// Audit trail of the exception that demoted an enforcing action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaiverRef {
+    pub ticket: String,
+    pub requested_by: String,
+    pub approved_by: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnforcementEvent {
@@ -13,6 +23,9 @@ pub struct EnforcementEvent {
     pub namespace: String,
     pub comm: String,
     pub syscall: String,
+    /// Set only on waived events.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub waiver: Option<WaiverRef>,
 }
 
 /// Self-contained export record: readable without access to the cluster
@@ -50,6 +63,7 @@ mod tests {
                 namespace: "prod".into(),
                 comm: "sh".into(),
                 syscall: "execve".into(),
+                waiver: None,
             },
         };
         let json = serde_json::to_string(&env).expect("serialize");
@@ -57,9 +71,41 @@ mod tests {
         assert!(json.contains("\"agentRole\":\"observe\""));
         assert!(json.contains("\"degraded\":true"));
         assert!(json.contains("\"ts\":"));
+        assert!(!json.contains("\"waiver\""));
         let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.node, "node-a");
         assert_eq!(back.ts, env.ts);
         assert_eq!(back.event.rule.to_string(), "no-shell");
+        assert_eq!(back.event.waiver, None);
+    }
+
+    #[test]
+    fn waiver_ref_camel_case_and_absent_field_decodes() {
+        let ev = EnforcementEvent {
+            policy: PolicyId::new("p"),
+            rule: RuleId::new("no-runtime-sock"),
+            action: "waived".into(),
+            image_digest: None,
+            pod: "web".into(),
+            namespace: "payments".into(),
+            comm: "curl".into(),
+            syscall: "openat".into(),
+            waiver: Some(WaiverRef {
+                ticket: "JIRA-1".into(),
+                requested_by: "sre".into(),
+                approved_by: "sec-arch".into(),
+                expires_at: Utc::now(),
+            }),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        assert!(json.contains("\"waiver\":{\"ticket\":\"JIRA-1\""));
+        assert!(json.contains("\"requestedBy\":\"sre\""));
+        assert!(json.contains("\"approvedBy\":\"sec-arch\""));
+        assert!(json.contains("\"expiresAt\":"));
+        // Pre-waiver records (no `waiver` key) still decode.
+        let legacy = r#"{"policy":"p","rule":"r","action":"kill","imageDigest":null,
+            "pod":"w","namespace":"n","comm":"sh","syscall":"execve"}"#;
+        let back: EnforcementEvent = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(back.waiver, None);
     }
 }
