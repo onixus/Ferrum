@@ -6,6 +6,10 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "ferrum_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ferrumctl"
 path = "src/main.rs"
@@ -16,7 +20,9 @@ chrono.workspace = true
 clap.workspace = true
 ferrum-api.workspace = true
 ferrum-compiler.workspace = true
-ferrum-crypto.workspace = true
+# The only crate that turns on x509: issuance stays off the admission/agent
+# dependency graph.
+ferrum-crypto = { workspace = true, features = ["x509"] }
 ferrum-ids.workspace = true
 ferrum-policy.workspace = true
 serde.workspace = true

@@ -1,0 +1,42 @@
+# The webhook config is valid; the workload behind it is not. It mounts a
+# Secret nobody issues and points --tls-cert outside the mount, so the API
+# server would meet a certificate the operator never created. Do not fix.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-admission
+  namespace: ferrum
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-admission
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-admission
+    spec:
+      serviceAccountName: ferrum-admission
+      containers:
+        - name: admission
+          image: ghcr.io/ferrum/ferrum-admission:v0.1.0
+          args:
+            - serve
+            - --tls-cert
+            - /var/lib/self-signed/tls.crt
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/ferrum/tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: ferrum-admission-serving

@@ -1,0 +1,40 @@
+Install order
+=============
+
+The webhook cannot be applied from this directory as it stands: the API server
+needs a caBundle, and the serving Secret does not exist yet. Both come from one
+offline command.
+
+1. Issue the PKI. Writes ferrum-admission-tls.secret.yaml (mode 0600),
+   ca.crt, and validatingwebhookconfiguration.yaml rendered from the template:
+
+       ferrumctl gen-webhook-pki --service ferrum-admission --namespace ferrum \
+           --days 365 --out-dir deploy/admission
+
+   It refuses to overwrite existing output. Neither the Secret nor the rendered
+   configuration belongs in git.
+
+2. Apply the Secret, then the rest of this directory:
+
+       kubectl apply -f deploy/namespace.yaml
+       kubectl apply -f deploy/admission/ferrum-admission-tls.secret.yaml
+       kubectl apply -f deploy/admission/serviceaccount.yaml \
+                     -f deploy/admission/rbac.yaml \
+                     -f deploy/admission/service.yaml \
+                     -f deploy/admission/deployment.yaml
+
+3. Apply the webhook configuration last: with failurePolicy=Fail it starts
+   rejecting requests the moment it exists.
+
+       kubectl apply -f deploy/admission/validatingwebhookconfiguration.yaml
+
+Build features
+==============
+
+deployment.yaml passes --apiserver, so the image must be built with the
+`apiserver` feature: without it the binary refuses that flag and exits. Drop
+the flag only if you accept that every policy carrying a namespace or
+ServiceAccount selector denies each Pod it selects.
+
+Rotation is not this command's job. Re-run step 1 into a clean directory before
+the certificate expires and re-apply steps 2 and 3.

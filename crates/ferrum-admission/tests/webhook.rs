@@ -3,6 +3,7 @@
 mod common;
 
 use chrono::{DateTime, Days, TimeZone, Utc};
+use ferrum_admission::StaticLabels;
 use ferrum_admission::{
     encode_fsig, handle_review_bytes, load_bundle, load_path, load_source, parse_program,
     poll_bundle_file, poll_exceptions_file, AdmissionProgram, ReviewConfig, WebhookState,
@@ -471,6 +472,7 @@ fn in_scope_exception_waives_only_that_rule() {
     let cfg = ReviewConfig {
         policy_name: "prod-restricted".into(),
         policy_namespace: String::new(),
+        ..Default::default()
     };
     let waived = cfg.handle_bytes(&body, Some(&program), &exceptions, now());
     assert_eq!(waived.status, 200);
@@ -489,6 +491,7 @@ fn in_scope_exception_waives_only_that_rule() {
     let other = ReviewConfig {
         policy_name: "other-policy".into(),
         policy_namespace: String::new(),
+        ..Default::default()
     };
     let other = other.handle_bytes(&body, Some(&program), &exceptions, now());
     let other: Value = serde_json::from_slice(&other.body).unwrap();
@@ -848,6 +851,7 @@ fn exceptions_mount_rotation_gates_scope_and_ttl() {
     let cfg = ReviewConfig {
         policy_name: "prod-restricted".into(),
         policy_namespace: String::new(),
+        ..Default::default()
     };
     let state = Arc::new(WebhookState::new(
         load_ok(&fsig, &pk),
@@ -1004,6 +1008,7 @@ fn exceptions_reload_missing_file_is_empty_and_unverifiable_resets() {
     let cfg = ReviewConfig {
         policy_name: "prod-restricted".into(),
         policy_namespace: String::new(),
+        ..Default::default()
     };
     let live = wallclock_exception(
         "prod-restricted",
@@ -1095,4 +1100,185 @@ fn cargo_toml_hot_path_keeps_boundary() {
             "{forbidden} must not be in [dependencies]: {deps}"
         );
     }
+}
+
+const ZONE: &str = "ferrum.io/zone";
+const TIER: &str = "ferrum.io/tier";
+
+fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Signed, PSS-clean apart from `privileged`: the policy denies it wherever it
+/// applies, and allows it wherever it does not.
+fn privileged_pod_in(namespace: &str, service_account: &str) -> Value {
+    let mut obj = pod(IMAGE, image_annotations(IMAGE, &SK), true);
+    obj["metadata"]["namespace"] = json!(namespace);
+    obj["spec"]["serviceAccountName"] = json!(service_account);
+    obj
+}
+
+fn selected_program(mutate: impl FnOnce(&mut ClusterSecurityPolicySpec)) -> AdmissionProgram {
+    let mut spec = enforce_spec(PolicyMode::Enforce, pk_hex(&SK));
+    mutate(&mut spec);
+    let (fsig, pk) = make_fsig(spec, &SK);
+    load_ok(&fsig, &pk)
+}
+
+fn cfg_with(labels: StaticLabels) -> ReviewConfig {
+    ReviewConfig {
+        policy_name: "prod-restricted".into(),
+        labels: Arc::new(labels),
+        ..Default::default()
+    }
+}
+
+fn decide(cfg: &ReviewConfig, program: &AdmissionProgram, object: Value, uid: &str) -> Value {
+    let reply = cfg.handle_bytes(&review(object, uid), Some(program), &[], now());
+    assert_eq!(reply.status, 200, "expected HTTP 200 AdmissionReview");
+    serde_json::from_slice(&reply.body).expect("response json")
+}
+
+#[test]
+fn warm_cache_applies_a_namespace_selector_to_its_own_namespace_only() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .namespace_selector
+            .match_labels
+            .insert(ZONE.into(), "pci".into());
+    });
+    assert!(
+        !program.selector.namespace_selector.match_labels.is_empty(),
+        "fixture must carry the selector into the bundle"
+    );
+    let cfg = cfg_with(
+        StaticLabels::default()
+            .with_namespace("pci-ns", labels(&[(ZONE, "pci")]))
+            .with_namespace("public-ns", labels(&[(ZONE, "public")]))
+            .warm(),
+    );
+
+    let denied = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("pci-ns", "default"),
+        "uid-pci",
+    );
+    assert_eq!(denied["response"]["allowed"], false);
+    let msg = deny_msg(&denied);
+    assert!(
+        msg.contains(RULE_PRIVILEGED) || msg.contains("privileged"),
+        "denied by the rule, not by a missing-label fallback: {msg}"
+    );
+
+    let allowed = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("public-ns", "default"),
+        "uid-public",
+    );
+    assert_eq!(
+        allowed["response"]["allowed"], true,
+        "a namespace that does not match the selector is not this policy's business"
+    );
+}
+
+#[test]
+fn warm_cache_keeps_service_account_labels_inside_their_namespace() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .service_account_selector
+            .match_labels
+            .insert(TIER.into(), "frontend".into());
+    });
+    let cfg = cfg_with(
+        StaticLabels::default()
+            .with_service_account("prod", "web-sa", labels(&[(TIER, "frontend")]))
+            .with_service_account("dev", "web-sa", labels(&[(TIER, "sandbox")]))
+            .warm(),
+    );
+
+    let denied = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("prod", "web-sa"),
+        "uid-sa-prod",
+    );
+    assert_eq!(denied["response"]["allowed"], false);
+
+    let allowed = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("dev", "web-sa"),
+        "uid-sa-dev",
+    );
+    assert_eq!(
+        allowed["response"]["allowed"], true,
+        "same ServiceAccount name in another namespace is a different subject"
+    );
+}
+
+#[test]
+fn cold_cache_denies_a_selected_policy_but_not_an_unselected_one() {
+    let selected = selected_program(|spec| {
+        spec.selector
+            .namespace_selector
+            .match_labels
+            .insert(ZONE.into(), "pci".into());
+    });
+    let cold = cfg_with(StaticLabels::default());
+    let reply = decide(
+        &cold,
+        &selected,
+        privileged_pod_in("pci-ns", "default"),
+        "uid-cold",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    let msg = deny_msg(&reply);
+    assert!(msg.contains("labels unavailable"), "{msg}");
+
+    // No namespace/SA selector: the cold cache is irrelevant, nothing changes.
+    let unselected = selected_program(|_| {});
+    let clean = pod(IMAGE, image_annotations(IMAGE, &SK), false);
+    let reply = decide(&cold, &unselected, clean, "uid-cold-clean");
+    assert_eq!(reply["response"]["allowed"], true);
+    let reply = decide(
+        &cold,
+        &unselected,
+        privileged_pod_in("any-ns", "default"),
+        "uid-cold-priv",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    assert!(deny_msg(&reply).contains(RULE_PRIVILEGED) || deny_msg(&reply).contains("privileged"));
+}
+
+#[test]
+fn cluster_labels_come_from_the_flag_and_need_no_warm_cache() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .cluster_selector
+            .match_labels
+            .insert("env".into(), "prod".into());
+    });
+    let cfg = cfg_with(StaticLabels::cluster(labels(&[("env", "prod")])));
+    let reply = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("any-ns", "default"),
+        "uid-cluster",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    assert!(!deny_msg(&reply).contains("labels unavailable"));
+
+    let elsewhere = cfg_with(StaticLabels::cluster(labels(&[("env", "staging")])));
+    let reply = decide(
+        &elsewhere,
+        &program,
+        privileged_pod_in("any-ns", "default"),
+        "uid-cluster-2",
+    );
+    assert_eq!(reply["response"]["allowed"], true);
 }

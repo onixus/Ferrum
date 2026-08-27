@@ -52,6 +52,16 @@ futures = { version = "=0.3.30", default-features = false, features = ["std"] }
 # rustc 1.75: kube 0.93.1 pulls edition2024 (home/zeroize). kube 0.88.1 + k8s-openapi 0.21.1.
 home = "=0.5.9"
 libc = "=0.2.189"
+# Offline PKI for the admission webhook serving cert (ferrum-crypto, feature
+# "x509"; ferrum-cli is the only crate that turns it on). Without an issuer in
+# this tree the deploy manifests carry a caBundle placeholder and cannot be
+# applied at all. Per-crate builds of admission/agent must not link it; the
+# Jenkins 'Crate boundary' stage checks the graphs a release build resolves.
+# A --workspace build unifies features across members and does link it.
+rcgen = { version = "=0.12.1", default-features = false, features = ["ring", "pem"] }
+# Same feature, other half: issuance without verification would be a fake Ok.
+# `verify` is what actually checks the serving cert against the CA key.
+x509-parser = { version = "=0.16.0", features = ["verify"] }
 indexmap = { version = "=2.2.6", default-features = false, features = ["std"] }
 k8s-openapi = { version = "=0.21.1", default-features = false, features = ["v1_28"] }
 kube = { version = "=0.88.1", default-features = false, features = ["client", "runtime", "rustls-tls"] }

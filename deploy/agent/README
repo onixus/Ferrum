@@ -12,3 +12,12 @@ hostPID is in the respond variant only. The kernel reports tgid from the
 initial pid namespace, so kill without hostPID would signal the wrong process;
 granting it to an observe-only install would hand over every process on the
 node for nothing.
+
+The datapath ELF lives at /usr/share/ferrum/ferrum-ebpf-progs.bpf.o inside the
+agent image and is passed as --bpf-elf in both DaemonSets. An agent built with
+the attach feature exits rather than run without it; an agent built without
+attach ignores the flag and reports Degraded.
+
+The respond ClusterRole grants pods delete only. pods/eviction and
+networkpolicies were there for Isolate, which the agent does not implement and
+refuses; they come back when it does.

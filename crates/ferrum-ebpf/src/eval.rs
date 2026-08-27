@@ -48,6 +48,25 @@ impl From<&EventMeta> for EventMeta {
 pub struct Decision {
     pub action: Action,
     pub rule_id: Option<String>,
+    /// The selector could not be resolved: a non-empty cluster / namespace /
+    /// ServiceAccount selector was matched against labels nobody has observed
+    /// yet. The rules were applied anyway (fail closed), and the carrier must
+    /// treat this as Degraded rather than as a clean decision.
+    pub labels_unknown: bool,
+}
+
+/// Outcome of matching a program selector against a workload identity.
+///
+/// Cluster / namespace / ServiceAccount labels are not carried by the event:
+/// they are joined in from watch caches that can be cold, relisting after a
+/// 410, or dead. An empty map there means "never observed", not "no labels",
+/// so it is not a non-match. Admission fails closed on exactly this condition
+/// (`require_labels_if_selected`); the runtime plane must not diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorMatch {
+    Match,
+    NoMatch,
+    LabelsUnknown,
 }
 
 /// Raw rule match. Ignores `mode` / `disabled` / selector so tests can assert MVP effects.
@@ -70,43 +89,84 @@ pub fn matched_action(spec: &EbpfSpec, event: &SyscallEvent<'_>) -> Decision {
         Some((rule, _)) => Decision {
             action: rule.action,
             rule_id: Some(rule.id.clone()),
+            labels_unknown: false,
         },
         None => Decision {
             action: spec.default_action,
             rule_id: None,
+            labels_unknown: false,
         },
     }
 }
 
 /// Apply selector, then mode / disabled. Observe and Audit never deny/kill/isolate.
 /// Selector miss: this program does not apply (`Allow`). Empty selector is cluster-wide.
+/// Labels not observed: the program is applied and the decision is flagged
+/// `labels_unknown`, because skipping the rules there is a silent fail-open.
 pub fn decide(spec: &EbpfSpec, event: &SyscallEvent<'_>, identity: &WorkloadIdentity) -> Decision {
-    if !selector_matches(&spec.selector, identity) {
-        return Decision {
-            action: Action::Allow,
-            rule_id: None,
-        };
-    }
+    let labels_unknown = match selector_match(&spec.selector, identity) {
+        SelectorMatch::NoMatch => {
+            return Decision {
+                action: Action::Allow,
+                rule_id: None,
+                labels_unknown: false,
+            }
+        }
+        SelectorMatch::Match => false,
+        SelectorMatch::LabelsUnknown => true,
+    };
     let mut decision = matched_action(spec, event);
     decision.action = cap_for_mode(spec.mode, spec.disabled, decision.action);
+    decision.labels_unknown = labels_unknown;
     decision
 }
 
+/// True only for a resolved match. An unresolved selector is NOT a match here;
+/// callers that must not fail open use [`selector_match`].
 pub fn selector_matches(selector: &PolicySelector, identity: &WorkloadIdentity) -> bool {
+    matches!(selector_match(selector, identity), SelectorMatch::Match)
+}
+
+pub fn selector_match(selector: &PolicySelector, identity: &WorkloadIdentity) -> SelectorMatch {
     if selector.is_empty() {
-        return true;
+        return SelectorMatch::Match;
     }
+    // No pod behind the cgroup at all: the index missed, which is its own
+    // Degraded signal. Nothing here can be resolved against that identity.
     if selector.is_namespaced() && identity.is_unknown() {
-        return false;
+        return SelectorMatch::NoMatch;
     }
-    label_selector_matches(&selector.cluster_selector, &identity.cluster_labels)
+    // Workload labels ride on the pod record itself, so they are known as soon
+    // as the pod is; the other three are joined in from separate watches.
+    if labels_missing(&selector.cluster_selector, &identity.cluster_labels)
+        || labels_missing(&selector.namespace_selector, &identity.namespace_labels)
+        || labels_missing(
+            &selector.service_account_selector,
+            &identity.service_account_labels,
+        )
+    {
+        return SelectorMatch::LabelsUnknown;
+    }
+    let matched = label_selector_matches(&selector.cluster_selector, &identity.cluster_labels)
         && label_selector_matches(&selector.namespace_selector, &identity.namespace_labels)
         && label_selector_matches(&selector.workload_selector, &identity.workload_labels)
         && label_selector_matches(
             &selector.service_account_selector,
             &identity.service_account_labels,
         )
-        && image_matches(selector, identity)
+        && image_matches(selector, identity);
+    if matched {
+        SelectorMatch::Match
+    } else {
+        SelectorMatch::NoMatch
+    }
+}
+
+fn labels_missing(
+    selector: &LabelSelector,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    !selector.is_empty() && labels.is_empty()
 }
 
 fn image_matches(selector: &PolicySelector, identity: &WorkloadIdentity) -> bool {

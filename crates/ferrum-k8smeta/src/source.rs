@@ -7,9 +7,11 @@
 //! exact move rule T1610 exists to kill.
 
 use crate::cgroupfs::{container_id_matches, strip_container_scheme};
+use crate::labels::LabelCache;
 use crate::WorkloadIdentity;
 use ferrum_common::Result;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContainerRecord {
@@ -29,7 +31,10 @@ pub struct PodRecord {
     pub service_account: String,
     pub resource_version: String,
     pub labels: BTreeMap<String, String>,
+    /// Joined in from the Namespace/ServiceAccount caches, not from the Pod
+    /// object: neither set of labels exists on a Pod.
     pub namespace_labels: BTreeMap<String, String>,
+    pub service_account_labels: BTreeMap<String, String>,
     pub containers: Vec<ContainerRecord>,
 }
 
@@ -51,7 +56,7 @@ impl PodRecord {
             cluster_labels: BTreeMap::new(),
             namespace_labels: self.namespace_labels.clone(),
             workload_labels: self.labels.clone(),
-            service_account_labels: BTreeMap::new(),
+            service_account_labels: self.service_account_labels.clone(),
             image: container.image.clone(),
             image_digest: container.image_digest.clone(),
         }
@@ -72,20 +77,59 @@ impl PodMetadataSource for Vec<PodRecord> {
 /// Pods keyed by UID, scoped to one node. Everything scheduled elsewhere is
 /// dropped on the way in, so a compromised watch stream cannot inject a pod
 /// this node never ran.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct PodCache {
     node_name: String,
     pods: HashMap<String, PodRecord>,
     resource_version: String,
+    namespaces: LabelCache,
+    service_accounts: LabelCache,
+    labels_unknown: AtomicU64,
+}
+
+impl Clone for PodCache {
+    fn clone(&self) -> Self {
+        Self {
+            node_name: self.node_name.clone(),
+            pods: self.pods.clone(),
+            resource_version: self.resource_version.clone(),
+            namespaces: self.namespaces.clone(),
+            service_accounts: self.service_accounts.clone(),
+            labels_unknown: AtomicU64::new(self.labels_unknown_total()),
+        }
+    }
 }
 
 impl PodCache {
     pub fn new(node_name: impl Into<String>) -> Self {
         Self {
             node_name: node_name.into(),
-            pods: HashMap::new(),
-            resource_version: String::new(),
+            ..Default::default()
         }
+    }
+
+    pub fn namespaces(&self) -> &LabelCache {
+        &self.namespaces
+    }
+
+    pub fn namespaces_mut(&mut self) -> &mut LabelCache {
+        &mut self.namespaces
+    }
+
+    pub fn service_accounts(&self) -> &LabelCache {
+        &self.service_accounts
+    }
+
+    pub fn service_accounts_mut(&mut self) -> &mut LabelCache {
+        &mut self.service_accounts
+    }
+
+    /// Pods whose namespace or ServiceAccount was not in the label caches when
+    /// their identity was built. Those pods carry EMPTY labels, so a policy
+    /// selector will not match them; the counter is how that stays visible
+    /// instead of looking like a deliberate non-match.
+    pub fn labels_unknown_total(&self) -> u64 {
+        self.labels_unknown.load(Ordering::Relaxed)
     }
 
     pub fn node_name(&self) -> &str {
@@ -143,8 +187,33 @@ impl PodCache {
 }
 
 impl PodMetadataSource for PodCache {
+    /// Joins the label caches in on the way out, so every consumer of a
+    /// `PodRecord` gets namespace/ServiceAccount labels without knowing they
+    /// come from two other watches.
     fn snapshot(&self) -> Result<Vec<PodRecord>> {
-        Ok(self.pods.values().cloned().collect())
+        Ok(self
+            .pods
+            .values()
+            .map(|pod| {
+                let mut pod = pod.clone();
+                let mut unknown = 0u64;
+                match self.namespaces.labels_of("", &pod.namespace) {
+                    Some(labels) => pod.namespace_labels = labels.clone(),
+                    None => unknown += 1,
+                }
+                match self
+                    .service_accounts
+                    .labels_of(&pod.namespace, &pod.service_account)
+                {
+                    Some(labels) => pod.service_account_labels = labels.clone(),
+                    None => unknown += 1,
+                }
+                if unknown > 0 {
+                    self.labels_unknown.fetch_add(unknown, Ordering::Relaxed);
+                }
+                pod
+            })
+            .collect())
     }
 }
 

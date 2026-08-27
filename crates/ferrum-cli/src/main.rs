@@ -4,12 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-mod compile;
-mod fsig;
-mod lint_deploy;
-mod sign;
-mod validate;
-mod verify;
+use ferrum_cli::{compile, gen_pki, lint_deploy, sign, validate, verify};
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +36,21 @@ enum Commands {
     },
     /// Проверить манифесты установки на инварианты threat model. Офлайн, без kube.
     LintDeploy { dir: PathBuf },
+    /// Выпустить офлайн CA и serving-сертификат вебхука; напечатать Secret и caBundle.
+    GenWebhookPki {
+        #[arg(long, default_value = "ferrum-admission")]
+        service: String,
+        #[arg(long, default_value = "ferrum")]
+        namespace: String,
+        #[arg(long, default_value_t = 365)]
+        days: u64,
+        /// Записать Secret, ca.crt и отрендеренную конфигурацию вебхука в каталог.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        /// Шаблон вебхука; по умолчанию берётся из --out-dir.
+        #[arg(long)]
+        template: Option<PathBuf>,
+    },
     /// Проверить подпись FSIG пином trust root (64 hex-символа Ed25519).
     Verify {
         path: PathBuf,
@@ -64,5 +74,18 @@ fn run() -> Result<()> {
         Commands::Sign { path, key, output } => sign::sign_file(&path, &key, &output),
         Commands::Verify { path, trust_root } => verify::verify_file(&path, &trust_root),
         Commands::LintDeploy { dir } => lint_deploy::lint_deploy_dir(&dir),
+        Commands::GenWebhookPki {
+            service,
+            namespace,
+            days,
+            out_dir,
+            template,
+        } => gen_pki::gen_webhook_pki(&gen_pki::GenPkiArgs {
+            service,
+            namespace,
+            days,
+            out_dir,
+            template,
+        }),
     }
 }

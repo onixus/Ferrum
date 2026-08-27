@@ -1,0 +1,5 @@
+# Output of `ferrumctl gen-webhook-pki`. A real CA and a serving key never
+# belong in git.
+validatingwebhookconfiguration.yaml
+*.secret.yaml
+ca.crt

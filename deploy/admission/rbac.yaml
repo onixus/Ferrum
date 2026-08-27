@@ -4,9 +4,15 @@ metadata:
   name: ferrum-admission
   labels:
     app.kubernetes.io/part-of: ferrum
-# Deliberately empty: an admission plugin that can read the cluster is a
-# lateral-movement target. Bundle and exceptions arrive as a mounted Secret.
-rules: []
+# Read-only, and only the two kinds whose labels a policy selector needs.
+# Everything else (bundle, exceptions) still arrives as a mounted Secret: an
+# admission plugin that can read the cluster is a lateral-movement target.
+# No "get": the label stream issues exactly two request shapes,
+# `?resourceVersion=0` (list) and `?watch=1` (watch), and never reads one object.
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "serviceaccounts"]
+    verbs: ["list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

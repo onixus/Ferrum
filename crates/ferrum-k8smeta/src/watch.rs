@@ -5,6 +5,7 @@
 //! path. The stream is plain HTTP/1.1 over rustls, same shape as
 //! `ferrum-admission::server`.
 
+use crate::labels::{LabelObject, LabelWatchEvent};
 use crate::source::{normalize_runtime_id, ContainerRecord, PodCache, PodRecord};
 use ferrum_common::{FerrumError, Result};
 use serde_json::Value;
@@ -80,13 +81,8 @@ pub fn parse_watch_event(line: &[u8]) -> Result<PodWatchEvent> {
                 .to_string(),
         )),
         "ERROR" => {
-            let code = object.get("code").and_then(Value::as_i64).unwrap_or(0);
-            let message = object
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("watch error")
-                .to_string();
-            if code == 410 || object.get("reason").and_then(Value::as_str) == Some("Expired") {
+            let (gone, message) = watch_error(object);
+            if gone {
                 Ok(PodWatchEvent::Gone(message))
             } else {
                 Ok(PodWatchEvent::Error(message))
@@ -148,6 +144,103 @@ fn event_resource_version(event: &PodWatchEvent) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Parse a `NamespaceList` or `ServiceAccountList` into (resourceVersion,
+/// objects). Only `metadata.name`, `metadata.namespace` and `metadata.labels`
+/// are read: nothing else in those objects is a policy input, and a selector
+/// must not start depending on secrets or annotations by accident.
+pub fn parse_labels_list(kind: &str, bytes: &[u8]) -> Result<(String, Vec<LabelObject>)> {
+    let root: Value = serde_json::from_slice(bytes)
+        .map_err(|e| FerrumError::Degraded(format!("{kind} json: {e}")))?;
+    let got = root.get("kind").and_then(Value::as_str).unwrap_or_default();
+    if got != kind {
+        return Err(FerrumError::Degraded(format!(
+            "expected {kind} from apiserver, got {got:?}"
+        )));
+    }
+    let rv = root
+        .pointer("/metadata/resourceVersion")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let objects = root
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(parse_label_object).collect())
+        .unwrap_or_default();
+    Ok((rv, objects))
+}
+
+/// Parse one line of a namespaces/serviceaccounts `watch=1` stream. Pure.
+pub fn parse_labels_watch_event(line: &[u8]) -> Result<LabelWatchEvent> {
+    let root: Value = serde_json::from_slice(line)
+        .map_err(|e| FerrumError::Degraded(format!("watch json: {e}")))?;
+    let kind = root.get("type").and_then(Value::as_str).unwrap_or_default();
+    let object = root.get("object").unwrap_or(&Value::Null);
+    match kind {
+        "ADDED" | "MODIFIED" | "DELETED" => {
+            let parsed = parse_label_object(object).ok_or_else(|| {
+                FerrumError::Degraded(format!("watch {kind} object has no metadata.name"))
+            })?;
+            Ok(match kind {
+                "ADDED" => LabelWatchEvent::Added(parsed),
+                "MODIFIED" => LabelWatchEvent::Modified(parsed),
+                _ => LabelWatchEvent::Deleted(parsed),
+            })
+        }
+        "BOOKMARK" => Ok(LabelWatchEvent::Bookmark(
+            object
+                .pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        )),
+        "ERROR" => {
+            let (gone, message) = watch_error(object);
+            if gone {
+                Ok(LabelWatchEvent::Gone(message))
+            } else {
+                Ok(LabelWatchEvent::Error(message))
+            }
+        }
+        other => Err(FerrumError::Degraded(format!("unknown watch type {other}"))),
+    }
+}
+
+/// `410 Gone` / `Expired` means the resourceVersion is unusable and resuming
+/// would skip changes silently.
+fn watch_error(object: &Value) -> (bool, String) {
+    let code = object.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let message = object
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("watch error")
+        .to_string();
+    let gone = code == 410 || object.get("reason").and_then(Value::as_str) == Some("Expired");
+    (gone, message)
+}
+
+fn parse_label_object(object: &Value) -> Option<LabelObject> {
+    let meta = object.get("metadata")?;
+    let name = meta.get("name").and_then(Value::as_str)?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(LabelObject {
+        namespace: meta
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        name,
+        labels: string_map(meta.get("labels")),
+        resource_version: meta
+            .get("resourceVersion")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 /// A Pod object without a UID or a name is unusable; returning None keeps it
@@ -233,7 +326,10 @@ pub fn parse_pod(object: &Value) -> Option<PodRecord> {
             .unwrap_or_default()
             .to_string(),
         labels: string_map(meta.get("labels")),
+        // Namespace/ServiceAccount labels are not on the Pod object; the label
+        // caches fill them in on the way out of PodCache::snapshot.
         namespace_labels: BTreeMap::new(),
+        service_account_labels: BTreeMap::new(),
         containers,
     })
 }
@@ -264,12 +360,149 @@ fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+mod label_parse_tests {
+    use super::*;
+    use crate::labels::{apply_labels_event, apply_labels_stream, LabelCache};
+
+    const NS_LIST: &[u8] = br#"{
+        "kind": "NamespaceList",
+        "metadata": {"resourceVersion": "2001"},
+        "items": [
+          {"metadata": {"name": "prod", "resourceVersion": "1900",
+                        "labels": {"ferrum.io/zone": "pci"}}},
+          {"metadata": {"name": "dev", "resourceVersion": "1901", "labels": {}}},
+          {"metadata": {"resourceVersion": "1902"}}
+        ]
+    }"#;
+
+    #[test]
+    fn namespace_list_keeps_only_name_and_labels() {
+        let (rv, objects) = parse_labels_list("NamespaceList", NS_LIST).expect("list");
+        assert_eq!(rv, "2001");
+        // The nameless item is dropped, not stored under an empty key.
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].name, "prod");
+        assert!(objects[0].namespace.is_empty());
+        assert_eq!(
+            objects[0].labels.get("ferrum.io/zone").map(String::as_str),
+            Some("pci")
+        );
+        assert!(objects[1].labels.is_empty());
+    }
+
+    #[test]
+    fn wrong_kind_is_degraded_not_an_empty_list() {
+        let err = parse_labels_list("ServiceAccountList", NS_LIST).expect_err("kind mismatch");
+        assert!(err.to_string().contains("ServiceAccountList"), "{err}");
+    }
+
+    #[test]
+    fn service_account_list_carries_its_namespace() {
+        let raw = br#"{
+            "kind": "ServiceAccountList",
+            "metadata": {"resourceVersion": "3001"},
+            "items": [
+              {"metadata": {"name": "default", "namespace": "prod",
+                            "labels": {"tier": "front"}}},
+              {"metadata": {"name": "default", "namespace": "dev",
+                            "labels": {"tier": "sandbox"}}}
+            ]
+        }"#;
+        let (_, objects) = parse_labels_list("ServiceAccountList", raw).expect("list");
+        let mut cache = LabelCache::new();
+        cache.replace_all(objects);
+        assert_eq!(
+            cache.labels_or_empty("prod", "default").get("tier"),
+            Some(&"front".to_string())
+        );
+        assert_eq!(
+            cache.labels_or_empty("dev", "default").get("tier"),
+            Some(&"sandbox".to_string())
+        );
+    }
+
+    #[test]
+    fn watch_events_add_modify_delete_and_bookmark() {
+        let mut cache = LabelCache::new();
+        cache.replace_all(Vec::new());
+        let added = parse_labels_watch_event(
+            br#"{"type":"ADDED","object":{"metadata":{"name":"prod","resourceVersion":"5",
+                 "labels":{"ferrum.io/zone":"pci"}}}}"#,
+        )
+        .expect("added");
+        assert_eq!(apply_labels_event(&mut cache, added), WatchOutcome::Applied);
+        assert_eq!(
+            cache.labels_or_empty("", "prod").get("ferrum.io/zone"),
+            Some(&"pci".to_string())
+        );
+
+        let modified = parse_labels_watch_event(
+            br#"{"type":"MODIFIED","object":{"metadata":{"name":"prod","resourceVersion":"6",
+                 "labels":{"ferrum.io/zone":"public"}}}}"#,
+        )
+        .expect("modified");
+        apply_labels_event(&mut cache, modified);
+        assert_eq!(
+            cache.labels_or_empty("", "prod").get("ferrum.io/zone"),
+            Some(&"public".to_string())
+        );
+
+        let bookmark = parse_labels_watch_event(
+            br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"7"}}}"#,
+        )
+        .expect("bookmark");
+        apply_labels_event(&mut cache, bookmark);
+        assert_eq!(cache.resource_version(), "7");
+
+        let deleted = parse_labels_watch_event(
+            br#"{"type":"DELETED","object":{"metadata":{"name":"prod","resourceVersion":"8"}}}"#,
+        )
+        .expect("deleted");
+        assert_eq!(
+            apply_labels_event(&mut cache, deleted),
+            WatchOutcome::Removed
+        );
+        assert!(cache.labels_of("", "prod").is_none());
+    }
+
+    #[test]
+    fn expired_resource_version_demands_a_relist() {
+        let line = br#"{"type":"ERROR","object":{"kind":"Status","reason":"Expired","message":"too old resource version: 2 (9)","code":410}}"#;
+        match parse_labels_watch_event(line).expect("parse") {
+            LabelWatchEvent::Gone(msg) => {
+                assert!(msg.contains("too old resource version"), "{msg}")
+            }
+            other => panic!("410 must be Gone, got {other:?}"),
+        }
+        let mut cache = LabelCache::new();
+        cache.replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1);
+        let outcome = apply_labels_stream(&mut cache, line).expect("apply");
+        assert_eq!(outcome, WatchOutcome::MustRelist);
+        // A relist demand must not empty the cache we already have.
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn non_410_watch_error_is_not_a_relist() {
+        let line = br#"{"type":"ERROR","object":{"kind":"Status","message":"boom","code":500}}"#;
+        match parse_labels_watch_event(line).expect("parse") {
+            LabelWatchEvent::Error(msg) => assert_eq!(msg, "boom"),
+            other => panic!("500 must stay Error, got {other:?}"),
+        }
+    }
+}
+
 #[cfg(feature = "apiserver")]
-pub use client::{ApiserverConfig, ApiserverWatcher, SERVICE_ACCOUNT_DIR};
+pub use client::{ApiserverConfig, ApiserverWatcher, LabelWatcher, SERVICE_ACCOUNT_DIR};
 
 #[cfg(feature = "apiserver")]
 mod client {
-    use super::{apply_watch_event, event_resource_version, parse_pod_list, parse_watch_event};
+    use super::{
+        apply_watch_event, event_resource_version, parse_labels_list, parse_labels_watch_event,
+        parse_pod_list, parse_watch_event,
+    };
+    use crate::labels::{label_event_resource_version, try_apply_labels_event, LabelCache};
     use crate::source::PodCache;
     use crate::watch::WatchOutcome;
     use ferrum_common::{FerrumError, Result};
@@ -309,8 +542,25 @@ mod client {
     }
 
     impl ApiserverConfig {
+        /// In-cluster config for a cluster-wide watch. No node name: the
+        /// namespaces/serviceaccounts watches carry no fieldSelector, so there
+        /// is nothing to scope them to.
+        pub fn cluster_wide() -> Result<Self> {
+            Self::in_cluster(String::new())
+        }
+
         /// In-cluster config: Service env vars plus the projected SA volume.
         pub fn from_service_account(node_name: impl Into<String>) -> Result<Self> {
+            let node_name = node_name.into();
+            if node_name.is_empty() {
+                return Err(FerrumError::Degraded(
+                    "node name required: an unscoped pod watch is a cluster-wide read".into(),
+                ));
+            }
+            Self::in_cluster(node_name)
+        }
+
+        fn in_cluster(node_name: String) -> Result<Self> {
             let host = std::env::var("KUBERNETES_SERVICE_HOST")
                 .map_err(|_| FerrumError::Degraded("KUBERNETES_SERVICE_HOST unset".into()))?;
             let port = std::env::var("KUBERNETES_SERVICE_PORT_HTTPS")
@@ -318,12 +568,6 @@ mod client {
                 .unwrap_or_else(|_| "443".into())
                 .parse::<u16>()
                 .map_err(|e| FerrumError::Degraded(format!("KUBERNETES_SERVICE_PORT: {e}")))?;
-            let node_name = node_name.into();
-            if node_name.is_empty() {
-                return Err(FerrumError::Degraded(
-                    "node name required: an unscoped pod watch is a cluster-wide read".into(),
-                ));
-            }
             let dir = PathBuf::from(SERVICE_ACCOUNT_DIR);
             Ok(Self {
                 host,
@@ -344,6 +588,33 @@ mod client {
                 ))
             })?;
             Ok(raw.trim().to_string())
+        }
+
+        fn connect(&self) -> Result<TlsStream> {
+            let cfg = self.tls_config()?;
+            let name = rustls::ServerName::try_from(self.server_name.as_str())
+                .map_err(|e| FerrumError::Degraded(format!("apiserver server name: {e}")))?;
+            let conn = rustls::ClientConnection::new(cfg, name)
+                .map_err(|e| FerrumError::Degraded(format!("tls client: {e}")))?;
+            let tcp = TcpStream::connect((self.host.as_str(), self.port))
+                .map_err(|e| FerrumError::Degraded(format!("apiserver connect: {e}")))?;
+            let _ = tcp.set_nodelay(true);
+            Ok(rustls::StreamOwned::new(conn, tcp))
+        }
+
+        fn request(&self, stream: &mut TlsStream, path: &str) -> Result<()> {
+            let token = self.token()?;
+            let mut req = String::new();
+            req.push_str(&format!("GET {path} HTTP/1.1\r\n"));
+            req.push_str(&format!("Host: {}\r\n", self.server_name));
+            req.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            req.push_str("Accept: application/json\r\n");
+            req.push_str("User-Agent: ferrum-k8smeta\r\n");
+            req.push_str("Connection: close\r\n\r\n");
+            stream
+                .write_all(req.as_bytes())
+                .and_then(|_| stream.flush())
+                .map_err(|e| FerrumError::Degraded(format!("apiserver request: {e}")))
         }
 
         fn tls_config(&self) -> Result<Arc<rustls::ClientConfig>> {
@@ -401,33 +672,6 @@ mod client {
             f(&mut guard)
         }
 
-        fn connect(&self) -> Result<TlsStream> {
-            let cfg = self.config.tls_config()?;
-            let name = rustls::ServerName::try_from(self.config.server_name.as_str())
-                .map_err(|e| FerrumError::Degraded(format!("apiserver server name: {e}")))?;
-            let conn = rustls::ClientConnection::new(cfg, name)
-                .map_err(|e| FerrumError::Degraded(format!("tls client: {e}")))?;
-            let tcp = TcpStream::connect((self.config.host.as_str(), self.config.port))
-                .map_err(|e| FerrumError::Degraded(format!("apiserver connect: {e}")))?;
-            let _ = tcp.set_nodelay(true);
-            Ok(rustls::StreamOwned::new(conn, tcp))
-        }
-
-        fn request(&self, stream: &mut TlsStream, path: &str) -> Result<()> {
-            let token = self.config.token()?;
-            let mut req = String::new();
-            req.push_str(&format!("GET {path} HTTP/1.1\r\n"));
-            req.push_str(&format!("Host: {}\r\n", self.config.server_name));
-            req.push_str(&format!("Authorization: Bearer {token}\r\n"));
-            req.push_str("Accept: application/json\r\n");
-            req.push_str("User-Agent: ferrum-agent\r\n");
-            req.push_str("Connection: close\r\n\r\n");
-            stream
-                .write_all(req.as_bytes())
-                .and_then(|_| stream.flush())
-                .map_err(|e| FerrumError::Degraded(format!("apiserver request: {e}")))
-        }
-
         fn list_path(&self) -> String {
             format!(
                 "/api/v1/pods?fieldSelector={}&resourceVersion=0",
@@ -445,9 +689,9 @@ mod client {
 
         /// Full list; replaces the cache. Returns the resourceVersion to watch from.
         pub fn relist(&self) -> Result<String> {
-            let mut stream = self.connect()?;
+            let mut stream = self.config.connect()?;
             let path = self.list_path();
-            self.request(&mut stream, &path)?;
+            self.config.request(&mut stream, &path)?;
             let mut reader = BufReader::new(stream);
             let head = read_head(&mut reader)?;
             if head.status != 200 {
@@ -470,9 +714,9 @@ mod client {
         /// resourceVersion expired (410) and resuming would silently skip
         /// changes; the caller must relist.
         pub fn watch_once(&self, rv: &str) -> Result<WatchOutcome> {
-            let mut stream = self.connect()?;
+            let mut stream = self.config.connect()?;
             let path = self.watch_path(rv);
-            self.request(&mut stream, &path)?;
+            self.config.request(&mut stream, &path)?;
             let mut reader = BufReader::new(stream);
             let head = read_head(&mut reader)?;
             match head.status {
@@ -536,9 +780,245 @@ mod client {
         }
 
         /// List, watch, reconnect forever. 410 relists instead of resuming.
+        /// Namespace and ServiceAccount labels ride along on their own threads:
+        /// they feed the same `PodCache`, so no caller has to ask for them.
         pub fn run(&self) -> ! {
+            for service_accounts in [false, true] {
+                let stream = LabelStream {
+                    config: self.config.clone(),
+                    kind: if service_accounts {
+                        SERVICE_ACCOUNTS
+                    } else {
+                        NAMESPACES
+                    },
+                    sink: Box::new(PodCacheLabels {
+                        cache: self.cache(),
+                        service_accounts,
+                    }),
+                };
+                std::thread::spawn(move || stream.run());
+            }
             watch_loop(|| self.cycle(), std::thread::sleep, None);
             unreachable!("watch_loop without a budget never returns")
+        }
+    }
+
+    const NAMESPACES: LabelKind = LabelKind {
+        list_kind: "NamespaceList",
+        resource: "namespaces",
+    };
+    const SERVICE_ACCOUNTS: LabelKind = LabelKind {
+        list_kind: "ServiceAccountList",
+        resource: "serviceaccounts",
+    };
+
+    #[derive(Debug, Clone, Copy)]
+    struct LabelKind {
+        list_kind: &'static str,
+        resource: &'static str,
+    }
+
+    /// Where a label stream writes. The two label caches of a `PodCache` live
+    /// inside it, behind the same lock as the pods, so they cannot be handed
+    /// out as separate `Arc`s.
+    trait LabelSink: Send + Sync {
+        fn with(&self, f: &mut dyn FnMut(&mut LabelCache));
+    }
+
+    struct SharedLabels(Arc<RwLock<LabelCache>>);
+
+    impl LabelSink for SharedLabels {
+        fn with(&self, f: &mut dyn FnMut(&mut LabelCache)) {
+            f(&mut self.0.write().unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+
+    struct PodCacheLabels {
+        cache: Arc<RwLock<PodCache>>,
+        service_accounts: bool,
+    }
+
+    impl LabelSink for PodCacheLabels {
+        fn with(&self, f: &mut dyn FnMut(&mut LabelCache)) {
+            let mut guard = self.cache.write().unwrap_or_else(|e| e.into_inner());
+            if self.service_accounts {
+                f(guard.service_accounts_mut());
+            } else {
+                f(guard.namespaces_mut());
+            }
+        }
+    }
+
+    /// One cluster-wide list+watch of a label-bearing kind.
+    struct LabelStream {
+        config: ApiserverConfig,
+        kind: LabelKind,
+        sink: Box<dyn LabelSink>,
+    }
+
+    impl LabelStream {
+        fn relist(&self) -> Result<String> {
+            let mut stream = self.config.connect()?;
+            let path = format!("/api/v1/{}?resourceVersion=0", self.kind.resource);
+            self.config.request(&mut stream, &path)?;
+            let mut reader = BufReader::new(stream);
+            let head = read_head(&mut reader)?;
+            if head.status != 200 {
+                return Err(FerrumError::Degraded(format!(
+                    "apiserver {} list returned {}",
+                    self.kind.resource, head.status
+                )));
+            }
+            let mut body = Vec::new();
+            read_body(&mut reader, &head, &mut body)?;
+            let (rv, objects) = parse_labels_list(self.kind.list_kind, &body)?;
+            let mut objects = Some(objects);
+            let listed_rv = rv.clone();
+            let mut stored: Result<()> = Ok(());
+            self.sink.with(&mut |cache| {
+                stored = cache.try_replace_all(objects.take().unwrap_or_default());
+                if stored.is_ok() {
+                    cache.set_resource_version(listed_rv.clone());
+                }
+            });
+            // A list past the cache ceilings leaves it cold; relisting on the
+            // next cycle is the only honest answer.
+            stored?;
+            Ok(rv)
+        }
+
+        fn watch_once(&self, rv: &str) -> Result<WatchOutcome> {
+            let mut stream = self.config.connect()?;
+            let path = format!(
+                "/api/v1/{}?watch=1&allowWatchBookmarks=true&resourceVersion={}",
+                self.kind.resource,
+                percent_encode(rv)
+            );
+            self.config.request(&mut stream, &path)?;
+            let mut reader = BufReader::new(stream);
+            let head = read_head(&mut reader)?;
+            match head.status {
+                200 => {}
+                410 => return Ok(WatchOutcome::MustRelist),
+                other => {
+                    return Err(FerrumError::Degraded(format!(
+                        "apiserver {} watch returned {other}",
+                        self.kind.resource
+                    )))
+                }
+            }
+            let mut body = BodyReader::new(&mut reader, &head);
+            loop {
+                let mut line = Vec::new();
+                match read_line(&mut body, &mut line) {
+                    Ok(0) => return Ok(WatchOutcome::Applied),
+                    Ok(_) => {}
+                    Err(e) => return Err(FerrumError::Degraded(format!("watch stream: {e}"))),
+                }
+                if line.iter().all(|b| b.is_ascii_whitespace()) {
+                    continue;
+                }
+                let event = match parse_labels_watch_event(&line) {
+                    Ok(e) => e,
+                    // One malformed frame must not drop the whole cache.
+                    Err(err) => {
+                        eprintln!(
+                            "ferrum-k8smeta: skipping {} watch frame: {err}",
+                            self.kind.resource
+                        );
+                        continue;
+                    }
+                };
+                let next_rv = label_event_resource_version(&event);
+                let mut event = Some(event);
+                let mut applied: Result<WatchOutcome> = Ok(WatchOutcome::Ignored);
+                self.sink.with(&mut |cache| {
+                    if let Some(next) = next_rv.clone() {
+                        cache.set_resource_version(next);
+                    }
+                    if let Some(event) = event.take() {
+                        applied = try_apply_labels_event(cache, event);
+                    }
+                });
+                // An object the cache refuses to hold ends the stream: growing
+                // the map without a ceiling is how one apiserver OOMs us.
+                let outcome = applied?;
+                if outcome == WatchOutcome::MustRelist {
+                    return Ok(outcome);
+                }
+            }
+        }
+
+        fn cycle(&self) -> Result<()> {
+            let mut rv = self.relist()?;
+            loop {
+                match self.watch_once(&rv)? {
+                    WatchOutcome::MustRelist => return Ok(()),
+                    _ => {
+                        let mut current = String::new();
+                        self.sink
+                            .with(&mut |cache| current = cache.resource_version().to_string());
+                        if current.is_empty() {
+                            return Ok(());
+                        }
+                        rv = current;
+                    }
+                }
+            }
+        }
+
+        fn run(self) -> ! {
+            watch_loop(|| self.cycle(), std::thread::sleep, None);
+            unreachable!("watch_loop without a budget never returns")
+        }
+    }
+
+    /// Cluster-wide Namespace and ServiceAccount label caches. This is the
+    /// admission-side entry point: it never reads Pods, so the webhook's RBAC
+    /// stays get/list/watch on those two kinds.
+    pub struct LabelWatcher {
+        config: ApiserverConfig,
+        namespaces: Arc<RwLock<LabelCache>>,
+        service_accounts: Arc<RwLock<LabelCache>>,
+    }
+
+    impl LabelWatcher {
+        pub fn new(config: ApiserverConfig) -> Self {
+            Self {
+                config,
+                namespaces: Arc::new(RwLock::new(LabelCache::new())),
+                service_accounts: Arc::new(RwLock::new(LabelCache::new())),
+            }
+        }
+
+        pub fn namespaces(&self) -> Arc<RwLock<LabelCache>> {
+            Arc::clone(&self.namespaces)
+        }
+
+        pub fn service_accounts(&self) -> Arc<RwLock<LabelCache>> {
+            Arc::clone(&self.service_accounts)
+        }
+
+        /// Both streams on their own threads. Returns immediately: the caller
+        /// keeps serving while the caches are still cold.
+        pub fn spawn(&self) {
+            for (sink, kind) in [
+                (
+                    Box::new(SharedLabels(self.namespaces())) as Box<dyn LabelSink>,
+                    NAMESPACES,
+                ),
+                (
+                    Box::new(SharedLabels(self.service_accounts())) as Box<dyn LabelSink>,
+                    SERVICE_ACCOUNTS,
+                ),
+            ] {
+                let stream = LabelStream {
+                    config: self.config.clone(),
+                    kind,
+                    sink,
+                };
+                std::thread::spawn(move || stream.run());
+            }
         }
     }
 

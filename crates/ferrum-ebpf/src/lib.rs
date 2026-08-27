@@ -5,22 +5,25 @@
 mod envelope;
 mod eval;
 mod event;
-#[cfg(feature = "attach")]
 mod kernel;
 mod loader;
 mod spec;
 
 pub use envelope::{extract_febp, BUNDLE_FORMAT, BUNDLE_MAGIC};
-pub use eval::{decide, matched_action, selector_matches, Decision, EventMeta, SyscallEvent};
+pub use eval::{
+    decide, matched_action, selector_match, selector_matches, Decision, EventMeta, SelectorMatch,
+    SyscallEvent,
+};
 pub use event::{
     decode_event, encode_event, event_meta, syscall_event, syscall_name, SyscallArch,
     EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
 };
 pub use ferrum_ebpf_progs::{
-    Event, COMM_LEN, EVENTS_DROPPED_TOTAL, EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER,
-    MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
+    Event, CGROUPS_MAX_ENTRIES, COMM_LEN, EVENTS_DROPPED_TOTAL, EVENT_FLAG_AGENT_SELF,
+    EVENT_FLAG_CONTAINER, MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
 };
 pub use ferrum_ids::AGENT_ABI;
+pub use kernel::{plan_cgroup_sync, CgroupSyncPlan, SyncStats};
 #[cfg(feature = "attach")]
 pub use kernel::{KernelHandle, RingReader};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
@@ -557,6 +560,96 @@ mod tests {
         let good = loader.last_good().expect("lkg").digest.clone();
         assert_compile(loader.load_bundle(&digest_of(&spec), &spec));
         assert_eq!(loader.last_good().expect("lkg").digest, good);
+    }
+
+    /// Enforcing program whose namespace selector is `ferrum.io/zone In
+    /// (pci, secrets)`, with one container-only shell kill rule.
+    fn zone_selected_spec() -> EbpfSpec {
+        let mut w = Writer::new();
+        w.put_magic(&EBPF_MAGIC);
+        w.put_u32(AGENT_ABI);
+        w.put_u8(Mode::Enforce.as_u8());
+        w.put_bool(false);
+        w.put_i32(100);
+        w.put_u8(Action::Audit.as_u8());
+        put_empty_label_selector(&mut w);
+        w.put_u16(0);
+        w.put_u16(1);
+        w.put_str("ferrum.io/zone");
+        w.put_str("In");
+        w.put_str_list(&["pci", "secrets"]);
+        put_empty_label_selector(&mut w);
+        put_empty_label_selector(&mut w);
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.put_u16(1);
+        w.put_str("no-shell");
+        w.put_str_list(&["execve"]);
+        w.put_u8(Action::Kill.as_u8());
+        w.put_str_list(&["sh"]);
+        w.put_bool(true);
+        w.put_str_list(&[]);
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        parse_febp(&w.finish()).expect("parse")
+    }
+
+    /// The label caches are cold, relisting or dead: the pod is known, its
+    /// namespace labels are not. Empty labels are not a non-match, and the
+    /// program must not be silently skipped — admission fails closed on the
+    /// very same condition.
+    #[test]
+    fn unobserved_labels_are_not_a_non_match() {
+        let spec = zone_selected_spec();
+        let shell = ev("execve", "sh", "/bin/sh", true, false);
+        let mut cold = pci_identity();
+        cold.namespace_labels.clear();
+
+        assert_eq!(
+            selector_match(&spec.selector, &cold),
+            SelectorMatch::LabelsUnknown
+        );
+        assert!(!selector_matches(&spec.selector, &cold));
+
+        let decision = decide(&spec, &shell, &cold);
+        assert_eq!(
+            decision.action,
+            Action::Kill,
+            "a rule must not be skipped because its selector could not be resolved"
+        );
+        assert!(decision.labels_unknown);
+
+        // Resolved identities are unaffected in both directions.
+        let hot = pci_identity();
+        assert_eq!(selector_match(&spec.selector, &hot), SelectorMatch::Match);
+        assert!(!decide(&spec, &shell, &hot).labels_unknown);
+        let mut public = pci_identity();
+        public
+            .namespace_labels
+            .insert("ferrum.io/zone".into(), "public".into());
+        assert_eq!(
+            selector_match(&spec.selector, &public),
+            SelectorMatch::NoMatch
+        );
+        let miss = decide(&spec, &shell, &public);
+        assert_eq!(miss.action, Action::Allow);
+        assert!(!miss.labels_unknown);
+    }
+
+    /// An unresolved selector still reports through the loader, so the carrier
+    /// can degrade on it.
+    #[test]
+    fn loader_reports_unresolved_labels() {
+        let mut loader = Loader::new();
+        load_mvp(&mut loader);
+        let mut cold = pci_identity();
+        cold.namespace_labels.clear();
+        // The MVP bundle has no selector at all: nothing to resolve.
+        assert!(
+            !loader
+                .decide(&ev("execve", "sh", "/bin/sh", true, false), &cold)
+                .labels_unknown
+        );
     }
 
     #[test]

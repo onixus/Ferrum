@@ -33,6 +33,17 @@ const UNRESOLVED_ROLE_REF: &str = "FD016";
 const AGGREGATED_ROLE: &str = "FD017";
 const RESPOND_WITHOUT_HOST_PID: &str = "FD018";
 const UNNEEDED_HOST_PID: &str = "FD019";
+const WEBHOOK_CA_BUNDLE: &str = "FD020";
+const WEBHOOK_TLS_SECRET: &str = "FD021";
+
+/// The token a webhook template carries instead of a certificate. Committing a
+/// real CA is not an option, so the applied file is produced by
+/// `ferrumctl gen-webhook-pki` and only the template lives in git.
+pub const CA_BUNDLE_PLACEHOLDER: &str = "REPLACE_WITH_PEM_CA_BUNDLE_BASE64";
+/// Files whose name carries this infix are templates, not manifests.
+pub const TEMPLATE_INFIX: &str = ".tmpl.";
+/// Secret name the issuance instruction produces: `<service>` + this.
+pub const WEBHOOK_TLS_SECRET_SUFFIX: &str = "-tls";
 
 /// roleRef targets that are not in this tree and that we still accept: the API
 /// server creates them itself, and both are narrow enough that binding one is
@@ -70,6 +81,8 @@ struct Doc {
     file: String,
     /// Files named `optional-*.yaml` are not part of the base install.
     base: bool,
+    /// `*.tmpl.yaml`: not applied as-is, checked for the placeholder instead.
+    template: bool,
     value: Value,
 }
 
@@ -98,6 +111,7 @@ fn collect_findings(dir: &Path) -> Result<(Vec<Finding>, usize)> {
     check_wildcard_rules(&docs, &mut findings);
     check_pod_templates(&docs, &mut findings);
     check_webhooks(&docs, &mut findings);
+    check_webhook_tls(&docs, &mut findings);
     check_crd_catalog(dir, &mut findings);
     Ok((findings, docs.len()))
 }
@@ -111,11 +125,13 @@ fn load_docs(dir: &Path) -> Result<Vec<Doc>> {
     for path in files {
         let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let name = path.display().to_string();
-        let base = !path
+        let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("optional-"))
-            .unwrap_or(false);
+            .unwrap_or_default()
+            .to_string();
+        let base = !file_name.starts_with("optional-");
+        let template = file_name.contains(TEMPLATE_INFIX);
         for (i, doc) in serde_yaml::Deserializer::from_str(&raw).enumerate() {
             let value = Value::deserialize(doc)
                 .with_context(|| format!("parse {} (document {})", path.display(), i + 1))?;
@@ -125,6 +141,7 @@ fn load_docs(dir: &Path) -> Result<Vec<Doc>> {
             docs.push(Doc {
                 file: name.clone(),
                 base,
+                template,
                 value,
             });
         }
@@ -534,6 +551,7 @@ fn check_webhooks(docs: &[Doc], findings: &mut Vec<Finding>) {
                     ),
                 });
             }
+            check_ca_bundle(doc, wname, webhook, findings);
             let excluded = namespace_exclusions(webhook);
             for ns in WEBHOOK_EXEMPT_NAMESPACES {
                 if !excluded.contains(ns) {
@@ -549,6 +567,170 @@ fn check_webhooks(docs: &[Doc], findings: &mut Vec<Finding>) {
             }
         }
     }
+}
+
+/// A webhook whose `caBundle` is a placeholder cannot be applied; a webhook
+/// whose `caBundle` is not base64 of PEM CERTIFICATE blocks is applied and then
+/// fails every handshake. Templates carry the token and nothing else.
+fn check_ca_bundle(doc: &Doc, wname: &str, webhook: &Value, findings: &mut Vec<Finding>) {
+    let value = webhook
+        .get("clientConfig")
+        .and_then(|c| c.get("caBundle"))
+        .and_then(Value::as_str);
+    let mut fail = |msg: String| {
+        findings.push(Finding {
+            code: WEBHOOK_CA_BUNDLE,
+            file: doc.file.clone(),
+            msg,
+        })
+    };
+    let Some(value) = value else {
+        fail(format!(
+            "webhook '{wname}' has no clientConfig.caBundle; the API server would trust the              cluster's default roots for a certificate no public CA issued"
+        ));
+        return;
+    };
+    let value = value.trim();
+    if doc.template {
+        if value != CA_BUNDLE_PLACEHOLDER {
+            fail(format!(
+                "webhook '{wname}' is in a template but its caBundle is not the                  {CA_BUNDLE_PLACEHOLDER} token; a template must not carry a real CA"
+            ));
+        }
+        return;
+    }
+    if value.is_empty() {
+        fail(format!("webhook '{wname}' has an empty caBundle"));
+        return;
+    }
+    if value == CA_BUNDLE_PLACEHOLDER {
+        fail(format!(
+            "webhook '{wname}' still carries the {CA_BUNDLE_PLACEHOLDER} placeholder; run \
+             `ferrumctl gen-webhook-pki` and apply what it renders"
+        ));
+        return;
+    }
+    let decoded = match ferrum_crypto::x509::base64_decode(value) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            fail(format!(
+                "webhook '{wname}' caBundle is not valid base64: {e}"
+            ));
+            return;
+        }
+    };
+    let Ok(text) = String::from_utf8(decoded) else {
+        fail(format!(
+            "webhook '{wname}' caBundle does not decode to PEM text"
+        ));
+        return;
+    };
+    if let Err(e) = ferrum_crypto::x509::pem_certificates(&text) {
+        fail(format!(
+            "webhook '{wname}' caBundle does not decode to PEM CERTIFICATE blocks: {e}"
+        ));
+    }
+}
+
+/// The webhook's Service must be backed by a workload that actually mounts the
+/// Secret the issuance step writes, and whose `--tls-cert`/`--tls-key` point
+/// inside that mount. A cert on disk somewhere else is a cert the server never
+/// serves.
+fn check_webhook_tls(docs: &[Doc], findings: &mut Vec<Finding>) {
+    for doc in docs {
+        if kind(doc) != "ValidatingWebhookConfiguration" {
+            continue;
+        }
+        for webhook in seq(&doc.value, "webhooks") {
+            let wname = webhook
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unnamed>");
+            let Some(service) = webhook
+                .get("clientConfig")
+                .and_then(|c| c.get("service"))
+                .and_then(|s| s.get("name"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let secret = format!("{service}{WEBHOOK_TLS_SECRET_SUFFIX}");
+            let mut fail = |msg: String| {
+                findings.push(Finding {
+                    code: WEBHOOK_TLS_SECRET,
+                    file: doc.file.clone(),
+                    msg,
+                })
+            };
+            let Some(spec) = docs
+                .iter()
+                .filter(|d| name(d) == service)
+                .find_map(pod_spec)
+            else {
+                fail(format!(
+                    "webhook '{wname}' is served by Service '{service}', but no workload named                      '{service}' in this tree mounts its serving certificate"
+                ));
+                continue;
+            };
+            let Some(mount_dir) = tls_mount_dir(spec, &secret) else {
+                fail(format!(
+                    "webhook '{wname}' expects Secret '{secret}' (what `ferrumctl                      gen-webhook-pki` writes), but '{service}' mounts no such volume"
+                ));
+                continue;
+            };
+            for flag in ["--tls-cert", "--tls-key"] {
+                match flag_value(spec, flag) {
+                    Some(path) if path.starts_with(&format!("{mount_dir}/")) => {}
+                    Some(path) => fail(format!(
+                        "webhook '{wname}': '{service}' passes {flag} {path}, which is outside                          the '{secret}' mount at {mount_dir}"
+                    )),
+                    None => fail(format!(
+                        "webhook '{wname}': '{service}' passes no {flag}, so the mounted                          Secret '{secret}' is never served"
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// mountPath of the container volume backed by `secret`, without a trailing slash.
+fn tls_mount_dir(spec: &Value, secret: &str) -> Option<String> {
+    let volume = seq(spec, "volumes").iter().find(|v| {
+        v.get("secret")
+            .and_then(|s| s.get("secretName"))
+            .and_then(Value::as_str)
+            == Some(secret)
+    })?;
+    let vname = volume.get("name").and_then(Value::as_str)?;
+    seq(spec, "containers")
+        .iter()
+        .flat_map(|c| seq(c, "volumeMounts"))
+        .find(|m| m.get("name").and_then(Value::as_str) == Some(vname))
+        .and_then(|m| m.get("mountPath").and_then(Value::as_str))
+        .map(|p| p.trim_end_matches('/').to_string())
+}
+
+/// `--flag value` and `--flag=value` both count; container args are written
+/// either way across this tree.
+fn flag_value(spec: &Value, flag: &str) -> Option<String> {
+    for container in seq(spec, "containers") {
+        // Not `str_list`: it lowercases, and a mount path is case-sensitive.
+        let argv: Vec<String> = ["command", "args"]
+            .iter()
+            .flat_map(|key| seq(container, key))
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        for (i, arg) in argv.iter().enumerate() {
+            if let Some(v) = arg.strip_prefix(&format!("{flag}=")) {
+                return Some(v.to_string());
+            }
+            if arg == flag {
+                return argv.get(i + 1).cloned();
+            }
+        }
+    }
+    None
 }
 
 fn namespace_exclusions(webhook: &Value) -> BTreeSet<String> {
@@ -716,10 +898,77 @@ mod tests {
     }
 
     #[test]
+    fn a_placeholder_ca_bundle_outside_a_template_is_a_finding() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-cabundle");
+        assert_eq!(
+            codes,
+            [WEBHOOK_CA_BUNDLE]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn a_webhook_that_serves_an_unissued_secret_is_a_finding() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-webhook-tls");
+        assert_eq!(
+            codes,
+            [WEBHOOK_TLS_SECRET]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// The committed tree holds the template, never a rendered configuration.
+    #[test]
+    fn the_template_keeps_the_placeholder_and_nothing_else() {
+        let raw = fs::read_to_string(repo_path(
+            "deploy/admission/validatingwebhookconfiguration.tmpl.yaml",
+        ))
+        .expect("webhook template");
+        assert!(raw.contains(CA_BUNDLE_PLACEHOLDER));
+        assert!(
+            !repo_path("deploy/admission/validatingwebhookconfiguration.yaml").exists(),
+            "a rendered webhook configuration must not be committed"
+        );
+    }
+
+    #[test]
+    fn a_real_ca_bundle_passes() {
+        let ca = ferrum_crypto::x509::issue_ca(
+            "ferrum-admission-ca",
+            std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let bundle = ferrum_crypto::x509::base64_encode(ca.cert_pem.as_bytes());
+        let docs = vec![Doc {
+            file: "webhook.yaml".into(),
+            base: true,
+            template: false,
+            value: serde_yaml::from_str(&format!(
+                "kind: ValidatingWebhookConfiguration\nwebhooks:\n  - name: policy.ferrum.io\n    clientConfig:\n      caBundle: {bundle}\n"
+            ))
+            .unwrap(),
+        }];
+        let mut findings = Vec::new();
+        for webhook in seq(&docs[0].value, "webhooks") {
+            check_ca_bundle(&docs[0], "policy.ferrum.io", webhook, &mut findings);
+        }
+        assert!(
+            findings.is_empty(),
+            "{}",
+            findings.first().map(|f| f.msg.clone()).unwrap_or_default()
+        );
+    }
+
+    #[test]
     fn allowlisted_external_role_ref_is_not_a_finding() {
         let docs = vec![Doc {
             file: "rbac.yaml".into(),
             base: true,
+            template: false,
             value: serde_yaml::from_str(
                 r#"
 kind: ClusterRoleBinding
@@ -769,6 +1018,7 @@ subjects:
         let docs = vec![Doc {
             file: "rbac.yaml".into(),
             base: true,
+            template: false,
             value: serde_yaml::from_str(
                 r#"
 kind: ClusterRoleBinding
@@ -797,6 +1047,7 @@ subjects:
         let docs = vec![Doc {
             file: "optional-respond.yaml".into(),
             base: false,
+            template: false,
             value: serde_yaml::from_str(
                 r#"
 kind: ClusterRoleBinding
@@ -848,6 +1099,7 @@ subjects:
             .map(|(_, yaml)| Doc {
                 file: "rbac.yaml".into(),
                 base: true,
+                template: false,
                 value: serde_yaml::from_str(yaml).unwrap(),
             })
             .collect();
@@ -863,6 +1115,7 @@ subjects:
         let docs = vec![Doc {
             file: "webhook.yaml".into(),
             base: true,
+            template: false,
             value: serde_yaml::from_str(
                 r#"
 kind: ValidatingWebhookConfiguration
@@ -879,6 +1132,7 @@ webhooks:
         }];
         let mut findings = Vec::new();
         check_webhooks(&docs, &mut findings);
+        check_webhook_tls(&docs, &mut findings);
         let codes: BTreeSet<&str> = findings.iter().map(|f| f.code).collect();
         assert!(codes.contains(WEBHOOK_SIDE_EFFECTS));
         assert!(codes.contains(WEBHOOK_TIMEOUT));

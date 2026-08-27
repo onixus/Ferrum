@@ -4,8 +4,8 @@
 
 use ferrum_admission::{
     admit_bytes, load_path, load_tls_config, parse_trust_root, poll_bundle_file,
-    poll_exceptions_file, serve_listener, verify_exceptions_fsig, AdmissionSubject, ReviewConfig,
-    WebhookState,
+    poll_exceptions_file, serve_listener, verify_exceptions_fsig, AdmissionSubject, LabelSource,
+    ReviewConfig, StaticLabels, WebhookState,
 };
 use ferrum_api::PolicyExceptionSpec;
 use std::collections::BTreeMap;
@@ -27,7 +27,7 @@ fn cmd_eval(args: &[String]) {
     if args.len() != 3 {
         eprintln!("usage: ferrum-admission <program.fadm> <subject.json>");
         eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <exceptions.fsig> --policy-name <name>] <admissionreview.json>");
-        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000]");
+        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000] [--apiserver [host:port]] [--cluster-label k=v]");
         eprintln!("missing or invalid compiled program denies the request (fail closed)");
         exit(2);
     }
@@ -138,7 +138,8 @@ fn cmd_serve(args: &[String]) {
     };
     // In serve mode --exceptions is a mount, not a static file: the list is
     // hot-reloaded alongside the bundle. Missing file = empty list.
-    let cfg = review_config(&flags);
+    let mut cfg = review_config(&flags);
+    cfg.labels = label_source(&flags);
     let exceptions_path = flags
         .map
         .get("exceptions")
@@ -244,7 +245,81 @@ fn review_config(flags: &Flags) -> ReviewConfig {
             .get("policy-namespace")
             .cloned()
             .unwrap_or_default(),
+        ..Default::default()
     }
+}
+
+/// `--cluster-label k=v`, repeatable as `k=v,k2=v2`. MVP-1 has no cluster
+/// object to read these from; they are operator-stated, not discovered.
+fn cluster_labels(flags: &Flags) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(raw) = flags.map.get("cluster-label") else {
+        return out;
+    };
+    for pair in raw.split(',').filter(|s| !s.trim().is_empty()) {
+        match pair.split_once('=') {
+            Some((k, v)) if !k.trim().is_empty() => {
+                out.insert(k.trim().to_string(), v.trim().to_string());
+            }
+            _ => die(&format!("--cluster-label expects k=v, got {pair:?}")),
+        }
+    }
+    out
+}
+
+/// Live namespace/ServiceAccount labels, or a cold source that denies every
+/// policy with such a selector until the watch lists.
+#[cfg(feature = "apiserver")]
+fn label_source(flags: &Flags) -> Arc<dyn LabelSource> {
+    use ferrum_k8smeta::watch::{ApiserverConfig, LabelWatcher};
+
+    let cluster = cluster_labels(flags);
+    let Some(target) = flags.map.get("apiserver") else {
+        eprintln!(
+            "ferrum-admission: --apiserver not set; policies with a namespace or \
+             ServiceAccount selector will fail closed"
+        );
+        return Arc::new(StaticLabels::cluster(cluster));
+    };
+    let mut config = match ApiserverConfig::cluster_wide() {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("error: apiserver: {err}");
+            exit(2);
+        }
+    };
+    if !target.is_empty() {
+        match target.rsplit_once(':') {
+            Some((host, port)) => {
+                config.host = host.to_string();
+                config.port = port
+                    .parse()
+                    .unwrap_or_else(|_| die("invalid --apiserver port"));
+            }
+            None => config.host = target.clone(),
+        }
+    }
+    let watcher = LabelWatcher::new(config);
+    let source = ferrum_admission::WatchedLabels::new(
+        watcher.namespaces(),
+        watcher.service_accounts(),
+        cluster,
+    );
+    watcher.spawn();
+    // The watcher owns nothing the caches need; the threads keep the Arcs alive.
+    Arc::new(source)
+}
+
+#[cfg(not(feature = "apiserver"))]
+fn label_source(flags: &Flags) -> Arc<dyn LabelSource> {
+    if flags.map.contains_key("apiserver") {
+        die("--apiserver requires the `apiserver` feature at build time");
+    }
+    eprintln!(
+        "ferrum-admission: built without the `apiserver` feature; policies with a namespace or \
+         ServiceAccount selector will fail closed"
+    );
+    Arc::new(StaticLabels::cluster(cluster_labels(flags)))
 }
 
 fn exceptions_and_config(

@@ -9,6 +9,7 @@
 mod bundle;
 mod encoding;
 mod eval;
+mod labels;
 mod program;
 mod review;
 mod server;
@@ -30,6 +31,9 @@ pub use eval::{
     RULE_REQUIRE_DIGEST, RULE_RUN_AS_ROOT, RULE_UNSIGNED, RULE_WILDCARDS_RBAC,
 };
 pub use ferrum_ids::Digest;
+#[cfg(feature = "apiserver")]
+pub use labels::WatchedLabels;
+pub use labels::{ColdLabels, LabelSource, StaticLabels};
 pub use program::{parse_program, AdmissionProgram, ADMISSION_ABI, ADMISSION_MAGIC};
 pub use review::{handle_review_bytes, ReviewConfig, ReviewReply};
 pub use server::{

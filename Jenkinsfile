@@ -51,6 +51,10 @@ pipeline {
                     # compiled behind these.
                     cargo clippy -p ferrum-k8smeta --features apiserver --all-targets -- -D warnings
                     cargo clippy -p ferrum-agent --features attach --all-targets -- -D warnings
+                    # attach+apiserver is the only production combination: the
+                    # cgroup sync into ferrum_cgroups is compiled out of every
+                    # other one.
+                    cargo clippy -p ferrum-agent --features attach,apiserver --all-targets -- -D warnings
                 '''
             }
         }
@@ -110,6 +114,48 @@ pipeline {
             }
         }
 
+        stage('Crate boundary') {
+            steps {
+                sh '''
+                    set -eu
+                    # ferrum-crypto/x509 pulls a certificate generator and a
+                    # parser. Only ferrumctl issues PKI; the decision path must
+                    # not link either. Per-crate graphs are what a release build
+                    # resolves (`cargo build -p ...`); a --workspace graph
+                    # unifies features across members and always shows them, so
+                    # it cannot answer this question.
+                    fail=0
+                    for target in \
+                        "ferrum-admission:" \
+                        "ferrum-admission:apiserver" \
+                        "ferrum-agent:" \
+                        "ferrum-agent:attach" \
+                        "ferrum-agent:apiserver" \
+                        "ferrum-agent:attach,apiserver"
+                    do
+                        crate="${target%%:*}"
+                        features="${target#*:}"
+                        if [ -n "$features" ]; then
+                            tree="$(cargo tree -p "$crate" -e normal --features "$features")"
+                        else
+                            tree="$(cargo tree -p "$crate" -e normal)"
+                        fi
+                        for forbidden in rcgen x509-parser; do
+                            if printf '%s\n' "$tree" | grep -qE "(^| )$forbidden v"; then
+                                echo "crate boundary: $crate (features=${features:-default}) links $forbidden" >&2
+                                fail=1
+                            fi
+                        done
+                    done
+                    if [ "$fail" -ne 0 ]; then
+                        echo "the admission/agent dependency graph must not carry ferrum-crypto/x509" >&2
+                        exit 1
+                    fi
+                    echo "ok: rcgen and x509-parser stay off the admission and agent graphs"
+                '''
+            }
+        }
+
         stage('Validate policies') {
             steps {
                 sh '''
@@ -130,6 +176,37 @@ pipeline {
                     fi
                     echo "ok: exception-bad-no-ticket.yaml rejected"
                     cargo run -p ferrum-cli --quiet -- lint-deploy deploy
+                    # The committed tree carries a webhook template, not an
+                    # applicable configuration. Prove the issuance step closes
+                    # that gap instead of trusting the template alone.
+                    rm -rf /tmp/ferrum-pki && cp -r deploy /tmp/ferrum-pki
+                    cargo run -p ferrum-cli --quiet -- gen-webhook-pki \
+                        --service ferrum-admission --namespace ferrum --days 365 \
+                        --out-dir /tmp/ferrum-pki/admission
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- gen-webhook-pki \
+                        --service ferrum-admission --namespace ferrum --days 365 \
+                        --out-dir /tmp/ferrum-pki/admission >/dev/null 2>&1
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "gen-webhook-pki must refuse to overwrite issued PKI" >&2
+                        exit 1
+                    fi
+                    echo "ok: gen-webhook-pki refuses to overwrite"
+                    # The template is not applied; only the rendered file is.
+                    rm /tmp/ferrum-pki/admission/validatingwebhookconfiguration.tmpl.yaml
+                    cargo run -p ferrum-cli --quiet -- lint-deploy /tmp/ferrum-pki
+                    rm -rf /tmp/ferrum-pki
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- lint-deploy crates/ferrum-testkit/fixtures/deploy-bad-cabundle >/tmp/ferrum-bad-cabundle.out 2>/tmp/ferrum-bad-cabundle.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "fixtures/deploy-bad-cabundle must fail lint-deploy" >&2
+                        exit 1
+                    fi
+                    echo "ok: caBundle placeholder rejected"
                     set +e
                     cargo run -p ferrum-cli --quiet -- lint-deploy crates/ferrum-testkit/fixtures/deploy-bad >/tmp/ferrum-bad-deploy.out 2>/tmp/ferrum-bad-deploy.err
                     status=$?

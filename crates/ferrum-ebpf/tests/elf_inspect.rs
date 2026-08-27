@@ -7,16 +7,25 @@
 //! Parsing is hand-rolled ELF64LE (headers + symtab) to keep ferrum-ebpf
 //! free of ELF crates.
 
-use ferrum_ebpf::{MAP_CGROUPS, MAP_EVENTS, MAP_SELF, TRACEPOINTS};
+use ferrum_ebpf::{CGROUPS_MAX_ENTRIES, MAP_CGROUPS, MAP_EVENTS, MAP_SELF, TRACEPOINTS};
 
 const SHT_SYMTAB: u32 = 2;
 const STT_FUNC: u8 = 2;
 const STT_OBJECT: u8 = 1;
 
+/// `bpf_map_def` as aya-ebpf emits it into the `maps` section: seven u32s
+/// (type, key_size, value_size, max_entries, map_flags, id, pinning).
+const MAP_DEF_LEN: usize = 28;
+const BPF_MAP_TYPE_HASH: u32 = 1;
+
 struct Sym {
     name: String,
     kind: u8,
     section: String,
+    /// Offset of the symbol inside its section, and its declared size.
+    value: usize,
+    size: usize,
+    shndx: usize,
 }
 
 fn u16_at(data: &[u8], off: usize) -> u16 {
@@ -101,23 +110,44 @@ fn symbols(elf: &[u8]) -> Vec<Sym> {
                 } else {
                     String::new()
                 },
+                value: u64_at(entry, 8) as usize,
+                size: u64_at(entry, 16) as usize,
+                shndx,
             }
         })
         .collect()
 }
 
-#[test]
-fn elf_contains_all_tracepoints() {
+/// Bytes of the section a symbol lives in.
+fn section_data<'a>(elf: &'a [u8], sym: &Sym) -> &'a [u8] {
+    let section = &sections(elf)[sym.shndx];
+    &elf[section.offset..section.offset + section.size]
+}
+
+fn u32_field(def: &[u8], index: usize) -> u32 {
+    u32_at(def, index * 4)
+}
+
+/// The compiled ELF, or None when there is nothing to inspect. In the BPF ELF
+/// CI stage a skip is a failure, or a lost env var silently turns the only
+/// real gate into a no-op.
+fn elf_or_skip() -> Option<(String, Vec<u8>)> {
     let Ok(path) = std::env::var("FERRUM_BPF_ELF") else {
-        // In the BPF ELF CI stage the skip must be a failure, or a lost env
-        // var silently turns the only real gate into a no-op.
         if std::env::var_os("FERRUM_BPF_ELF_REQUIRED").is_some() {
             panic!("FERRUM_BPF_ELF_REQUIRED is set but FERRUM_BPF_ELF is not");
         }
         println!("skipping: FERRUM_BPF_ELF not set (no compiled bpf ELF to inspect)");
-        return;
+        return None;
     };
     let elf = std::fs::read(&path).unwrap_or_else(|err| panic!("read {path}: {err}"));
+    Some((path, elf))
+}
+
+#[test]
+fn elf_contains_all_tracepoints() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
     let syms = symbols(&elf);
 
     for (prog, category, name) in TRACEPOINTS {
@@ -138,4 +168,45 @@ fn elf_contains_all_tracepoints() {
         assert_eq!(sym.kind, STT_OBJECT, "{map} is not a map object");
         assert_eq!(sym.section, "maps", "{map} is outside the maps section");
     }
+}
+
+/// Static ABI check of `ferrum_cgroups`, NOT a check that attach works: the
+/// map definition compiled into the ELF must match what
+/// `KernelHandle::sync_container_cgroups` writes (u64 -> u8) and what
+/// `plan_cgroup_sync` sizes against. A silent drift here means the container
+/// flag is never set and every `container_only` rule stops matching.
+#[test]
+fn cgroups_map_definition_matches_the_userspace_abi() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
+    let syms = symbols(&elf);
+    let sym = syms
+        .iter()
+        .find(|s| s.name == MAP_CGROUPS)
+        .unwrap_or_else(|| panic!("map symbol {MAP_CGROUPS} missing from {path}"));
+    assert_eq!(
+        sym.size, MAP_DEF_LEN,
+        "{MAP_CGROUPS} is {} bytes, expected a {MAP_DEF_LEN}-byte bpf_map_def",
+        sym.size
+    );
+    let data = section_data(&elf, sym);
+    let def = &data[sym.value..sym.value + MAP_DEF_LEN];
+    assert_eq!(
+        u32_field(def, 0),
+        BPF_MAP_TYPE_HASH,
+        "{MAP_CGROUPS} is not BPF_MAP_TYPE_HASH"
+    );
+    assert_eq!(
+        u32_field(def, 1),
+        8,
+        "{MAP_CGROUPS} key is not a u64 cgroup id"
+    );
+    assert_eq!(u32_field(def, 2), 1, "{MAP_CGROUPS} value is not a u8 flag");
+    assert_eq!(
+        u32_field(def, 3),
+        CGROUPS_MAX_ENTRIES,
+        "{MAP_CGROUPS} max_entries disagrees with CGROUPS_MAX_ENTRIES, which is what \
+         plan_cgroup_sync refuses to overflow"
+    );
 }

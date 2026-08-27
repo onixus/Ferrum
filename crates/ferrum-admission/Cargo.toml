@@ -14,10 +14,18 @@ ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ids.workspace = true
 ferrum-policy.workspace = true
+# Label watch only, and never with the k8smeta default features: the decision
+# path must not grow a second client.
+# Not `workspace = true`: that form cannot turn default features off here.
+ferrum-k8smeta = { path = "../ferrum-k8smeta", default-features = false, optional = true }
 rustls = "=0.21.11"
 rustls-pemfile = "=1.0.4"
 serde.workspace = true
 serde_json.workspace = true
+
+[features]
+default = []
+apiserver = ["dep:ferrum-k8smeta", "ferrum-k8smeta/apiserver"]
 
 [dev-dependencies]
 ferrum-compiler.workspace = true
