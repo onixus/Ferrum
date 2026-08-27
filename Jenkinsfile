@@ -114,6 +114,48 @@ pipeline {
             }
         }
 
+        stage('Crate boundary') {
+            steps {
+                sh '''
+                    set -eu
+                    # ferrum-crypto/x509 pulls a certificate generator and a
+                    # parser. Only ferrumctl issues PKI; the decision path must
+                    # not link either. Per-crate graphs are what a release build
+                    # resolves (`cargo build -p ...`); a --workspace graph
+                    # unifies features across members and always shows them, so
+                    # it cannot answer this question.
+                    fail=0
+                    for target in \
+                        "ferrum-admission:" \
+                        "ferrum-admission:apiserver" \
+                        "ferrum-agent:" \
+                        "ferrum-agent:attach" \
+                        "ferrum-agent:apiserver" \
+                        "ferrum-agent:attach,apiserver"
+                    do
+                        crate="${target%%:*}"
+                        features="${target#*:}"
+                        if [ -n "$features" ]; then
+                            tree="$(cargo tree -p "$crate" -e normal --features "$features")"
+                        else
+                            tree="$(cargo tree -p "$crate" -e normal)"
+                        fi
+                        for forbidden in rcgen x509-parser; do
+                            if printf '%s\n' "$tree" | grep -qE "(^| )$forbidden v"; then
+                                echo "crate boundary: $crate (features=${features:-default}) links $forbidden" >&2
+                                fail=1
+                            fi
+                        done
+                    done
+                    if [ "$fail" -ne 0 ]; then
+                        echo "the admission/agent dependency graph must not carry ferrum-crypto/x509" >&2
+                        exit 1
+                    fi
+                    echo "ok: rcgen and x509-parser stay off the admission and agent graphs"
+                '''
+            }
+        }
+
         stage('Validate policies') {
             steps {
                 sh '''
