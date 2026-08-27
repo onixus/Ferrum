@@ -10,9 +10,9 @@ use ferrum_api::{
 };
 use ferrum_policy::{validate_cluster_policy, validate_exception, validate_namespaced_policy};
 use ferrum_testkit::{
-    bpf_deny, cluster_admin_bind_deny, docker_sock_kill, exec_sh_kill, privileged_deny,
-    runtime_unobservable_syscall, try_exception_from_yaml, unsigned_deny,
-    EXCEPTION_WITHOUT_TTL_YAML,
+    bpf_not_from_agent_audit, cluster_admin_bind_deny, docker_sock_kill, exec_sh_kill,
+    privileged_deny, runtime_unexecutable_action, runtime_unobservable_syscall,
+    try_exception_from_yaml, unsigned_deny, EXCEPTION_WITHOUT_TTL_YAML,
 };
 use serde_yaml::Value;
 
@@ -216,20 +216,21 @@ fn acceptance_fixtures_agree_with_the_invariant_copy() {
         ("cluster-admin bind deny", cluster_admin_bind_deny()),
         ("exec+sh kill", exec_sh_kill()),
         ("docker.sock kill", docker_sock_kill()),
-        ("bpf deny", bpf_deny()),
+        ("bpf not from the agent", bpf_not_from_agent_audit()),
     ] {
         validate_cluster_policy(&spec).unwrap_or_else(|e| panic!("{name} must validate: {e}"));
     }
 
-    // §D `bpf()` not from the agent → deny. The row names an action this plane
-    // decides but cannot execute — a tracepoint fires after the syscall has
-    // run. That is why the agent exports REFUSE_DENY_NOT_ENFORCEABLE on every
-    // runtime Deny (asserted end to end in acceptance.rs), and why every
-    // syscall the row names must be one the datapath actually hooks: a rule
-    // that never fires would pass this drift gate silently.
-    let bpf = bpf_deny();
+    // §D `bpf()` not from the agent → deny. The deny is admission's: it refuses
+    // the pod before it can call `bpf()` at all. The runtime row carries the
+    // audit record that names the caller, because a tracepoint fires after the
+    // syscall has already run — an action this plane decides and cannot
+    // execute is a verdict that never happened. Every syscall the row names
+    // must also be one the datapath actually hooks: a rule that never fires
+    // would pass this drift gate silently.
+    let bpf = bpf_not_from_agent_audit();
     let rule = &bpf.runtime.rules[0];
-    assert_eq!(rule.action, RuntimeAction::Deny);
+    assert_eq!(rule.action, RuntimeAction::Audit);
     assert!(rule.match_on.not_agent_self);
     for syscall in &rule.syscalls {
         assert!(
@@ -238,6 +239,25 @@ fn acceptance_fixtures_agree_with_the_invariant_copy() {
         );
     }
     assert!(rule.syscalls.iter().any(|s| s == "bpf"));
+}
+
+/// The action half of the same family, on the same negative example CI runs:
+/// the runtime plane executes allow/audit/kill, and a rule naming anything
+/// else is a signed verdict nobody carries out. A match cannot rescue it, so
+/// the fixture is deliberately a well-matched rule.
+#[test]
+fn a_rule_whose_action_the_runtime_plane_cannot_execute_does_not_validate() {
+    let spec = runtime_unexecutable_action().spec;
+    let err = validate_cluster_policy(&spec).expect_err("runtime deny is not executable");
+    let msg = err.to_string();
+    assert!(msg.contains("no-module"), "{msg}");
+    assert!(msg.contains("deny"), "{msg}");
+
+    // Isolate is the other half: rejected with a match, not only without one.
+    let mut isolate = runtime_unexecutable_action().spec;
+    isolate.runtime.rules[0].action = RuntimeAction::Isolate;
+    let err = validate_cluster_policy(&isolate).expect_err("isolate has no implementation");
+    assert!(err.to_string().contains("no-module"), "{err}");
 }
 
 /// The gate the negative example proves in CI, kept here so it also fails a

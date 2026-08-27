@@ -57,12 +57,21 @@ spec:
           commIn: [sh, bash, ash, dash, zsh]
           containerOnly: true
         action: kill
+      # containerOnly: the node's own containerd/kubelet opens these sockets
+      # constantly. Without it every one of those opens decides kill, gets
+      # refused because the caller is not in a container, and is exported as a
+      # kill that never happened — a permanent false stream on a healthy node.
       - id: no-runtime-sock
         match:
           pathSuffix: [docker.sock, containerd.sock, crio.sock]
+          containerOnly: true
         action: kill
+      # audit, not deny: a tracepoint fires after the syscall has already run,
+      # so the runtime plane cannot un-run bpf()/init_module(). Blocking those
+      # is admission's job (admit.deny SYS_MODULE, privileged); what this plane
+      # can honestly do is name the caller in the audit trail.
       - id: no-module
         syscalls: [init_module, finit_module, bpf]
         match:
           notAgentSelf: true
-        action: deny
+        action: audit

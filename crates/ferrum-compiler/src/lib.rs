@@ -292,8 +292,11 @@ mod tests {
             ebpf.runtime.rules[1].match_on.path_suffix,
             vec!["docker.sock", "containerd.sock", "crio.sock"]
         );
+        assert!(ebpf.runtime.rules[1].match_on.container_only);
         assert_eq!(ebpf.runtime.rules[2].id, "no-module");
-        assert_eq!(ebpf.runtime.rules[2].action, RuntimeAction::Deny);
+        // audit, not deny: the runtime plane's tracepoint fires after the
+        // syscall has run, so `deny` would encode a verdict nothing executes.
+        assert_eq!(ebpf.runtime.rules[2].action, RuntimeAction::Audit);
         assert!(ebpf.runtime.rules[2].match_on.not_agent_self);
     }
 

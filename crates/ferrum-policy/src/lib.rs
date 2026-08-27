@@ -202,6 +202,24 @@ pub fn validate_rule_predicates(
     Ok(())
 }
 
+/// Тот же инвариант «правило может сработать», но для действия: runtime-план
+/// исполняет ровно Allow / Audit / Kill. `Deny` он решает и не исполняет —
+/// tracepoint срабатывает после того, как syscall уже выполнен, отменять
+/// нечего; это глагол admission. `Isolate` не реализован ни в одном плане.
+/// Правило с таким действием валидируется, компилируется, подписывается,
+/// совпадает — и не делает ничего, оставляя поток решений, которых не было.
+pub fn validate_rule_action(rule_id: &str, action: RuntimeAction) -> Result<()> {
+    match action {
+        RuntimeAction::Deny => Err(FerrumError::Validation(format!(
+            "rule '{rule_id}': action=deny — runtime-план его не исполняет: tracepoint срабатывает после syscall, отменить вызов нечем. Deny — глагол admission (admit.deny); в runtime исполнимы allow, audit, kill"
+        ))),
+        RuntimeAction::Isolate => Err(FerrumError::Validation(format!(
+            "rule '{rule_id}': action=isolate — реализации изоляции нет; правило совпадёт и не сделает ничего. В runtime исполнимы allow, audit, kill"
+        ))),
+        RuntimeAction::Allow | RuntimeAction::Audit | RuntimeAction::Kill => Ok(()),
+    }
+}
+
 /// Why naming one spelling of an operation and not the other breaks
 /// enforcement. Both directions are holes, but of opposite kinds: the missing
 /// form either lets the call through on the arches that serve it, or the named
@@ -232,6 +250,13 @@ fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
             "runtime.defaultAction Kill/Isolate — это kill-all, не политика".into(),
         ));
     }
+    // Тот же инвариант, что и для действия правила: defaultAction=deny — это
+    // решение на каждое событие, которое план не исполняет ни разу.
+    if runtime.default_action == RuntimeAction::Deny {
+        return Err(FerrumError::Validation(
+            "runtime.defaultAction deny — runtime-план его не исполняет: tracepoint срабатывает после syscall. Deny — глагол admission (admit.deny); по умолчанию исполнимы allow и audit".into(),
+        ));
+    }
     let mut ids = std::collections::BTreeSet::new();
     for rule in &runtime.rules {
         if rule.id.trim().is_empty() {
@@ -243,6 +268,7 @@ fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
                 rule.id
             )));
         }
+        validate_rule_action(&rule.id, rule.action)?;
         validate_rule_syscalls(&rule.id, &rule.syscalls)?;
         validate_rule_predicates(
             &rule.id,
@@ -412,6 +438,82 @@ mod tests {
         assert!(validate_cluster_policy(&spec).is_err());
     }
 
+    fn action_rule_spec(action: RuntimeAction) -> ClusterSecurityPolicySpec {
+        ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                rules: vec![RuntimeRule {
+                    id: "no-module".into(),
+                    syscalls: vec!["init_module".into(), "finit_module".into(), "bpf".into()],
+                    match_on: RuntimeMatch {
+                        not_agent_self: true,
+                        ..Default::default()
+                    },
+                    action,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Same family as the unobserved syscall and the oversized predicate, but
+    /// on the action: a rule the runtime plane decides and cannot execute is a
+    /// permanent stream of verdicts that never happened. A match cannot save
+    /// it, so the well-matched rule is the one that has to be rejected here.
+    #[test]
+    fn an_action_the_runtime_plane_cannot_execute_is_rejected() {
+        let err = validate_cluster_policy(&action_rule_spec(RuntimeAction::Deny))
+            .expect_err("runtime deny is not executable");
+        let msg = err.to_string();
+        assert!(matches!(err, FerrumError::Validation(_)), "{msg}");
+        assert!(msg.contains("no-module"), "{msg}");
+        assert!(msg.contains("deny"), "{msg}");
+        assert!(msg.contains("admission"), "{msg}");
+
+        let err = validate_cluster_policy(&action_rule_spec(RuntimeAction::Isolate))
+            .expect_err("isolate has no implementation");
+        let msg = err.to_string();
+        assert!(matches!(err, FerrumError::Validation(_)), "{msg}");
+        assert!(msg.contains("no-module"), "{msg}");
+        assert!(msg.contains("isolate"), "{msg}");
+
+        for executable in [
+            RuntimeAction::Allow,
+            RuntimeAction::Audit,
+            RuntimeAction::Kill,
+        ] {
+            validate_cluster_policy(&action_rule_spec(executable))
+                .unwrap_or_else(|e| panic!("{executable:?} is executable: {e}"));
+        }
+    }
+
+    /// The namespaced kind compiles from the same validator; a policy author
+    /// must not get the unexecutable action back by writing a SecurityPolicy.
+    #[test]
+    fn namespaced_policy_rejects_the_same_action() {
+        let spec = SecurityPolicySpec {
+            runtime: action_rule_spec(RuntimeAction::Deny).runtime,
+            ..Default::default()
+        };
+        let err = validate_namespaced_policy(&spec).expect_err("runtime deny is not executable");
+        assert!(err.to_string().contains("no-module"), "{err}");
+    }
+
+    /// `defaultAction: deny` is the same defect on every event rather than on
+    /// one rule: nothing matches, everything decides an action nobody runs.
+    #[test]
+    fn default_action_deny_rejected() {
+        let spec = ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                default_action: RuntimeAction::Deny,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = validate_cluster_policy(&spec).expect_err("default deny is not executable");
+        assert!(err.to_string().contains("defaultAction"), "{err}");
+    }
+
     fn runtime_rule_spec(syscalls: &[&str], action: RuntimeAction) -> ClusterSecurityPolicySpec {
         ClusterSecurityPolicySpec {
             runtime: RuntimeSpec {
@@ -437,7 +539,7 @@ mod tests {
                     id: "probe".into(),
                     syscalls: vec![],
                     match_on: m,
-                    action: RuntimeAction::Deny,
+                    action: RuntimeAction::Audit,
                 }],
                 ..Default::default()
             },
@@ -505,7 +607,7 @@ mod tests {
     fn syscall_outside_the_datapath_is_rejected() {
         for action in [
             RuntimeAction::Kill,
-            RuntimeAction::Deny,
+            RuntimeAction::Allow,
             RuntimeAction::Audit,
         ] {
             let err = validate_cluster_policy(&runtime_rule_spec(&["ptrace"], action))

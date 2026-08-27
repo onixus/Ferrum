@@ -4,11 +4,12 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use ferrum_admission::{
-    admit, load_bundle, AdmissionSubject, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED, RULE_UNSIGNED,
+    admit, load_bundle, AdmissionSubject, RULE_ADDED_CAPABILITIES, RULE_CLUSTER_ADMIN_BIND,
+    RULE_PRIVILEGED, RULE_UNSIGNED,
 };
 use ferrum_agent::{
     apply_role, encode_fsig, Agent, AgentConfig, AgentRole, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY,
-    EXCEPTIONS_FSIG_KEY, REFUSE_DENY_NOT_ENFORCEABLE, WAIVED_ACTION,
+    EXCEPTIONS_FSIG_KEY, WAIVED_ACTION,
 };
 use ferrum_api::{PolicyExceptionSpec, PolicyMode};
 use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
@@ -396,19 +397,38 @@ fn only_signed_exceptions_are_accepted_from_the_mount() {
 
 /// §D `bpf()` not from the agent → deny, and which layer carries the deny.
 ///
-/// The decision layer denies; the reaction layer cannot execute it, because a
-/// tracepoint fires after the syscall has run. The agent says so explicitly
-/// instead of exporting `executed=false` with no reason, which is what an
-/// event nobody had a rule for looks like. Blocking `bpf()` before it runs is
-/// admission's job, not this plane's.
+/// Admission carries it: it refuses the pod that could load a module before it
+/// runs at all (`admit.deny` privileged / SYS_MODULE, asserted here and in the
+/// admission cases above). The runtime plane cannot: its tracepoint fires
+/// after the syscall has already returned, so a runtime `deny` would be a
+/// verdict decided and never executed — a permanent export stream of denials
+/// that never happened. What this plane can honestly execute is the audit
+/// record naming the caller, and `ferrum-policy` now refuses to compile the
+/// dishonest version.
 #[test]
 fn bpf_not_from_agent_is_denied() {
+    // The deny half, before the syscall exists to observe.
+    let program = program();
+    let mut privileged_loader = compliant_subject();
+    privileged_loader.privileged = true;
+    privileged_loader.added_capabilities = vec!["SYS_MODULE".into()];
+    let denied = admit(&program, &privileged_loader, &[], now());
+    assert!(!denied.allowed);
+    assert!(denied.rule_ids.iter().any(|r| r == RULE_PRIVILEGED));
+    assert!(denied.rule_ids.iter().any(|r| r == RULE_ADDED_CAPABILITIES));
+
+    // The runtime half: the caller is named, and the record does not claim a
+    // reaction that never ran.
     let agent = loaded_agent();
     let decision = agent.matched_action(&ev("bpf", "loader", "", false));
-    assert_eq!(decision.action, Action::Deny);
+    assert_eq!(decision.action, Action::Audit);
     assert_eq!(decision.rule_id.as_deref(), Some("no-module"));
 
     let from_agent = agent.matched_action(&ev("bpf", "ferrum-agent", "", true));
+    assert_eq!(
+        from_agent.rule_id, None,
+        "the agent's own bpf() is not a hit"
+    );
     assert_ne!(from_agent.action, Action::Deny);
     assert_ne!(from_agent.action, Action::Kill);
 
@@ -416,22 +436,26 @@ fn bpf_not_from_agent_is_denied() {
     let refused_before = agent.respond_refused_total();
     let sink = MemorySink::new();
     let exported = agent.handle_event_at(7, &ev("bpf", "loader", "", false), &sink, now());
-    assert_eq!(exported.action, Action::Deny);
+    assert_eq!(exported.action, Action::Audit);
 
     let events = sink.events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].action, "deny");
+    assert_eq!(events[0].action, "audit");
     assert_eq!(events[0].rule.as_str(), "no-module");
+    assert_eq!(events[0].comm, "loader");
     assert!(
         !events[0].executed,
-        "a tracepoint cannot un-run the syscall"
+        "an audit record executes nothing, and must not claim otherwise"
     );
     assert_eq!(
-        events[0].respond_error.as_deref(),
-        Some(REFUSE_DENY_NOT_ENFORCEABLE),
-        "a deny with no reason is indistinguishable from doing nothing"
+        events[0].respond_error, None,
+        "nothing was refused: there was nothing to execute"
     );
-    assert_eq!(agent.respond_refused_total(), refused_before + 1);
+    assert_eq!(
+        agent.respond_refused_total(),
+        refused_before,
+        "a rule the plane can execute must not feed the refusal counter"
+    );
 }
 
 #[test]
