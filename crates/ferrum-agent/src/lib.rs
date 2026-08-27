@@ -214,6 +214,19 @@ pub struct Agent {
     /// The policy in force is a subset of the snapshot that was signed.
     /// Cleared only by a bundle that installs whole.
     lkg_partial: AtomicBool,
+    /// Last malformed record. A record that failed to decode carried a syscall
+    /// no rule ever saw, exactly like a ring drop, so it decays the same way.
+    decode_failed_at: Mutex<Option<Instant>>,
+    /// Export losses (full queue, failed write) observed on the sink so far,
+    /// so a new loss is told apart from an old total.
+    export_lost_seen: AtomicU64,
+    /// Last observed export loss. Bursty by nature on a busy node: decayed,
+    /// never latched, or it would pin the agent Degraded for the process
+    /// lifetime and drown the signals that do recover.
+    export_lost_at: Mutex<Option<Instant>>,
+    /// A fault nothing in this process will undo: the record path, or the
+    /// agent-self identity the datapath needs. First reason wins.
+    terminal_fault: Mutex<Option<String>>,
 }
 
 impl Agent {
@@ -267,6 +280,10 @@ impl Agent {
             path_truncated_at: Mutex::new(None),
             lkg_rules_dropped: AtomicU64::new(0),
             lkg_partial: AtomicBool::new(false),
+            decode_failed_at: Mutex::new(None),
+            export_lost_seen: AtomicU64::new(0),
+            export_lost_at: Mutex::new(None),
+            terminal_fault: Mutex::new(None),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -293,6 +310,14 @@ impl Agent {
             // set and every container_only rule (shell, docker.sock) misses.
             || !self.container_map_ready()
             || self.export_dead.load(Ordering::Relaxed)
+            // Enforcement that happened and was not written down is the
+            // repudiation case: a full queue or a full disk loses the record
+            // of a kill on a node that would otherwise report healthy.
+            || self.export_lossy_recent()
+            // A record no rule ever saw is the same loss as a ring drop,
+            // whichever side of the ring dropped it.
+            || self.decode_failures_recent()
+            || self.terminal_fault().is_some()
             // A selector the agent could not resolve is not a non-match: the
             // rules were applied fail-closed, and that is a Degraded plane
             // until the label caches catch up.
@@ -553,6 +578,62 @@ impl Agent {
         self.export_dead.load(Ordering::Relaxed)
     }
 
+    /// Events the export path lost: dropped by a full queue, or accepted and
+    /// never written. Both mean an enforcement that happened left no record.
+    pub fn export_lost_total(&self) -> u64 {
+        self.export_lost_seen.load(Ordering::Relaxed)
+    }
+
+    /// The export lost something recently. Deliberately decaying: a busy node
+    /// drops export events in bursts, and a latch here would pin the agent
+    /// Degraded for the process lifetime and drown the ring-drop and
+    /// label-unknown signals that do recover.
+    pub fn export_lossy_recent(&self) -> bool {
+        self.export_lossy_recent_at(Instant::now())
+    }
+
+    pub fn export_lossy_recent_at(&self, now: Instant) -> bool {
+        within(&self.export_lost_at, now, DEGRADED_RECOVERY)
+    }
+
+    /// Read what the sink has lost since the last look. `export_writer_dead`
+    /// alone only covers a writer that is gone; a full queue and a failed
+    /// write lose the record of a kill that really happened while every other
+    /// signal still reads healthy (RFC-02 §C, repudiation).
+    pub fn note_export_state_at<S: EventSink>(&self, sink: &S, now: Instant) {
+        if sink.export_writer_dead() {
+            self.export_dead.store(true, Ordering::Relaxed);
+        }
+        let lost = sink
+            .export_queue_dropped_total()
+            .saturating_add(sink.export_write_failed_total());
+        let seen = self.export_lost_seen.swap(lost, Ordering::Relaxed);
+        if lost > seen {
+            mark_now(&self.export_lost_at, now);
+        }
+    }
+
+    /// A fault the process cannot recover from. Latched on purpose: unlike the
+    /// decaying signals, nothing here ever clears on its own.
+    pub fn terminal_fault(&self) -> Option<String> {
+        self.terminal_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// First reason wins: the cause is what an operator needs, not the latest
+    /// consequence of it.
+    pub fn mark_terminal_fault(&self, reason: impl Into<String>) {
+        let mut slot = self
+            .terminal_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(reason.into());
+        }
+    }
+
     pub fn clock_rollback_total(&self) -> u64 {
         self.clock.clock_rollback_total()
     }
@@ -619,7 +700,28 @@ impl Agent {
     }
 
     pub fn record_decode_failure(&self, n: u64) {
+        self.record_decode_failure_at(n, Instant::now());
+    }
+
+    /// A malformed record is not telemetry: it carried a syscall that no rule
+    /// ever matched against, which is the same loss as an in-kernel ring drop
+    /// and degrades the agent on the same decaying terms.
+    pub fn record_decode_failure_at(&self, n: u64, now: Instant) {
+        if n == 0 {
+            return;
+        }
         self.decode_failed.fetch_add(n, Ordering::Relaxed);
+        mark_now(&self.decode_failed_at, now);
+    }
+
+    /// Records failed to decode recently enough to still mean something.
+    /// Recoverable: a source that stops emitting garbage stops the signal.
+    pub fn decode_failures_recent(&self) -> bool {
+        self.decode_failures_recent_at(Instant::now())
+    }
+
+    pub fn decode_failures_recent_at(&self, now: Instant) -> bool {
+        within(&self.decode_failed_at, now, DEGRADED_RECOVERY)
     }
 
     pub fn unknown_syscall_total(&self) -> u64 {
@@ -982,8 +1084,15 @@ impl Agent {
         if waiver.is_some() {
             decision.action = Action::Audit;
         }
-        decision.action = apply_role(self.role, decision.action);
+        // React on the action the policy decided, not on the one the role
+        // allows: `apply_role` rewrites Kill to Audit, and a reaction that
+        // never saw a Kill cannot say why it did not kill. The guards in
+        // `react` refuse on the role first, so nothing is signalled here that
+        // was not signalled before; the difference is that the export now
+        // carries REFUSE_ROLE instead of being byte-identical to a rule that
+        // really did say audit.
         let (executed, respond_error) = self.react(&decision, &meta, &identity, event);
+        decision.action = apply_role(self.role, decision.action);
         let policy = match self.loader.last_good() {
             Some(loaded) => PolicyId::new(loaded.digest.as_str()),
             None => PolicyId::new("none"),
@@ -1016,9 +1125,7 @@ impl Agent {
             path_unknown: decision.path_unknown,
             waiver,
         });
-        if sink.export_writer_dead() {
-            self.export_dead.store(true, Ordering::Relaxed);
-        }
+        self.note_export_state_at(sink, Instant::now());
         decision
     }
 
@@ -1033,11 +1140,7 @@ impl Agent {
         event: &SyscallEvent<'_>,
     ) -> (bool, Option<String>) {
         match decision.action {
-            Action::Kill => {}
-            Action::Isolate => {
-                self.respond_refused.fetch_add(1, Ordering::Relaxed);
-                return (false, Some(respond::REFUSE_ISOLATE.into()));
-            }
+            Action::Kill | Action::Isolate => {}
             // Deny is a decision this layer cannot execute; saying so is the
             // difference between a policy nobody enforces and one whose gap
             // is on the record. Allow/Audit fall through with no reason
@@ -1061,6 +1164,13 @@ impl Agent {
         ) {
             self.respond_refused.fetch_add(1, Ordering::Relaxed);
             return (false, Some(reason.into()));
+        }
+        // Checked after the guards, not before them: under observe an isolate
+        // rule did not run because the role is disabled, and that is the
+        // reason the operator needs to read.
+        if matches!(decision.action, Action::Isolate) {
+            self.respond_refused.fetch_add(1, Ordering::Relaxed);
+            return (false, Some(respond::REFUSE_ISOLATE.into()));
         }
         // The decision was made on an event that has been through a queue and
         // a poll interval; the pid space wraps in far less. Confirm the target
@@ -3457,5 +3567,143 @@ mod tests {
         assert_eq!(decision.action, Action::Kill);
         assert!(sink.events()[0].waiver.is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A loaded, attached agent with a synced container map and nothing wrong
+    /// with it: the baseline every degradation test starts from.
+    fn healthy_agent() -> Agent {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+        assert!(!agent.is_degraded());
+        agent
+    }
+
+    /// A record that failed to decode carried a syscall no rule ever saw —
+    /// the same loss as an in-kernel ring drop, on the other side of the ring.
+    /// It degrades on the same terms, and recovers on them too.
+    #[test]
+    fn malformed_records_degrade_and_then_recover() {
+        let agent = healthy_agent();
+        let t0 = Instant::now();
+
+        assert_eq!(
+            pump_records(
+                &agent,
+                ferrum_ebpf::SyscallArch::X86_64,
+                [vec![0u8; 3]],
+                &MemorySink::new()
+            )
+            .decode_failed,
+            1
+        );
+        assert!(agent.records_decode_failed_total() >= 1);
+
+        agent.record_decode_failure_at(4, t0);
+        assert_eq!(agent.records_decode_failed_total(), 5);
+        assert!(agent.decode_failures_recent_at(t0 + MARGIN));
+        assert!(agent.is_degraded(), "a record no rule saw is a lost event");
+
+        // The source stops emitting garbage: the signal decays, unlike a latch
+        // that only a restart clears.
+        assert!(!agent.decode_failures_recent_at(t0 + DEGRADED_RECOVERY));
+    }
+
+    /// A kill that really happened and was never written down is the
+    /// repudiation case: a full export queue or a full `/var/log/ferrum` must
+    /// not leave the node reporting healthy. Bursty, so it decays.
+    #[test]
+    fn a_lossy_export_degrades_and_then_recovers() {
+        #[derive(Default)]
+        struct LossySink {
+            queue_dropped: AtomicU64,
+            write_failed: AtomicU64,
+        }
+        impl EventSink for LossySink {
+            fn emit(&self, _event: &EnforcementEvent) {}
+            fn export_queue_dropped_total(&self) -> u64 {
+                self.queue_dropped.load(Ordering::Relaxed)
+            }
+            fn export_write_failed_total(&self) -> u64 {
+                self.write_failed.load(Ordering::Relaxed)
+            }
+        }
+
+        let agent = healthy_agent();
+        let sink = LossySink::default();
+        let t0 = Instant::now();
+
+        // A quiet export proves nothing is wrong and nothing is latched.
+        agent.note_export_state_at(&sink, t0);
+        assert!(!agent.is_degraded());
+
+        sink.queue_dropped.store(3, Ordering::Relaxed);
+        agent.note_export_state_at(&sink, t0);
+        assert_eq!(agent.export_lost_total(), 3);
+        assert!(agent.export_lossy_recent_at(t0 + MARGIN));
+        assert!(agent.is_degraded(), "unrecorded enforcement is Degraded");
+
+        // The burst ends; the totals stand still and the signal decays. A
+        // latch here would pin the node Degraded for the process lifetime.
+        agent.note_export_state_at(&sink, t0 + DEGRADED_RECOVERY);
+        assert!(!agent.export_lossy_recent_at(t0 + DEGRADED_RECOVERY));
+
+        // A failed write counts the same: accepted and never written down.
+        sink.write_failed.store(1, Ordering::Relaxed);
+        let t1 = t0 + DEGRADED_RECOVERY;
+        agent.note_export_state_at(&sink, t1);
+        assert_eq!(agent.export_lost_total(), 4);
+        assert!(agent.export_lossy_recent_at(t1 + MARGIN));
+
+        // The event path reads it too, not just a direct caller.
+        let t2 = t1 + DEGRADED_RECOVERY * 2;
+        assert!(!agent.export_lossy_recent_at(t2));
+        sink.queue_dropped.store(9, Ordering::Relaxed);
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert!(agent.export_lossy_recent());
+        assert!(agent.is_degraded());
+    }
+
+    /// Observe demotes Kill to Audit, which is the sanctioned default — but
+    /// the exported event must still say the policy asked for a kill and this
+    /// role does not kill, instead of being byte-identical to a rule that
+    /// really did say audit.
+    #[test]
+    fn a_kill_rule_under_observe_exports_the_role_refusal() {
+        let agent = healthy_agent();
+        assert_eq!(agent.role(), AgentRole::Observe);
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Audit);
+        let event = &sink.events()[0];
+        assert_eq!(event.action, "audit");
+        assert!(!event.executed);
+        assert_eq!(event.respond_error.as_deref(), Some(REFUSE_ROLE));
+        assert_eq!(agent.respond_kill_total(), 0);
+        // Demoting is not a fault: observe is the shipped default.
+        assert!(!agent.is_degraded());
+
+        // A rule that genuinely says audit is still distinguishable: no
+        // reaction was refused, because none was ever asked for.
+        let quiet = healthy_agent();
+        let quiet_sink = MemorySink::new();
+        quiet.handle_event(
+            container_meta(4242),
+            &ev("openat", "cat", "/etc/passwd", true, false),
+            &quiet_sink,
+        );
+        let quiet_event = &quiet_sink.events()[0];
+        assert_ne!(quiet_event.action, "kill");
+        assert_eq!(quiet_event.respond_error, None);
     }
 }
