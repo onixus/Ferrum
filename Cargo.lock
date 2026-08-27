@@ -582,6 +582,7 @@ dependencies = [
 name = "ferrum-export"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ferrum-ids",
  "ferrum-proto",
  "serde_json",
@@ -616,8 +617,10 @@ dependencies = [
 name = "ferrum-proto"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ferrum-ids",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
