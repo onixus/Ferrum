@@ -1,11 +1,14 @@
 //! Node agent. Last-known-good bundle, never fail-open if CP dies.
 
-use ferrum_agent::{parse_trust_root, Agent, AgentConfig, AgentRole};
+use ferrum_agent::{parse_trust_root, Agent, AgentConfig, AgentRole, RESPOND_NO_HOST_PIDNS};
 use ferrum_common::FerrumError;
 use ferrum_export::{EventSink, QueueSink, RotatingFileSink, SinkContext};
+use ferrum_k8smeta::SharedCgroupIndex;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::exit;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const DEFAULT_EXPORT_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -13,6 +16,16 @@ const DEFAULT_EXPORT_KEEP: usize = 5;
 /// Events buffered between the decision path and the file writer. Full queue
 /// drops telemetry (counted); it never blocks a decision.
 const DEFAULT_EXPORT_QUEUE: usize = 8192;
+/// How often the cgroup tree is re-scanned and re-joined against the pod
+/// snapshot. A container that starts between two ticks is a lookup miss, not
+/// a wrong identity.
+#[cfg(feature = "apiserver")]
+const CGROUP_REFRESH: Duration = Duration::from_secs(2);
+/// Poll step of the shutdown watcher; only the exit path pays it.
+const SHUTDOWN_TICK: Duration = Duration::from_millis(50);
+
+/// Set from the SIGTERM/SIGINT handler, which may do nothing else.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -94,8 +107,18 @@ fn main() {
         policy_name,
     });
     if role.respond_enabled() {
-        agent.set_responder(Box::new(ferrum_agent::SignalResponder));
+        // The datapath reports tgids from the initial pid namespace. Without
+        // hostPID they name other processes here, so respond is refused rather
+        // than aimed at whatever happens to hold that pid in this namespace.
+        if ferrum_agent::host_pid_namespace() {
+            agent.set_responder(Box::new(ferrum_agent::SignalResponder));
+        } else {
+            eprintln!("ferrum-agent: {RESPOND_NO_HOST_PIDNS}");
+            agent.disable_respond(RESPOND_NO_HOST_PIDNS);
+        }
     }
+
+    spawn_cgroup_refresh(agent.cgroup_index(), node.clone());
 
     if let Err(err) = agent.restore_last_known_good() {
         eprintln!("ferrum-agent: {err}");
@@ -123,7 +146,7 @@ fn main() {
         }
     }
 
-    let role_name = if role.respond_enabled() {
+    let role_name = if agent.role().respond_enabled() {
         "respond"
     } else {
         "observe"
@@ -141,8 +164,79 @@ fn main() {
     ctx.set_bundle_digest(agent.last_good_digest().cloned());
     ctx.set_degraded(agent.is_degraded());
     let sink = std::sync::Arc::new(QueueSink::new(inner, export_queue));
+    install_signal_handlers();
+    spawn_shutdown_watcher(Arc::clone(&sink));
 
     run(agent, sink, ctx, bundle_path, reload_ms, &flags)
+}
+
+/// Fills the cgroup→pod index. Until it holds something, every namespaced
+/// policy misses, which the agent reports as Degraded.
+#[cfg(feature = "apiserver")]
+fn spawn_cgroup_refresh(index: SharedCgroupIndex, node: String) {
+    use ferrum_k8smeta::watch::{ApiserverConfig, ApiserverWatcher};
+    use ferrum_k8smeta::{CgroupResolver, StdCgroupFs, DEFAULT_CGROUP_ROOT};
+
+    let config = match ApiserverConfig::from_service_account(node) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!(
+                "ferrum-agent: no apiserver config ({err}); cgroup index stays empty and \
+                 namespaced policies cannot match. Degraded."
+            );
+            return;
+        }
+    };
+    let watcher = Arc::new(ApiserverWatcher::new(config));
+    let cache = watcher.cache();
+    let watch_thread = Arc::clone(&watcher);
+    std::thread::spawn(move || watch_thread.run());
+    std::thread::spawn(move || {
+        let resolver = CgroupResolver::new(index);
+        let source = ferrum_agent::SharedPodSource::new(cache);
+        let fs = StdCgroupFs;
+        let root = PathBuf::from(DEFAULT_CGROUP_ROOT);
+        loop {
+            if let Err(err) = resolver.refresh(&fs, &root, &source) {
+                eprintln!("ferrum-agent: cgroup refresh failed, keeping the last index: {err}");
+            }
+            std::thread::sleep(CGROUP_REFRESH);
+        }
+    });
+}
+
+#[cfg(not(feature = "apiserver"))]
+fn spawn_cgroup_refresh(index: SharedCgroupIndex, _node: String) {
+    let _ = index;
+    eprintln!(
+        "ferrum-agent: built without the apiserver feature: no pod metadata, the cgroup index \
+         stays empty and namespaced policies cannot match. Degraded."
+    );
+}
+
+extern "C" fn on_terminate(_signal: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+fn install_signal_handlers() {
+    // Async-signal-safe by construction: the handler only sets a flag.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::signal(libc::SIGTERM, on_terminate as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_terminate as libc::sighandler_t);
+    }
+}
+
+/// SIGTERM must not throw away events the queue already accepted: they are
+/// enforcement history, and the kubelet gives no second chance to write them.
+fn spawn_shutdown_watcher(sink: Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>) {
+    std::thread::spawn(move || loop {
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            sink.close();
+            exit(0);
+        }
+        std::thread::sleep(SHUTDOWN_TICK);
+    });
 }
 
 #[cfg(feature = "attach")]
@@ -156,7 +250,7 @@ fn run(
 ) -> ! {
     use ferrum_ebpf::{KernelHandle, SyscallArch};
     use std::sync::mpsc::sync_channel;
-    use std::sync::{Arc, RwLock};
+    use std::sync::RwLock;
 
     let elf_path = match flags.map.get("bpf-elf").filter(|s| !s.is_empty()) {
         Some(p) => PathBuf::from(p),

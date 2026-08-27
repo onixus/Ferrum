@@ -14,11 +14,12 @@ use ferrum_common::{FerrumError, Result};
 use ferrum_ebpf::{extract_febp, Action, Decision, EventMeta, Loader, SyscallEvent};
 use ferrum_export::EventSink;
 use ferrum_ids::{Digest, PolicyId, RuleId};
-use ferrum_k8smeta::{CgroupIndex, WorkloadIdentity};
+use ferrum_k8smeta::{PodMetadataSource, PodRecord, SharedCgroupIndex, WorkloadIdentity};
 use ferrum_proto::{EnforcementEvent, WaiverRef};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -26,9 +27,11 @@ static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 pub use clock::{MonotonicFloor, MAX_EXCEPTION_DAYS};
 pub use pump::{pump_channel, pump_channel_host, pump_records, pump_records_host, PumpStats};
 pub use respond::{
-    NoopResponder, Responder, SignalResponder, REFUSE_AGENT_SELF, REFUSE_ISOLATE,
-    REFUSE_NOT_CONTAINER, REFUSE_NO_RESPONDER, REFUSE_ROLE, REFUSE_TGID_INIT, REFUSE_TGID_SELF,
-    REFUSE_TGID_ZERO, REFUSE_UNKNOWN_IDENTITY,
+    host_pid_namespace, host_pid_namespace_at, NoopResponder, ProcCgroupCheck, Responder,
+    SignalResponder, TargetCheck, HOST_PID_NS_INO, MAX_TGID, REFUSE_AGENT_SELF, REFUSE_ISOLATE,
+    REFUSE_NOT_CONTAINER, REFUSE_NO_RESPONDER, REFUSE_ROLE, REFUSE_STALE_TARGET,
+    REFUSE_TARGET_GONE, REFUSE_TGID_INIT, REFUSE_TGID_RANGE, REFUSE_TGID_SELF, REFUSE_TGID_ZERO,
+    REFUSE_UNKNOWN_IDENTITY, RESPOND_NO_HOST_PIDNS,
 };
 pub use source::{
     decode_fsig, encode_fsig, extract_fsig, load_exceptions_source, load_path, load_source,
@@ -86,7 +89,8 @@ pub struct AgentConfig {
 pub struct Agent {
     role: AgentRole,
     loader: Loader,
-    cgroups: CgroupIndex,
+    /// Shared with the refresher thread: the event path only reads it.
+    cgroups: SharedCgroupIndex,
     cp_down: bool,
     lkg_dir: Option<PathBuf>,
     trust_root: Vec<u8>,
@@ -106,10 +110,20 @@ pub struct Agent {
     /// None until the carrier installs one. The library never signals by
     /// default: respond is opt-in and wired in `main`, not implied by a role.
     responder: Option<Box<dyn Responder>>,
+    /// Re-reads the target's cgroup right before the signal. Defaults to the
+    /// real `/proc`, so a caller that forgets to wire one refuses kills
+    /// instead of signalling a pid that may have been reused.
+    target_check: Box<dyn TargetCheck>,
+    /// Set when respond was asked for and cannot be honoured (no host pid
+    /// namespace): the agent runs in observe and stays Degraded.
+    respond_disabled: Mutex<Option<String>>,
     clock: MonotonicFloor,
     respond_kill: AtomicU64,
     respond_refused: AtomicU64,
     respond_failed: AtomicU64,
+    respond_stale_target: AtomicU64,
+    /// Latched from the sink: export died, enforcement is no longer recorded.
+    export_dead: AtomicBool,
 }
 
 impl Agent {
@@ -126,7 +140,7 @@ impl Agent {
         let mut agent = Self {
             role: config.role,
             loader,
-            cgroups: CgroupIndex::new(),
+            cgroups: SharedCgroupIndex::new(),
             cp_down: false,
             lkg_dir: config.lkg_dir,
             trust_root: config.trust_root,
@@ -139,10 +153,14 @@ impl Agent {
             datapath_degraded: AtomicBool::new(false),
             attached: AtomicBool::new(false),
             responder: None,
+            target_check: Box::new(ProcCgroupCheck::new()),
+            respond_disabled: Mutex::new(None),
             clock,
             respond_kill: AtomicU64::new(0),
             respond_refused: AtomicU64::new(0),
             respond_failed: AtomicU64::new(0),
+            respond_stale_target: AtomicU64::new(0),
+            export_dead: AtomicBool::new(false),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -161,6 +179,11 @@ impl Agent {
             || self.loader.is_degraded()
             || !self.pins_attached()
             || self.datapath_degraded.load(Ordering::Relaxed)
+            // An empty cgroup index is not "no pods": every lookup misses, so
+            // every namespaced selector silently fails to match.
+            || self.cgroups.is_empty()
+            || self.export_dead.load(Ordering::Relaxed)
+            || self.respond_disabled_reason().is_some()
     }
 
     /// True only while a `KernelHandle` attach is live. `Loader::attach_pins`
@@ -183,6 +206,29 @@ impl Agent {
         self.responder = Some(responder);
     }
 
+    /// Replace the pre-signal target check (tests, a non-standard `/proc`).
+    pub fn set_target_check(&mut self, check: Box<dyn TargetCheck>) {
+        self.target_check = check;
+    }
+
+    /// Respond was requested and cannot be delivered: drop to observe, keep
+    /// the reason, and stay Degraded rather than signalling blind.
+    pub fn disable_respond(&mut self, reason: impl Into<String>) {
+        self.role = AgentRole::Observe;
+        self.responder = None;
+        *self
+            .respond_disabled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(reason.into());
+    }
+
+    pub fn respond_disabled_reason(&self) -> Option<String> {
+        self.respond_disabled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub fn respond_kill_total(&self) -> u64 {
         self.respond_kill.load(Ordering::Relaxed)
     }
@@ -195,6 +241,19 @@ impl Agent {
     /// errored). Not a refusal: the agent meant to kill and could not.
     pub fn respond_failed_total(&self) -> u64 {
         self.respond_failed.load(Ordering::Relaxed)
+    }
+
+    /// Kills refused because the tgid no longer lives in the cgroup that
+    /// raised the event, or the process is already gone. Each one is a signal
+    /// that was NOT sent to a reused pid.
+    pub fn respond_stale_target_total(&self) -> u64 {
+        self.respond_stale_target.load(Ordering::Relaxed)
+    }
+
+    /// True once the export writer thread has died: enforcement still runs,
+    /// but nothing is recorded, which is a Degraded agent.
+    pub fn export_writer_dead(&self) -> bool {
+        self.export_dead.load(Ordering::Relaxed)
     }
 
     pub fn clock_rollback_total(&self) -> u64 {
@@ -372,8 +431,18 @@ impl Agent {
         self.install_verified(&bytes, expected.as_ref()).map(|_| ())
     }
 
-    pub fn insert_cgroup(&mut self, inode: u64, identity: WorkloadIdentity) {
+    pub fn insert_cgroup(&self, inode: u64, identity: WorkloadIdentity) {
         self.cgroups.insert(inode, identity);
+    }
+
+    /// Handle for the refresher thread (`CgroupResolver` writes through it).
+    pub fn cgroup_index(&self) -> SharedCgroupIndex {
+        self.cgroups.clone()
+    }
+
+    /// Number of resolved cgroups. Zero means every namespaced selector misses.
+    pub fn cgroup_index_len(&self) -> usize {
+        self.cgroups.len()
     }
 
     pub fn lookup_cgroup(&self, inode: u64) -> Result<WorkloadIdentity> {
@@ -536,6 +605,9 @@ impl Agent {
             respond_error,
             waiver,
         });
+        if sink.export_writer_dead() {
+            self.export_dead.store(true, Ordering::Relaxed);
+        }
         decision
     }
 
@@ -570,6 +642,22 @@ impl Agent {
         ) {
             self.respond_refused.fetch_add(1, Ordering::Relaxed);
             return (false, Some(reason.into()));
+        }
+        // The decision was made on an event that has been through a queue and
+        // a poll interval; the pid space wraps in far less. Confirm the target
+        // is still the workload that raised it before signalling anything.
+        match self.target_check.cgroup_id(meta.tgid) {
+            Some(current) if current == meta.cgroup_id => {}
+            Some(_) => {
+                self.respond_stale_target.fetch_add(1, Ordering::Relaxed);
+                self.respond_refused.fetch_add(1, Ordering::Relaxed);
+                return (false, Some(respond::REFUSE_STALE_TARGET.into()));
+            }
+            None => {
+                self.respond_stale_target.fetch_add(1, Ordering::Relaxed);
+                self.respond_refused.fetch_add(1, Ordering::Relaxed);
+                return (false, Some(respond::REFUSE_TARGET_GONE.into()));
+            }
         }
         let responder = match &self.responder {
             Some(responder) => responder,
@@ -624,6 +712,23 @@ impl Agent {
     /// Does not create pins. LSM on `PIN_PATH` is required in production.
     pub fn attach_pins(&self) -> Result<()> {
         self.loader.attach_pins()
+    }
+}
+
+/// Pod metadata read from a cache someone else keeps current (the apiserver
+/// watch thread). The refresher only reads it, so a stalled watch shows up as
+/// an index that stops changing, never as a half-written snapshot.
+pub struct SharedPodSource(std::sync::Arc<std::sync::RwLock<ferrum_k8smeta::PodCache>>);
+
+impl SharedPodSource {
+    pub fn new(cache: std::sync::Arc<std::sync::RwLock<ferrum_k8smeta::PodCache>>) -> Self {
+        Self(cache)
+    }
+}
+
+impl PodMetadataSource for SharedPodSource {
+    fn snapshot(&self) -> Result<Vec<PodRecord>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).snapshot()
     }
 }
 
@@ -1929,10 +2034,22 @@ mod tests {
         }
     }
 
+    /// Stands in for `/proc/<tgid>/cgroup`: the cgroup the target is in right
+    /// now, or `None` for a process that is already gone.
+    struct StaticCheck(Option<u64>);
+
+    impl TargetCheck for StaticCheck {
+        fn cgroup_id(&self, _tgid: u32) -> Option<u64> {
+            self.0
+        }
+    }
+
     fn respond_agent_with_fake() -> (Agent, std::sync::Arc<FakeResponder>) {
         let mut agent = Agent::new(cfg_respond());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         agent.insert_cgroup(7, identity("pod-a"));
+        // The target is still in the cgroup that raised the event.
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
         let fake = std::sync::Arc::new(FakeResponder::default());
         agent.set_responder(Box::new(std::sync::Arc::clone(&fake)));
         (agent, fake)
@@ -2125,6 +2242,7 @@ mod tests {
         let mut agent = Agent::new(cfg_respond());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
         let sink = MemorySink::new();
         agent.handle_event(
             container_meta(4242),
@@ -2139,10 +2257,118 @@ mod tests {
         );
     }
 
+    /// The decision travelled through a queue and a poll interval; by the time
+    /// it lands the pid may belong to somebody else. Signal only if the target
+    /// is still in the cgroup that raised the event.
+    #[test]
+    fn a_reused_pid_is_refused_instead_of_killed() {
+        let cases = [
+            (Some(9_999u64), REFUSE_STALE_TARGET),
+            (None, REFUSE_TARGET_GONE),
+        ];
+        for (current, reason) in cases {
+            let (mut agent, fake) = respond_agent_with_fake();
+            agent.set_target_check(Box::new(StaticCheck(current)));
+            let sink = MemorySink::new();
+            let decision = agent.handle_event(
+                container_meta(4242),
+                &ev("execve", "sh", "/bin/sh", true, false),
+                &sink,
+            );
+            assert_eq!(decision.action, Action::Kill);
+            assert!(fake.killed().is_empty(), "{reason}");
+            assert!(!sink.events()[0].executed);
+            assert_eq!(sink.events()[0].respond_error.as_deref(), Some(reason));
+            assert_eq!(agent.respond_stale_target_total(), 1);
+            assert_eq!(agent.respond_kill_total(), 0);
+        }
+
+        // Same event, target still in its own cgroup: the kill goes out.
+        let (agent, fake) = respond_agent_with_fake();
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &MemorySink::new(),
+        );
+        assert_eq!(fake.killed(), vec![4242]);
+        assert_eq!(agent.respond_stale_target_total(), 0);
+    }
+
+    /// An empty index is not "this node runs no pods": it means every lookup
+    /// misses and every namespaced selector silently fails to match.
+    #[test]
+    fn an_empty_cgroup_index_is_degraded() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        assert_eq!(agent.cgroup_index_len(), 0);
+        assert!(agent.is_degraded(), "empty index must be Degraded");
+
+        agent.insert_cgroup(7, identity("pod-a"));
+        assert!(!agent.is_degraded());
+
+        // The refresher writes through a shared handle, not through the agent.
+        let index = agent.cgroup_index();
+        index.replace_all(std::collections::HashMap::new());
+        assert!(agent.is_degraded());
+        index.insert(8, identity("pod-b"));
+        assert_eq!(agent.lookup_cgroup(8).expect("hit").pod, "pod-b");
+        assert!(!agent.is_degraded());
+    }
+
+    /// Respond that cannot be delivered (no host pid namespace) drops to
+    /// observe and says so, instead of signalling into the wrong namespace.
+    #[test]
+    fn respond_without_the_host_pid_namespace_falls_back_to_observe() {
+        let (mut agent, fake) = respond_agent_with_fake();
+        agent.disable_respond(RESPOND_NO_HOST_PIDNS);
+        assert_eq!(agent.role(), AgentRole::Observe);
+        assert_eq!(
+            agent.respond_disabled_reason().as_deref(),
+            Some(RESPOND_NO_HOST_PIDNS)
+        );
+        assert!(agent.is_degraded());
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Audit);
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_kill_total(), 0);
+    }
+
+    /// A dead export writer is not a telemetry hiccup: enforcement runs on
+    /// unrecorded, which the agent must report.
+    #[test]
+    fn a_dead_export_writer_degrades_the_agent() {
+        struct DeadSink;
+        impl EventSink for DeadSink {
+            fn emit(&self, _event: &EnforcementEvent) {}
+            fn export_writer_dead(&self) -> bool {
+                true
+            }
+        }
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, identity("pod-a"));
+        assert!(!agent.is_degraded());
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &DeadSink,
+        );
+        assert!(agent.export_writer_dead());
+        assert!(agent.is_degraded());
+    }
+
     #[test]
     fn attached_flag_is_not_implied_by_a_loaded_bundle() {
         let mut agent = Agent::new(cfg());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
         assert!(!agent.pins_attached());
         assert!(agent.is_degraded());
         agent.set_attached(true);

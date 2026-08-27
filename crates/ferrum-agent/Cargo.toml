@@ -11,6 +11,10 @@ description = "Only BPF carrier. Forbidden: ferrum-compiler, cluster-admin SA."
 # Real kernel datapath (aya, CAP_BPF, a compiled bpf-target ELF). Off by
 # default: the default build verifies bundles but has no datapath.
 attach = ["ferrum-ebpf/attach"]
+# Pod metadata from the apiserver (`spec.nodeName=$NODE`). Without it nothing
+# fills the cgroup index, so the agent runs Degraded instead of pretending
+# every namespaced policy simply has no workloads.
+apiserver = ["ferrum-k8smeta/apiserver"]
 
 [dependencies]
 chrono.workspace = true
