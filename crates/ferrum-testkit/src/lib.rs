@@ -400,7 +400,11 @@ mod tests {
         let obj = runtime_arch_split_syscall();
         assert_eq!(obj.kind, "ClusterSecurityPolicy");
         let rule = &obj.spec.runtime.rules[0];
-        assert_eq!(rule.syscalls, vec!["openat"], "half of the open/openat pair");
+        assert_eq!(
+            rule.syscalls,
+            vec!["openat"],
+            "half of the open/openat pair"
+        );
         assert_eq!(rule.action, RuntimeAction::Kill);
     }
 
