@@ -1,0 +1,57 @@
+# Not a template — the name carries no .tmpl. infix — so the placeholder here is
+# what an operator would actually hand to the API server. Do not fix.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: ferrum-admission
+webhooks:
+  - name: policy.ferrum.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["ferrum", "kube-system"]
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    clientConfig:
+      service:
+        name: ferrum-admission
+        namespace: ferrum
+        path: /validate
+      caBundle: REPLACE_WITH_PEM_CA_BUNDLE_BASE64
+---
+# Second way to be unapplicable: base64 that decodes to something that is not a
+# PEM CERTIFICATE block.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: ferrum-admission-garbage
+webhooks:
+  - name: garbage.ferrum.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["ferrum", "kube-system"]
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+    clientConfig:
+      service:
+        name: ferrum-admission
+        namespace: ferrum
+        path: /validate
+      caBundle: bm90IGEgY2VydGlmaWNhdGU=
