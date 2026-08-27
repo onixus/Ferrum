@@ -55,6 +55,12 @@ pub const CGROUP_PUBLISHER_GONE: &str =
     "cgroup publisher gone: the container map can no longer follow the index";
 /// The carrier that applies published sets is gone; publishing is pointless.
 pub const CGROUP_CARRIER_GONE: &str = "cgroup carrier gone: nothing applies the published set";
+/// Nothing decodes ring records any more: the reader still drains the ring, so
+/// the kernel does not stall, but every record it takes out is discarded
+/// before a rule sees it. Terminal in this process — the pump thread is not
+/// respawned — so it is latched, not decayed.
+pub const RECORD_CHANNEL_GONE: &str =
+    "record channel gone: ring records are drained and discarded before any rule sees them";
 /// Bound on the per-cgroup disagreement window map. Beyond this the oldest
 /// windows are dropped; a cgroup that keeps disagreeing simply reopens one.
 const CONTAINER_FLAG_TRACKED_MAX: usize = 4096;
@@ -1294,6 +1300,24 @@ pub fn publish_cgroups<T>(tx: &std::sync::mpsc::SyncSender<T>, update: T) -> boo
         tx.try_send(update),
         Err(std::sync::mpsc::TrySendError::Disconnected(_))
     )
+}
+
+/// Hand one raw ring record to whoever decodes it. A full channel blocks on
+/// purpose (backpressure onto the reader, so the kernel drops and counts it);
+/// a disconnected one is different in kind — the pump thread is gone, so every
+/// record from here on is read out of the ring and discarded before a rule
+/// sees it. That is latched, not decayed: nothing respawns the pump. Returns
+/// false once the channel is gone.
+pub fn publish_record(
+    tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    agent: &Agent,
+    record: Vec<u8>,
+) -> bool {
+    if tx.send(record).is_err() {
+        agent.mark_terminal_fault(RECORD_CHANNEL_GONE);
+        return false;
+    }
+    true
 }
 
 pub fn apply_role(role: AgentRole, action: Action) -> Action {
@@ -3609,6 +3633,27 @@ mod tests {
         // The source stops emitting garbage: the signal decays, unlike a latch
         // that only a restart clears.
         assert!(!agent.decode_failures_recent_at(t0 + DEGRADED_RECOVERY));
+    }
+
+    /// Nothing decodes ring records any more. The reader keeps draining so the
+    /// kernel does not stall, but every record it takes out is discarded, and
+    /// no restart of anything in this process brings the pump back: latched.
+    #[test]
+    fn a_disconnected_record_channel_latches() {
+        let agent = healthy_agent();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        assert!(publish_record(&tx, &agent, vec![1, 2, 3]));
+        assert!(agent.terminal_fault().is_none());
+        assert!(!agent.is_degraded());
+
+        drop(rx);
+        assert!(!publish_record(&tx, &agent, vec![4, 5, 6]));
+        assert_eq!(agent.terminal_fault().as_deref(), Some(RECORD_CHANNEL_GONE));
+        // No window to wait out, unlike the decaying signals: nothing in this
+        // process respawns the pump, so the reason stays put.
+        assert!(agent.is_degraded());
+        assert!(!agent.decode_failures_recent_at(Instant::now() + DEGRADED_RECOVERY));
+        assert!(agent.terminal_fault().is_some());
     }
 
     /// A kill that really happened and was never written down is the

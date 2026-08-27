@@ -368,6 +368,7 @@ fn run(
             ferrum_agent::RingLoop::new(Duration::from_millis(reload_ms), Instant::now());
         let mut publisher_alive = true;
         let mut drop_check_broken = false;
+        let mut records_alive = true;
         loop {
             if publisher_alive {
                 let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
@@ -405,7 +406,17 @@ fn run(
                 Instant::now(),
                 || {
                     reader.drain(|record| {
-                        let _ = tx.send(record.to_vec());
+                        if !records_alive {
+                            return;
+                        }
+                        let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
+                        if !ferrum_agent::publish_record(&tx, &guard, record.to_vec()) {
+                            // Keep draining so a full ring does not stall the
+                            // kernel, but stop pretending these records reach
+                            // a rule.
+                            eprintln!("ferrum-agent: {}", ferrum_agent::RECORD_CHANNEL_GONE);
+                            records_alive = false;
+                        }
                     })
                 },
                 || handle.events_dropped_total(),
