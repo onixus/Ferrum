@@ -291,7 +291,7 @@ fn only_signed_exceptions_are_accepted_from_the_mount() {
     let dir = temp_lkg();
     std::fs::create_dir_all(&dir).expect("tmpdir");
     let (fsig, digest, _) = signed_bundle();
-    std::fs::write(dir.join(BUNDLE_FSIG_KEY), &fsig).expect("bundle.fsig");
+    std::fs::write(dir.join(BUNDLE_FSIG_KEY), fsig).expect("bundle.fsig");
     std::fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_str().as_bytes()).expect("digest");
 
     let mut waiver = exception_ok().spec;
@@ -396,6 +396,58 @@ fn cp_down_keeps_last_known_good_not_fail_open() {
     let restarted = respond_agent(Some(dir.clone()));
     assert!(restarted.using_last_known_good());
     assert_eq!(restarted.last_good_digest(), Some(&digest));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The FSIG codec exists in four copies (controller, agent, admission, CLI)
+/// because the crate boundary forbids a shared runtime dependency. This is the
+/// gate that catches drift: bytes the controller actually publishes must be
+/// accepted by both consumers of the waiver channel.
+#[test]
+fn controller_signed_exceptions_are_accepted_by_agent_and_admission() {
+    let mut waiver = exception_ok().spec;
+    waiver.target.rules = vec!["no-runtime-sock".into()];
+    let specs = vec![waiver];
+
+    // Produced by the control plane, not by a test-local encoder.
+    let sealed = ferrum_controller::exceptions_fsig(&specs, &SK).expect("controller signs");
+    assert_eq!(
+        ferrum_controller::EXCEPTIONS_FSIG_KEY,
+        EXCEPTIONS_FSIG_KEY,
+        "controller and agent must agree on the Secret key"
+    );
+    let trust_root = public_key_from_secret(&SK).expect("public key");
+
+    // Admission verifies the same envelope against its pinned trust root.
+    let payload = ferrum_admission::verify_exceptions_fsig(&sealed, &trust_root)
+        .expect("admission accepts controller bytes");
+    let decoded: Vec<PolicyExceptionSpec> =
+        serde_json::from_slice(&payload).expect("payload is the spec array");
+    assert_eq!(decoded, specs);
+
+    // The agent takes it from the mount and the waiver demotes the kill.
+    let dir = temp_lkg();
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let (fsig, digest, _) = signed_bundle();
+    std::fs::write(dir.join(BUNDLE_FSIG_KEY), fsig).expect("bundle.fsig");
+    std::fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_str().as_bytes()).expect("digest");
+    std::fs::write(dir.join(EXCEPTIONS_FSIG_KEY), &sealed).expect("exceptions.fsig");
+
+    let mut agent = respond_agent(None);
+    agent.apply_path(&dir).expect("bundle from mount");
+    assert_eq!(
+        agent.reload_exceptions_path(&dir).expect("agent accepts"),
+        1
+    );
+    agent.insert_cgroup(7, payments_identity());
+    let sink = MemorySink::new();
+    let sock = ev("openat", "curl", "/var/run/docker.sock", false);
+    assert_eq!(
+        agent.handle_event_at(7, &sock, &sink, now()).action,
+        Action::Audit
+    );
+    assert_eq!(sink.events()[0].action, WAIVED_ACTION);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

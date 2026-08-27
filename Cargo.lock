@@ -635,6 +635,7 @@ dependencies = [
  "ferrum-agent",
  "ferrum-api",
  "ferrum-compiler",
+ "ferrum-controller",
  "ferrum-crypto",
  "ferrum-ebpf",
  "ferrum-export",
