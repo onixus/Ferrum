@@ -597,7 +597,7 @@ mod client {
     use crate::watch::WatchOutcome;
     use ferrum_common::{FerrumError, Result};
     use std::io::{self, BufRead, BufReader, Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpStream, ToSocketAddrs};
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
@@ -620,6 +620,13 @@ mod client {
     /// A cycle that streamed at least this long was a healthy connection, so
     /// the next reconnect starts from the base delay again.
     const HEALTHY_STREAM: Duration = Duration::from_secs(60);
+    /// A blackholed connection blocks in `read()` forever, and a watch thread
+    /// parked there never reconnects while the cache silently ages out. Half
+    /// the freshness budget: the timeout fires, the cycle reconnects and
+    /// relists, all before `PodCache::snapshot` starts refusing. Long enough
+    /// that ordinary bookmark gaps on a quiet cluster do not trip it.
+    const IO_TIMEOUT: Duration = Duration::from_secs(POD_WATCH_BUDGET.as_secs() / 2);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[derive(Debug, Clone)]
     pub struct ApiserverConfig {
@@ -686,10 +693,40 @@ mod client {
                 .map_err(|e| FerrumError::Degraded(format!("apiserver server name: {e}")))?;
             let conn = rustls::ClientConnection::new(cfg, name)
                 .map_err(|e| FerrumError::Degraded(format!("tls client: {e}")))?;
-            let tcp = TcpStream::connect((self.host.as_str(), self.port))
-                .map_err(|e| FerrumError::Degraded(format!("apiserver connect: {e}")))?;
-            let _ = tcp.set_nodelay(true);
+            let tcp = self.dial()?;
             Ok(rustls::StreamOwned::new(conn, tcp))
+        }
+
+        /// Connect with every deadline set before the socket is used once.
+        fn dial(&self) -> Result<TcpStream> {
+            let addrs = (self.host.as_str(), self.port)
+                .to_socket_addrs()
+                .map_err(|e| FerrumError::Degraded(format!("apiserver resolve: {e}")))?;
+            let mut last: Option<io::Error> = None;
+            for addr in addrs {
+                match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                    Ok(tcp) => {
+                        let _ = tcp.set_nodelay(true);
+                        // Not best-effort: a socket with no read deadline is
+                        // exactly the hang these timeouts exist to break, so
+                        // failing to set them fails the connect.
+                        tcp.set_read_timeout(Some(IO_TIMEOUT))
+                            .and_then(|_| tcp.set_write_timeout(Some(IO_TIMEOUT)))
+                            .map_err(|e| {
+                                FerrumError::Degraded(format!("apiserver socket timeout: {e}"))
+                            })?;
+                        return Ok(tcp);
+                    }
+                    Err(e) => last = Some(e),
+                }
+            }
+            Err(FerrumError::Degraded(match last {
+                Some(e) => format!("apiserver connect: {e}"),
+                None => format!(
+                    "apiserver {}:{} resolved to no address",
+                    self.host, self.port
+                ),
+            }))
         }
 
         fn request(&self, stream: &mut TlsStream, path: &str) -> Result<()> {
@@ -1511,6 +1548,59 @@ mod client {
             );
             assert_eq!(*slept.last().expect("delays"), MAX_RECONNECT_BACKOFF);
             assert!(slept.iter().all(|d| *d <= MAX_RECONNECT_BACKOFF));
+        }
+
+        fn silent_config() -> (std::net::TcpListener, ApiserverConfig) {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            let config = ApiserverConfig {
+                host: "127.0.0.1".into(),
+                port,
+                server_name: "kubernetes.default.svc".into(),
+                node_name: "node-a".into(),
+                token_path: PathBuf::from("/nonexistent/token"),
+                ca_path: PathBuf::from("/nonexistent/ca.crt"),
+            };
+            (listener, config)
+        }
+
+        #[test]
+        fn every_dialed_socket_carries_both_deadlines() {
+            let (_listener, config) = silent_config();
+            let tcp = config.dial().expect("dial");
+            assert_eq!(tcp.read_timeout().expect("read"), Some(IO_TIMEOUT));
+            assert_eq!(tcp.write_timeout().expect("write"), Some(IO_TIMEOUT));
+        }
+
+        #[test]
+        fn a_peer_that_never_answers_ends_in_an_error_not_a_hang() {
+            let (_listener, config) = silent_config();
+            let mut tcp = config.dial().expect("dial");
+            // Same mechanism as IO_TIMEOUT, shortened so the test is not the
+            // one waiting out the budget.
+            tcp.set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("timeout");
+            let mut buf = [0u8; 1];
+            let err = tcp.read(&mut buf).expect_err("read must not block forever");
+            assert!(
+                matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn io_timeout_expires_well_inside_the_freshness_budget() {
+            // The reconnect and relist have to happen while the cache is still
+            // fresh; a timeout at or past the budget would let it go stale.
+            assert!(IO_TIMEOUT < POD_WATCH_BUDGET);
+            assert!(IO_TIMEOUT + CONNECT_TIMEOUT < POD_WATCH_BUDGET);
+            assert!(
+                IO_TIMEOUT > HEALTHY_STREAM,
+                "bookmark gaps on a quiet cluster must not trip it"
+            );
         }
 
         #[test]
