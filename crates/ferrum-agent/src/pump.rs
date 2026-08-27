@@ -10,7 +10,7 @@
 
 use crate::Agent;
 use ferrum_common::{FerrumError, Result};
-use ferrum_ebpf::{decode_event, syscall_event, syscall_name, SyscallArch};
+use ferrum_ebpf::{decode_event, event_meta, syscall_event, syscall_name, SyscallArch};
 use ferrum_export::EventSink;
 use std::sync::mpsc::Receiver;
 
@@ -44,7 +44,7 @@ where
                 } else {
                     stats.handled += 1;
                 }
-                agent.handle_event(event.cgroup_id, &view, sink);
+                agent.handle_event(event_meta(&event), &view, sink);
             }
             Err(_) => {
                 stats.decode_failed += 1;

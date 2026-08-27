@@ -476,6 +476,7 @@ dependencies = [
  "ferrum-policy",
  "ferrum-proto",
  "ferrum-wasm-host",
+ "libc",
  "serde_json",
  "serde_yaml 0.8.26",
 ]

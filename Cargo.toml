@@ -51,6 +51,7 @@ ed25519-compact = { version = "=2.1.1", default-features = false, features = ["s
 futures = { version = "=0.3.30", default-features = false, features = ["std"] }
 # rustc 1.75: kube 0.93.1 pulls edition2024 (home/zeroize). kube 0.88.1 + k8s-openapi 0.21.1.
 home = "=0.5.9"
+libc = "=0.2.189"
 indexmap = { version = "=2.2.6", default-features = false, features = ["std"] }
 k8s-openapi = { version = "=0.21.1", default-features = false, features = ["v1_28"] }
 kube = { version = "=0.88.1", default-features = false, features = ["client", "runtime", "rustls-tls"] }

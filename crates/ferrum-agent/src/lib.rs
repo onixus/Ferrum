@@ -3,13 +3,15 @@
 
 #![deny(unsafe_code)]
 
+mod clock;
 mod pump;
+mod respond;
 mod source;
 
 use chrono::{DateTime, Utc};
 use ferrum_api::PolicyExceptionSpec;
 use ferrum_common::{FerrumError, Result};
-use ferrum_ebpf::{extract_febp, Action, Decision, Loader, SyscallEvent};
+use ferrum_ebpf::{extract_febp, Action, Decision, EventMeta, Loader, SyscallEvent};
 use ferrum_export::EventSink;
 use ferrum_ids::{Digest, PolicyId, RuleId};
 use ferrum_k8smeta::{CgroupIndex, WorkloadIdentity};
@@ -21,7 +23,13 @@ use std::time::Duration;
 
 static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+pub use clock::{MonotonicFloor, MAX_EXCEPTION_DAYS};
 pub use pump::{pump_channel, pump_channel_host, pump_records, pump_records_host, PumpStats};
+pub use respond::{
+    NoopResponder, Responder, SignalResponder, REFUSE_AGENT_SELF, REFUSE_ISOLATE,
+    REFUSE_NOT_CONTAINER, REFUSE_NO_RESPONDER, REFUSE_ROLE, REFUSE_TGID_INIT, REFUSE_TGID_SELF,
+    REFUSE_TGID_ZERO, REFUSE_UNKNOWN_IDENTITY,
+};
 pub use source::{
     decode_fsig, encode_fsig, extract_fsig, load_exceptions_source, load_path, load_source,
     parse_trust_root, read_exceptions_path, read_source_path, ExtractedFsig, BUNDLE_DIGEST_KEY,
@@ -92,6 +100,16 @@ pub struct Agent {
     /// enforce rules can no longer be trusted to match, so the agent is
     /// Degraded even though the loaded bundle itself is fine.
     datapath_degraded: AtomicBool,
+    /// True only after a real `KernelHandle::attach`; never inferred from a
+    /// successful userspace bundle load.
+    attached: AtomicBool,
+    /// None until the carrier installs one. The library never signals by
+    /// default: respond is opt-in and wired in `main`, not implied by a role.
+    responder: Option<Box<dyn Responder>>,
+    clock: MonotonicFloor,
+    respond_kill: AtomicU64,
+    respond_refused: AtomicU64,
+    respond_failed: AtomicU64,
 }
 
 impl Agent {
@@ -100,6 +118,11 @@ impl Agent {
             Some(dir) => Loader::with_lkg_dir(dir.clone()),
             None => Loader::new(),
         };
+        let clock = match &config.lkg_dir {
+            Some(dir) => MonotonicFloor::with_dir(dir.clone()),
+            None => MonotonicFloor::new(),
+        };
+        clock.anchor_from_exceptions(&config.exceptions);
         let mut agent = Self {
             role: config.role,
             loader,
@@ -114,6 +137,12 @@ impl Agent {
             decode_failed: AtomicU64::new(0),
             unknown_syscalls: AtomicU64::new(0),
             datapath_degraded: AtomicBool::new(false),
+            attached: AtomicBool::new(false),
+            responder: None,
+            clock,
+            respond_kill: AtomicU64::new(0),
+            respond_refused: AtomicU64::new(0),
+            respond_failed: AtomicU64::new(0),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -134,8 +163,61 @@ impl Agent {
             || self.datapath_degraded.load(Ordering::Relaxed)
     }
 
+    /// True only while a `KernelHandle` attach is live. `Loader::attach_pins`
+    /// stays Degraded: nothing is pinned at `PIN_PATH` yet, and that gap in
+    /// the threat model is not covered by this flag.
     pub fn pins_attached(&self) -> bool {
-        false
+        self.attached.load(Ordering::Relaxed)
+    }
+
+    /// Set by the carrier after `KernelHandle::attach` returns Ok, and cleared
+    /// when the handle is dropped.
+    pub fn set_attached(&self, attached: bool) {
+        self.attached.store(attached, Ordering::Relaxed);
+    }
+
+    /// Install the reaction backend (`SignalResponder` in production, a fake
+    /// in tests). Without one, a Kill decision is refused, not silently
+    /// dropped.
+    pub fn set_responder(&mut self, responder: Box<dyn Responder>) {
+        self.responder = Some(responder);
+    }
+
+    pub fn respond_kill_total(&self) -> u64 {
+        self.respond_kill.load(Ordering::Relaxed)
+    }
+
+    pub fn respond_refused_total(&self) -> u64 {
+        self.respond_refused.load(Ordering::Relaxed)
+    }
+
+    /// Reactions that passed every guard and still failed (the signal itself
+    /// errored). Not a refusal: the agent meant to kill and could not.
+    pub fn respond_failed_total(&self) -> u64 {
+        self.respond_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn clock_rollback_total(&self) -> u64 {
+        self.clock.clock_rollback_total()
+    }
+
+    pub fn clock(&self) -> &MonotonicFloor {
+        &self.clock
+    }
+
+    /// Wall clock guarded by the monotonic floor. A backwards jump marks the
+    /// datapath Degraded: waiver expiry is decided on this reading.
+    pub fn now(&self) -> DateTime<Utc> {
+        self.now_from(Utc::now())
+    }
+
+    pub fn now_from(&self, wall: DateTime<Utc>) -> DateTime<Utc> {
+        let before = self.clock.clock_rollback_total();
+        let now = self.clock.now_from(wall);
+        if self.clock.clock_rollback_total() != before {
+            self.datapath_degraded.store(true, Ordering::Relaxed);
+        }
+        now
     }
 
     pub fn using_last_known_good(&self) -> bool {
@@ -204,6 +286,7 @@ impl Agent {
     }
 
     pub fn set_exceptions(&mut self, list: Vec<PolicyExceptionSpec>) {
+        self.clock.anchor_from_exceptions(&list);
         self.exceptions = list;
     }
 
@@ -220,6 +303,7 @@ impl Agent {
         match self.verify_and_parse_exceptions(bytes) {
             Ok(list) => {
                 let n = list.len();
+                self.clock.anchor_from_exceptions(&list);
                 self.exceptions = list;
                 Ok(n)
             }
@@ -387,23 +471,27 @@ impl Agent {
         self.loader.matched_action(event)
     }
 
-    pub fn handle_event<S: EventSink>(
+    /// `meta` carries the structural identity of the record (cgroup for the
+    /// pod lookup, tgid for the reaction). A bare `u64` still works and means
+    /// "cgroup only": it carries no tgid, so it can never cause a kill.
+    pub fn handle_event<S: EventSink, M: Into<EventMeta>>(
         &self,
-        cgroup: u64,
+        meta: M,
         event: &SyscallEvent<'_>,
         sink: &S,
     ) -> Decision {
-        self.handle_event_at(cgroup, event, sink, Utc::now())
+        self.handle_event_at(meta, event, sink, self.now())
     }
 
-    pub fn handle_event_at<S: EventSink>(
+    pub fn handle_event_at<S: EventSink, M: Into<EventMeta>>(
         &self,
-        cgroup: u64,
+        meta: M,
         event: &SyscallEvent<'_>,
         sink: &S,
         now: DateTime<Utc>,
     ) -> Decision {
-        let identity = match self.cgroups.lookup_cgroup(cgroup) {
+        let meta: EventMeta = meta.into();
+        let identity = match self.cgroups.lookup_cgroup(meta.cgroup_id) {
             Ok(id) => id,
             Err(_) => WorkloadIdentity::unknown(),
         };
@@ -420,6 +508,7 @@ impl Agent {
             decision.action = Action::Audit;
         }
         decision.action = apply_role(self.role, decision.action);
+        let (executed, respond_error) = self.react(&decision, &meta, &identity, event);
         let policy = match self.loader.last_good() {
             Some(loaded) => PolicyId::new(loaded.digest.as_str()),
             None => PolicyId::new("none"),
@@ -441,9 +530,64 @@ impl Agent {
             namespace: identity.namespace,
             comm: event.comm.into(),
             syscall: event.syscall.into(),
+            pid: meta.pid,
+            tgid: meta.tgid,
+            executed,
+            respond_error,
             waiver,
         });
         decision
+    }
+
+    /// Turn a decision into a reaction. Every path that does not signal
+    /// returns a reason, which is exported with `executed=false`; nothing here
+    /// fails silently, and nothing pretends an unimplemented reaction ran.
+    fn react(
+        &self,
+        decision: &Decision,
+        meta: &EventMeta,
+        identity: &WorkloadIdentity,
+        event: &SyscallEvent<'_>,
+    ) -> (bool, Option<String>) {
+        match decision.action {
+            Action::Kill => {}
+            Action::Isolate => {
+                self.respond_refused.fetch_add(1, Ordering::Relaxed);
+                return (false, Some(respond::REFUSE_ISOLATE.into()));
+            }
+            _ => return (false, None),
+        }
+        // The datapath flags are authoritative for the reaction: the string
+        // view can be rebuilt by a caller, the record flags cannot.
+        let agent_self = meta.agent_self || event.agent_self;
+        let in_container = meta.in_container && event.in_container;
+        if let Some(reason) = respond::refuse_reason(
+            self.role.respond_enabled(),
+            meta.tgid,
+            agent_self,
+            in_container,
+            identity.is_unknown(),
+        ) {
+            self.respond_refused.fetch_add(1, Ordering::Relaxed);
+            return (false, Some(reason.into()));
+        }
+        let responder = match &self.responder {
+            Some(responder) => responder,
+            None => {
+                self.respond_refused.fetch_add(1, Ordering::Relaxed);
+                return (false, Some(respond::REFUSE_NO_RESPONDER.into()));
+            }
+        };
+        match responder.kill(meta.tgid) {
+            Ok(()) => {
+                self.respond_kill.fetch_add(1, Ordering::Relaxed);
+                (true, None)
+            }
+            Err(err) => {
+                self.respond_failed.fetch_add(1, Ordering::Relaxed);
+                (false, Some(err.to_string()))
+            }
+        }
     }
 
     /// A live in-scope exception demotes only enforcing actions on a named
@@ -504,37 +648,69 @@ pub fn poll_bundle(
 ) -> ! {
     // Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
     // Start with no stamp so a rotation between first load and this thread is not skipped.
-    let mut stamp = None;
-    let mut exceptions_stamp = None;
+    let mut stamps = PollStamps::default();
     loop {
         std::thread::sleep(interval);
-        if let Some(next) = source::source_stamp(path) {
-            if Some(next) != stamp {
-                stamp = Some(next);
-                if let Err(err) = agent.apply_path(path) {
-                    eprintln!("ferrum-agent: bundle reload failed, keeping last-known-good: {err}");
+        poll_once(agent, path, &mut stamps, export);
+    }
+}
+
+/// `poll_bundle` for a datapath that is pumping events concurrently: the write
+/// lock is taken per tick, not held across the sleep, so reload never blocks
+/// the decision path for longer than one reload.
+pub fn poll_bundle_shared(
+    agent: &std::sync::RwLock<Agent>,
+    path: &Path,
+    interval: Duration,
+    export: Option<&ferrum_export::SinkContext>,
+) -> ! {
+    let mut stamps = PollStamps::default();
+    loop {
+        std::thread::sleep(interval);
+        let mut guard = agent.write().unwrap_or_else(|e| e.into_inner());
+        poll_once(&mut guard, path, &mut stamps, export);
+    }
+}
+
+#[derive(Default)]
+struct PollStamps {
+    bundle: Option<source::SourceStamp>,
+    exceptions: Option<source::FileStamp>,
+}
+
+fn poll_once(
+    agent: &mut Agent,
+    path: &Path,
+    stamps: &mut PollStamps,
+    export: Option<&ferrum_export::SinkContext>,
+) {
+    if let Some(next) = source::source_stamp(path) {
+        if Some(next) != stamps.bundle {
+            stamps.bundle = Some(next);
+            if let Err(err) = agent.apply_path(path) {
+                eprintln!("ferrum-agent: bundle reload failed, keeping last-known-good: {err}");
+            }
+        }
+    }
+    match source::exceptions_stamp(path) {
+        None => {
+            if stamps.exceptions.take().is_some() {
+                agent.set_exceptions(Vec::new());
+            }
+        }
+        Some(next) => {
+            if Some(next) != stamps.exceptions {
+                stamps.exceptions = Some(next);
+                if let Err(err) = agent.reload_exceptions_path(path) {
+                    eprintln!("ferrum-agent: exceptions reload failed, waivers dropped: {err}");
                 }
             }
         }
-        match source::exceptions_stamp(path) {
-            None => {
-                if exceptions_stamp.take().is_some() {
-                    agent.set_exceptions(Vec::new());
-                }
-            }
-            Some(next) => {
-                if Some(next) != exceptions_stamp {
-                    exceptions_stamp = Some(next);
-                    if let Err(err) = agent.reload_exceptions_path(path) {
-                        eprintln!("ferrum-agent: exceptions reload failed, waivers dropped: {err}");
-                    }
-                }
-            }
-        }
-        if let Some(ctx) = export {
-            ctx.set_bundle_digest(agent.last_good_digest().cloned());
-            ctx.set_degraded(agent.is_degraded());
-        }
+    }
+    agent.clock().persist();
+    if let Some(ctx) = export {
+        ctx.set_bundle_digest(agent.last_good_digest().cloned());
+        ctx.set_degraded(agent.is_degraded());
     }
 }
 
@@ -1732,5 +1908,288 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Records what would have been signalled. No CAP, no victim process.
+    #[derive(Default)]
+    struct FakeResponder {
+        killed: std::sync::Mutex<Vec<u32>>,
+    }
+
+    impl FakeResponder {
+        fn killed(&self) -> Vec<u32> {
+            self.killed.lock().expect("lock").clone()
+        }
+    }
+
+    impl Responder for std::sync::Arc<FakeResponder> {
+        fn kill(&self, tgid: u32) -> Result<()> {
+            self.killed.lock().expect("lock").push(tgid);
+            Ok(())
+        }
+    }
+
+    fn respond_agent_with_fake() -> (Agent, std::sync::Arc<FakeResponder>) {
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        let fake = std::sync::Arc::new(FakeResponder::default());
+        agent.set_responder(Box::new(std::sync::Arc::clone(&fake)));
+        (agent, fake)
+    }
+
+    fn container_meta(tgid: u32) -> EventMeta {
+        EventMeta {
+            cgroup_id: 7,
+            pid: tgid,
+            tgid,
+            in_container: true,
+            agent_self: false,
+        }
+    }
+
+    #[test]
+    fn respond_kill_reaches_the_responder() {
+        let (agent, fake) = respond_agent_with_fake();
+        let meta = container_meta(4242);
+        let decision = agent.handle_event(
+            meta,
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &MemorySink::new(),
+        );
+        assert_eq!(decision.action, Action::Kill);
+        assert_eq!(fake.killed(), vec![4242]);
+        assert_eq!(agent.respond_kill_total(), 1);
+        assert_eq!(agent.respond_refused_total(), 0);
+    }
+
+    #[test]
+    fn observe_never_calls_kill() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        let fake = std::sync::Arc::new(FakeResponder::default());
+        agent.set_responder(Box::new(std::sync::Arc::clone(&fake)));
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Audit);
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_kill_total(), 0);
+        assert!(!sink.events()[0].executed);
+    }
+
+    #[test]
+    fn agent_self_is_never_killed() {
+        let (agent, fake) = respond_agent_with_fake();
+        let mut meta = container_meta(4242);
+        meta.agent_self = true;
+        let sink = MemorySink::new();
+        agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", true, true), &sink);
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_refused_total(), 1);
+        assert!(!sink.events()[0].executed);
+        assert_eq!(
+            sink.events()[0].respond_error.as_deref(),
+            Some(REFUSE_AGENT_SELF)
+        );
+    }
+
+    #[test]
+    fn host_process_is_never_killed() {
+        let (agent, fake) = respond_agent_with_fake();
+        let mut meta = container_meta(4242);
+        meta.in_container = false;
+        let sink = MemorySink::new();
+        // The rule itself is not container-only, so the decision is still Kill.
+        let decision = agent.handle_event(
+            meta,
+            &ev("openat", "app", "/var/run/docker.sock", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Kill);
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_refused_total(), 1);
+        assert_eq!(
+            sink.events()[0].respond_error.as_deref(),
+            Some(REFUSE_NOT_CONTAINER)
+        );
+    }
+
+    #[test]
+    fn unknown_identity_is_never_killed() {
+        let (agent, fake) = respond_agent_with_fake();
+        let mut meta = container_meta(4242);
+        // cgroup not in the index: identity is unknown, so there is no pod to
+        // attribute the kill to.
+        meta.cgroup_id = 999;
+        let sink = MemorySink::new();
+        agent.handle_event(
+            meta,
+            &ev("openat", "app", "/var/run/docker.sock", true, false),
+            &sink,
+        );
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_refused_total(), 1);
+        assert_eq!(
+            sink.events()[0].respond_error.as_deref(),
+            Some(REFUSE_UNKNOWN_IDENTITY)
+        );
+        assert!(!sink.events()[0].executed);
+    }
+
+    #[test]
+    fn init_and_self_tgid_are_never_killed() {
+        let (agent, fake) = respond_agent_with_fake();
+        let sink = MemorySink::new();
+        for tgid in [0, 1, std::process::id()] {
+            agent.handle_event(
+                container_meta(tgid),
+                &ev("execve", "sh", "/bin/sh", true, false),
+                &sink,
+            );
+        }
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_refused_total(), 3);
+        assert!(sink.events().iter().all(|e| !e.executed));
+        assert!(sink
+            .events()
+            .iter()
+            .all(|e| e.respond_error.is_some() && e.action == "kill"));
+    }
+
+    #[test]
+    fn cgroup_only_call_site_carries_no_tgid() {
+        let (agent, fake) = respond_agent_with_fake();
+        let sink = MemorySink::new();
+        // The back-compatible `u64` form has no pid/tgid, so it can only ever
+        // observe: nothing structural to signal.
+        agent.handle_event(7, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+        assert!(fake.killed().is_empty());
+        assert_eq!(sink.events()[0].tgid, 0);
+        assert!(!sink.events()[0].executed);
+    }
+
+    #[test]
+    fn isolate_is_not_pretended_to_run() {
+        let mut agent = Agent::new(cfg_respond());
+        let spec = {
+            let mut w = Writer::new();
+            w.put_magic(&EBPF_MAGIC);
+            w.put_u32(AGENT_ABI);
+            w.put_u8(Mode::Enforce.as_u8());
+            w.put_bool(false);
+            w.put_i32(0);
+            w.put_u8(Action::Audit.as_u8());
+            for _ in 0..4 {
+                put_empty_label_selector(&mut w);
+            }
+            w.put_str_list(&[]);
+            w.put_bool(false);
+            w.put_u16(1);
+            w.put_str("isolate-shell");
+            w.put_str_list(&["execve"]);
+            w.put_u8(Action::Isolate.as_u8());
+            w.put_str_list(&["sh"]);
+            w.put_bool(true);
+            w.put_str_list(&[]);
+            w.put_str_list(&[]);
+            w.put_bool(false);
+            w.finish()
+        };
+        load_signed(&mut agent, &spec);
+        agent.insert_cgroup(7, identity("pod-a"));
+        let fake = std::sync::Arc::new(FakeResponder::default());
+        agent.set_responder(Box::new(std::sync::Arc::clone(&fake)));
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Isolate);
+        assert!(fake.killed().is_empty());
+        assert!(!sink.events()[0].executed);
+        assert_eq!(
+            sink.events()[0].respond_error.as_deref(),
+            Some(REFUSE_ISOLATE)
+        );
+        assert_eq!(agent.respond_refused_total(), 1);
+    }
+
+    #[test]
+    fn without_a_responder_kill_is_refused_not_silent() {
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        let sink = MemorySink::new();
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(agent.respond_kill_total(), 0);
+        assert_eq!(agent.respond_refused_total(), 1);
+        assert_eq!(
+            sink.events()[0].respond_error.as_deref(),
+            Some(REFUSE_NO_RESPONDER)
+        );
+    }
+
+    #[test]
+    fn attached_flag_is_not_implied_by_a_loaded_bundle() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        assert!(!agent.pins_attached());
+        assert!(agent.is_degraded());
+        agent.set_attached(true);
+        assert!(agent.pins_attached());
+        assert!(!agent.is_degraded());
+        agent.set_attached(false);
+        assert!(agent.is_degraded());
+    }
+
+    #[test]
+    fn clock_rollback_keeps_an_expired_waiver_expired() {
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("tmpdir");
+        let mut agent = Agent::new(AgentConfig {
+            lkg_dir: Some(dir.clone()),
+            policy_name: "prod-restricted".into(),
+            ..cfg_respond()
+        });
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+
+        let t0 = Utc::now();
+        // A waiver that expired yesterday: only a clock moved backwards could
+        // bring it back to life.
+        let mut spec = waiver("ns", "prod-restricted", &["no-shell"]);
+        spec.expires_at = t0 - chrono::Days::new(1);
+        agent.set_exceptions(vec![spec]);
+
+        assert_eq!(agent.now_from(t0), t0);
+        assert!(!agent.datapath_degraded());
+
+        let back = t0 - chrono::Days::new(30);
+        let observed = agent.now_from(back);
+        assert_eq!(observed, t0);
+        assert_eq!(agent.clock_rollback_total(), 1);
+        assert!(agent.datapath_degraded());
+        assert!(agent.is_degraded());
+
+        let sink = MemorySink::new();
+        let decision = agent.handle_event_at(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+            observed,
+        );
+        assert_eq!(decision.action, Action::Kill);
+        assert!(sink.events()[0].waiver.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

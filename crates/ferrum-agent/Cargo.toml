@@ -7,6 +7,11 @@ publish.workspace = true
 rust-version.workspace = true
 description = "Only BPF carrier. Forbidden: ferrum-compiler, cluster-admin SA."
 
+[features]
+# Real kernel datapath (aya, CAP_BPF, a compiled bpf-target ELF). Off by
+# default: the default build verifies bundles but has no datapath.
+attach = ["ferrum-ebpf/attach"]
+
 [dependencies]
 chrono.workspace = true
 ferrum-api.workspace = true
@@ -19,6 +24,8 @@ ferrum-k8smeta.workspace = true
 ferrum-policy.workspace = true
 ferrum-proto.workspace = true
 ferrum-wasm-host.workspace = true
+# kill(2) for the respond role; no other syscall wrapper is used.
+libc.workspace = true
 # Exceptions JSON is parsed only at reload time, never on the per-event path.
 serde_json.workspace = true
 
