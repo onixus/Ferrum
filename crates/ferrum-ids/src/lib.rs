@@ -55,15 +55,19 @@ pub const DATAPATH_SYSCALLS: &[&str] = &[
 pub struct ArchRestrictedSyscall {
     pub syscall: &'static str,
     pub arches: &'static [&'static str],
-    /// Syscall covering the same operation on every arch, when one exists.
-    pub portable_companion: Option<&'static str>,
 }
 
 pub const ARCH_RESTRICTED_SYSCALLS: &[ArchRestrictedSyscall] = &[ArchRestrictedSyscall {
     syscall: "open",
     arches: &["x86_64"],
-    portable_companion: Some("openat"),
 }];
+
+/// Spellings of one kernel operation. Where an arch serves several of them the
+/// caller picks the number freely and the datapath reports the one it was
+/// called with, so a rule naming part of a class is bypassed by calling another
+/// member: `openat` alone misses `open(2)` on x86_64, `open` alone is dead on
+/// aarch64. The gates therefore demand the whole class, in both directions.
+pub const SYSCALL_EQUIVALENCE_CLASSES: &[&[&str]] = &[&["open", "openat"]];
 
 pub fn is_datapath_syscall(name: &str) -> bool {
     DATAPATH_SYSCALLS.contains(&name)
@@ -71,6 +75,31 @@ pub fn is_datapath_syscall(name: &str) -> bool {
 
 pub fn arch_restricted_syscall(name: &str) -> Option<&'static ArchRestrictedSyscall> {
     ARCH_RESTRICTED_SYSCALLS.iter().find(|r| r.syscall == name)
+}
+
+pub fn syscall_equivalence_class(name: &str) -> Option<&'static [&'static str]> {
+    SYSCALL_EQUIVALENCE_CLASSES
+        .iter()
+        .copied()
+        .find(|class| class.contains(&name))
+}
+
+/// First `(listed, missing)` pair where `listed` is a syscall the rule names
+/// and `missing` another spelling of the same operation it does not. `None`
+/// means every class the rule touches is named in full.
+pub fn uncovered_equivalent_syscall<S: AsRef<str>>(
+    named: &[S],
+) -> Option<(&'static str, &'static str)> {
+    let names: Vec<&str> = named.iter().map(|s| s.as_ref().trim()).collect();
+    for class in SYSCALL_EQUIVALENCE_CLASSES {
+        let Some(listed) = class.iter().copied().find(|m| names.contains(m)) else {
+            continue;
+        };
+        if let Some(missing) = class.iter().copied().find(|m| !names.contains(m)) {
+            return Some((listed, missing));
+        }
+    }
+    None
 }
 
 /// Datapath syscalls observable on `arch`.
@@ -105,11 +134,38 @@ mod tests {
         for r in ARCH_RESTRICTED_SYSCALLS {
             assert!(is_datapath_syscall(r.syscall), "{}", r.syscall);
             assert!(!r.arches.is_empty(), "{}", r.syscall);
-            if let Some(companion) = r.portable_companion {
-                assert!(is_datapath_syscall(companion), "{companion}");
-                assert!(arch_restricted_syscall(companion).is_none());
+            // An arch-restricted syscall with no equivalent elsewhere would be
+            // unenforceable on the other arches with nothing to name instead.
+            let class = syscall_equivalence_class(r.syscall)
+                .unwrap_or_else(|| panic!("{} needs an equivalence class", r.syscall));
+            assert!(class.iter().any(|m| arch_restricted_syscall(m).is_none()));
+        }
+    }
+
+    #[test]
+    fn equivalence_classes_name_real_datapath_syscalls() {
+        for class in SYSCALL_EQUIVALENCE_CLASSES {
+            assert!(class.len() > 1, "a one-member class constrains nothing");
+            for member in *class {
+                assert!(is_datapath_syscall(member), "{member}");
+                assert_eq!(syscall_equivalence_class(member), Some(*class));
             }
         }
+    }
+
+    #[test]
+    fn partial_equivalence_class_is_reported_in_both_directions() {
+        assert_eq!(
+            uncovered_equivalent_syscall(&["openat"]),
+            Some(("openat", "open"))
+        );
+        assert_eq!(
+            uncovered_equivalent_syscall(&[" open ".to_string()]),
+            Some(("open", "openat"))
+        );
+        assert_eq!(uncovered_equivalent_syscall(&["open", "openat"]), None);
+        assert_eq!(uncovered_equivalent_syscall(&["execve"]), None);
+        assert_eq!(uncovered_equivalent_syscall::<&str>(&[]), None);
     }
 
     #[test]

@@ -85,20 +85,15 @@ fn reject_unobservable_syscalls(fx: &Effects<'_>) -> Result<()> {
                 )));
             }
         }
-        for restricted in ferrum_ids::ARCH_RESTRICTED_SYSCALLS {
-            let Some(companion) = restricted.portable_companion else {
-                continue;
-            };
-            if rule.syscalls.iter().any(|s| s.trim() == restricted.syscall)
-                && !rule.syscalls.iter().any(|s| s.trim() == companion)
-            {
-                return Err(FerrumError::Compile(format!(
-                    "rule '{}': syscall '{}' exists only on {}; one signed bundle serves the whole cluster, so add '{companion}' or the rule is dead on the other nodes",
-                    rule.id,
-                    restricted.syscall,
-                    restricted.arches.join(", ")
-                )));
-            }
+        if let Some((listed, missing)) = ferrum_ids::uncovered_equivalent_syscall(&rule.syscalls) {
+            let arches = ferrum_ids::arch_restricted_syscall(missing)
+                .or_else(|| ferrum_ids::arch_restricted_syscall(listed))
+                .map(|r| r.arches.join(", "))
+                .unwrap_or_else(|| "every arch".to_string());
+            return Err(FerrumError::Compile(format!(
+                "rule '{}': syscall '{listed}' named without '{missing}'; they are one kernel operation and {arches} serves both, so one signed bundle for the whole cluster must name both or the other form walks past the rule",
+                rule.id
+            )));
         }
     }
     Ok(())
@@ -337,13 +332,21 @@ mod tests {
     }
 
     #[test]
-    fn open_without_openat_does_not_compile() {
-        assert!(compile_cluster_policy(&syscall_rule_spec(&["open"])).is_err());
-        let spec = syscall_rule_spec(&["open"]);
-        let fx = Effects::from(&spec);
-        match reject_unobservable_syscalls(&fx) {
-            Err(FerrumError::Compile(msg)) => assert!(msg.contains("openat"), "{msg}"),
-            other => panic!("expected Compile, got {other:?}"),
+    fn half_named_open_class_does_not_compile() {
+        // Both directions: 'open' alone is dead on aarch64, 'openat' alone is
+        // walked past by open(2) on x86_64. The compiler's gate is asserted
+        // directly too — the validator is not the only way into it.
+        for named in [&["open"][..], &["openat"][..]] {
+            assert!(compile_cluster_policy(&syscall_rule_spec(named)).is_err());
+            let spec = syscall_rule_spec(named);
+            let fx = Effects::from(&spec);
+            match reject_unobservable_syscalls(&fx) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("open") && msg.contains("openat"), "{msg}");
+                    assert!(msg.contains("x86_64"), "{msg}");
+                }
+                other => panic!("expected Compile, got {other:?}"),
+            }
         }
         compile_cluster_policy(&syscall_rule_spec(&["open", "openat"])).expect("portable pair");
     }

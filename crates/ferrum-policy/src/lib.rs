@@ -166,23 +166,34 @@ pub fn validate_rule_syscalls(rule_id: &str, syscalls: &[String]) -> Result<()> 
             )));
         }
     }
-    for restricted in ferrum_ids::ARCH_RESTRICTED_SYSCALLS {
-        if !syscalls.iter().any(|s| s.trim() == restricted.syscall) {
-            continue;
-        }
-        let Some(companion) = restricted.portable_companion else {
-            continue;
-        };
-        if syscalls.iter().any(|s| s.trim() == companion) {
-            continue;
-        }
+    if let Some((listed, missing)) = ferrum_ids::uncovered_equivalent_syscall(syscalls) {
         return Err(FerrumError::Validation(format!(
-            "rule '{rule_id}': syscall '{}' есть только на {}; на aarch64 правило мертво — добавьте '{companion}'. Bundle один на кластер, второго сигнала не будет",
-            restricted.syscall,
-            restricted.arches.join(", ")
+            "rule '{rule_id}': syscall '{listed}' назван без '{missing}' — {}. Bundle один на кластер: перечислите обе формы",
+            equivalence_gap(listed, missing)
         )));
     }
     Ok(())
+}
+
+/// Why naming one spelling of an operation and not the other breaks
+/// enforcement. Both directions are holes, but of opposite kinds: the missing
+/// form either lets the call through on the arches that serve it, or the named
+/// form never exists on the arches that do not.
+fn equivalence_gap(listed: &str, missing: &str) -> String {
+    match (
+        ferrum_ids::arch_restricted_syscall(listed),
+        ferrum_ids::arch_restricted_syscall(missing),
+    ) {
+        (_, Some(r)) => format!(
+            "это одна операция ядра, и на {} вызов '{missing}' обходит правило",
+            r.arches.join(", ")
+        ),
+        (Some(r), None) => format!(
+            "'{listed}' есть только на {}, на остальных арках правило мертво",
+            r.arches.join(", ")
+        ),
+        (None, None) => format!("это одна операция ядра, вызов '{missing}' обходит правило"),
+    }
 }
 
 fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
@@ -412,8 +423,8 @@ mod tests {
     #[test]
     fn every_datapath_syscall_is_accepted() {
         for syscall in ferrum_ids::DATAPATH_SYSCALLS {
-            let names: Vec<&str> = match ferrum_ids::arch_restricted_syscall(syscall) {
-                Some(r) => vec![syscall, r.portable_companion.expect("companion")],
+            let names: Vec<&str> = match ferrum_ids::syscall_equivalence_class(syscall) {
+                Some(class) => class.to_vec(),
                 None => vec![syscall],
             };
             validate_cluster_policy(&runtime_rule_spec(&names, RuntimeAction::Kill))
@@ -426,10 +437,28 @@ mod tests {
         let err = validate_cluster_policy(&runtime_rule_spec(&["open"], RuntimeAction::Kill))
             .expect_err("open alone is arch-split enforcement");
         let msg = err.to_string();
-        assert!(msg.contains("aarch64"), "{msg}");
+        assert!(msg.contains("x86_64"), "{msg}");
         assert!(msg.contains("openat"), "{msg}");
         validate_cluster_policy(&runtime_rule_spec(&["open", "openat"], RuntimeAction::Kill))
             .expect("open+openat is portable");
+    }
+
+    #[test]
+    fn openat_without_open_is_bypassed_on_x86_64() {
+        let err = validate_cluster_policy(&runtime_rule_spec(&["openat"], RuntimeAction::Kill))
+            .expect_err("openat alone leaves open(2) unenforced on x86_64");
+        let msg = err.to_string();
+        assert!(msg.contains("x86_64"), "{msg}");
+        assert!(msg.contains("'open'"), "{msg}");
+    }
+
+    #[test]
+    fn path_match_without_syscalls_stays_portable() {
+        // path_prefix-only rules expand to every path-bearing syscall in the
+        // datapath, so they never carry a half-named equivalence class.
+        let mut spec = runtime_rule_spec(&[], RuntimeAction::Kill);
+        spec.runtime.rules[0].match_on.path_prefix = vec!["/var/run/docker.sock".into()];
+        validate_cluster_policy(&spec).expect("path-only rule is portable");
     }
 
     #[test]
