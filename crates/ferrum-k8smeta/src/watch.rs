@@ -120,7 +120,7 @@ pub fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOut
             WatchOutcome::Ignored
         }
         PodWatchEvent::Gone(_) => {
-            cache.set_relist_pending(true);
+            cache.raise_relist_pending();
             WatchOutcome::MustRelist
         }
         PodWatchEvent::Error(_) => WatchOutcome::Ignored,
@@ -552,7 +552,7 @@ mod label_parse_tests {
         }"#;
         let (_, objects) = parse_labels_list("ServiceAccountList", raw).expect("list");
         let mut cache = LabelCache::new();
-        cache.replace_all(objects);
+        cache.try_replace_all(objects).expect("list fits");
         assert_eq!(
             cache.labels_or_empty("prod", "default").get("tier"),
             Some(&"front".to_string())
@@ -566,7 +566,7 @@ mod label_parse_tests {
     #[test]
     fn watch_events_add_modify_delete_and_bookmark() {
         let mut cache = LabelCache::new();
-        cache.replace_all(Vec::new());
+        cache.try_replace_all(Vec::new()).expect("list fits");
         let added = parse_labels_watch_event(
             br#"{"type":"ADDED","object":{"metadata":{"name":"prod","resourceVersion":"5",
                  "labels":{"ferrum.io/zone":"pci"}}}}"#,
@@ -617,7 +617,9 @@ mod label_parse_tests {
             other => panic!("410 must be Gone, got {other:?}"),
         }
         let mut cache = LabelCache::new();
-        cache.replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1);
+        cache
+            .try_replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1)
+            .expect("list fits");
         assert!(cache.is_warm());
         let outcome = apply_labels_stream(&mut cache, line).expect("apply");
         assert_eq!(outcome, WatchOutcome::MustRelist);
@@ -627,7 +629,9 @@ mod label_parse_tests {
         // selector must not be decided off them until a list lands.
         assert!(cache.relist_pending());
         assert!(!cache.is_warm(), "410 is liveness, not warmth");
-        cache.replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1);
+        cache
+            .try_replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1)
+            .expect("list fits");
         assert!(!cache.relist_pending());
         assert!(cache.is_warm(), "a completed relist clears the debt");
     }
@@ -910,7 +914,7 @@ mod client {
                 200 => {}
                 // Same fact as an in-band 410, only delivered as a status.
                 410 => {
-                    self.with_cache(|c| c.set_relist_pending(true));
+                    self.with_cache(|c| c.raise_relist_pending());
                     return Ok(WatchOutcome::MustRelist);
                 }
                 other => {
@@ -1092,7 +1096,7 @@ mod client {
                 200 => {}
                 // Same fact as an in-band 410, only delivered as a status.
                 410 => {
-                    self.sink.with(&mut |cache| cache.set_relist_pending(true));
+                    self.sink.with(&mut |cache| cache.raise_relist_pending());
                     return Ok(WatchOutcome::MustRelist);
                 }
                 other => {

@@ -167,9 +167,10 @@ impl PodCache {
         self.relist_pending
     }
 
-    /// Raise the obligation on `410`, clear it only when a full list lands.
-    pub fn set_relist_pending(&mut self, pending: bool) {
-        self.relist_pending = pending;
+    /// Raise the obligation on `410`. There is deliberately no public way to
+    /// lower it: only a completed [`PodCache::replace_all`] discharges it.
+    pub fn raise_relist_pending(&mut self) {
+        self.relist_pending = true;
     }
 
     /// Time since the last watch frame. `None` until the first list lands.
@@ -251,11 +252,13 @@ impl PodCache {
 
     /// Full list result: the only thing that discharges a pending relist.
     pub fn replace_all(&mut self, pods: Vec<PodRecord>) {
-        self.relist_pending = false;
         self.pods.clear();
         for pod in pods {
             self.upsert(pod);
         }
+        // Last, so that a future ceiling that can refuse the list above leaves
+        // the obligation standing rather than discharging it on a partial cache.
+        self.relist_pending = false;
     }
 
     fn owns(&self, pod: &PodRecord) -> bool {

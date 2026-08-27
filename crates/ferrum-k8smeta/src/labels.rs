@@ -125,9 +125,10 @@ impl LabelCache {
         self.relist_pending
     }
 
-    /// Raise the obligation on `410`, clear it only when a full list lands.
-    pub fn set_relist_pending(&mut self, pending: bool) {
-        self.relist_pending = pending;
+    /// Raise the obligation on `410`. There is deliberately no public way to
+    /// lower it: only a completed [`LabelCache::try_replace_all`] discharges it.
+    pub fn raise_relist_pending(&mut self) {
+        self.relist_pending = true;
     }
 
     /// Time since the last list, bookmark or event. `None` while cold.
@@ -263,11 +264,6 @@ impl LabelCache {
         }
     }
 
-    /// Full list result. Replaces everything and marks the cache warm.
-    pub fn replace_all(&mut self, objects: Vec<LabelObject>) {
-        let _ = self.try_replace_all(objects);
-    }
-
     /// A list that does not fit leaves the cache empty and cold rather than
     /// half applied: a partial map answers selectors with labels the object
     /// does not have, and cold is the state consumers already fail closed on.
@@ -324,7 +320,7 @@ pub fn try_apply_labels_event(
             WatchOutcome::Ignored
         }
         LabelWatchEvent::Gone(_) => {
-            cache.set_relist_pending(true);
+            cache.raise_relist_pending();
             WatchOutcome::MustRelist
         }
         LabelWatchEvent::Error(_) => WatchOutcome::Ignored,
@@ -378,17 +374,19 @@ mod tests {
     fn cold_cache_is_not_an_empty_cluster() {
         let mut cache = LabelCache::new();
         assert!(!cache.is_warm());
-        cache.replace_all(Vec::new());
+        cache.try_replace_all(Vec::new()).expect("list fits");
         assert!(cache.is_warm(), "a completed list of zero objects is warm");
     }
 
     #[test]
     fn same_service_account_name_does_not_leak_across_namespaces() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![
-            object("prod", "default", "zone", "pci"),
-            object("dev", "default", "zone", "public"),
-        ]);
+        cache
+            .try_replace_all(vec![
+                object("prod", "default", "zone", "pci"),
+                object("dev", "default", "zone", "public"),
+            ])
+            .expect("list fits");
         assert_eq!(
             cache.labels_or_empty("prod", "default").get("zone"),
             Some(&"pci".to_string())
@@ -403,7 +401,9 @@ mod tests {
     #[test]
     fn delete_drops_labels_instead_of_keeping_stale_ones() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         let outcome = apply_labels_event(
             &mut cache,
             LabelWatchEvent::Deleted(object("", "prod", "zone", "pci")),
@@ -416,7 +416,9 @@ mod tests {
     #[test]
     fn gone_demands_a_relist_and_keeps_the_cache() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         let outcome = apply_labels_event(
             &mut cache,
             LabelWatchEvent::Gone("too old resource version".into()),
@@ -428,7 +430,9 @@ mod tests {
         assert!(cache.relist_pending());
         assert!(!cache.is_warm());
         assert!(cache.is_stale(), "listed once, of unknown correctness");
-        cache.replace_all(vec![object("", "prod", "zone", "public")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "public")])
+            .expect("list fits");
         assert!(!cache.relist_pending());
         assert!(cache.is_warm());
     }
@@ -436,7 +440,9 @@ mod tests {
     #[test]
     fn a_failed_relist_leaves_the_debt_standing() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         apply_labels_event(&mut cache, LabelWatchEvent::Gone("expired".into()));
         let mut fat = object("", "dev", "zone", "public");
         fat.labels
@@ -527,7 +533,9 @@ mod tests {
     #[test]
     fn a_cache_nobody_refreshed_stops_reporting_warm() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         assert!(cache.is_warm());
         assert!(cache.age().expect("listed") < Duration::from_secs(60));
 
@@ -574,7 +582,9 @@ mod tests {
     fn a_shorter_budget_expires_sooner() {
         let mut cache = LabelCache::new();
         cache.set_max_age(Duration::from_secs(30));
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         let t0 = Instant::now();
         cache.mark_fresh_at(t0);
         assert!(cache.is_warm_at(t0 + Duration::from_secs(29)));

@@ -83,12 +83,18 @@ fn labelled_cache() -> PodCache {
     let ns = std::fs::read(fixture("namespaces-list.json")).expect("ns fixture");
     let (ns_rv, namespaces) = parse_labels_list("NamespaceList", &ns).expect("parse ns list");
     assert_eq!(ns_rv, "2001");
-    cache.namespaces_mut().replace_all(namespaces);
+    cache
+        .namespaces_mut()
+        .try_replace_all(namespaces)
+        .expect("list fits");
     cache.namespaces_mut().set_resource_version(ns_rv);
 
     let sa = std::fs::read(fixture("serviceaccounts-list.json")).expect("sa fixture");
     let (sa_rv, accounts) = parse_labels_list("ServiceAccountList", &sa).expect("parse sa list");
-    cache.service_accounts_mut().replace_all(accounts);
+    cache
+        .service_accounts_mut()
+        .try_replace_all(accounts)
+        .expect("list fits");
     cache.service_accounts_mut().set_resource_version(sa_rv);
     cache
 }
