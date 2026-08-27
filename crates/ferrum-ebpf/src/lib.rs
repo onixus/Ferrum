@@ -20,12 +20,15 @@ pub use event::{
     EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
 };
 pub use ferrum_ebpf_progs::{
-    Event, CGROUPS_MAX_ENTRIES, COMM_LEN, EVENTS_DROPPED_TOTAL, EVENT_FLAG_AGENT_SELF,
-    EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELF,
-    PATH_LEN,
+    Event, CGROUPS_MAX_ENTRIES, COMM_LEN, DATAPATH_ABI, EVENTS_DROPPED_TOTAL, EVENTS_RING_BYTES,
+    EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, MAP_CGROUPS,
+    MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
 };
 pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
-pub use kernel::{plan_cgroup_sync, CgroupSyncPlan, SyncStats};
+pub use kernel::{
+    elf_map_def, plan_cgroup_sync, verify_map_defs, CgroupSyncPlan, MapDef, SyncStats, MAP_DEF_LEN,
+    REQUIRED_MAPS,
+};
 #[cfg(feature = "attach")]
 pub use kernel::{KernelHandle, RingReader};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
