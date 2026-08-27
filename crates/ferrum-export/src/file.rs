@@ -238,7 +238,7 @@ impl EventSink for RotatingFileSink {
         }
     }
 
-    fn events_dropped_total(&self) -> u64 {
+    fn export_write_failed_total(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
@@ -303,7 +303,7 @@ impl<W: Write> EventSink for EnvelopeWriterSink<W> {
         }
     }
 
-    fn events_dropped_total(&self) -> u64 {
+    fn export_write_failed_total(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
@@ -375,7 +375,7 @@ mod tests {
         assert!(env.degraded);
         assert_eq!(env.bundle_digest.unwrap().to_string(), "sha256:abc");
         assert_eq!(env.event.rule.to_string(), "no-shell");
-        assert_eq!(sink.events_dropped_total(), 0);
+        assert_eq!(sink.export_write_failed_total(), 0);
     }
 
     #[test]
@@ -386,7 +386,7 @@ mod tests {
         for _ in 0..20 {
             sink.emit(&sample());
         }
-        assert_eq!(sink.events_dropped_total(), 0);
+        assert_eq!(sink.export_write_failed_total(), 0);
         let mut total = 0;
         let mut rotated = 0;
         for name in [
@@ -421,7 +421,7 @@ mod tests {
         let sink = RotatingFileSink::new(&dir, 8, 2, ctx());
         sink.emit(&sample());
         sink.emit(&sample());
-        assert_eq!(sink.events_dropped_total(), 0);
+        assert_eq!(sink.export_write_failed_total(), 0);
         let mut total = 0;
         for name in ["events.jsonl", "events.jsonl.1", "events.jsonl.2"] {
             let path = dir.join(name);
@@ -442,7 +442,7 @@ mod tests {
         for _ in 0..3 {
             sink.emit(&sample());
         }
-        assert_eq!(sink.events_dropped_total(), 3);
+        assert_eq!(sink.export_write_failed_total(), 3);
     }
 
     #[test]
@@ -520,9 +520,9 @@ mod tests {
             ctx(),
         );
         sink.emit(&sample());
-        assert_eq!(sink.events_dropped_total(), 1);
+        assert_eq!(sink.export_write_failed_total(), 1);
         sink.emit(&sample());
-        assert_eq!(sink.events_dropped_total(), 1);
+        assert_eq!(sink.export_write_failed_total(), 1);
         let buf = sink.lock_writer().buf.clone();
         let text = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = text.lines().collect();

@@ -2,11 +2,13 @@
 //!
 //! The record source is abstract (any iterator or an mpsc channel), so tests
 //! and a future kernel ring reader share one path. A record that fails to
-//! decode is counted separately from in-kernel ring drops — it is telemetry
-//! loss, never a reason to stop the loop or to fail open. A record whose
-//! syscall nr is outside the decode table marks the agent Degraded: the table
-//! and the event source disagree, so enforce matching can no longer be
-//! trusted; the event is still exported for visibility.
+//! decode is counted separately from in-kernel ring drops — same loss, other
+//! side of the ring: it carried a syscall that no rule ever matched against,
+//! so it degrades the agent on the same decaying terms rather than being
+//! written off as telemetry. It is never a reason to stop the loop or to fail
+//! open. A record whose syscall nr is outside the decode table marks the agent
+//! Degraded: the table and the event source disagree, so enforce matching can
+//! no longer be trusted; the event is still exported for visibility.
 
 use crate::Agent;
 use ferrum_common::{FerrumError, Result};
@@ -19,7 +21,8 @@ pub struct PumpStats {
     /// Records decoded, named, and pushed through `handle_event`.
     pub handled: u64,
     /// Malformed records, counted in `records_decode_failed_total`, not in
-    /// `events_dropped_total` (that one is the in-kernel ring counter).
+    /// `events_dropped_total` (that one is the in-kernel ring counter). Each
+    /// one is an event no rule saw, and degrades the agent while it recurs.
     pub decode_failed: u64,
     /// Records with a syscall nr outside the decode table; each marks the
     /// agent Degraded via `record_unknown_syscall`.

@@ -108,8 +108,8 @@ impl<S: EventSink + Send + Sync + 'static> EventSink for QueueSink<S> {
         }
     }
 
-    fn events_dropped_total(&self) -> u64 {
-        self.inner.events_dropped_total()
+    fn export_write_failed_total(&self) -> u64 {
+        self.inner.export_write_failed_total()
     }
 
     fn export_queue_dropped_total(&self) -> u64 {
@@ -164,8 +164,8 @@ mod tests {
             self.inner.emit(event);
         }
 
-        fn events_dropped_total(&self) -> u64 {
-            self.inner.events_dropped_total()
+        fn export_write_failed_total(&self) -> u64 {
+            self.inner.export_write_failed_total()
         }
     }
 
@@ -222,7 +222,7 @@ mod tests {
         assert!(!sink.export_writer_dead());
 
         let inner = sink.shutdown();
-        assert_eq!(inner.events_dropped_total(), 0);
+        assert_eq!(inner.export_write_failed_total(), 0);
         let written = std::fs::read_to_string(dir.join("events.jsonl")).expect("events.jsonl");
         let lines = written.lines().filter(|l| !l.is_empty()).count();
         assert_eq!(lines as u64, sent as u64 - dropped);
