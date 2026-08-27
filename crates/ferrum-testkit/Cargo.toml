@@ -10,3 +10,14 @@ rust-version.workspace = true
 ferrum-api.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
+
+# Acceptance tests drive the real pipeline; none of this leaks into the
+# fixture library itself.
+[dev-dependencies]
+chrono.workspace = true
+ferrum-admission = { path = "../ferrum-admission" }
+ferrum-agent = { path = "../ferrum-agent" }
+ferrum-compiler.workspace = true
+ferrum-crypto.workspace = true
+ferrum-ebpf.workspace = true
+ferrum-ids.workspace = true

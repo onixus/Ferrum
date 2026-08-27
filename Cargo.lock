@@ -411,6 +411,9 @@ dependencies = [
  "chrono",
  "clap",
  "ferrum-api",
+ "ferrum-compiler",
+ "ferrum-crypto",
+ "ferrum-ids",
  "ferrum-policy",
  "ferrum-testkit",
  "serde",
@@ -529,7 +532,14 @@ dependencies = [
 name = "ferrum-testkit"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "ferrum-admission",
+ "ferrum-agent",
  "ferrum-api",
+ "ferrum-compiler",
+ "ferrum-crypto",
+ "ferrum-ebpf",
+ "ferrum-ids",
  "serde",
  "serde_yaml 0.8.26",
 ]
