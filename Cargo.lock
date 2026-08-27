@@ -530,16 +530,19 @@ dependencies = [
 name = "ferrum-controller"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ferrum-api",
  "ferrum-common",
  "ferrum-compiler",
  "ferrum-crypto",
  "ferrum-ids",
+ "ferrum-policy",
  "ferrum-testkit",
  "futures",
  "home",
  "k8s-openapi",
  "kube",
+ "serde",
  "serde_json",
  "serde_yaml 0.8.26",
  "tokio",

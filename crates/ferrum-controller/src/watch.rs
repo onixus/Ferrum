@@ -1,14 +1,28 @@
-//! Watch ClusterSecurityPolicy as DynamicObject. Not kube::runtime::Controller.
+//! Watch ClusterSecurityPolicy, SecurityPolicy and PolicyException as
+//! DynamicObject. Not kube::runtime::Controller, no kube-derive (rustc 1.75).
 
-use crate::apply::{live_secret_matches, load_bundle_secret, persist, plan_apply, ApplyPlan};
-use crate::{compile_status_err, reconcile, ObservedPolicy, ReconcileInput, WatchConfig};
-use ferrum_api::{ClusterSecurityPolicySpec, PolicyStatus, RolloutStatus};
+use crate::apply::{
+    live_secret_matches, load_bundle_secret, namespaced_secret_name, patch_secret_exceptions,
+    patch_status_dynamic, persist, persist_dynamic, persist_exceptions, plan_apply,
+    plan_apply_namespaced, secret_name, ApplyPlan,
+};
+use crate::{
+    compile_status_err, exception_status_patch, reconcile, reconcile_exception,
+    reconcile_namespaced, NamespacedReconcileInput, ObservedException, ObservedNamespacedPolicy,
+    ObservedPolicy, ReconcileInput, WatchConfig,
+};
+use ferrum_api::{
+    ClusterSecurityPolicySpec, PolicyExceptionSpec, PolicyExceptionStatus, PolicyStatus,
+    RolloutStatus, SecurityPolicySpec,
+};
 use ferrum_common::{FerrumError, Result};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::{watcher, WatchStreamExt};
 use kube::Client;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 pub fn cluster_security_policy_gvk() -> GroupVersionKind {
     GroupVersionKind::gvk(
@@ -22,18 +36,27 @@ pub fn cluster_security_policy_resource() -> ApiResource {
     ApiResource::from_gvk(&cluster_security_policy_gvk())
 }
 
+pub fn security_policy_gvk() -> GroupVersionKind {
+    GroupVersionKind::gvk(ferrum_api::GROUP, ferrum_api::VERSION, "SecurityPolicy")
+}
+
+pub fn security_policy_resource() -> ApiResource {
+    ApiResource::from_gvk(&security_policy_gvk())
+}
+
+pub fn policy_exception_gvk() -> GroupVersionKind {
+    GroupVersionKind::gvk(ferrum_api::GROUP, ferrum_api::VERSION, "PolicyException")
+}
+
+pub fn policy_exception_resource() -> ApiResource {
+    ApiResource::from_gvk(&policy_exception_gvk())
+}
+
 pub fn observe_policy(obj: &DynamicObject) -> Result<ObservedPolicy> {
-    let name = obj
-        .metadata
-        .name
-        .clone()
-        .filter(|n| !n.is_empty())
-        .ok_or_else(|| {
-            FerrumError::Validation("ClusterSecurityPolicy metadata.name is missing".into())
-        })?;
+    let name = require_name(obj, "ClusterSecurityPolicy")?;
     let generation = obj.metadata.generation.unwrap_or(0);
     let resource_version = obj.metadata.resource_version.clone().unwrap_or_default();
-    let spec = decode_spec(obj)?;
+    let spec: ClusterSecurityPolicySpec = decode_spec(obj, "ClusterSecurityPolicy")?;
     Ok(ObservedPolicy {
         name,
         generation,
@@ -42,17 +65,61 @@ pub fn observe_policy(obj: &DynamicObject) -> Result<ObservedPolicy> {
     })
 }
 
-fn decode_spec(obj: &DynamicObject) -> Result<ClusterSecurityPolicySpec> {
+pub fn observe_namespaced_policy(obj: &DynamicObject) -> Result<ObservedNamespacedPolicy> {
+    let name = require_name(obj, "SecurityPolicy")?;
+    let namespace = require_namespace(obj, "SecurityPolicy")?;
+    let generation = obj.metadata.generation.unwrap_or(0);
+    let resource_version = obj.metadata.resource_version.clone().unwrap_or_default();
+    let spec: SecurityPolicySpec = decode_spec(obj, "SecurityPolicy")?;
+    Ok(ObservedNamespacedPolicy {
+        name,
+        namespace,
+        generation,
+        resource_version,
+        spec,
+    })
+}
+
+/// Missing/invalid spec (e.g. no expiresAt) is a Validation error the caller
+/// records in the object's status; the exception never becomes live.
+pub fn observe_exception(obj: &DynamicObject) -> Result<ObservedException> {
+    let name = require_name(obj, "PolicyException")?;
+    let namespace = require_namespace(obj, "PolicyException")?;
+    let spec: PolicyExceptionSpec = decode_spec(obj, "PolicyException")?;
+    Ok(ObservedException {
+        name,
+        namespace,
+        spec,
+    })
+}
+
+fn require_name(obj: &DynamicObject, kind: &str) -> Result<String> {
+    obj.metadata
+        .name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| FerrumError::Validation(format!("{kind} metadata.name is missing")))
+}
+
+fn require_namespace(obj: &DynamicObject, kind: &str) -> Result<String> {
+    obj.metadata
+        .namespace
+        .clone()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| FerrumError::Validation(format!("{kind} metadata.namespace is missing")))
+}
+
+fn decode_spec<T: serde::de::DeserializeOwned>(obj: &DynamicObject, kind: &str) -> Result<T> {
     let spec_val = match &obj.data {
         serde_json::Value::Object(map) => map.get("spec"),
         _ => None,
     };
     match spec_val {
-        None | Some(serde_json::Value::Null) => Err(FerrumError::Validation(
-            "ClusterSecurityPolicy spec is missing".into(),
-        )),
+        None | Some(serde_json::Value::Null) => {
+            Err(FerrumError::Validation(format!("{kind} spec is missing")))
+        }
         Some(value) => serde_json::from_value(value.clone())
-            .map_err(|e| FerrumError::Validation(format!("ClusterSecurityPolicy spec: {e}"))),
+            .map_err(|e| FerrumError::Validation(format!("{kind} spec: {e}"))),
     }
 }
 
@@ -107,17 +174,41 @@ fn failed_status_already_recorded(obj: &DynamicObject, generation: i64, plan: &A
     og == Some(generation) && !ready && digest.is_empty()
 }
 
+/// Live exceptions keyed by `namespace/name` so revoked objects drop out.
+type ExceptionSet = Arc<Mutex<BTreeMap<String, PolicyExceptionSpec>>>;
+
+fn snapshot_exceptions(set: &ExceptionSet) -> Vec<PolicyExceptionSpec> {
+    set.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect()
+}
+
 pub async fn run_watch(cfg: WatchConfig) -> Result<()> {
     let client = Client::try_default()
         .await
         .map_err(|e| FerrumError::Degraded(format!("kube client: {e}")))?;
+    let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+    tokio::select! {
+        r = run_cluster_policy_watch(&client, &cfg, &exceptions) => r,
+        r = run_namespaced_policy_watch(&client, &cfg, &exceptions) => r,
+        r = run_exception_watch(&client, &cfg, &exceptions) => r,
+    }
+}
+
+async fn run_cluster_policy_watch(
+    client: &Client,
+    cfg: &WatchConfig,
+    exceptions: &ExceptionSet,
+) -> Result<()> {
     let api: Api<DynamicObject> =
         Api::all_with(client.clone(), &cluster_security_policy_resource());
     let mut stream = std::pin::pin!(watcher(api, watcher::Config::default()).applied_objects());
     while let Some(event) = stream.next().await {
         match event {
             Ok(obj) => {
-                if let Err(err) = reconcile_object(&client, &cfg, obj).await {
+                if let Err(err) = reconcile_object(client, cfg, exceptions, obj).await {
                     eprintln!("ferrum-controller: {err}");
                 }
             }
@@ -129,19 +220,139 @@ pub async fn run_watch(cfg: WatchConfig) -> Result<()> {
     ))
 }
 
-async fn reconcile_object(client: &Client, cfg: &WatchConfig, obj: DynamicObject) -> Result<()> {
-    let name = match obj.metadata.name.as_deref() {
-        Some(n) if !n.is_empty() => n.to_string(),
-        _ => {
-            return Err(FerrumError::Validation(
-                "ClusterSecurityPolicy metadata.name is missing".into(),
-            ));
+async fn run_namespaced_policy_watch(
+    client: &Client,
+    cfg: &WatchConfig,
+    exceptions: &ExceptionSet,
+) -> Result<()> {
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &security_policy_resource());
+    let mut stream = std::pin::pin!(watcher(api, watcher::Config::default()).applied_objects());
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(obj) => {
+                if let Err(err) = reconcile_namespaced_object(client, cfg, exceptions, obj).await {
+                    eprintln!("ferrum-controller: {err}");
+                }
+            }
+            Err(err) => eprintln!("ferrum-controller watch: {err}"),
         }
-    };
+    }
+    Err(FerrumError::Degraded("SecurityPolicy watch ended".into()))
+}
+
+async fn run_exception_watch(
+    client: &Client,
+    cfg: &WatchConfig,
+    exceptions: &ExceptionSet,
+) -> Result<()> {
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &policy_exception_resource());
+    // Raw watcher events: Deleted must revoke, applied_objects would hide it.
+    let mut stream = std::pin::pin!(watcher(api, watcher::Config::default()));
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(ev) => {
+                if let Err(err) = handle_exception_event(client, cfg, exceptions, ev).await {
+                    eprintln!("ferrum-controller: {err}");
+                }
+            }
+            Err(err) => eprintln!("ferrum-controller watch: {err}"),
+        }
+    }
+    Err(FerrumError::Degraded("PolicyException watch ended".into()))
+}
+
+async fn handle_exception_event(
+    client: &Client,
+    cfg: &WatchConfig,
+    exceptions: &ExceptionSet,
+    event: watcher::Event<DynamicObject>,
+) -> Result<()> {
+    match event {
+        watcher::Event::Applied(obj) => {
+            apply_exception_object(client, exceptions, &obj).await?;
+        }
+        watcher::Event::Deleted(obj) => {
+            if let (Some(ns), Some(name)) = (
+                obj.metadata.namespace.as_deref(),
+                obj.metadata.name.as_deref(),
+            ) {
+                exceptions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&format!("{ns}/{name}"));
+            }
+        }
+        watcher::Event::Restarted(objs) => {
+            exceptions.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            for obj in &objs {
+                apply_exception_object(client, exceptions, obj).await?;
+            }
+        }
+    }
+    persist_exceptions(client, &cfg.namespace, &snapshot_exceptions(exceptions)).await
+}
+
+/// Status to record on the object plus the spec to serialize, if live.
+/// A spec that fails to decode (e.g. missing expiresAt) is Rejected too.
+pub(crate) fn exception_disposition(
+    obj: &DynamicObject,
+) -> (PolicyExceptionStatus, Option<PolicyExceptionSpec>) {
+    match observe_exception(obj) {
+        Ok(observed) => {
+            let outcome = reconcile_exception(&observed.spec);
+            (outcome.status, outcome.live)
+        }
+        Err(err) => (
+            PolicyExceptionStatus {
+                active: false,
+                message: err.to_string(),
+            },
+            None,
+        ),
+    }
+}
+
+async fn apply_exception_object(
+    client: &Client,
+    exceptions: &ExceptionSet,
+    obj: &DynamicObject,
+) -> Result<()> {
+    let name = require_name(obj, "PolicyException")?;
+    let namespace = require_namespace(obj, "PolicyException")?;
+    let key = format!("{namespace}/{name}");
+    let (status, live) = exception_disposition(obj);
+    {
+        let mut set = exceptions.lock().unwrap_or_else(|e| e.into_inner());
+        match live {
+            Some(spec) => {
+                set.insert(key, spec);
+            }
+            None => {
+                set.remove(&key);
+            }
+        }
+    }
+    patch_status_dynamic(
+        client,
+        &policy_exception_resource(),
+        Some(&namespace),
+        &name,
+        &exception_status_patch(&status),
+    )
+    .await
+}
+
+async fn reconcile_object(
+    client: &Client,
+    cfg: &WatchConfig,
+    exceptions: &ExceptionSet,
+    obj: DynamicObject,
+) -> Result<()> {
+    let name = require_name(&obj, "ClusterSecurityPolicy")?;
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
-        let secret = load_bundle_secret(client, &cfg.namespace, &name).await?;
+        let secret = load_bundle_secret(client, &cfg.namespace, &secret_name(&name)).await?;
         if should_skip_applied(
             generation,
             og,
@@ -168,18 +379,114 @@ async fn reconcile_object(client: &Client, cfg: &WatchConfig, obj: DynamicObject
         Err(err) => plan_apply(
             &name,
             &cfg.namespace,
-            &crate::ReconcileOutcome::Failed(PolicyStatus {
-                observed_generation: generation,
-                compile: compile_status_err(&err),
-                rollout: RolloutStatus::default(),
-            }),
+            &failed_outcome(generation, &err),
             &cfg.trust_root,
         ),
     };
     if failed_status_already_recorded(&obj, generation, &plan) {
         return Ok(());
     }
-    persist(client, &name, &cfg.namespace, &plan).await
+    persist(client, &name, &cfg.namespace, &plan).await?;
+    attach_exceptions(client, cfg, exceptions, &plan).await
+}
+
+async fn reconcile_namespaced_object(
+    client: &Client,
+    cfg: &WatchConfig,
+    exceptions: &ExceptionSet,
+    obj: DynamicObject,
+) -> Result<()> {
+    let name = require_name(&obj, "SecurityPolicy")?;
+    let policy_namespace = require_namespace(&obj, "SecurityPolicy")?;
+    let generation = obj.metadata.generation.unwrap_or(0);
+    let (og, ready, digest) = status_compile(&obj);
+    if ready {
+        let secret = load_bundle_secret(
+            client,
+            &cfg.namespace,
+            &namespaced_secret_name(&name, &policy_namespace),
+        )
+        .await?;
+        if should_skip_applied(
+            generation,
+            og,
+            ready,
+            &digest,
+            secret.as_ref(),
+            &cfg.trust_root,
+        ) {
+            return Ok(());
+        }
+    }
+    let plan = match observe_namespaced_policy(&obj) {
+        Ok(observed) => {
+            let outcome = reconcile_namespaced(NamespacedReconcileInput {
+                spec: &observed.spec,
+                observed_generation: observed.generation,
+                secret_key: &cfg.secret_key,
+                library: cfg.library.as_ref(),
+                clusters: &cfg.clusters,
+            });
+            plan_apply_namespaced(
+                &observed.name,
+                &observed.namespace,
+                &cfg.namespace,
+                &outcome,
+                &cfg.trust_root,
+            )
+        }
+        Err(err) => plan_apply_namespaced(
+            &name,
+            &policy_namespace,
+            &cfg.namespace,
+            &failed_outcome(generation, &err),
+            &cfg.trust_root,
+        ),
+    };
+    if failed_status_already_recorded(&obj, generation, &plan) {
+        return Ok(());
+    }
+    persist_dynamic(
+        client,
+        &security_policy_resource(),
+        Some(&policy_namespace),
+        &name,
+        &cfg.namespace,
+        &plan,
+    )
+    .await?;
+    attach_exceptions(client, cfg, exceptions, &plan).await
+}
+
+/// A freshly created bundle Secret must carry the current exception list too;
+/// the exception watch only patches Secrets that already exist.
+async fn attach_exceptions(
+    client: &Client,
+    cfg: &WatchConfig,
+    exceptions: &ExceptionSet,
+    plan: &ApplyPlan,
+) -> Result<()> {
+    let Some(secret) = &plan.secret else {
+        return Ok(());
+    };
+    let Some(secret_name) = secret.metadata.name.as_deref() else {
+        return Ok(());
+    };
+    patch_secret_exceptions(
+        client,
+        &cfg.namespace,
+        secret_name,
+        &snapshot_exceptions(exceptions),
+    )
+    .await
+}
+
+fn failed_outcome(generation: i64, err: &FerrumError) -> crate::ReconcileOutcome {
+    crate::ReconcileOutcome::Failed(PolicyStatus {
+        observed_generation: generation,
+        compile: compile_status_err(err),
+        rollout: RolloutStatus::default(),
+    })
 }
 
 #[cfg(test)]
@@ -555,5 +862,188 @@ mod tests {
         let plan = plan_apply("bare", DEFAULT_NAMESPACE, &failed, &pk());
         assert!(failed_status_already_recorded(&obj, 2, &plan));
         assert!(!should_skip_applied(2, Some(2), false, "", None, &pk()));
+    }
+
+    fn namespaced_spec() -> ferrum_api::SecurityPolicySpec {
+        let cluster = prod_restricted().spec;
+        serde_json::from_value(serde_json::to_value(cluster).expect("to json"))
+            .expect("SecurityPolicySpec shares the shape")
+    }
+
+    fn dynamic_namespaced(
+        name: &str,
+        namespace: &str,
+        generation: i64,
+        spec: &ferrum_api::SecurityPolicySpec,
+    ) -> DynamicObject {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "ferrum.io/v1",
+            "kind": "SecurityPolicy",
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "generation": generation,
+                "resourceVersion": "7",
+            },
+            "spec": spec,
+        }))
+        .expect("DynamicObject")
+    }
+
+    #[test]
+    fn namespaced_and_exception_gvks() {
+        let sp = security_policy_resource();
+        assert_eq!(sp.plural, "securitypolicies");
+        assert_eq!(sp.api_version, "ferrum.io/v1");
+        let pe = policy_exception_resource();
+        assert_eq!(pe.plural, "policyexceptions");
+        assert_eq!(pe.api_version, "ferrum.io/v1");
+    }
+
+    #[test]
+    fn namespaced_policy_gets_namespace_suffixed_verifiable_secret() {
+        let spec = namespaced_spec();
+        let obj = dynamic_namespaced("prod-restricted", "payments", 3, &spec);
+        let observed = observe_namespaced_policy(&obj).expect("observe");
+        assert_eq!(observed.namespace, "payments");
+        assert_eq!(observed.generation, 3);
+        let outcome = crate::reconcile_namespaced(crate::NamespacedReconcileInput {
+            spec: &observed.spec,
+            observed_generation: observed.generation,
+            secret_key: &RFC8032_SK,
+            library: None,
+            clusters: &[],
+        });
+        let plan = crate::plan_apply_namespaced(
+            &observed.name,
+            &observed.namespace,
+            DEFAULT_NAMESPACE,
+            &outcome,
+            &pk(),
+        );
+        let secret = plan.secret.expect("FSIG Secret");
+        assert_eq!(
+            secret.metadata.name.as_deref(),
+            Some("ferrum-bundle-prod-restricted-payments")
+        );
+        let fsig = &secret
+            .data
+            .as_ref()
+            .expect("data")
+            .get("bundle.fsig")
+            .expect("bundle.fsig")
+            .0;
+        let decoded = crate::SignedBundle::decode(fsig).expect("decode");
+        crate::verify_signed_bundle(&decoded, &pk()).expect("fsig verifies");
+        assert_eq!(plan.status["status"]["observedGeneration"], 3);
+    }
+
+    #[test]
+    fn namespaced_failure_policy_ignore_rejected_no_secret() {
+        let mut spec = namespaced_spec();
+        spec.admit.failure_policy = ferrum_api::FailurePolicy::Ignore;
+        let obj = dynamic_namespaced("break-glass", "payments", 1, &spec);
+        let observed = observe_namespaced_policy(&obj).expect("observe");
+        let outcome = crate::reconcile_namespaced(crate::NamespacedReconcileInput {
+            spec: &observed.spec,
+            observed_generation: 1,
+            secret_key: &RFC8032_SK,
+            library: None,
+            clusters: &[],
+        });
+        let status = match &outcome {
+            crate::ReconcileOutcome::Failed(s) => s,
+            crate::ReconcileOutcome::Applied(_) => panic!("Ignore must not compile"),
+        };
+        assert!(!status.compile.ready);
+        assert!(
+            status.compile.message.contains("Ignore"),
+            "{}",
+            status.compile.message
+        );
+        let plan = crate::plan_apply_namespaced(
+            "break-glass",
+            "payments",
+            DEFAULT_NAMESPACE,
+            &outcome,
+            &pk(),
+        );
+        assert!(plan.secret.is_none());
+    }
+
+    #[test]
+    fn exception_without_expires_at_rejected_in_status_not_in_json() {
+        let obj: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "ferrum.io/v1",
+            "kind": "PolicyException",
+            "metadata": { "name": "no-ttl", "namespace": "payments" },
+            "spec": {
+                "ticket": "JIRA-1",
+                "requestedBy": "sre",
+                "reason": "temporary debug sidecar",
+                "target": { "policies": ["prod-restricted"], "rules": ["no-shell"] }
+            }
+        }))
+        .expect("obj");
+        assert!(observe_exception(&obj).is_err());
+        let (status, live) = exception_disposition(&obj);
+        assert!(!status.active);
+        assert!(status.message.contains("expiresAt"), "{}", status.message);
+        assert!(live.is_none());
+        let json = crate::exceptions_json(&[]).expect("json");
+        assert_eq!(json, b"[]");
+    }
+
+    #[test]
+    fn live_exception_survives_disposition_and_json_roundtrip() {
+        let expires = chrono::Utc::now() + chrono::Days::new(7);
+        let obj: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "ferrum.io/v1",
+            "kind": "PolicyException",
+            "metadata": { "name": "debug-sidecar", "namespace": "payments" },
+            "spec": {
+                "ticket": "JIRA-18421",
+                "requestedBy": "sre",
+                "approvedBy": "ib",
+                "reason": "temporary debug sidecar",
+                "expiresAt": expires.to_rfc3339(),
+                "fourEyes": true,
+                "target": {
+                    "namespace": "payments",
+                    "policies": ["prod-restricted"],
+                    "rules": ["no-shell"]
+                }
+            }
+        }))
+        .expect("obj");
+        let (status, live) = exception_disposition(&obj);
+        assert!(status.active, "{}", status.message);
+        let spec = live.expect("live spec");
+        let json = crate::exceptions_json(&[spec.clone()]).expect("json");
+        let decoded: Vec<ferrum_api::PolicyExceptionSpec> =
+            serde_json::from_slice(&json).expect("admission-side decode");
+        assert_eq!(decoded, vec![spec]);
+    }
+
+    #[test]
+    fn over_90_day_exception_rejected() {
+        let expires = chrono::Utc::now() + chrono::Days::new(120);
+        let obj: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "ferrum.io/v1",
+            "kind": "PolicyException",
+            "metadata": { "name": "forever", "namespace": "payments" },
+            "spec": {
+                "ticket": "JIRA-2",
+                "requestedBy": "sre",
+                "reason": "temporary debug sidecar",
+                "expiresAt": expires.to_rfc3339(),
+                "target": { "policies": ["prod-restricted"], "rules": ["no-shell"] }
+            }
+        }))
+        .expect("obj");
+        let (status, live) = exception_disposition(&obj);
+        assert!(!status.active);
+        assert!(live.is_none());
+        assert!(!status.message.is_empty());
     }
 }
