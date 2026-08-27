@@ -12,20 +12,22 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::bundle::{
-    load_source_with_digest, read_source_path, source_snapshot_dir, BUNDLE_DIGEST_KEY,
-    BUNDLE_FSIG_KEY,
+    exceptions_file_path, load_source_with_digest, read_exceptions_path, read_source_path,
+    source_snapshot_dir, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY,
 };
 use crate::program::AdmissionProgram;
 use crate::review::ReviewConfig;
+use ferrum_common::FerrumError;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-/// Verified program plus pinned trust-root. Reload never fail-opens.
+/// Verified program plus pinned trust-root. Bundle reload never fail-opens;
+/// the exception list is hot-swappable TTL'd data, re-scoped by eval per request.
 pub struct WebhookState {
     program: RwLock<AdmissionProgram>,
     trust_root: Vec<u8>,
-    exceptions: Vec<PolicyExceptionSpec>,
+    exceptions: RwLock<Vec<PolicyExceptionSpec>>,
     config: ReviewConfig,
 }
 
@@ -39,7 +41,7 @@ impl WebhookState {
         Self {
             program: RwLock::new(program),
             trust_root,
-            exceptions,
+            exceptions: RwLock::new(exceptions),
             config,
         }
     }
@@ -51,8 +53,39 @@ impl WebhookState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let exceptions = self
+            .exceptions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.config
-            .handle_bytes(body, Some(&program), &self.exceptions, Utc::now())
+            .handle_bytes(body, Some(&program), &exceptions, Utc::now())
+    }
+
+    pub fn set_exceptions(&self, list: Vec<PolicyExceptionSpec>) {
+        *self.exceptions.write().unwrap_or_else(|e| e.into_inner()) = list;
+    }
+
+    /// Parse a PolicyExceptionSpec JSON array (controller `exceptions.json`).
+    /// Garbage keeps the previous list: the bundle is fail-closed, but a broken
+    /// exception file must not flip decisions either way.
+    pub fn try_reload_exceptions(&self, bytes: &[u8]) -> ferrum_common::Result<usize> {
+        let list: Vec<PolicyExceptionSpec> = serde_json::from_slice(bytes)
+            .map_err(|e| FerrumError::Validation(format!("exceptions.json: {e}")))?;
+        let n = list.len();
+        self.set_exceptions(list);
+        Ok(n)
+    }
+
+    /// Missing file = empty list; unreadable or garbage = keep previous (Err).
+    pub fn try_reload_exceptions_path(&self, path: &Path) -> ferrum_common::Result<usize> {
+        match read_exceptions_path(path)? {
+            Some(bytes) => self.try_reload_exceptions(&bytes),
+            None => {
+                self.set_exceptions(Vec::new());
+                Ok(0)
+            }
+        }
     }
 
     /// Verify `bytes` (raw FSIG or Secret JSON). On success swap; on error keep last-good.
@@ -272,6 +305,47 @@ fn poll_loop(path: PathBuf, interval: Duration, state: Arc<WebhookState>) {
         stamp = Some(next);
         if let Err(err) = state.try_reload_path(&path) {
             eprintln!("ferrum-admission: bundle reload failed, keeping last-known-good: {err}");
+        }
+    }
+}
+
+/// Watch the `--exceptions` mount (dir with `exceptions.json`, or the file
+/// itself). File gone = swap to empty; garbage = keep the previous list.
+pub fn poll_exceptions_file(
+    path: impl Into<PathBuf>,
+    interval: Duration,
+    state: Arc<WebhookState>,
+) {
+    let path = path.into();
+    thread::spawn(move || poll_exceptions_loop(path, interval, state));
+}
+
+fn poll_exceptions_loop(path: PathBuf, interval: Duration, state: Arc<WebhookState>) {
+    let mut stamp: Option<FileStamp> = None;
+    let mut cleared = false;
+    loop {
+        thread::sleep(interval);
+        // Re-resolve every tick: kubelet `..data` rotation moves the file.
+        match stamp_one(&exceptions_file_path(&path)) {
+            None => {
+                if !cleared {
+                    state.set_exceptions(Vec::new());
+                    cleared = true;
+                    stamp = None;
+                }
+            }
+            Some(next) => {
+                cleared = false;
+                if Some(next) == stamp {
+                    continue;
+                }
+                stamp = Some(next);
+                if let Err(err) = state.try_reload_exceptions_path(&path) {
+                    eprintln!(
+                        "ferrum-admission: exceptions reload failed, keeping previous list: {err}"
+                    );
+                }
+            }
         }
     }
 }

@@ -32,6 +32,11 @@ pub const SIGNED_FORMAT: u32 = 1;
 pub const BUNDLE_FSIG_KEY: &str = "bundle.fsig";
 /// Controller Secret data key for SHA-256(raw) as UTF-8 hex bytes.
 pub const BUNDLE_DIGEST_KEY: &str = "digest";
+/// Controller Secret data key for the live PolicyException list (JSON array of
+/// PolicyExceptionSpec). Duplicated on purpose: no ferrum-controller dep.
+/// Exceptions are TTL'd data, not signed policy — eval re-checks scope and
+/// expiresAt per request.
+pub const EXCEPTIONS_JSON_KEY: &str = "exceptions.json";
 /// kubelet projected-volume symlink to the current Secret snapshot directory.
 pub const KUBELET_DATA_DIR: &str = "..data";
 
@@ -122,6 +127,29 @@ pub fn read_source_path(path: &Path) -> Result<(Vec<u8>, Option<Digest>)> {
 pub fn load_path(path: &Path, trust_root: &[u8]) -> Result<(AdmissionProgram, Digest)> {
     let (bytes, expected) = read_source_path(path)?;
     load_source_with_digest(&bytes, trust_root, expected.as_ref())
+}
+
+/// `--exceptions` mount resolution: a directory means the `exceptions.json`
+/// key inside the current kubelet `..data` snapshot; a file path is used as-is.
+pub(crate) fn exceptions_file_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        snapshot_dir(path).join(EXCEPTIONS_JSON_KEY)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// `Ok(None)` = file absent = empty exception list (not an error, not deny-all).
+pub fn read_exceptions_path(path: &Path) -> Result<Option<Vec<u8>>> {
+    let file = exceptions_file_path(path);
+    match std::fs::read(&file) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(FerrumError::Degraded(format!(
+            "read {}: {err}",
+            file.display()
+        ))),
+    }
 }
 
 /// Snapshot directory used for mtime+len watches. `None` for a plain file.
