@@ -303,10 +303,10 @@ fn agent_self_bpf_is_neither_denied_nor_signalled() {
 /// A record whose cgroup the index has never resolved. The rules still run
 /// (the record reaches the sink), but the namespaced selector cannot match, so
 /// the verdict falls through to the spec default and the reaction is refused
-/// for unknown identity. Nothing on the agent counts this class of miss —
-/// `cgroup_index_len` is the only signal, and it is not per-record.
+/// for unknown identity. That fall-through is not an allow the policy chose,
+/// so the agent counts the miss and goes Degraded until the index catches up.
 #[test]
-fn a_cgroup_missing_from_the_index_falls_through_to_the_default_action() {
+fn a_cgroup_missing_from_the_index_is_counted_and_degrades() {
     const CGROUP_UNKNOWN: u64 = 4_242_424;
     for arch in ARCHES {
         let (agent, killed) = replay_agent(None);
@@ -327,6 +327,13 @@ fn a_cgroup_missing_from_the_index_falls_through_to_the_default_action() {
         assert!(!events[0].executed);
         assert_eq!(agent.respond_kill_total(), 0);
         assert!(killed_tgids(&killed).is_empty());
+        assert!(
+            agent.identity_unknown_total() >= 1,
+            "an index miss must not be silent on {}",
+            arch.as_str()
+        );
+        assert!(agent.identity_unknown_recent(), "{}", arch.as_str());
+        assert!(agent.is_degraded());
     }
 }
 

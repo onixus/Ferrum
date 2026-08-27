@@ -183,6 +183,8 @@ pub struct Agent {
     /// EVENT_FLAG_CONTAINER. Every one of these is a `container_only` rule
     /// that did not match on a real container.
     container_flag_disagreement: AtomicU64,
+    identity_unknown: AtomicU64,
+    identity_unknown_at: Mutex<Option<Instant>>,
     /// When the last whole sync plan was accepted. Freshness, not just
     /// success: a publisher that stopped leaves `container_map_synced` true
     /// forever otherwise.
@@ -247,6 +249,8 @@ impl Agent {
             container_map_entries: AtomicU64::new(0),
             container_map_error: Mutex::new(None),
             container_flag_disagreement: AtomicU64::new(0),
+            identity_unknown: AtomicU64::new(0),
+            identity_unknown_at: Mutex::new(None),
             container_map_synced_at: Mutex::new(None),
             container_flag_window: Mutex::new(HashMap::new()),
             container_flag_fault_at: Mutex::new(None),
@@ -293,6 +297,10 @@ impl Agent {
             // decided without the bytes it names. The rule still fired, but on
             // an assertion, and a node making those is Degraded.
             || self.path_truncated_recent()
+            // A cgroup the index cannot name makes every namespaced selector
+            // answer "no match" for a reason that has nothing to do with the
+            // policy. That is a missed enforcement, not an allow.
+            || self.identity_unknown_recent()
             || self.container_flag_degraded()
             || self.respond_disabled_reason().is_some()
     }
@@ -441,6 +449,26 @@ impl Agent {
     pub fn record_labels_unknown(&self, now: Instant) {
         self.labels_unknown.fetch_add(1, Ordering::Relaxed);
         mark_now(&self.labels_unknown_at, now);
+    }
+
+    pub fn identity_unknown_total(&self) -> u64 {
+        self.identity_unknown.load(Ordering::Relaxed)
+    }
+
+    pub fn identity_unknown_recent(&self) -> bool {
+        self.identity_unknown_recent_at(Instant::now())
+    }
+
+    pub fn identity_unknown_recent_at(&self, now: Instant) -> bool {
+        within(&self.identity_unknown_at, now, DEGRADED_RECOVERY)
+    }
+
+    /// A cgroup the index cannot name. The counterpart of
+    /// `note_container_flag_disagreement`, which covers the opposite direction
+    /// (index knows the pod, kernel did not flag it).
+    pub fn record_identity_unknown(&self, now: Instant) {
+        self.identity_unknown.fetch_add(1, Ordering::Relaxed);
+        mark_now(&self.identity_unknown_at, now);
     }
 
     /// True only while a `KernelHandle` attach is live. `Loader::attach_pins`
@@ -871,7 +899,14 @@ impl Agent {
                 }
                 id
             }
-            Err(_) => WorkloadIdentity::unknown(),
+            Err(_) => {
+                // A miss is not "this cgroup is not a container": a namespaced
+                // selector cannot match an unknown identity, so `decide`
+                // answers Allow and a container_only kill rule silently does
+                // not fire. Nothing else moves on this path, so count it here.
+                self.record_identity_unknown(Instant::now());
+                WorkloadIdentity::unknown()
+            }
         };
         let mut decision = self.loader.decide(event, &identity);
         if decision.labels_unknown {
