@@ -220,3 +220,73 @@ fn acceptance_fixtures_agree_with_the_invariant_copy() {
         validate_cluster_policy(&spec).unwrap_or_else(|e| panic!("{name} must validate: {e}"));
     }
 }
+
+/// The install tree is the fourth place an invariant is written down, and the
+/// only one an operator actually applies. Same lint the CLI runs.
+mod deploy_tree {
+    use ferrum_cli::gen_pki::{self, WEBHOOK_RENDERED_FILE, WEBHOOK_TEMPLATE_FILE};
+    use ferrum_cli::lint_deploy::{lint_deploy_dir, CA_BUNDLE_PLACEHOLDER};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn repo_path(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel)
+    }
+
+    #[test]
+    fn deploy_tree_passes_the_lint() {
+        lint_deploy_dir(&repo_path("deploy")).expect("deploy/ must satisfy every invariant");
+    }
+
+    #[test]
+    fn a_committed_placeholder_ca_bundle_fails_the_lint() {
+        let err = lint_deploy_dir(&repo_path(
+            "crates/ferrum-testkit/fixtures/deploy-bad-cabundle",
+        ))
+        .expect_err("a caBundle placeholder outside a template must fail");
+        assert!(err.to_string().contains("violated"), "{err}");
+    }
+
+    /// End to end: what `gen-webhook-pki` renders is what the lint accepts.
+    /// Without this the two halves can drift and the tree is unapplicable again.
+    #[test]
+    fn issued_pki_makes_the_tree_applicable() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ferrum-deploy-gate-{nanos}"));
+        let admission = root.join("admission");
+        std::fs::create_dir_all(&admission).unwrap();
+        for entry in std::fs::read_dir(repo_path("deploy/admission")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                std::fs::copy(&path, admission.join(path.file_name().unwrap())).unwrap();
+            }
+        }
+        assert!(
+            std::fs::read_to_string(admission.join(WEBHOOK_TEMPLATE_FILE))
+                .unwrap()
+                .contains(CA_BUNDLE_PLACEHOLDER)
+        );
+
+        gen_pki::gen_webhook_pki(&gen_pki::GenPkiArgs {
+            service: "ferrum-admission".into(),
+            namespace: "ferrum".into(),
+            days: 365,
+            out_dir: Some(admission.clone()),
+            template: None,
+        })
+        .expect("issue webhook PKI");
+
+        // The rendered file is the one an operator applies; the lint has to
+        // accept it, not just the template it came from.
+        std::fs::remove_file(admission.join(WEBHOOK_TEMPLATE_FILE)).unwrap();
+        assert!(admission.join(WEBHOOK_RENDERED_FILE).is_file());
+        let result = lint_deploy_dir(&root);
+        std::fs::remove_dir_all(&root).ok();
+        result.expect("the rendered tree must pass the lint");
+    }
+}

@@ -17,6 +17,8 @@ serde_yaml.workspace = true
 chrono.workspace = true
 ferrum-admission = { path = "../ferrum-admission" }
 ferrum-agent = { path = "../ferrum-agent" }
+# The deploy gate runs the lint and the PKI issuance the CLI ships, not a copy.
+ferrum-cli = { path = "../ferrum-cli" }
 ferrum-compiler.workspace = true
 # Only to prove the controller's on-wire exceptions.fsig is what the agent and
 # admission actually accept; the four codec copies cannot drift silently.

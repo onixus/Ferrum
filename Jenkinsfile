@@ -134,6 +134,37 @@ pipeline {
                     fi
                     echo "ok: exception-bad-no-ticket.yaml rejected"
                     cargo run -p ferrum-cli --quiet -- lint-deploy deploy
+                    # The committed tree carries a webhook template, not an
+                    # applicable configuration. Prove the issuance step closes
+                    # that gap instead of trusting the template alone.
+                    rm -rf /tmp/ferrum-pki && cp -r deploy /tmp/ferrum-pki
+                    cargo run -p ferrum-cli --quiet -- gen-webhook-pki \
+                        --service ferrum-admission --namespace ferrum --days 365 \
+                        --out-dir /tmp/ferrum-pki/admission
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- gen-webhook-pki \
+                        --service ferrum-admission --namespace ferrum --days 365 \
+                        --out-dir /tmp/ferrum-pki/admission >/dev/null 2>&1
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "gen-webhook-pki must refuse to overwrite issued PKI" >&2
+                        exit 1
+                    fi
+                    echo "ok: gen-webhook-pki refuses to overwrite"
+                    # The template is not applied; only the rendered file is.
+                    rm /tmp/ferrum-pki/admission/validatingwebhookconfiguration.tmpl.yaml
+                    cargo run -p ferrum-cli --quiet -- lint-deploy /tmp/ferrum-pki
+                    rm -rf /tmp/ferrum-pki
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- lint-deploy crates/ferrum-testkit/fixtures/deploy-bad-cabundle >/tmp/ferrum-bad-cabundle.out 2>/tmp/ferrum-bad-cabundle.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "fixtures/deploy-bad-cabundle must fail lint-deploy" >&2
+                        exit 1
+                    fi
+                    echo "ok: caBundle placeholder rejected"
                     set +e
                     cargo run -p ferrum-cli --quiet -- lint-deploy crates/ferrum-testkit/fixtures/deploy-bad >/tmp/ferrum-bad-deploy.out 2>/tmp/ferrum-bad-deploy.err
                     status=$?

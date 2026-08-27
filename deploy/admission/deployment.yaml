@@ -91,8 +91,8 @@ spec:
           secret:
             secretName: ferrum-bundle-cluster-prod-restricted
             optional: true
-        # Serving certificate. Issuance is out of this tree; the Secret is
-        # expected to exist with tls.crt/tls.key.
+        # Serving certificate, issued offline by `ferrumctl gen-webhook-pki`,
+        # which writes this Secret and the caBundle that matches it.
         - name: tls
           secret:
             secretName: ferrum-admission-tls
