@@ -86,6 +86,11 @@ impl KernelHandle {
             .map_err(|err| degraded(MAP_CGROUPS, err))
     }
 
+    /// Take ownership of the event ring wrapped in a [`RingReader`].
+    pub fn take_ring_reader(&mut self) -> Result<RingReader> {
+        self.take_ring().map(RingReader::new)
+    }
+
     /// Take ownership of the event ring for a reader loop; each item is one
     /// wire `Event` record for `decode_event`.
     pub fn take_ring(&mut self) -> Result<RingBuf<MapData>> {
@@ -94,6 +99,32 @@ impl KernelHandle {
             .take_map(MAP_EVENTS)
             .ok_or_else(|| missing(MAP_EVENTS))?;
         RingBuf::try_from(map).map_err(|err| degraded(MAP_EVENTS, err))
+    }
+}
+
+/// Consumer side of `ferrum_events`.
+///
+/// Limitation: no epoll/AsyncFd here, so the caller polls — `drain` returns
+/// what is currently in the ring and the loop sleeps between empty passes;
+/// latency is bounded by that sleep, not by the kernel waking us.
+pub struct RingReader {
+    ring: RingBuf<MapData>,
+}
+
+impl RingReader {
+    pub fn new(ring: RingBuf<MapData>) -> Self {
+        Self { ring }
+    }
+
+    /// Hand every record currently in the ring to `f`, returning how many.
+    /// The slice is only valid for the callback: copy what you keep.
+    pub fn drain(&mut self, mut f: impl FnMut(&[u8])) -> usize {
+        let mut n = 0;
+        while let Some(item) = self.ring.next() {
+            f(&item);
+            n += 1;
+        }
+        n
     }
 }
 
