@@ -46,6 +46,11 @@ pipeline {
                     rustup component add clippy
                     cargo clippy --workspace --all-targets -- -D warnings
                     cargo clippy -p ferrum-ebpf --features attach --all-targets -- -D warnings
+                    # Default features hide the production paths: the k8smeta
+                    # apiserver client and the agent's real datapath are only
+                    # compiled behind these.
+                    cargo clippy -p ferrum-k8smeta --features apiserver --all-targets -- -D warnings
+                    cargo clippy -p ferrum-agent --features attach --all-targets -- -D warnings
                 '''
             }
         }
