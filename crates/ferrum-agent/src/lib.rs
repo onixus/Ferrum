@@ -1379,6 +1379,7 @@ impl Agent {
             // match from a proven one without them.
             labels_unknown: decision.labels_unknown,
             path_unknown: decision.path_unknown,
+            container_unknown: decision.container_unknown,
             waiver,
         });
         self.note_export_state_at(sink, Instant::now());
@@ -3942,6 +3943,10 @@ mod tests {
             sink.events()[0].respond_error.as_deref(),
             Some(REFUSE_NOT_CONTAINER)
         );
+        // Carried as a field, not only as a reason string: the node counter is
+        // an aggregate, so a collector reading this one record has nothing to
+        // filter or group on unless the flag rides along with it.
+        assert!(sink.events()[0].container_unknown);
         assert_ne!(decision.action, Action::Kill);
         assert!(fake.killed().is_empty());
     }
@@ -3969,6 +3974,7 @@ mod tests {
         let decision = agent.handle_event(meta, &ev("bpf", "curl", "", false, false), &sink);
         assert_eq!(decision.action, Action::Deny);
         assert!(!decision.container_unknown);
+        assert!(!sink.events()[0].container_unknown);
         assert_eq!(agent.container_unproven_total(), 0);
     }
 

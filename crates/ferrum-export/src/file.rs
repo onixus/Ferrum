@@ -330,6 +330,7 @@ mod tests {
             executed: false,
             labels_unknown: false,
             path_unknown: false,
+            container_unknown: false,
             respond_error: None,
             waiver: None,
         }

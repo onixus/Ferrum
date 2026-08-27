@@ -52,6 +52,7 @@ fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
     }
     reject_unobservable_syscalls(&fx)?;
     reject_unobservable_predicates(&fx)?;
+    reject_unexecutable_actions(&fx)?;
     let admission_program = encode::encode_admission(&fx)?;
     let ebpf_spec = encode::encode_ebpf(&fx)?;
     let wasm = ferrum_wasm_abi::placeholder_module().to_vec();
@@ -124,6 +125,43 @@ fn reject_unobservable_predicates(fx: &Effects<'_>) -> Result<()> {
                     ferrum_ids::PATH_MATCH_MAX
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Third gate of the same family, on the verb rather than on the match:
+/// the runtime plane executes exactly Allow / Audit / Kill. `Deny` it decides
+/// and never carries out — the tracepoint fires after the syscall has already
+/// run, so there is nothing left to refuse; deny is admission's verb
+/// (`admit.deny`). `Isolate` has no implementation in any plane. A rule with
+/// either action compiles, is signed and matches, and then does nothing.
+///
+/// `ferrum_policy::validate_rule_action` says the same thing, and every
+/// current caller runs it first. That is exactly why this exists: the
+/// validator is advisory, and a bundle reaching the encoder by another route
+/// must not lose the invariant on the way.
+fn reject_unexecutable_actions(fx: &Effects<'_>) -> Result<()> {
+    if fx.runtime.default_action == RuntimeAction::Deny {
+        return Err(FerrumError::Compile(
+            "runtime.defaultAction deny: the runtime plane does not execute it — the tracepoint fires after the syscall. Deny is admission's verb (admit.deny); allow and audit are executable defaults".into(),
+        ));
+    }
+    for rule in &fx.runtime.rules {
+        match rule.action {
+            RuntimeAction::Deny => {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': action=deny is not executed by the runtime plane — the tracepoint fires after the syscall, there is nothing left to cancel. Deny is admission's verb (admit.deny); runtime executes allow, audit, kill",
+                    rule.id
+                )));
+            }
+            RuntimeAction::Isolate => {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': action=isolate has no implementation; the rule would match and do nothing. Runtime executes allow, audit, kill",
+                    rule.id
+                )));
+            }
+            RuntimeAction::Allow | RuntimeAction::Audit | RuntimeAction::Kill => {}
         }
     }
     Ok(())
@@ -475,6 +513,67 @@ mod tests {
                 }
                 other => panic!("expected Compile, got {other:?}"),
             }
+        }
+    }
+
+    /// The encoder's own copy of the rule-action invariant. Every current
+    /// caller runs `validate_*` first, so this reaches `emit_bundle` directly:
+    /// going through `compile_cluster_policy` would prove only that the
+    /// validator still works, and the second gate exists precisely because the
+    /// first one may not be in the path.
+    #[test]
+    fn an_unexecutable_action_does_not_encode() {
+        fn action_spec(action: RuntimeAction) -> ClusterSecurityPolicySpec {
+            ClusterSecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    rules: vec![RuntimeRule {
+                        id: "no-shell".into(),
+                        syscalls: vec!["execve".into()],
+                        match_on: RuntimeMatch {
+                            comm_in: vec!["sh".into()],
+                            ..Default::default()
+                        },
+                        action,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        for (action, needle) in [
+            (RuntimeAction::Deny, "deny"),
+            (RuntimeAction::Isolate, "isolate"),
+        ] {
+            let spec = action_spec(action);
+            match emit_bundle(Effects::from(&spec)) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("no-shell"), "{msg}");
+                    assert!(msg.contains(needle), "{msg}");
+                    assert!(msg.contains("allow, audit, kill"), "{msg}");
+                }
+                other => panic!("expected Compile, got {other:?}"),
+            }
+        }
+
+        // The same rule with an executable verb still encodes, so the gate
+        // refuses the action and not the rule around it.
+        emit_bundle(Effects::from(&action_spec(RuntimeAction::Audit))).expect("audit encodes");
+
+        // The default carries the same invariant: a verdict on every event
+        // that the plane never executes.
+        let spec = ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                default_action: RuntimeAction::Deny,
+                rules: vec![],
+            },
+            ..Default::default()
+        };
+        match emit_bundle(Effects::from(&spec)) {
+            Err(FerrumError::Compile(msg)) => {
+                assert!(msg.contains("defaultAction deny"), "{msg}");
+            }
+            other => panic!("expected Compile, got {other:?}"),
         }
     }
 
