@@ -336,11 +336,27 @@ fn run(
             park_degraded(&agent, ctx, bundle_path, reload_ms);
         }
     };
-    if let Err(err) = handle.set_self_tgid(std::process::id() as u64) {
-        // Without the self tgid the datapath cannot flag agent-self events,
-        // and the agent could be told to kill itself. Refuse to run attached.
-        eprintln!("ferrum-agent: {err}");
-        exit(2);
+    // The datapath writes `bpf_get_current_pid_tgid()`, an initial-pid-namespace
+    // tgid. Without hostPID this process's pid names a different, arbitrary
+    // process there — publishing it would leave EVENT_FLAG_AGENT_SELF unset for
+    // the agent and set for whoever holds that number (typically init), so every
+    // notAgentSelf rule would exempt the wrong process and apply to the agent.
+    // Leave `ferrum_self` unconfigured instead, and say why.
+    let self_tgid = ferrum_agent::self_tgid_to_publish(
+        &agent.read().unwrap_or_else(|e| e.into_inner()),
+        std::process::id() as u64,
+    );
+    match self_tgid {
+        Some(tgid) => {
+            if let Err(err) = handle.set_self_tgid(tgid) {
+                // Without the self tgid the datapath cannot flag agent-self
+                // events, and the agent could be told to kill itself. Refuse
+                // to run attached.
+                eprintln!("ferrum-agent: {err}");
+                exit(2);
+            }
+        }
+        None => eprintln!("ferrum-agent: {}", ferrum_agent::SELF_TGID_UNPUBLISHED),
     }
     let mut reader = match handle.take_ring_reader() {
         Ok(reader) => reader,

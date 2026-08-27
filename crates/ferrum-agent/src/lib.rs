@@ -61,6 +61,13 @@ pub const CGROUP_CARRIER_GONE: &str = "cgroup carrier gone: nothing applies the 
 /// respawned — so it is latched, not decayed.
 pub const RECORD_CHANNEL_GONE: &str =
     "record channel gone: ring records are drained and discarded before any rule sees them";
+/// The datapath writes `bpf_get_current_pid_tgid()`, which is the initial pid
+/// namespace. Publishing this process's namespaced pid as `ferrum_self` would
+/// flag an unrelated init-ns process as the agent, so nothing is published and
+/// EVENT_FLAG_AGENT_SELF is never set: `notAgentSelf` cannot be honoured here.
+pub const SELF_TGID_UNPUBLISHED: &str =
+    "agent self tgid not published: not in the host pid namespace, so notAgentSelf rules \
+     cannot be honoured on this node";
 /// Bound on the per-cgroup disagreement window map. Beyond this the oldest
 /// windows are dropped; a cgroup that keeps disagreeing simply reopens one.
 const CONTAINER_FLAG_TRACKED_MAX: usize = 4096;
@@ -1318,6 +1325,30 @@ pub fn publish_record(
         return false;
     }
     true
+}
+
+/// The tgid to publish as `ferrum_self`, or nothing. The datapath writes
+/// `bpf_get_current_pid_tgid()`, which is the initial pid namespace; without
+/// hostPID this process's pid names an unrelated process there, so publishing
+/// it would exempt that process from every `notAgentSelf` rule and apply those
+/// rules to the agent. Nothing is published instead — `ferrum_self` stays 0,
+/// which the datapath already reads as "not configured" — and the agent is
+/// Degraded, because `notAgentSelf` cannot be honoured on that node.
+pub fn self_tgid_to_publish_at(agent: &Agent, ns_link: &Path, tgid: u64) -> Option<u64> {
+    if host_pid_namespace_at(ns_link) {
+        return Some(tgid);
+    }
+    agent.mark_terminal_fault(SELF_TGID_UNPUBLISHED);
+    None
+}
+
+/// `self_tgid_to_publish_at` against the running host's `/proc`.
+pub fn self_tgid_to_publish(agent: &Agent, tgid: u64) -> Option<u64> {
+    if host_pid_namespace() {
+        return Some(tgid);
+    }
+    agent.mark_terminal_fault(SELF_TGID_UNPUBLISHED);
+    None
 }
 
 pub fn apply_role(role: AgentRole, action: Action) -> Action {
@@ -3750,5 +3781,53 @@ mod tests {
         let quiet_event = &quiet_sink.events()[0];
         assert_ne!(quiet_event.action, "kill");
         assert_eq!(quiet_event.respond_error, None);
+    }
+
+    /// Outside the initial pid namespace the datapath's tgids name other
+    /// processes: publishing this process's pid as `ferrum_self` would exempt
+    /// whoever holds that number and aim every notAgentSelf rule at the agent.
+    #[test]
+    fn a_namespaced_pid_is_not_published_as_the_agent_self() {
+        let dir = temp_dir("selfns");
+        let host = dir.join("host-pid");
+        std::os::unix::fs::symlink(format!("pid:[{HOST_PID_NS_INO}]"), &host).expect("symlink");
+        let other = dir.join("other-pid");
+        std::os::unix::fs::symlink("pid:[4026533333]", &other).expect("symlink");
+
+        let agent = healthy_agent();
+        assert_eq!(self_tgid_to_publish_at(&agent, &host, 1234), Some(1234));
+        assert!(agent.terminal_fault().is_none());
+        assert!(!agent.is_degraded());
+
+        let elsewhere = healthy_agent();
+        assert_eq!(self_tgid_to_publish_at(&elsewhere, &other, 1234), None);
+        assert_eq!(
+            elsewhere.terminal_fault().as_deref(),
+            Some(SELF_TGID_UNPUBLISHED)
+        );
+        assert!(elsewhere.is_degraded());
+
+        // An unreadable link is the same answer: never guess an identity the
+        // datapath will act on.
+        let missing = healthy_agent();
+        assert_eq!(
+            self_tgid_to_publish_at(&missing, &dir.join("absent"), 1234),
+            None
+        );
+        assert!(missing.is_degraded());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrum-agent-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("tmpdir");
+        dir
     }
 }
