@@ -38,13 +38,13 @@ metadata:
     ferrum.io/optional: "respond"
 # Defined here, bound nowhere in the base install. Binding lives in
 # optional-respond.yaml.
+#
+# pods/eviction and networkpolicies were granted for Action::Isolate, which
+# does not exist in the agent: every Isolate decision is refused
+# (REFUSE_ISOLATE), so those verbs are only reachable by an attacker who owns
+# the respond ServiceAccount token. Restore them in the same change that
+# implements Isolate, not before.
 rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "delete"]
-  - apiGroups: [""]
-    resources: ["pods/eviction"]
-    verbs: ["create"]
-  - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
-    verbs: ["get", "list", "watch", "create", "update", "delete"]

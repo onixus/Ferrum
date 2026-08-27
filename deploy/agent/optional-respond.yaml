@@ -72,6 +72,10 @@ spec:
             - $(NODE_NAME)
             - --export-dir
             - /var/log/ferrum
+            # An attach build refuses to start without this. The ELF ships in
+            # the image; it is not built at runtime.
+            - --bpf-elf
+            - /usr/share/ferrum/ferrum-ebpf-progs.bpf.o
           env:
             - name: NODE_NAME
               valueFrom:

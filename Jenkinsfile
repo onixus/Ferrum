@@ -51,6 +51,10 @@ pipeline {
                     # compiled behind these.
                     cargo clippy -p ferrum-k8smeta --features apiserver --all-targets -- -D warnings
                     cargo clippy -p ferrum-agent --features attach --all-targets -- -D warnings
+                    # attach+apiserver is the only production combination: the
+                    # cgroup sync into ferrum_cgroups is compiled out of every
+                    # other one.
+                    cargo clippy -p ferrum-agent --features attach,apiserver --all-targets -- -D warnings
                 '''
             }
         }
