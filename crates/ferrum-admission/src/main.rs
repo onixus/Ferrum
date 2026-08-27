@@ -3,13 +3,15 @@
 #![deny(unsafe_code)]
 
 use ferrum_admission::{
-    admit_bytes, load_bundle, load_tls_config, parse_trust_root, serve, AdmissionSubject,
-    ReviewConfig, WebhookState,
+    admit_bytes, load_path, load_tls_config, parse_trust_root, poll_bundle_file, serve_listener,
+    AdmissionSubject, ReviewConfig, WebhookState,
 };
 use ferrum_api::PolicyExceptionSpec;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::exit;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -24,7 +26,7 @@ fn cmd_eval(args: &[String]) {
     if args.len() != 3 {
         eprintln!("usage: ferrum-admission <program.fadm> <subject.json>");
         eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <json> --policy-name <name>] <admissionreview.json>");
-        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig> --trust-root <32-byte-hex> [--tls-cert --tls-key]");
+        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--tls-cert --tls-key] [--reload-ms 1000]");
         eprintln!("missing or invalid compiled program denies the request (fail closed)");
         exit(2);
     }
@@ -80,9 +82,8 @@ fn cmd_review(args: &[String]) {
             exit(2);
         }
     };
-    let bundle = read_file(&bundle_path);
-    let program = match load_bundle(&bundle, &trust_root) {
-        Ok(p) => p,
+    let program = match load_path(Path::new(&bundle_path), &trust_root) {
+        Ok((p, _)) => p,
         Err(err) => {
             eprintln!("error: bundle: {err}");
             exit(2);
@@ -126,9 +127,9 @@ fn cmd_serve(args: &[String]) {
             exit(2);
         }
     };
-    let bundle = read_file(&bundle_path);
-    let program = match load_bundle(&bundle, &trust_root) {
-        Ok(p) => p,
+    let watch_path = std::path::PathBuf::from(&bundle_path);
+    let program = match load_path(&watch_path, &trust_root) {
+        Ok((p, _)) => p,
         Err(err) => {
             eprintln!("error: bundle: {err}");
             exit(2);
@@ -152,13 +153,26 @@ fn cmd_serve(args: &[String]) {
         }
     };
 
-    let state = Arc::new(WebhookState {
-        program,
-        exceptions,
-        config: cfg,
-    });
+    let reload_ms: u64 = match flags.map.get("reload-ms") {
+        Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|_| die("invalid --reload-ms")),
+        _ => 1000,
+    };
+
+    let state = Arc::new(WebhookState::new(program, trust_root, exceptions, cfg));
+    let listener = match std::net::TcpListener::bind(&listen) {
+        Ok(l) => l,
+        Err(err) => {
+            eprintln!("error: bind {listen}: {err}");
+            exit(2);
+        }
+    };
     eprintln!("ferrum-admission listening on {listen}");
-    if let Err(err) = serve(&listen, state, tls) {
+    poll_bundle_file(
+        watch_path,
+        Duration::from_millis(reload_ms),
+        Arc::clone(&state),
+    );
+    if let Err(err) = serve_listener(listener, state, tls) {
         eprintln!("error: serve: {err}");
         exit(2);
     }

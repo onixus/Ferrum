@@ -4,19 +4,23 @@ mod common;
 
 use chrono::{DateTime, Days, TimeZone, Utc};
 use ferrum_admission::{
-    encode_fsig, handle_review_bytes, load_bundle, parse_program, AdmissionProgram, ReviewConfig,
-    ADMISSION_ABI, IMAGE_SIGNATURE_ANNOTATION, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED,
-    RULE_UNSIGNED,
+    encode_fsig, handle_review_bytes, load_bundle, load_path, load_source, parse_program,
+    poll_bundle_file, AdmissionProgram, ReviewConfig, WebhookState, ADMISSION_ABI,
+    BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, IMAGE_SIGNATURE_ANNOTATION, RULE_CLUSTER_ADMIN_BIND,
+    RULE_PRIVILEGED, RULE_UNSIGNED,
 };
 use ferrum_api::{
     AdmitDeny, AdmitMutate, AdmitSpec, ClusterSecurityPolicy, ClusterSecurityPolicySpec,
     ExceptionTarget, FailurePolicy, PolicyExceptionSpec, PolicyMode, PssProfile, SupplySpec,
     TrustRoot,
 };
+use ferrum_common::FerrumError;
 use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
 use ferrum_crypto::{public_key_from_secret, sign_bundle};
 use ferrum_ids::AGENT_ABI;
 use serde_json::{json, Value};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const SK: [u8; 32] = [0x11; 32];
 const SK_OTHER: [u8; 32] = [0x22; 32];
@@ -32,6 +36,33 @@ fn hex_encode(bytes: &[u8]) -> String {
     for &b in bytes {
         out.push(HEX[(b >> 4) as usize] as char);
         out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn b64_encode(data: &[u8]) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i < data.len() {
+        let rem = data.len() - i;
+        let b0 = data[i];
+        let b1 = if rem > 1 { data[i + 1] } else { 0 };
+        let b2 = if rem > 2 { data[i + 2] } else { 0 };
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(B64[((n >> 18) & 63) as usize] as char);
+        out.push(B64[((n >> 12) & 63) as usize] as char);
+        if rem > 1 {
+            out.push(B64[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if rem > 2 {
+            out.push(B64[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
     }
     out
 }
@@ -123,13 +154,75 @@ fn enforce_spec(mode: PolicyMode, pk_hex: String) -> ClusterSecurityPolicySpec {
     }
 }
 
-fn make_fsig(spec: ClusterSecurityPolicySpec, sk: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+fn make_signed(spec: ClusterSecurityPolicySpec, sk: &[u8; 32]) -> (Vec<u8>, Vec<u8>, String) {
     let fadm = compile(spec);
     let raw = bundle_digest_material(AGENT_ABI, ADMISSION_ABI, &fadm, b"", b"").expect("frmb");
     let pk = public_key_from_secret(sk).expect("pk");
     let sig = sign_bundle(&raw, sk).expect("sign");
     let fsig = encode_fsig(&raw, &sig, &pk).expect("fsig");
+    let digest = ferrum_crypto::bundle_digest(&raw);
+    (fsig, pk, digest.as_str().to_string())
+}
+
+fn make_fsig(spec: ClusterSecurityPolicySpec, sk: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+    let (fsig, pk, _) = make_signed(spec, sk);
     (fsig, pk)
+}
+
+fn controller_secret(fsig: &[u8], digest_hex: Option<&str>) -> Vec<u8> {
+    let mut data = serde_json::Map::new();
+    data.insert(BUNDLE_FSIG_KEY.into(), json!(b64_encode(fsig)));
+    if let Some(digest_hex) = digest_hex {
+        data.insert(
+            BUNDLE_DIGEST_KEY.into(),
+            json!(b64_encode(digest_hex.as_bytes())),
+        );
+    }
+    serde_json::to_vec(&json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": "ferrum-bundle-prod-restricted",
+            "namespace": "ferrum"
+        },
+        "type": "Opaque",
+        "data": data
+    }))
+    .expect("secret json")
+}
+
+fn assert_integrity<T: std::fmt::Debug>(result: Result<T, FerrumError>) {
+    match result {
+        Err(FerrumError::Integrity(_)) => {}
+        other => panic!("expected Integrity, got {other:?}"),
+    }
+}
+
+fn webhook_state(fsig: &[u8], pk: &[u8]) -> WebhookState {
+    WebhookState::new(
+        load_ok(fsig, pk),
+        pk.to_vec(),
+        vec![],
+        ReviewConfig::default(),
+    )
+}
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "ferrum-admission-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+}
+
+fn write_secret_dir(dir: &std::path::Path, fsig: &[u8], digest: &str) {
+    std::fs::write(dir.join(BUNDLE_FSIG_KEY), fsig).expect("bundle.fsig");
+    std::fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_bytes()).expect("digest");
 }
 
 fn load_ok(fsig: &[u8], pk: &[u8]) -> AdmissionProgram {
@@ -425,4 +518,295 @@ fn prod_restricted_namespace_selector_without_labels_fail_closed() {
         msg.contains("namespace") || msg.contains("labels") || msg.contains("fail closed"),
         "{msg}"
     );
+}
+
+fn handle_json(state: &WebhookState, body: &[u8]) -> Value {
+    let reply = state.handle(body);
+    assert_eq!(reply.status, 200, "expected HTTP 200 AdmissionReview");
+    serde_json::from_slice(&reply.body).expect("response json")
+}
+
+fn deny_msg(resp: &Value) -> String {
+    resp["response"]["status"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn controller_secret_json_loads_and_denies_unsigned_pod() {
+    let (fsig, pk, digest) = make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let secret = controller_secret(&fsig, Some(&digest));
+    let program = load_source(&secret, &pk).expect("controller Secret + trust-root");
+    let obj = pod(IMAGE, json!({}), false);
+    let resp = admit_review(&review(obj, "uid-secret"), Some(&program), &[]);
+    assert_eq!(resp["response"]["allowed"], false);
+    let msg = deny_msg(&resp);
+    assert!(
+        msg.contains("unsigned") || msg.contains(RULE_UNSIGNED),
+        "{msg}"
+    );
+}
+
+#[test]
+fn digest_mismatch_truncated_wrong_pin_do_not_swap() {
+    let (fsig, pk, _digest) = make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let state = webhook_state(&fsig, &pk);
+    let unsigned = review(pod(IMAGE, json!({}), false), "uid-keep");
+
+    assert_integrity(load_source(
+        &controller_secret(&fsig, Some(&"00".repeat(32))),
+        &pk,
+    ));
+    assert_integrity(state.try_reload(&controller_secret(&fsig, Some(&"00".repeat(32)))));
+
+    let truncated = &fsig[..fsig.len().saturating_sub(4)];
+    assert_integrity(load_source(truncated, &pk));
+    assert_integrity(state.try_reload(truncated));
+
+    let other = public_key_from_secret(&SK_OTHER).expect("other pk");
+    assert_integrity(load_source(&fsig, &other));
+    let (fsig_other, _) = make_fsig(
+        enforce_spec(PolicyMode::Enforce, pk_hex(&SK_OTHER)),
+        &SK_OTHER,
+    );
+    assert_integrity(state.try_reload(&fsig_other));
+
+    let resp = handle_json(&state, &unsigned);
+    assert_eq!(resp["response"]["allowed"], false);
+    let msg = deny_msg(&resp);
+    assert!(
+        msg.contains("unsigned") || msg.contains(RULE_UNSIGNED),
+        "{msg}"
+    );
+}
+
+#[test]
+fn empty_or_missing_bundle_fsig_is_integrity() {
+    let pk = public_key_from_secret(&SK).expect("pk");
+    let missing = br#"{"apiVersion":"v1","kind":"Secret","data":{}}"#;
+    assert_integrity(load_source(missing, &pk));
+    let empty = controller_secret(b"", None);
+    assert_integrity(load_source(&empty, &pk));
+}
+
+#[test]
+fn unsigned_frmb_or_fadm_in_secret_is_integrity() {
+    let (fsig, pk) = make_fsig(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let fadm = compile(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)));
+    let frmb = bundle_digest_material(AGENT_ABI, ADMISSION_ABI, &fadm, b"", b"").expect("frmb");
+    assert_integrity(load_source(&controller_secret(&fadm, None), &pk));
+    assert_integrity(load_source(&controller_secret(&frmb, None), &pk));
+    let state = webhook_state(&fsig, &pk);
+    assert_integrity(state.try_reload(&controller_secret(&fadm, None)));
+    assert_integrity(state.try_reload(&controller_secret(&frmb, None)));
+}
+
+#[test]
+fn successful_second_fsig_swaps_and_handle_uses_new_program() {
+    let (fsig_enforce, pk, _) = make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let (fsig_observe, pk2, digest) =
+        make_signed(enforce_spec(PolicyMode::Observe, pk_hex(&SK)), &SK);
+    assert_eq!(pk, pk2);
+    let state = webhook_state(&fsig_enforce, &pk);
+    let body = review(pod(IMAGE, image_annotations(IMAGE, &SK), true), "uid-swap");
+    let denied = handle_json(&state, &body);
+    assert_eq!(denied["response"]["allowed"], false);
+
+    let loaded = state
+        .try_reload(&controller_secret(&fsig_observe, Some(&digest)))
+        .expect("second FSIG");
+    assert_eq!(loaded.as_str(), digest);
+    let allowed = handle_json(&state, &body);
+    assert_eq!(
+        allowed["response"]["allowed"], true,
+        "observe program must apply after swap"
+    );
+}
+
+#[test]
+fn failed_reload_keeps_last_good_mvp_denies() {
+    let (fsig, pk, _) = make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let state = webhook_state(&fsig, &pk);
+    assert_integrity(state.try_reload(b"not-a-bundle"));
+    assert_integrity(state.try_reload(&controller_secret(&fsig, Some(&"00".repeat(32)))));
+    assert_integrity(state.try_reload(&fsig[..fsig.len().saturating_sub(8)]));
+
+    let unsigned = handle_json(&state, &review(pod(IMAGE, json!({}), false), "uid-u"));
+    assert_eq!(unsigned["response"]["allowed"], false);
+    let umsg = deny_msg(&unsigned);
+    assert!(
+        umsg.contains("unsigned") || umsg.contains(RULE_UNSIGNED),
+        "{umsg}"
+    );
+
+    let priv_obj = pod(IMAGE, image_annotations(IMAGE, &SK), true);
+    let privileged = handle_json(&state, &review(priv_obj, "uid-p"));
+    assert_eq!(privileged["response"]["allowed"], false);
+    let pmsg = deny_msg(&privileged);
+    assert!(
+        pmsg.contains("privileged") || pmsg.contains(RULE_PRIVILEGED),
+        "{pmsg}"
+    );
+
+    let admin = handle_json(&state, &review(cluster_admin_bind(), "uid-a"));
+    assert_eq!(admin["response"]["allowed"], false);
+    let amsg = deny_msg(&admin);
+    assert!(
+        amsg.contains("cluster-admin") || amsg.contains(RULE_CLUSTER_ADMIN_BIND),
+        "{amsg}"
+    );
+}
+
+#[test]
+fn dir_matching_digest_loads_and_denies_unsigned() {
+    let (fsig, pk, digest) = make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let dir = temp_dir("dir-match");
+    write_secret_dir(&dir, &fsig, &digest);
+    let (program, loaded) = load_path(&dir, &pk).expect("dir + matching digest");
+    assert_eq!(loaded.as_str(), digest);
+    let resp = admit_review(
+        &review(pod(IMAGE, json!({}), false), "uid-dir"),
+        Some(&program),
+        &[],
+    );
+    assert_eq!(resp["response"]["allowed"], false);
+    let msg = deny_msg(&resp);
+    assert!(
+        msg.contains("unsigned") || msg.contains(RULE_UNSIGNED),
+        "{msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn dir_mismatched_digest_does_not_swap() {
+    let (fsig_enforce, pk, digest) =
+        make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let (fsig_observe, _, _) = make_signed(enforce_spec(PolicyMode::Observe, pk_hex(&SK)), &SK);
+    let dir = temp_dir("dir-mismatch");
+    write_secret_dir(&dir, &fsig_enforce, &digest);
+    let (program, _) = load_path(&dir, &pk).expect("initial dir load");
+    let state = WebhookState::new(program, pk.clone(), vec![], ReviewConfig::default());
+    let body = review(
+        pod(IMAGE, image_annotations(IMAGE, &SK), true),
+        "uid-dir-mm",
+    );
+    assert_eq!(handle_json(&state, &body)["response"]["allowed"], false);
+
+    write_secret_dir(&dir, &fsig_observe, &"00".repeat(32));
+    assert_integrity(load_path(&dir, &pk));
+    assert_integrity(state.try_reload_path(&dir));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "matching pin + mismatched sibling digest must not swap"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn poll_reloads_on_mtime_len_and_keeps_lkg_if_file_vanishes() {
+    let (fsig_enforce, pk, digest_enforce) =
+        make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let (fsig_observe, _, digest_observe) =
+        make_signed(enforce_spec(PolicyMode::Observe, pk_hex(&SK)), &SK);
+    let dir = temp_dir("poll-dir");
+    write_secret_dir(&dir, &fsig_enforce, &digest_enforce);
+    let state = Arc::new(webhook_state(&fsig_enforce, &pk));
+    poll_bundle_file(dir.clone(), Duration::from_millis(50), Arc::clone(&state));
+    write_secret_dir(&dir, &fsig_observe, "bad");
+    let body = review(pod(IMAGE, image_annotations(IMAGE, &SK), true), "uid-poll");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "poll must not swap on sibling digest mismatch"
+    );
+    write_secret_dir(&dir, &fsig_observe, &digest_observe);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let resp = handle_json(&state, &body);
+        if resp["response"]["allowed"] == true {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "poll did not swap to observe program"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_file(dir.join(BUNDLE_FSIG_KEY));
+    let _ = std::fs::remove_file(dir.join(BUNDLE_DIGEST_KEY));
+    std::thread::sleep(Duration::from_millis(150));
+    let still = handle_json(&state, &body);
+    assert_eq!(
+        still["response"]["allowed"], true,
+        "vanished file must not clear last-known-good"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn serve_missing_bundle_exits_2() {
+    let exe = env!("CARGO_BIN_EXE_ferrum-admission");
+    let output = std::process::Command::new(exe)
+        .args([
+            "serve",
+            "--bundle",
+            "/no/such/ferrum-bundle",
+            "--trust-root",
+            &pk_hex(&SK),
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .output()
+        .expect("spawn serve");
+    assert_eq!(output.status.code(), Some(2));
+
+    let dir = std::env::temp_dir().join(format!(
+        "ferrum-admission-empty-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("empty dir");
+    let output = std::process::Command::new(exe)
+        .args([
+            "serve",
+            "--bundle",
+            dir.to_str().expect("utf8 path"),
+            "--trust-root",
+            &pk_hex(&SK),
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .output()
+        .expect("spawn serve dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn cargo_toml_hot_path_keeps_boundary() {
+    let toml = include_str!("../Cargo.toml");
+    let start = toml.find("[dependencies]").expect("dependencies");
+    let section = &toml[start..];
+    let end = section[1..]
+        .find("\n[")
+        .map(|i| i + 1)
+        .unwrap_or(section.len());
+    let deps = &section[..end];
+    for forbidden in ["ferrum-compiler", "kube", "tokio", "serde_yaml", "aya"] {
+        let present = deps.lines().any(|line| {
+            let line = line.trim();
+            !line.starts_with('#') && line.starts_with(forbidden)
+        });
+        assert!(
+            !present,
+            "{forbidden} must not be in [dependencies]: {deps}"
+        );
+    }
 }

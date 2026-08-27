@@ -2,29 +2,79 @@
 
 use chrono::Utc;
 use ferrum_api::PolicyExceptionSpec;
+use ferrum_ids::Digest;
 use rustls::ServerConfig;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::{Duration, SystemTime};
 
+use crate::bundle::{
+    load_source_with_digest, read_source_path, source_snapshot_dir, BUNDLE_DIGEST_KEY,
+    BUNDLE_FSIG_KEY,
+};
 use crate::program::AdmissionProgram;
 use crate::review::ReviewConfig;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-/// Loaded once at process start. Missing pin/bundle never reach this type.
+/// Verified program plus pinned trust-root. Reload never fail-opens.
 pub struct WebhookState {
-    pub program: AdmissionProgram,
-    pub exceptions: Vec<PolicyExceptionSpec>,
-    pub config: ReviewConfig,
+    program: RwLock<AdmissionProgram>,
+    trust_root: Vec<u8>,
+    exceptions: Vec<PolicyExceptionSpec>,
+    config: ReviewConfig,
 }
 
 impl WebhookState {
+    pub fn new(
+        program: AdmissionProgram,
+        trust_root: Vec<u8>,
+        exceptions: Vec<PolicyExceptionSpec>,
+        config: ReviewConfig,
+    ) -> Self {
+        Self {
+            program: RwLock::new(program),
+            trust_root,
+            exceptions,
+            config,
+        }
+    }
+
+    /// Clone the current program under a read lock, then evaluate. No disk I/O.
     pub fn handle(&self, body: &[u8]) -> crate::review::ReviewReply {
+        let program = self
+            .program
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         self.config
-            .handle_bytes(body, Some(&self.program), &self.exceptions, Utc::now())
+            .handle_bytes(body, Some(&program), &self.exceptions, Utc::now())
+    }
+
+    /// Verify `bytes` (raw FSIG or Secret JSON). On success swap; on error keep last-good.
+    pub fn try_reload(&self, bytes: &[u8]) -> ferrum_common::Result<Digest> {
+        self.try_reload_with_digest(bytes, None)
+    }
+
+    /// Verify bytes plus an expected SHA-256(raw) (directory sibling `digest`).
+    pub fn try_reload_with_digest(
+        &self,
+        bytes: &[u8],
+        expected_digest: Option<&Digest>,
+    ) -> ferrum_common::Result<Digest> {
+        let (program, digest) = load_source_with_digest(bytes, &self.trust_root, expected_digest)?;
+        *self.program.write().unwrap_or_else(|e| e.into_inner()) = program;
+        Ok(digest)
+    }
+
+    /// Load a file or directory mount. Directory `digest` mismatch does not swap.
+    pub fn try_reload_path(&self, path: &Path) -> ferrum_common::Result<Digest> {
+        let (bytes, expected) = read_source_path(path)?;
+        self.try_reload_with_digest(&bytes, expected.as_ref())
     }
 }
 
@@ -35,6 +85,15 @@ pub fn serve(
     tls: Option<Arc<ServerConfig>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(listen)?;
+    serve_listener(listener, state, tls)
+}
+
+/// Accept loop for an already-bound listener (poll starts after listen).
+pub fn serve_listener(
+    listener: TcpListener,
+    state: Arc<WebhookState>,
+    tls: Option<Arc<ServerConfig>>,
+) -> io::Result<()> {
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
@@ -189,4 +248,67 @@ pub fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConf
         .with_single_cert(certs, rustls::PrivateKey(key))
         .map_err(|e| format!("tls config: {e}"))?;
     Ok(Arc::new(cfg))
+}
+
+/// Watch `path` (file, or directory containing `bundle.fsig` + `digest`) on a std thread.
+/// Uses mtime+len and follows kubelet `..data`; a vanished file keeps last-good.
+pub fn poll_bundle_file(path: impl Into<PathBuf>, interval: Duration, state: Arc<WebhookState>) {
+    let path = path.into();
+    thread::spawn(move || poll_loop(path, interval, state));
+}
+
+fn poll_loop(path: PathBuf, interval: Duration, state: Arc<WebhookState>) {
+    // Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
+    // Start with no stamp so a rotation between first load and this thread is not skipped.
+    let mut stamp = None;
+    loop {
+        thread::sleep(interval);
+        let Some(next) = file_stamp(&path) else {
+            continue;
+        };
+        if Some(next) == stamp {
+            continue;
+        }
+        stamp = Some(next);
+        if let Err(err) = state.try_reload_path(&path) {
+            eprintln!("ferrum-admission: bundle reload failed, keeping last-known-good: {err}");
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: SystemTime,
+    len: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SourceStamp {
+    fsig: FileStamp,
+    digest: Option<FileStamp>,
+}
+
+fn stamp_one(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.is_dir() {
+        return None;
+    }
+    Some(FileStamp {
+        mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        len: meta.len(),
+    })
+}
+
+fn file_stamp(path: &Path) -> Option<SourceStamp> {
+    if let Some(snap) = source_snapshot_dir(path) {
+        Some(SourceStamp {
+            fsig: stamp_one(&snap.join(BUNDLE_FSIG_KEY))?,
+            digest: Some(stamp_one(&snap.join(BUNDLE_DIGEST_KEY))?),
+        })
+    } else {
+        Some(SourceStamp {
+            fsig: stamp_one(path)?,
+            digest: None,
+        })
+    }
 }

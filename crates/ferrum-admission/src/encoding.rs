@@ -69,7 +69,6 @@ pub fn b64_encode(data: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
 pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
     if s.is_empty() {
@@ -115,7 +114,6 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(test)]
 fn b64_val(b: u8) -> Result<u8> {
     match b {
         b'A'..=b'Z' => Ok(b - b'A'),
