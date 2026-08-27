@@ -10,10 +10,11 @@ mod common;
 
 use common::wire::{syscall_nr, RecordBuilder};
 use common::{
-    killed_tgids, replay_agent, respond_agent, temp_lkg, wire_reaction, CGROUP_PAYMENTS,
-    TGID_WORKLOAD,
+    killed_tgids, replay_agent, respond_agent, signed_bundle_mutated, temp_lkg, wire_reaction,
+    CGROUP_PAYMENTS, TGID_WORKLOAD,
 };
 use ferrum_agent::{pump_records, PumpStats};
+use ferrum_api::RuntimeAction;
 use ferrum_ebpf::{SyscallArch, EVENT_WIRE_LEN, SYSCALL_UNKNOWN};
 use ferrum_export::MemorySink;
 use ferrum_testkit::AcceptanceCase;
@@ -328,6 +329,41 @@ fn agent_self_bpf_is_neither_denied_nor_signalled() {
         assert_eq!(events[1].action, "audit", "the comm alone must not exempt");
         assert_eq!(events[1].rule.as_str(), "no-module");
         assert_eq!(agent.respond_kill_total(), 0);
+        assert!(killed_tgids(&killed).is_empty());
+
+        // The two assertions above used to be independent: `no-module` was
+        // `deny` and the default was `audit`. Both are `audit` now, so the
+        // action no longer separates "matched the rule" from "fell through to
+        // the default" and only the rule name carries the test. Restore the
+        // second discriminator by replaying the same records against the same
+        // policy with a default the rule does not share: the exempted call
+        // must follow the default and the other must not, which is the claim
+        // this test makes, stated without reading the rule name at all.
+        let (fsig, digest) = signed_bundle_mutated(|spec| {
+            spec.runtime.default_action = RuntimeAction::Allow;
+        });
+        let mut split = respond_agent(None);
+        split.apply_fsig(&fsig, Some(&digest)).expect("apply FSIG");
+        let killed = wire_reaction(&mut split);
+        let sink = MemorySink::new();
+        let records = vec![
+            bpf_call("ferrum-agent").agent_self(true).build(arch),
+            bpf_call("ferrum-agent").agent_self(false).build(arch),
+        ];
+        pump_records(&split, arch, records, &sink);
+
+        let events = sink.events();
+        assert_eq!(
+            events[0].action,
+            "allow",
+            "the agent's own bpf() must reach the default, {}",
+            arch.as_str()
+        );
+        assert_eq!(
+            events[1].action, "audit",
+            "the comm alone must not exempt: this verdict is the rule's, not the default's"
+        );
+        assert_eq!(split.respond_kill_total(), 0);
         assert!(killed_tgids(&killed).is_empty());
     }
 }
