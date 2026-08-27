@@ -47,6 +47,17 @@ pub struct EnforcementEvent {
     /// node counter for it is an aggregate and cannot be joined to a record.
     #[serde(default)]
     pub path_unknown: bool,
+    /// A `containerOnly` rule that would have decided this record was skipped
+    /// because the datapath did not flag the caller as a container, on a
+    /// caller nothing has yet proven is not one. Unlike the two above it does
+    /// not mark the verdict fail-closed — the flag stays the authority — but
+    /// it is the one signal saying the verdict was reached without knowing
+    /// whether the process was in a container. The node counter for it is an
+    /// aggregate and cannot be joined to a record, so without this field a
+    /// single exported event carries only a reason string and downstream can
+    /// neither filter nor aggregate on it.
+    #[serde(default)]
+    pub container_unknown: bool,
     /// Set only on waived events.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub waiver: Option<WaiverRef>,
@@ -92,6 +103,7 @@ mod tests {
                 executed: false,
                 labels_unknown: false,
                 path_unknown: false,
+                container_unknown: false,
                 respond_error: None,
                 waiver: None,
             },
@@ -109,9 +121,10 @@ mod tests {
         assert_eq!(back.event.waiver, None);
     }
 
-    /// Both flags are per-record: a reader of one event must be able to tell a
-    /// match taken on an unobserved path or unresolved labels from a proven
-    /// one. Records written before the fields existed still decode.
+    /// All three flags are per-record: a reader of one event must be able to
+    /// tell a match taken on an unobserved path, unresolved labels or an
+    /// unproven container from a proven one. Records written before the fields
+    /// existed still decode.
     #[test]
     fn unknown_flags_round_trip_and_default_on_legacy_records() {
         let mut ev = EnforcementEvent {
@@ -129,25 +142,31 @@ mod tests {
             respond_error: None,
             labels_unknown: true,
             path_unknown: true,
+            container_unknown: true,
             waiver: None,
         };
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(json.contains("\"labelsUnknown\":true"));
         assert!(json.contains("\"pathUnknown\":true"));
+        assert!(json.contains("\"containerUnknown\":true"));
         let back: EnforcementEvent = serde_json::from_str(&json).expect("deserialize");
         assert!(back.labels_unknown);
         assert!(back.path_unknown);
+        assert!(back.container_unknown);
 
         ev.labels_unknown = false;
         ev.path_unknown = false;
+        ev.container_unknown = false;
         let json = serde_json::to_string(&ev).expect("serialize");
         assert!(json.contains("\"pathUnknown\":false"));
+        assert!(json.contains("\"containerUnknown\":false"));
 
         let legacy = r#"{"policy":"p","rule":"r","action":"kill","imageDigest":null,
             "pod":"w","namespace":"n","comm":"sh","syscall":"execve"}"#;
         let back: EnforcementEvent = serde_json::from_str(legacy).expect("deserialize");
         assert!(!back.labels_unknown);
         assert!(!back.path_unknown);
+        assert!(!back.container_unknown);
     }
 
     #[test]
@@ -166,6 +185,7 @@ mod tests {
             executed: false,
             labels_unknown: false,
             path_unknown: false,
+            container_unknown: false,
             respond_error: None,
             waiver: Some(WaiverRef {
                 ticket: "JIRA-1".into(),
