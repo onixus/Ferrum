@@ -5,34 +5,12 @@
 //! `ferrum-ebpf-progs`. Every error surfaces as Degraded; a partial attach is
 //! rolled back by dropping the handle, never reported as Ok.
 
+use crate::TRACEPOINTS;
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 use aya::programs::TracePoint;
 use aya::Bpf;
 use ferrum_common::{FerrumError, Result};
 use ferrum_ebpf_progs::{EVENTS_DROPPED_TOTAL, MAP_CGROUPS, MAP_EVENTS, MAP_SELF};
-
-/// (program symbol in the ELF, tracepoint category, tracepoint name).
-pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
-    ("ferrum_sys_enter_execve", "syscalls", "sys_enter_execve"),
-    (
-        "ferrum_sys_enter_execveat",
-        "syscalls",
-        "sys_enter_execveat",
-    ),
-    ("ferrum_sys_enter_open", "syscalls", "sys_enter_open"),
-    ("ferrum_sys_enter_openat", "syscalls", "sys_enter_openat"),
-    ("ferrum_sys_enter_bpf", "syscalls", "sys_enter_bpf"),
-    (
-        "ferrum_sys_enter_init_module",
-        "syscalls",
-        "sys_enter_init_module",
-    ),
-    (
-        "ferrum_sys_enter_finit_module",
-        "syscalls",
-        "sys_enter_finit_module",
-    ),
-];
 
 /// Owns the loaded programs and maps; dropping it detaches everything.
 pub struct KernelHandle {
