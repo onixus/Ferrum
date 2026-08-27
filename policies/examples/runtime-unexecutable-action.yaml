@@ -1,0 +1,22 @@
+# Negative fixture: this policy MUST fail `ferrumctl validate`.
+#
+# The runtime plane executes exactly allow / audit / kill. `deny` it can decide
+# and never carry out: the tracepoint fires after the syscall has already run,
+# so there is nothing left to refuse — blocking `bpf()` before it runs belongs
+# to admission. A rule like this compiles, signs, ships, matches, and exports a
+# verdict that never happened. Kept next to the working examples so the CI
+# stage proves the gate is live.
+apiVersion: ferrum.io/v1
+kind: ClusterSecurityPolicy
+metadata:
+  name: unexecutable-action
+spec:
+  mode: enforce
+  runtime:
+    defaultAction: audit
+    rules:
+      - id: no-module
+        syscalls: [init_module, finit_module, bpf]
+        match:
+          notAgentSelf: true
+        action: deny

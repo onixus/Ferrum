@@ -1761,7 +1761,18 @@ mod tests {
         (material, digest)
     }
 
-    fn assert_mvp_actions(agent: &Agent) {
+    /// The three §D runtime verdicts a loaded bundle must produce.
+    ///
+    /// `bpf` is a parameter because the two bundle sources here genuinely
+    /// disagree about it and both are correct. Compiling
+    /// `prod-restricted.yaml` yields `audit`: cycle 7 made a runtime `deny` a
+    /// validation error, since a tracepoint fires after the syscall has run.
+    /// The hand-encoded FEBPs built from `put_mvp_rules` still say `deny` —
+    /// they are pre-gate bundles, which is exactly what a last-known-good
+    /// snapshot on disk is after an agent upgrade, and the agent must keep
+    /// honouring one. Collapsing the two would hide which bundle a test is
+    /// asserting against.
+    fn assert_mvp_actions(agent: &Agent, bpf: Action) {
         assert_eq!(
             agent
                 .matched_action(&ev("execve", "sh", "/bin/sh", true, false))
@@ -1778,7 +1789,7 @@ mod tests {
             agent
                 .matched_action(&ev("bpf", "x", "", true, false))
                 .action,
-            Action::Deny
+            bpf
         );
     }
 
@@ -2012,7 +2023,7 @@ mod tests {
         let mut agent = Agent::new(cfg());
         let digest = load_signed(&mut agent, &material);
         assert_eq!(digest, ferrum_crypto::bundle_digest(&material));
-        assert_mvp_actions(&agent);
+        assert_mvp_actions(&agent, Action::Deny);
     }
 
     #[test]
@@ -2024,7 +2035,7 @@ mod tests {
             .apply_fsig(&fsig, Some(&compiled_digest))
             .expect("apply");
         assert_eq!(digest, compiled_digest);
-        assert_mvp_actions(&agent);
+        assert_mvp_actions(&agent, Action::Audit);
     }
 
     #[test]
@@ -2038,7 +2049,7 @@ mod tests {
         fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_str().as_bytes()).expect("digest");
         let mut agent = Agent::new(cfg());
         agent.apply_path(&dir).expect("dir load");
-        assert_mvp_actions(&agent);
+        assert_mvp_actions(&agent, Action::Deny);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2056,7 +2067,7 @@ mod tests {
             agent.last_good_digest().map(|d| d.as_str()),
             Some(digest.as_str())
         );
-        assert_mvp_actions(&agent);
+        assert_mvp_actions(&agent, Action::Deny);
 
         let dir = temp_lkg();
         fs::create_dir_all(&dir).expect("tmpdir");
@@ -2164,7 +2175,7 @@ mod tests {
             agent.last_good_digest().map(|d| d.as_str()),
             Some(digest.as_str())
         );
-        assert_mvp_actions(&agent);
+        assert_mvp_actions(&agent, Action::Deny);
     }
 
     #[test]
@@ -2400,7 +2411,7 @@ mod tests {
         let missing = temp_lkg().join("gone");
         assert_integrity(agent.apply_path(&missing));
         assert!(agent.using_last_known_good());
-        assert_mvp_actions(&agent);
+        assert_mvp_actions(&agent, Action::Deny);
     }
 
     #[test]

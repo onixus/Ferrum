@@ -28,6 +28,11 @@ pub const RUNTIME_UNOBSERVABLE_SYSCALL_YAML: &str =
     include_str!("../../../policies/examples/runtime-unobservable-syscall.yaml");
 pub const RUNTIME_ARCH_SPLIT_SYSCALL_YAML: &str =
     include_str!("../../../policies/examples/runtime-arch-split-syscall.yaml");
+/// Negative fixture: a runtime rule whose action the runtime plane cannot
+/// execute. Same CI stage, same reason: the gate must exist where a policy
+/// author meets it, not only in a unit test.
+pub const RUNTIME_UNEXECUTABLE_ACTION_YAML: &str =
+    include_str!("../../../policies/examples/runtime-unexecutable-action.yaml");
 
 /// RFC §D: `expiresAt` is omitted on purpose so the API rejects the object.
 pub const EXCEPTION_WITHOUT_TTL_YAML: &str = include_str!("../fixtures/exception-without-ttl.yaml");
@@ -100,6 +105,10 @@ pub fn runtime_unobservable_syscall() -> ClusterSecurityPolicy {
 
 pub fn runtime_arch_split_syscall() -> ClusterSecurityPolicy {
     cluster_policy_from_yaml(RUNTIME_ARCH_SPLIT_SYSCALL_YAML)
+}
+
+pub fn runtime_unexecutable_action() -> ClusterSecurityPolicy {
+    cluster_policy_from_yaml(RUNTIME_UNEXECUTABLE_ACTION_YAML)
 }
 
 pub fn compliance_snapshot() -> ComplianceSnapshot {
@@ -270,6 +279,7 @@ pub fn docker_sock_kill() -> ClusterSecurityPolicySpec {
                         "containerd.sock".into(),
                         "crio.sock".into(),
                     ],
+                    container_only: true,
                     ..Default::default()
                 },
                 action: RuntimeAction::Kill,
@@ -280,8 +290,11 @@ pub fn docker_sock_kill() -> ClusterSecurityPolicySpec {
     }
 }
 
-/// RFC §D: `bpf()` not from the agent → deny.
-pub fn bpf_deny() -> ClusterSecurityPolicySpec {
+/// RFC §D: `bpf()` not from the agent. The deny is admission's (`admit.deny`
+/// carries SYS_MODULE and privileged); what the runtime plane can execute is
+/// the audit record that names the caller, because a tracepoint fires after
+/// the syscall has already run.
+pub fn bpf_not_from_agent_audit() -> ClusterSecurityPolicySpec {
     ClusterSecurityPolicySpec {
         runtime: RuntimeSpec {
             rules: vec![RuntimeRule {
@@ -291,7 +304,7 @@ pub fn bpf_deny() -> ClusterSecurityPolicySpec {
                     not_agent_self: true,
                     ..Default::default()
                 },
-                action: RuntimeAction::Deny,
+                action: RuntimeAction::Audit,
             }],
             ..Default::default()
         },
@@ -328,13 +341,17 @@ mod tests {
             obj.spec.runtime.rules[1].match_on.path_suffix,
             vec!["docker.sock", "containerd.sock", "crio.sock"]
         );
+        assert!(
+            obj.spec.runtime.rules[1].match_on.container_only,
+            "the node's own containerd opens these sockets; without containerOnly              every one of those opens is exported as a kill that never happened"
+        );
         assert_eq!(obj.spec.runtime.rules[2].id, "no-module");
         assert!(obj.spec.runtime.rules[2]
             .syscalls
             .iter()
             .any(|s| s == "bpf"));
         assert!(obj.spec.runtime.rules[2].match_on.not_agent_self);
-        assert_eq!(obj.spec.runtime.rules[2].action, RuntimeAction::Deny);
+        assert_eq!(obj.spec.runtime.rules[2].action, RuntimeAction::Audit);
     }
 
     #[test]
@@ -431,21 +448,40 @@ mod tests {
         let rule = &spec.runtime.rules[0];
         assert!(rule.match_on.path_suffix.iter().any(|p| p == "docker.sock"));
         assert_eq!(rule.action, RuntimeAction::Kill);
+        assert!(rule.match_on.container_only);
         let prod = &prod_restricted().spec.runtime.rules[1];
         assert_eq!(prod.id, "no-runtime-sock");
         assert_eq!(prod.action, RuntimeAction::Kill);
+        assert!(prod.match_on.container_only);
     }
 
+    /// §D `bpf()` not from the agent. The deny is carried by admission, which
+    /// refuses the pod before it runs; the runtime rule is the audit record
+    /// that names the caller. A runtime `deny` would be a verdict this plane
+    /// decides and never executes.
     #[test]
-    fn rfc_d_bpf_deny() {
-        let spec = bpf_deny();
+    fn rfc_d_bpf_not_from_agent() {
+        let spec = bpf_not_from_agent_audit();
         let rule = &spec.runtime.rules[0];
         assert!(rule.syscalls.iter().any(|s| s == "bpf"));
         assert!(rule.match_on.not_agent_self);
-        assert_eq!(rule.action, RuntimeAction::Deny);
+        assert_eq!(rule.action, RuntimeAction::Audit);
         let prod = &prod_restricted().spec.runtime.rules[2];
         assert!(prod.syscalls.iter().any(|s| s == "bpf"));
-        assert_eq!(prod.action, RuntimeAction::Deny);
+        assert_eq!(prod.action, RuntimeAction::Audit);
+        // The deny half of the case: admission refuses the module-loading pod.
+        let admit = &prod_restricted().spec.admit.deny;
+        assert!(admit.added_capabilities.iter().any(|c| c == "SYS_MODULE"));
+        assert!(admit.privileged);
+    }
+
+    #[test]
+    fn unexecutable_action_fixture_decodes_and_names_deny() {
+        let obj = runtime_unexecutable_action();
+        assert_eq!(obj.kind, "ClusterSecurityPolicy");
+        let rule = &obj.spec.runtime.rules[0];
+        assert_eq!(rule.id, "no-module");
+        assert_eq!(rule.action, RuntimeAction::Deny);
     }
 
     #[test]
@@ -504,7 +540,7 @@ mod tests {
             cluster_admin_bind_deny(),
             exec_sh_kill(),
             docker_sock_kill(),
-            bpf_deny(),
+            bpf_not_from_agent_audit(),
         ];
         for spec in specs {
             let yaml = serde_yaml::to_string(&spec).expect("spec yaml");

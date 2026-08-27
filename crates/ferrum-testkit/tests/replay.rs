@@ -13,7 +13,7 @@ use common::{
     killed_tgids, replay_agent, respond_agent, temp_lkg, wire_reaction, CGROUP_PAYMENTS,
     TGID_WORKLOAD,
 };
-use ferrum_agent::{pump_records, PumpStats, REFUSE_DENY_NOT_ENFORCEABLE};
+use ferrum_agent::{pump_records, PumpStats};
 use ferrum_ebpf::{SyscallArch, EVENT_WIRE_LEN, SYSCALL_UNKNOWN};
 use ferrum_export::MemorySink;
 use ferrum_testkit::AcceptanceCase;
@@ -191,6 +191,11 @@ fn replay_docker_sock_kill(arch: SyscallArch) {
     assert_eq!(killed_tgids(&killed).len(), expected_kills as usize);
 }
 
+/// §D `bpf()` not from the agent. Admission carries the deny (gated in
+/// `acceptance.rs`); from recorded bytes this plane produces the audit record
+/// that names the caller. `executed=false` with no `respond_error` is the
+/// honest shape for an audit: nothing was refused because there was nothing to
+/// carry out, and no kill is signalled off a syscall that already returned.
 fn replay_bpf_not_from_agent_deny(arch: SyscallArch) {
     let (agent, killed) = replay_agent(None);
     let sink = MemorySink::new();
@@ -199,17 +204,19 @@ fn replay_bpf_not_from_agent_deny(arch: SyscallArch) {
 
     let events = sink.events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].action, "deny");
+    assert_eq!(events[0].action, "audit");
     assert_eq!(events[0].rule.as_str(), "no-module");
+    assert_eq!(events[0].comm, "loader");
     assert!(
         !events[0].executed,
-        "a tracepoint cannot un-run the syscall"
+        "an audit record executes nothing, and must not claim otherwise"
     );
+    assert_eq!(events[0].respond_error, None);
     assert_eq!(
-        events[0].respond_error.as_deref(),
-        Some(REFUSE_DENY_NOT_ENFORCEABLE)
+        agent.respond_refused_total(),
+        0,
+        "an executable action must not feed the refusal counter"
     );
-    assert_eq!(agent.respond_refused_total(), 1);
     assert_eq!(agent.respond_kill_total(), 0);
     assert!(killed_tgids(&killed).is_empty());
 }
@@ -318,7 +325,7 @@ fn agent_self_bpf_is_neither_denied_nor_signalled() {
         let events = sink.events();
         assert_eq!(events[0].action, "audit", "{}", arch.as_str());
         assert_eq!(events[0].rule.as_str(), "default");
-        assert_eq!(events[1].action, "deny", "the comm alone must not exempt");
+        assert_eq!(events[1].action, "audit", "the comm alone must not exempt");
         assert_eq!(events[1].rule.as_str(), "no-module");
         assert_eq!(agent.respond_kill_total(), 0);
         assert!(killed_tgids(&killed).is_empty());
@@ -573,7 +580,7 @@ fn recorded_fixture_records_still_produce_the_acceptance_verdicts() {
                 "no-runtime-sock",
                 "kill",
             ),
-            ("bpf-loader.bin", bpf_call("loader"), "no-module", "deny"),
+            ("bpf-loader.bin", bpf_call("loader"), "no-module", "audit"),
         ];
 
         let (agent, _killed) = replay_agent(None);
