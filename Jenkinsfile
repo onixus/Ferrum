@@ -210,6 +210,32 @@ pipeline {
                         exit 1
                     fi
                     echo "ok: runtime-arch-split-syscall.yaml rejected"
+
+                    # The runtime plane executes allow/audit/kill. `deny` it
+                    # decides and never carries out: the tracepoint fires after
+                    # the syscall has already run. A rule like that ships
+                    # signed and exports verdicts that never happened, so the
+                    # validator has to refuse it instead of the agent
+                    # explaining itself afterwards. Grep the message, not just
+                    # the exit code: a fixture that fails on a schema error
+                    # would pass this stage for the wrong reason.
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- validate policies/examples/runtime-unexecutable-action.yaml >/tmp/ferrum-bad-action.out 2>/tmp/ferrum-bad-action.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "runtime-unexecutable-action.yaml must fail validation" >&2
+                        exit 1
+                    fi
+                    if ! grep -q "action=deny" /tmp/ferrum-bad-action.err /tmp/ferrum-bad-action.out; then
+                        echo "validation must name the unexecutable action" >&2
+                        exit 1
+                    fi
+                    if ! grep -q "no-module" /tmp/ferrum-bad-action.err /tmp/ferrum-bad-action.out; then
+                        echo "validation must name the offending rule" >&2
+                        exit 1
+                    fi
+                    echo "ok: runtime-unexecutable-action.yaml rejected"
                     cargo run -p ferrum-cli --quiet -- lint-deploy deploy
                     # The committed tree carries a webhook template, not an
                     # applicable configuration. Prove the issuance step closes
