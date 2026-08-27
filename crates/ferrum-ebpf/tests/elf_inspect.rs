@@ -109,6 +109,11 @@ fn symbols(elf: &[u8]) -> Vec<Sym> {
 #[test]
 fn elf_contains_all_tracepoints() {
     let Ok(path) = std::env::var("FERRUM_BPF_ELF") else {
+        // In the BPF ELF CI stage the skip must be a failure, or a lost env
+        // var silently turns the only real gate into a no-op.
+        if std::env::var_os("FERRUM_BPF_ELF_REQUIRED").is_some() {
+            panic!("FERRUM_BPF_ELF_REQUIRED is set but FERRUM_BPF_ELF is not");
+        }
         println!("skipping: FERRUM_BPF_ELF not set (no compiled bpf ELF to inspect)");
         return;
     };

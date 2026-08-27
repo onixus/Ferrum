@@ -97,7 +97,7 @@ pipeline {
                             exit 1
                         fi
                     done
-                    FERRUM_BPF_ELF="$elf" cargo test -p ferrum-ebpf --test elf_inspect
+                    FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" cargo test -p ferrum-ebpf --test elf_inspect
                     mkdir -p dist
                     cp "$elf" dist/ferrum-ebpf-progs.bpf.o
                 '''
