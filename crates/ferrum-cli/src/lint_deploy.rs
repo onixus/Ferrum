@@ -3,11 +3,13 @@
 //! finding. YAML is read untyped — `ferrumctl` carries no Kubernetes types.
 
 use anyhow::{bail, Context, Result};
+use ferrum_crypto::x509::SERVING_CERT_WARN_DAYS;
 use serde::Deserialize;
 use serde_yaml::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const MAX_WEBHOOK_TIMEOUT_SECONDS: i64 = 5;
 /// Namespaces the webhook must not gate: the webhook Pod itself and the control
@@ -35,6 +37,7 @@ const RESPOND_WITHOUT_HOST_PID: &str = "FD018";
 const UNNEEDED_HOST_PID: &str = "FD019";
 const WEBHOOK_CA_BUNDLE: &str = "FD020";
 const WEBHOOK_TLS_SECRET: &str = "FD021";
+const WEBHOOK_PKI_MISMATCH: &str = "FD022";
 
 /// The token a webhook template carries instead of a certificate. Committing a
 /// real CA is not an option, so the applied file is produced by
@@ -112,6 +115,7 @@ fn collect_findings(dir: &Path) -> Result<(Vec<Finding>, usize)> {
     check_pod_templates(&docs, &mut findings);
     check_webhooks(&docs, &mut findings);
     check_webhook_tls(&docs, &mut findings);
+    check_webhook_pki(&docs, &mut findings);
     check_crd_catalog(dir, &mut findings);
     Ok((findings, docs.len()))
 }
@@ -693,6 +697,118 @@ fn check_webhook_tls(docs: &[Doc], findings: &mut Vec<Finding>) {
     }
 }
 
+/// When the issued material is in the tree next to the manifest — the Secret
+/// `ferrumctl gen-webhook-pki` writes — the webhook's `caBundle` must be the CA
+/// that signed the leaf in it, and neither may be expired or inside the
+/// rotation window. Nothing else ties those two files together: today a
+/// caBundle that does not match the Secret is discovered as a handshake the API
+/// server rejects, which with `failurePolicy: Fail` is a cluster-wide stop.
+fn check_webhook_pki(docs: &[Doc], findings: &mut Vec<Finding>) {
+    let window = Duration::from_secs(SERVING_CERT_WARN_DAYS * 86_400);
+    for doc in docs {
+        if doc.template || kind(doc) != "ValidatingWebhookConfiguration" {
+            continue;
+        }
+        for webhook in seq(&doc.value, "webhooks") {
+            let wname = webhook
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unnamed>");
+            let Some(service) = webhook
+                .get("clientConfig")
+                .and_then(|c| c.get("service"))
+                .and_then(|s| s.get("name"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let secret = format!("{service}{WEBHOOK_TLS_SECRET_SUFFIX}");
+            // No issued material in this tree: the install has not reached the
+            // issuance step yet, and FD020/FD021 already cover the manifests.
+            let Some((secret_file, leaf)) = tls_secret_certificate(docs, &secret) else {
+                continue;
+            };
+            let mut fail = |msg: String| {
+                findings.push(Finding {
+                    code: WEBHOOK_PKI_MISMATCH,
+                    file: doc.file.clone(),
+                    msg,
+                })
+            };
+            let Some(ca) = ca_bundle_pem(webhook) else {
+                continue;
+            };
+            let leaf = match leaf {
+                Ok(pem) => pem,
+                Err(e) => {
+                    fail(format!(
+                        "webhook '{wname}': tls.crt in Secret '{secret}' ({secret_file}) is not \
+                         readable PEM: {e}"
+                    ));
+                    continue;
+                }
+            };
+            if let Err(e) = ferrum_crypto::x509::verify_issued_pair(&ca, &leaf) {
+                fail(format!(
+                    "webhook '{wname}' trusts a caBundle that does not match the serving \
+                     certificate in Secret '{secret}' ({secret_file}): {e}"
+                ));
+                continue;
+            }
+            for (what, pem) in [("caBundle CA", &ca), ("serving certificate", &leaf)] {
+                match ferrum_crypto::x509::expires_within(pem, window) {
+                    Ok(true) => fail(format!(
+                        "webhook '{wname}': the {what} has expired or expires within \
+                         {SERVING_CERT_WARN_DAYS} days; with failurePolicy: Fail that stops Pod \
+                         creation cluster-wide"
+                    )),
+                    Ok(false) => {}
+                    Err(e) => fail(format!("webhook '{wname}': unreadable {what}: {e}")),
+                }
+            }
+        }
+    }
+}
+
+/// PEM text of a webhook's `caBundle`, when it holds one. Malformed values are
+/// FD020's finding, not this rule's.
+fn ca_bundle_pem(webhook: &Value) -> Option<String> {
+    let value = webhook
+        .get("clientConfig")
+        .and_then(|c| c.get("caBundle"))
+        .and_then(Value::as_str)?
+        .trim();
+    if value.is_empty() || value == CA_BUNDLE_PLACEHOLDER {
+        return None;
+    }
+    String::from_utf8(ferrum_crypto::x509::base64_decode(value).ok()?).ok()
+}
+
+/// `tls.crt` of the `kubernetes.io/tls` Secret named `secret`, with the file it
+/// came from.
+fn tls_secret_certificate<'a>(
+    docs: &'a [Doc],
+    secret: &str,
+) -> Option<(&'a str, Result<String, String>)> {
+    let doc = docs.iter().find(|d| {
+        kind(d) == "Secret"
+            && name(d) == secret
+            && d.value.get("type").and_then(Value::as_str) == Some("kubernetes.io/tls")
+    })?;
+    let raw = doc
+        .value
+        .get("data")
+        .and_then(|d| d.get("tls.crt"))
+        .and_then(Value::as_str);
+    let pem = match raw {
+        None => Err("Secret carries no data.tls.crt".to_string()),
+        Some(value) => ferrum_crypto::x509::base64_decode(value)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|e| e.to_string())),
+    };
+    Some((doc.file.as_str(), pem))
+}
+
 /// mountPath of the container volume backed by `secret`, without a trailing slash.
 fn tls_mount_dir(spec: &Value, secret: &str) -> Option<String> {
     let volume = seq(spec, "volumes").iter().find(|v| {
@@ -963,6 +1079,91 @@ mod tests {
         );
     }
 
+    fn issued(days: u64) -> (String, String) {
+        use std::time::SystemTime;
+        let not_after = SystemTime::now() + Duration::from_secs(days * 86_400);
+        let ca = ferrum_crypto::x509::issue_ca("ferrum-admission-ca", not_after).unwrap();
+        let serving =
+            ferrum_crypto::x509::issue_serving_cert(&ca, "ferrum-admission", "ferrum", not_after)
+                .unwrap();
+        (ca.cert_pem, serving.cert_pem)
+    }
+
+    /// The pair a finished install has on disk: the rendered webhook plus the
+    /// Secret `gen-webhook-pki` wrote next to it.
+    fn pki_docs(ca_pem: &str, leaf_pem: &str) -> Vec<Doc> {
+        let bundle = ferrum_crypto::x509::base64_encode(ca_pem.as_bytes());
+        let crt = ferrum_crypto::x509::base64_encode(leaf_pem.as_bytes());
+        [
+            format!(
+                "kind: ValidatingWebhookConfiguration\nwebhooks:\n  - name: policy.ferrum.io\n    \
+                 clientConfig:\n      service:\n        name: ferrum-admission\n      \
+                 caBundle: {bundle}\n"
+            ),
+            format!(
+                "kind: Secret\nmetadata:\n  name: ferrum-admission-tls\n\
+                 type: kubernetes.io/tls\ndata:\n  tls.crt: {crt}\n"
+            ),
+        ]
+        .iter()
+        .map(|yaml| Doc {
+            file: "issued.yaml".into(),
+            base: true,
+            template: false,
+            value: serde_yaml::from_str(yaml).unwrap(),
+        })
+        .collect()
+    }
+
+    fn pki_findings(docs: &[Doc]) -> Vec<Finding> {
+        let mut findings = Vec::new();
+        check_webhook_pki(docs, &mut findings);
+        assert!(findings.iter().all(|f| f.code == WEBHOOK_PKI_MISMATCH));
+        findings
+    }
+
+    #[test]
+    fn issued_material_matching_the_ca_bundle_passes() {
+        let (ca, leaf) = issued(365);
+        let findings = pki_findings(&pki_docs(&ca, &leaf));
+        assert!(
+            findings.is_empty(),
+            "{}",
+            findings.first().map(|f| f.msg.clone()).unwrap_or_default()
+        );
+    }
+
+    /// The failure that is only visible in production today: the webhook is
+    /// applied with one CA and the Secret holds a leaf from another.
+    #[test]
+    fn a_ca_bundle_that_does_not_match_the_secret_is_a_finding() {
+        let (_ca, leaf) = issued(365);
+        let (other_ca, _other_leaf) = issued(365);
+        let findings = pki_findings(&pki_docs(&other_ca, &leaf));
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].msg.contains("does not match"),
+            "{}",
+            findings[0].msg
+        );
+    }
+
+    #[test]
+    fn material_inside_the_rotation_window_is_a_finding() {
+        let (ca, leaf) = issued(SERVING_CERT_WARN_DAYS / 2);
+        let findings = pki_findings(&pki_docs(&ca, &leaf));
+        assert_eq!(findings.len(), 2, "the CA and the leaf are both expiring");
+        assert!(findings.iter().all(|f| f.msg.contains("expires within")));
+    }
+
+    /// No issued material next to the manifests: the rule has nothing to check
+    /// and must not invent a finding for the committed tree.
+    #[test]
+    fn a_tree_without_issued_material_is_not_a_finding() {
+        let docs = vec![pki_docs(&issued(365).0, &issued(365).1).remove(0)];
+        assert!(pki_findings(&docs).is_empty());
+    }
+
     #[test]
     fn allowlisted_external_role_ref_is_not_a_finding() {
         let docs = vec![Doc {
@@ -1133,6 +1334,7 @@ webhooks:
         let mut findings = Vec::new();
         check_webhooks(&docs, &mut findings);
         check_webhook_tls(&docs, &mut findings);
+        check_webhook_pki(&docs, &mut findings);
         let codes: BTreeSet<&str> = findings.iter().map(|f| f.code).collect();
         assert!(codes.contains(WEBHOOK_SIDE_EFFECTS));
         assert!(codes.contains(WEBHOOK_TIMEOUT));
