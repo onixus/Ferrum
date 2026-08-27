@@ -26,6 +26,18 @@ pub trait EventSink {
     fn export_queue_dropped_total(&self) -> u64 {
         0
     }
+
+    /// Events lost because the writer behind the queue is gone. Distinct from
+    /// a full queue: this one never recovers in this process.
+    fn export_writer_lost_total(&self) -> u64 {
+        0
+    }
+
+    /// True once the export writer has died. The agent is Degraded from here
+    /// on: enforcement still runs, but nothing records it.
+    fn export_writer_dead(&self) -> bool {
+        false
+    }
 }
 
 /// Lets a caller pick a sink at runtime (file vs stdout) and still hand one
@@ -41,6 +53,14 @@ impl EventSink for Box<dyn EventSink + Send + Sync> {
 
     fn export_queue_dropped_total(&self) -> u64 {
         (**self).export_queue_dropped_total()
+    }
+
+    fn export_writer_lost_total(&self) -> u64 {
+        (**self).export_writer_lost_total()
+    }
+
+    fn export_writer_dead(&self) -> bool {
+        (**self).export_writer_dead()
     }
 }
 
