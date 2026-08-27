@@ -65,6 +65,11 @@ pub const RECORD_CHANNEL_GONE: &str =
 /// namespace. Publishing this process's namespaced pid as `ferrum_self` would
 /// flag an unrelated init-ns process as the agent, so nothing is published and
 /// EVENT_FLAG_AGENT_SELF is never set: `notAgentSelf` cannot be honoured here.
+///
+/// Reported always, Degraded only under respond (see
+/// `Agent::self_tgid_unpublished`): without `hostPID` this is the shipped
+/// observe install on every node, and the deploy linter forbids adding
+/// `hostPID: true` to it.
 pub const SELF_TGID_UNPUBLISHED: &str =
     "agent self tgid not published: not in the host pid namespace, so notAgentSelf rules \
      cannot be honoured on this node";
@@ -177,9 +182,18 @@ pub struct Agent {
     /// Set when respond was asked for and cannot be honoured (no host pid
     /// namespace): the agent runs in observe and stays Degraded.
     respond_disabled: Mutex<Option<String>>,
+    /// `ferrum_self` was left unconfigured because this process is not in the
+    /// initial pid namespace, so `notAgentSelf` cannot be honoured. Latched
+    /// (nothing re-enters the host namespace at runtime) but it is only a
+    /// Degraded plane under respond; see `is_degraded`.
+    self_tgid_unpublished: AtomicBool,
     clock: MonotonicFloor,
     respond_kill: AtomicU64,
     respond_refused: AtomicU64,
+    /// Kill/Isolate matches this node never attempted because the role is
+    /// observe. Counted apart from `respond_refused` on purpose: see
+    /// `respond_role_skipped_total`.
+    respond_role_skipped: AtomicU64,
     respond_failed: AtomicU64,
     respond_stale_target: AtomicU64,
     /// Latched from the sink: export died, enforcement is no longer recorded.
@@ -274,6 +288,7 @@ impl Agent {
             clock,
             respond_kill: AtomicU64::new(0),
             respond_refused: AtomicU64::new(0),
+            respond_role_skipped: AtomicU64::new(0),
             respond_failed: AtomicU64::new(0),
             respond_stale_target: AtomicU64::new(0),
             export_dead: AtomicBool::new(false),
@@ -297,6 +312,7 @@ impl Agent {
             export_lost_seen: AtomicU64::new(0),
             export_lost_at: Mutex::new(None),
             terminal_fault: Mutex::new(None),
+            self_tgid_unpublished: AtomicBool::new(false),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -353,6 +369,18 @@ impl Agent {
             || self.lkg_partial.load(Ordering::Relaxed)
             || self.container_flag_degraded()
             || self.respond_disabled_reason().is_some()
+            // Under respond only. Without `hostPID` the agent cannot publish
+            // `ferrum_self`, and that is the shipped base install: observe,
+            // no `hostPID`, and `lint-deploy` raises UNNEEDED_HOST_PID if an
+            // operator adds it. Treating it as a fault pinned every node in
+            // the fleet to Degraded from second one, drowning ring drops,
+            // label-unknown, export loss and last-known-good. The consequence
+            // there is one audit label the agent will not claim - the only
+            // `notAgentSelf` rule in the tree is `audit`. Under respond it is
+            // a different thing entirely: a wrong agent-self identity is a
+            // wrong kill target, so the operator who asked for respond must
+            // see it.
+            || (self.role.respond_enabled() && self.self_tgid_unpublished())
     }
 
     /// The kernel container map is usable: last sync succeeded and it holds
@@ -568,8 +596,22 @@ impl Agent {
         self.respond_kill.load(Ordering::Relaxed)
     }
 
+    /// Reactions the agent was in a position to attempt and would not: a
+    /// guard said no. On an observe node this stays 0 — the role skip is not
+    /// a refusal, it is the configuration — so an alert on this counter reads
+    /// "something stopped a kill that respond was supposed to make".
     pub fn respond_refused_total(&self) -> u64 {
         self.respond_refused.load(Ordering::Relaxed)
+    }
+
+    /// Kill/Isolate rules that matched on a node whose role does not react.
+    /// Every one of them is exported with REFUSE_ROLE, so the event trail is
+    /// unchanged; this is only the aggregate. Separate from
+    /// `respond_refused_total` because on the shipped observe default that
+    /// counter would otherwise climb with every shell exec on the node and
+    /// read as "reactions we refused" while meaning "kill rules that matched".
+    pub fn respond_role_skipped_total(&self) -> u64 {
+        self.respond_role_skipped.load(Ordering::Relaxed)
     }
 
     /// Reactions that passed every guard and still failed (the signal itself
@@ -633,6 +675,19 @@ impl Agent {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// `ferrum_self` was refused: `notAgentSelf` rules cannot be honoured on
+    /// this node. Reported on every role; Degraded only under respond.
+    pub fn self_tgid_unpublished(&self) -> bool {
+        self.self_tgid_unpublished.load(Ordering::Relaxed)
+    }
+
+    /// Latched: nothing moves a running process into the initial pid
+    /// namespace, so this never clears. Not a terminal fault - see
+    /// `is_degraded` for why the consequence depends on the role.
+    pub fn mark_self_tgid_unpublished(&self) {
+        self.self_tgid_unpublished.store(true, Ordering::Relaxed);
     }
 
     /// First reason wins: the cause is what an operator needs, not the latest
@@ -1180,7 +1235,17 @@ impl Agent {
             in_container,
             identity.is_unknown(),
         ) {
-            self.respond_refused.fetch_add(1, Ordering::Relaxed);
+            // The role skip is the configuration, not a refused reaction: on
+            // an observe node — the shipped default — every match of a kill
+            // rule reaches here. Counting those as refusals would make
+            // `respond_refused_total` mean "kill rules that matched" while
+            // still being named for something else. The event still carries
+            // REFUSE_ROLE either way.
+            if reason == respond::REFUSE_ROLE {
+                self.respond_role_skipped.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.respond_refused.fetch_add(1, Ordering::Relaxed);
+            }
             return (false, Some(reason.into()));
         }
         // Checked after the guards, not before them: under observe an isolate
@@ -1320,16 +1385,29 @@ pub fn publish_cgroups<T>(tx: &std::sync::mpsc::SyncSender<T>, update: T) -> boo
 /// record from here on is read out of the ring and discarded before a rule
 /// sees it. That is latched, not decayed: nothing respawns the pump. Returns
 /// false once the channel is gone.
+///
+/// Takes the lock, never a guard: no lock on the shared `Agent` may be held
+/// across the `send`, because the send blocks whenever the channel is full.
+/// A read guard held across that block is a three-thread deadlock — the bundle
+/// poller queues as a writer within one reload interval, `RwLock` then admits
+/// no new readers, the pump thread cannot take its own read guard, so the
+/// channel is never drained and the send never returns. Nothing decodes, kills
+/// or exports after that, and nothing says so. The lock is taken only on the
+/// disconnect path, after the blocking call has already returned; the hot path
+/// takes none at all.
 pub fn publish_record(
+    agent: &std::sync::RwLock<Agent>,
     tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
-    agent: &Agent,
     record: Vec<u8>,
 ) -> bool {
-    if tx.send(record).is_err() {
-        agent.mark_terminal_fault(RECORD_CHANNEL_GONE);
-        return false;
+    if tx.send(record).is_ok() {
+        return true;
     }
-    true
+    agent
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .mark_terminal_fault(RECORD_CHANNEL_GONE);
+    false
 }
 
 /// The tgid to publish as `ferrum_self`, or nothing. The datapath writes
@@ -1337,13 +1415,17 @@ pub fn publish_record(
 /// hostPID this process's pid names an unrelated process there, so publishing
 /// it would exempt that process from every `notAgentSelf` rule and apply those
 /// rules to the agent. Nothing is published instead — `ferrum_self` stays 0,
-/// which the datapath already reads as "not configured" — and the agent is
-/// Degraded, because `notAgentSelf` cannot be honoured on that node.
+/// which the datapath already reads as "not configured".
+///
+/// Recorded, not latched as a terminal fault: no `hostPID` is exactly the
+/// shipped observe install, so a fault here would pin the whole fleet to
+/// Degraded for behaviour the deploy linter mandates. `is_degraded` weighs it
+/// against the role.
 pub fn self_tgid_to_publish_at(agent: &Agent, ns_link: &Path, tgid: u64) -> Option<u64> {
     if host_pid_namespace_at(ns_link) {
         return Some(tgid);
     }
-    agent.mark_terminal_fault(SELF_TGID_UNPUBLISHED);
+    agent.mark_self_tgid_unpublished();
     None
 }
 
@@ -1352,7 +1434,7 @@ pub fn self_tgid_to_publish(agent: &Agent, tgid: u64) -> Option<u64> {
     if host_pid_namespace() {
         return Some(tgid);
     }
-    agent.mark_terminal_fault(SELF_TGID_UNPUBLISHED);
+    agent.mark_self_tgid_unpublished();
     None
 }
 
@@ -1572,7 +1654,14 @@ mod tests {
         w.put_u16(0);
     }
 
-    fn put_mvp_rules(w: &mut Writer) {
+    /// The §D runtime rules as a **pre-gate** bundle encodes them: `no-module`
+    /// with `deny`, `no-runtime-sock` without `containerOnly`. That is not the
+    /// policy we ship any more - it is what a last-known-good snapshot written
+    /// to disk before cycle 7 looks like, and an upgraded agent must keep
+    /// honouring one rather than run with no policy at all. Kept deliberately
+    /// out of step with the YAML; `put_prod_restricted_rules` is the encoder
+    /// that has to track it.
+    fn put_pregate_mvp_rules(w: &mut Writer) {
         w.put_u16(3);
         w.put_str("no-shell");
         w.put_str_list(&["execve", "execveat"]);
@@ -1613,8 +1702,44 @@ mod tests {
         }
         w.put_str_list(&[]);
         w.put_bool(false);
-        put_mvp_rules(&mut w);
+        put_pregate_mvp_rules(&mut w);
         w.finish()
+    }
+
+    /// The same three rules as `policies/examples/prod-restricted.yaml` states
+    /// them today: `no-module` is `audit`, because a tracepoint fires after the
+    /// syscall has already run and cycle 7 made an unexecutable runtime action
+    /// a validation error; `no-runtime-sock` is `containerOnly`, because the
+    /// node's own containerd and kubelet open those sockets constantly.
+    /// `compiler_frmb_round_trip` compares this byte-for-byte against what the
+    /// compiler produces from that YAML, so drift here is a test failure and
+    /// not a silently wrong reference.
+    fn put_prod_restricted_rules(w: &mut Writer) {
+        w.put_u16(3);
+        w.put_str("no-shell");
+        w.put_str_list(&["execve", "execveat"]);
+        w.put_u8(Action::Kill.as_u8());
+        w.put_str_list(&["sh", "bash", "ash", "dash", "zsh"]);
+        w.put_bool(true);
+        w.put_str_list(&[]);
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.put_str("no-runtime-sock");
+        w.put_str_list(&[]);
+        w.put_u8(Action::Kill.as_u8());
+        w.put_str_list(&[]);
+        w.put_bool(true);
+        w.put_str_list(&[]);
+        w.put_str_list(&["docker.sock", "containerd.sock", "crio.sock"]);
+        w.put_bool(false);
+        w.put_str("no-module");
+        w.put_str_list(&["init_module", "finit_module", "bpf"]);
+        w.put_u8(Action::Audit.as_u8());
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.put_str_list(&[]);
+        w.put_str_list(&[]);
+        w.put_bool(true);
     }
 
     /// FEBP matching `policies/examples/prod-restricted.yaml` runtime + selector.
@@ -1636,7 +1761,7 @@ mod tests {
         put_empty_label_selector(&mut w);
         w.put_str_list(&["registry.internal.example"]);
         w.put_bool(true);
-        put_mvp_rules(&mut w);
+        put_prod_restricted_rules(&mut w);
         w.finish()
     }
 
@@ -1767,7 +1892,7 @@ mod tests {
     /// disagree about it and both are correct. Compiling
     /// `prod-restricted.yaml` yields `audit`: cycle 7 made a runtime `deny` a
     /// validation error, since a tracepoint fires after the syscall has run.
-    /// The hand-encoded FEBPs built from `put_mvp_rules` still say `deny` —
+    /// The hand-encoded FEBPs built from `put_pregate_mvp_rules` still say `deny` —
     /// they are pre-gate bundles, which is exactly what a last-known-good
     /// snapshot on disk is after an agent upgrade, and the agent must keep
     /// honouring one. Collapsing the two would hide which bundle a test is
@@ -1994,6 +2119,18 @@ mod tests {
         let compiled = ferrum_compiler::compile_cluster_policy(&obj.spec).expect("compile");
         let ebpf = encode_prod_restricted_ebpf(AGENT_ABI);
         let parsed = parse_febp(&ebpf).expect("FEBP");
+        // The round trip, and the only thing here that can see drift in a rule
+        // body. Splicing the hand-encoded FEBP into the bundle below without
+        // this is how `no-module: deny` and a missing `containerOnly` survived
+        // in the reference after the YAML changed: nothing compared them, and
+        // every behavioural assertion below runs with `in_container = true`,
+        // where a wrong `container_only` is invisible.
+        let from_compiler = parse_febp(&compiled.ebpf_spec).expect("compiled FEBP");
+        assert_eq!(
+            from_compiler, parsed,
+            "the hand-encoded reference no longer matches what the compiler \
+             makes of prod-restricted.yaml"
+        );
         assert_eq!(parsed.priority, obj.spec.priority);
         assert_eq!(
             parsed.selector.image.registries_allow,
@@ -2023,7 +2160,9 @@ mod tests {
         let mut agent = Agent::new(cfg());
         let digest = load_signed(&mut agent, &material);
         assert_eq!(digest, ferrum_crypto::bundle_digest(&material));
-        assert_mvp_actions(&agent, Action::Deny);
+        // audit, not deny: this bundle is the shipped YAML, and the YAML says
+        // audit. `Deny` here was what made the drifted reference pass.
+        assert_mvp_actions(&agent, Action::Audit);
     }
 
     #[test]
@@ -3692,20 +3831,75 @@ mod tests {
     /// no restart of anything in this process brings the pump back: latched.
     #[test]
     fn a_disconnected_record_channel_latches() {
-        let agent = healthy_agent();
+        let shared = std::sync::RwLock::new(healthy_agent());
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-        assert!(publish_record(&tx, &agent, vec![1, 2, 3]));
-        assert!(agent.terminal_fault().is_none());
-        assert!(!agent.is_degraded());
+        assert!(publish_record(&shared, &tx, vec![1, 2, 3]));
+        {
+            let agent = shared.read().expect("read");
+            assert!(agent.terminal_fault().is_none());
+            assert!(!agent.is_degraded());
+        }
 
         drop(rx);
-        assert!(!publish_record(&tx, &agent, vec![4, 5, 6]));
+        assert!(!publish_record(&shared, &tx, vec![4, 5, 6]));
+        let agent = shared.read().expect("read");
         assert_eq!(agent.terminal_fault().as_deref(), Some(RECORD_CHANNEL_GONE));
         // No window to wait out, unlike the decaying signals: nothing in this
         // process respawns the pump, so the reason stays put.
         assert!(agent.is_degraded());
         assert!(!agent.decode_failures_recent_at(Instant::now() + DEGRADED_RECOVERY));
         assert!(agent.terminal_fault().is_some());
+    }
+
+    /// The ring thread blocks in `send` whenever the record channel is full -
+    /// that is the backpressure, and it must stay. What must never happen is
+    /// blocking there while holding a lock on the shared `Agent`: the bundle
+    /// poller takes `write()` once per reload interval, a queued writer stops
+    /// `RwLock` handing out further read guards, the pump thread then cannot
+    /// take its own read guard to drain, so the channel never empties and the
+    /// send never returns. Ring, poller and pump park forever, no record is
+    /// decoded, no rule runs, no kill happens and no envelope ever says so.
+    ///
+    /// The probe is the poller's side of that: while the ring thread is parked
+    /// inside a full-channel `send`, an exclusive lock must stay available.
+    /// Every attempt must succeed, not merely one - a single success could be
+    /// won before the ring thread reached the send at all.
+    #[test]
+    fn a_blocked_record_send_holds_no_lock_on_the_agent() {
+        let shared = std::sync::Arc::new(std::sync::RwLock::new(healthy_agent()));
+        // Capacity 1, primed: the ring thread's send below can only block,
+        // exactly as a full 16k channel behind a slow sink does.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        tx.send(vec![0]).expect("prime the channel full");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let ring_agent = std::sync::Arc::clone(&shared);
+        let ring = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal");
+            publish_record(&ring_agent, &tx, vec![1, 2, 3])
+        });
+        started_rx.recv().expect("ring thread running");
+
+        let mut refused = 0u32;
+        for _ in 0..20_000 {
+            match shared.try_write() {
+                Ok(guard) => drop(guard),
+                Err(_) => refused += 1,
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            refused, 0,
+            "a lock on the shared agent was held across a blocking send: the \
+             bundle poller cannot reload and the pump cannot drain"
+        );
+
+        // The backpressure itself is intact: the send did block, and it
+        // completes as soon as the pump takes a record off the channel.
+        assert_eq!(rx.recv().expect("primed record"), vec![0]);
+        assert_eq!(rx.recv().expect("blocked record"), vec![1, 2, 3]);
+        assert!(ring.join().expect("ring thread"), "the channel is alive");
+        assert!(shared.read().expect("read").terminal_fault().is_none());
     }
 
     /// A kill that really happened and was never written down is the
@@ -3787,6 +3981,12 @@ mod tests {
         assert!(!event.executed);
         assert_eq!(event.respond_error.as_deref(), Some(REFUSE_ROLE));
         assert_eq!(agent.respond_kill_total(), 0);
+        // The export says REFUSE_ROLE; the refusal counter does not move. On
+        // the shipped default every shell exec on the node lands here, and
+        // "reactions we refused" would then count "kill rules that matched" —
+        // an alert built on it would fire on a node doing exactly its job.
+        assert_eq!(agent.respond_refused_total(), 0);
+        assert_eq!(agent.respond_role_skipped_total(), 1);
         // Demoting is not a fault: observe is the shipped default.
         assert!(!agent.is_degraded());
 
@@ -3802,6 +4002,21 @@ mod tests {
         let quiet_event = &quiet_sink.events()[0];
         assert_ne!(quiet_event.action, "kill");
         assert_eq!(quiet_event.respond_error, None);
+        assert_eq!(quiet.respond_role_skipped_total(), 0);
+
+        // Under respond the same guards are real refusals again: this one is
+        // an agent-self event, which respond declines to kill.
+        let (responder, fake) = respond_agent_with_fake();
+        let mut meta = container_meta(4242);
+        meta.agent_self = true;
+        responder.handle_event(
+            meta,
+            &ev("execve", "sh", "/bin/sh", true, true),
+            &MemorySink::new(),
+        );
+        assert!(fake.killed().is_empty());
+        assert_eq!(responder.respond_refused_total(), 1);
+        assert_eq!(responder.respond_role_skipped_total(), 0);
     }
 
     /// Outside the initial pid namespace the datapath's tgids name other
@@ -3817,16 +4032,29 @@ mod tests {
 
         let agent = healthy_agent();
         assert_eq!(self_tgid_to_publish_at(&agent, &host, 1234), Some(1234));
-        assert!(agent.terminal_fault().is_none());
+        assert!(!agent.self_tgid_unpublished());
         assert!(!agent.is_degraded());
 
+        // Refusing to publish is the invariant and does not depend on the
+        // role. What the refusal *costs* does.
         let elsewhere = healthy_agent();
         assert_eq!(self_tgid_to_publish_at(&elsewhere, &other, 1234), None);
-        assert_eq!(
-            elsewhere.terminal_fault().as_deref(),
-            Some(SELF_TGID_UNPUBLISHED)
+        assert!(elsewhere.self_tgid_unpublished());
+        // Not a terminal fault: it would outrank and hide every recoverable
+        // signal for the lifetime of a perfectly healthy observe process.
+        assert!(elsewhere.terminal_fault().is_none());
+        assert!(
+            !elsewhere.is_degraded(),
+            "observe without hostPID is the shipped install, not a fault"
         );
-        assert!(elsewhere.is_degraded());
+
+        // Respond is the case where a wrong agent-self identity means a wrong
+        // kill target, so there it is Degraded.
+        let mut responder = healthy_agent();
+        responder.set_role(AgentRole::Respond);
+        assert_eq!(self_tgid_to_publish_at(&responder, &other, 1234), None);
+        assert!(responder.self_tgid_unpublished());
+        assert!(responder.is_degraded());
 
         // An unreadable link is the same answer: never guess an identity the
         // datapath will act on.
@@ -3835,8 +4063,58 @@ mod tests {
             self_tgid_to_publish_at(&missing, &dir.join("absent"), 1234),
             None
         );
-        assert!(missing.is_degraded());
+        assert!(missing.self_tgid_unpublished());
+        assert!(!missing.is_degraded());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The base install, not the function. `deploy/agent/daemonset.yaml` runs
+    /// `--role observe` and has no `hostPID` - and cannot get one:
+    /// `lint-deploy` raises UNNEEDED_HOST_PID for `hostPID: true` without
+    /// `--role respond`, and that gate is in CI. So every node running the
+    /// manifests we ship refuses to publish `ferrum_self`. If that were a
+    /// fault, the fleet would report Degraded from second one for doing
+    /// exactly what it was told, and the real signals - ring drops, label
+    /// misses, export loss, last-known-good - would arrive on a node already
+    /// crying wolf.
+    #[test]
+    fn the_shipped_observe_install_is_not_degraded_without_host_pid() {
+        let manifest = include_str!("../../../deploy/agent/daemonset.yaml");
+        let ds: serde_yaml::Value = serde_yaml::from_str(manifest).expect("daemonset yaml");
+        let pod = &ds["spec"]["template"]["spec"];
+        assert!(
+            pod.get("hostPID").is_none(),
+            "the shipped install has no hostPID and the linter forbids adding one"
+        );
+
+        let args: Vec<String> = pod["containers"][0]["args"]
+            .as_sequence()
+            .expect("args")
+            .iter()
+            .map(|a| a.as_str().expect("arg").to_string())
+            .collect();
+        let role_flag = args
+            .iter()
+            .position(|a| a == "--role")
+            .and_then(|i| args.get(i + 1))
+            .expect("--role in the shipped args");
+        let role = AgentRole::parse_name(role_flag).expect("role name");
+        assert_eq!(role, AgentRole::Observe);
+
+        let mut agent = healthy_agent();
+        agent.set_role(role);
+        // What the process does on that node, second one: no host pid
+        // namespace, so nothing is published as `ferrum_self`.
+        assert_eq!(
+            self_tgid_to_publish_at(&agent, Path::new("/proc/self/ns/pid-absent"), 1234),
+            None
+        );
+        assert!(agent.self_tgid_unpublished());
+        assert!(agent.terminal_fault().is_none());
+        assert!(
+            !agent.is_degraded(),
+            "the shipped, linter-blessed install must not report Degraded"
+        );
     }
 
     fn temp_dir(tag: &str) -> PathBuf {

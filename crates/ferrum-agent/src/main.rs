@@ -425,8 +425,11 @@ fn run(
                         if !records_alive {
                             return;
                         }
-                        let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
-                        if !ferrum_agent::publish_record(&tx, &guard, record.to_vec()) {
+                        // No guard on the shared agent is taken here: `send`
+                        // blocks while the channel is full, and a guard held
+                        // across that block parks this thread, the poller and
+                        // the pump forever. See `publish_record`.
+                        if !ferrum_agent::publish_record(&drop_agent, &tx, record.to_vec()) {
                             // Keep draining so a full ring does not stall the
                             // kernel, but stop pretending these records reach
                             // a rule.
