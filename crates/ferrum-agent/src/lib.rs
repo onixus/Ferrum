@@ -61,6 +61,34 @@ pub const CGROUP_CARRIER_GONE: &str = "cgroup carrier gone: nothing applies the 
 /// respawned — so it is latched, not decayed.
 pub const RECORD_CHANNEL_GONE: &str =
     "record channel gone: ring records are drained and discarded before any rule sees them";
+/// The attached ELF stamps its records with a datapath ABI this decoder does
+/// not decode. Proof, from the first record, that the ELF in this image is not
+/// the build the userspace was compiled against: the stamp lives in an
+/// instruction immediate, so neither `elf_inspect` nor the attach-time map
+/// check can see it, and the maps can match field for field while every record
+/// is refused. Latched, and on the first record rather than on a window: there
+/// is one ELF per attach, nothing in this process replaces it, and a node
+/// whose every record is refused must not report healthy merely because it
+/// went quiet.
+pub const DATAPATH_ABI_MISMATCH: &str =
+    "datapath abi mismatch: the attached eBPF ELF stamps ring records with an ABI this agent \
+     does not decode, so no record can ever reach a rule";
+/// Records keep failing to decode with not one succeeding in between. Unlike
+/// a stamp mismatch this is not proof of which build is attached, but a run
+/// this long with no success at all is not occasional corruption either: it is
+/// a record path that produces nothing a rule can see. Latched for the same
+/// reason as the stamp: the condition does not clear on its own, and the
+/// decaying window cannot say it while no traffic arrives.
+pub const DATAPATH_UNDECODABLE: &str =
+    "datapath undecodable: consecutive ring records failed to decode with none succeeding \
+     between them, so no record reaches a rule";
+/// How long a run of failures with no success in between must get before it
+/// stops being corruption and starts being a datapath that decodes nothing.
+/// A busy node loses records in bursts — a partial write, a torn record at a
+/// ring wrap — and those are separated by records that do decode. Only a run
+/// with *zero* successes in it reaches this, so a handful of bad records among
+/// many good ones never can, however many of them there are.
+pub const DECODE_FAILURE_RUN_MAX: u64 = 64;
 /// The datapath writes `bpf_get_current_pid_tgid()`, which is the initial pid
 /// namespace. Publishing this process's namespaced pid as `ferrum_self` would
 /// flag an unrelated init-ns process as the agent, so nothing is published and
@@ -164,6 +192,12 @@ pub struct Agent {
     policy_name: String,
     exceptions_reload_failed: AtomicU64,
     decode_failed: AtomicU64,
+    /// Consecutive decode failures with no successful decode between them.
+    /// Reset by every record that decodes: it separates "some records are
+    /// malformed" from "nothing decodes".
+    decode_failed_run: AtomicU64,
+    /// Records refused because their datapath ABI stamp is not this decoder's.
+    datapath_abi_mismatch: AtomicU64,
     unknown_syscalls: AtomicU64,
     /// Set when the decode table and the event source disagree (unknown nr):
     /// enforce rules can no longer be trusted to match, so the agent is
@@ -221,6 +255,14 @@ pub struct Agent {
     container_flag_window: Mutex<HashMap<u64, Instant>>,
     /// Last disagreement that outlived its publish window. Recoverable.
     container_flag_fault_at: Mutex<Option<Instant>>,
+    /// First unflagged event seen per cgroup the index does not resolve, i.e.
+    /// when the question "is this a container nobody has scanned yet, or a
+    /// process on the node that never will be one" was first asked about it.
+    /// Bounded by `CONTAINER_FLAG_TRACKED_MAX`.
+    container_unproven_window: Mutex<HashMap<u64, Instant>>,
+    /// `containerOnly` rules that would have decided a record and were skipped
+    /// on a caller the agent could not prove was not a container.
+    container_unproven: AtomicU64,
     /// Decisions taken against a selector that could not be resolved because
     /// the label caches had nothing for that namespace / SA / cluster.
     labels_unknown: AtomicU64,
@@ -279,6 +321,8 @@ impl Agent {
             policy_name: config.policy_name,
             exceptions_reload_failed: AtomicU64::new(0),
             decode_failed: AtomicU64::new(0),
+            decode_failed_run: AtomicU64::new(0),
+            datapath_abi_mismatch: AtomicU64::new(0),
             unknown_syscalls: AtomicU64::new(0),
             datapath_degraded: AtomicBool::new(false),
             attached: AtomicBool::new(false),
@@ -301,6 +345,8 @@ impl Agent {
             container_map_synced_at: Mutex::new(None),
             container_flag_window: Mutex::new(HashMap::new()),
             container_flag_fault_at: Mutex::new(None),
+            container_unproven_window: Mutex::new(HashMap::new()),
+            container_unproven: AtomicU64::new(0),
             labels_unknown: AtomicU64::new(0),
             labels_unknown_at: Mutex::new(None),
             ring_drop_at: Mutex::new(None),
@@ -387,10 +433,14 @@ impl Agent {
     /// something. An empty map is not "no pods" — it is every container_only
     /// rule silently not matching.
     pub fn container_map_ready(&self) -> bool {
+        self.container_map_ready_at(Instant::now())
+    }
+
+    pub fn container_map_ready_at(&self, now: Instant) -> bool {
         self.container_map_synced.load(Ordering::Relaxed)
             && self.container_map_entries.load(Ordering::Relaxed) > 0
             && self.container_map_error().is_none()
-            && !self.container_map_stale()
+            && !self.container_map_stale_at(now)
     }
 
     /// Nothing reaffirmed the map within `CONTAINER_MAP_SYNC_BUDGET`. The
@@ -475,6 +525,62 @@ impl Agent {
 
     pub fn container_flag_degraded_at(&self, now: Instant) -> bool {
         within(&self.container_flag_fault_at, now, DEGRADED_RECOVERY)
+    }
+
+    /// `containerOnly` rules that would have decided a record and were skipped
+    /// because the caller could not be shown to be a container.
+    pub fn container_unproven_total(&self) -> u64 {
+        self.container_unproven.load(Ordering::Relaxed)
+    }
+
+    /// Counted, not Degraded, and deliberately: the cgroup of a container
+    /// reaches the index one refresh before it reaches `ferrum_cgroups`, so
+    /// every pod start opens this window and a node that degraded on it would
+    /// degrade on ordinary healthy behaviour. What outlives the window is a
+    /// datapath fault, and `note_container_flag_disagreement` already decides
+    /// that. What this adds is that the record does not leave silently.
+    pub fn record_container_unproven(&self) {
+        self.container_unproven.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Can this record's caller be shown NOT to be a container?
+    ///
+    /// `container_only` keys on EVENT_FLAG_CONTAINER, which is unset for the
+    /// node's own containerd and equally unset for a pod whose cgroup the
+    /// refresher has not pushed into `ferrum_cgroups` yet. Nothing in the
+    /// record separates them. What does separate them is time: the index is
+    /// filled from a scan of the cgroup tree, so once a scan that resolved
+    /// AFTER this cgroup was first seen has landed and the cgroup is still not
+    /// a pod, it is not one - kubelet, containerd, sshd settle there within
+    /// one refresh and stay settled, and this answers false for them forever
+    /// after. Until then the honest answer is "unproven".
+    ///
+    /// False whenever the publish path is not healthy: with no live publisher
+    /// nothing will ever resolve, every host process would be unprovable
+    /// forever, and the permanent stream of refused kills that `containerOnly`
+    /// was added to stop would come straight back. A node in that state is
+    /// already Degraded on `container_map_ready`, which is the honest signal
+    /// for it.
+    pub fn container_unproven(&self, cgroup_id: u64, now: Instant) -> bool {
+        if !self.container_map_ready_at(now) {
+            return false;
+        }
+        let synced_at = *self
+            .container_map_synced_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut windows = self
+            .container_unproven_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if windows.len() >= CONTAINER_FLAG_TRACKED_MAX && !windows.contains_key(&cgroup_id) {
+            windows
+                .retain(|_, opened| now.saturating_duration_since(*opened) < CONTAINER_FLAG_GRACE);
+        }
+        let opened = *windows.entry(cgroup_id).or_insert(now);
+        // A scan that resolved after the question was first asked had every
+        // container running at that moment in it, this one included.
+        !synced_at.is_some_and(|at| at > opened)
     }
 
     /// Count one event whose cgroup the index knows but which the datapath did
@@ -785,6 +891,50 @@ impl Agent {
         }
         self.decode_failed.fetch_add(n, Ordering::Relaxed);
         mark_now(&self.decode_failed_at, now);
+        let run = self.decode_failed_run.fetch_add(n, Ordering::Relaxed) + n;
+        if run >= DECODE_FAILURE_RUN_MAX {
+            self.mark_terminal_fault(DATAPATH_UNDECODABLE);
+        }
+    }
+
+    /// One record decoded. The only thing that clears the failure run, and the
+    /// reason the run means anything: a node with no traffic keeps the run it
+    /// last had, while a node that decodes records resets it on every one.
+    pub fn record_decode_success(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        self.decode_failed_run.store(0, Ordering::Relaxed);
+    }
+
+    /// Consecutive decode failures with no success between them.
+    pub fn decode_failure_run(&self) -> u64 {
+        self.decode_failed_run.load(Ordering::Relaxed)
+    }
+
+    pub fn datapath_abi_mismatch_total(&self) -> u64 {
+        self.datapath_abi_mismatch.load(Ordering::Relaxed)
+    }
+
+    /// A record whose ABI stamp is not this decoder's. Counted as a decode
+    /// failure like any other refused record - it is one - but latched at
+    /// once, because unlike a malformed record it names its cause: the ELF
+    /// that wrote it is not the build this agent decodes, and no later record
+    /// from that ELF will decode either. Waiting for a window to fill, or for
+    /// a decaying one to keep being refreshed, is what let a node with a stale
+    /// ELF and no syscall traffic report healthy while its datapath was
+    /// entirely undecodable.
+    pub fn record_datapath_abi_mismatch(&self, stamp: u16) {
+        self.record_datapath_abi_mismatch_at(stamp, Instant::now());
+    }
+
+    pub fn record_datapath_abi_mismatch_at(&self, stamp: u16, now: Instant) {
+        self.datapath_abi_mismatch.fetch_add(1, Ordering::Relaxed);
+        self.record_decode_failure_at(1, now);
+        let expected = ferrum_ebpf::DATAPATH_ABI;
+        self.mark_terminal_fault(format!(
+            "{DATAPATH_ABI_MISMATCH} (record stamp {stamp:#06x}, this agent decodes {expected:#06x})"
+        ));
     }
 
     /// Records failed to decode recently enough to still mean something.
@@ -1107,9 +1257,18 @@ impl Agent {
         now: DateTime<Utc>,
     ) -> Decision {
         let meta: EventMeta = meta.into();
+        let at = Instant::now();
+        // Whether a `containerOnly` rule skipped on this record is worth
+        // reporting. Set in both branches below, for the two ways an unflagged
+        // record can still have come from a container.
+        let mut container_unproven = false;
         let identity = match self.cgroups.lookup_cgroup(meta.cgroup_id) {
             Ok(id) => {
                 if !meta.in_container {
+                    // The index resolves this cgroup to a pod, so the caller
+                    // is not merely unproven: it IS a container, and every
+                    // container_only rule silently did not apply to it.
+                    container_unproven = true;
                     // The index says this cgroup is a pod container and the
                     // datapath did not flag it: `ferrum_cgroups` is behind the
                     // index, so container_only rules are missing on real
@@ -1135,11 +1294,21 @@ impl Agent {
                 // rule silently does not fire.
                 if meta.in_container {
                     self.record_identity_unknown(Instant::now());
+                } else {
+                    // The other half, and the one `containerOnly` turned
+                    // silent: a pod whose cgroup the refresher has not scanned
+                    // yet is unflagged and unresolved exactly like the node's
+                    // own containerd. `container_unproven` is what tells them
+                    // apart, and it answers false for the host processes as
+                    // soon as one scan has been through.
+                    container_unproven = self.container_unproven(meta.cgroup_id, at);
                 }
                 WorkloadIdentity::unknown()
             }
         };
-        let mut decision = self.loader.decide(event, &identity);
+        let mut decision = self
+            .loader
+            .decide_with(event, &identity, container_unproven);
         if decision.labels_unknown {
             self.record_labels_unknown(Instant::now());
         }
@@ -1164,7 +1333,21 @@ impl Agent {
         // was not signalled before; the difference is that the export now
         // carries REFUSE_ROLE instead of being byte-identical to a rule that
         // really did say audit.
-        let (executed, respond_error) = self.react(&decision, &meta, &identity, event);
+        let (executed, mut respond_error) = self.react(&decision, &meta, &identity, event);
+        // Visible, not enforced. The datapath flag stays the authority for a
+        // reaction - upgrading a decision from flags the record does not carry
+        // is how a kill lands on the wrong process - so this does not make the
+        // rule fire. What it undoes is the silence: before `containerOnly` the
+        // rule matched and `react` refused it by name, and an operator could
+        // see "the kill did not happen, and here is why". Without this the
+        // same record leaves under the default action with no reason at all,
+        // which is the one thing worse than a refused kill.
+        if decision.container_unknown {
+            self.record_container_unproven();
+            if respond_error.is_none() {
+                respond_error = Some(respond::REFUSE_NOT_CONTAINER.into());
+            }
+        }
         decision.action = apply_role(self.role, decision.action);
         let policy = match self.loader.last_good() {
             Some(loaded) => PolicyId::new(loaded.digest.as_str()),
@@ -2689,6 +2872,150 @@ mod tests {
         assert_eq!(agent.events_dropped_total(), 0);
     }
 
+    /// A record from a pre-cycle-7 ELF: the layout is this one, the stamp is
+    /// the `_pad = 0` that build wrote. The maps match, so the attach-time
+    /// check passes and the reader drains the ring - and every record is
+    /// refused.
+    fn stale_ring_record(
+        syscall_nr: u32,
+        comm: &str,
+        path: &str,
+        flags: u8,
+        cgroup: u64,
+    ) -> Vec<u8> {
+        let mut wire = ring_record(syscall_nr, comm, path, flags, cgroup);
+        wire[22..24].copy_from_slice(&0u16.to_ne_bytes());
+        wire
+    }
+
+    /// F4. Maps that match let a stale ELF attach; the stamp is not in the ELF
+    /// to be checked, so the first refused record is the only evidence there
+    /// will ever be. The node must not be able to go quiet and report healthy:
+    /// nothing arrives to refresh the decaying window, so the answer has to be
+    /// latched at the first record and independent of when it is asked.
+    #[test]
+    fn a_datapath_whose_every_record_is_refused_is_degraded_without_more_traffic() {
+        use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER};
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+        let sink = MemorySink::new();
+
+        let stats = pump_records(
+            &agent,
+            SyscallArch::X86_64,
+            [stale_ring_record(
+                59,
+                "sh",
+                "/bin/sh",
+                EVENT_FLAG_CONTAINER,
+                7,
+            )],
+            &sink,
+        );
+        assert_eq!(
+            stats,
+            PumpStats {
+                handled: 0,
+                decode_failed: 1,
+                unknown_syscall: 0
+            }
+        );
+        assert!(sink.events().is_empty(), "no rule ever saw the record");
+        assert_eq!(agent.datapath_abi_mismatch_total(), 1);
+        assert_eq!(agent.records_decode_failed_total(), 1);
+
+        let reason = agent.terminal_fault().expect("one refused stamp is proof");
+        assert!(reason.starts_with(DATAPATH_ABI_MISMATCH), "{reason}");
+        assert!(
+            reason.contains("0x0000"),
+            "the stamp that arrived: {reason}"
+        );
+
+        // The node now goes quiet: no further record, and long enough that the
+        // decaying window has nothing left to say. It stays Degraded.
+        let much_later = Instant::now() + DEGRADED_RECOVERY * 4;
+        assert!(!agent.decode_failures_recent_at(much_later));
+        assert!(
+            agent.is_degraded(),
+            "a quiet node with a wrong ELF is not healthy"
+        );
+    }
+
+    /// The same conclusion without the stamp naming it: records that decode to
+    /// nothing, one after another, with not one succeeding in between. Latched
+    /// only once the run is long enough that corruption is no longer an
+    /// explanation.
+    #[test]
+    fn a_run_of_records_that_all_fail_to_decode_is_degraded_without_more_traffic() {
+        use ferrum_ebpf::SyscallArch;
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+        let sink = MemorySink::new();
+
+        let short: Vec<Vec<u8>> = (0..DECODE_FAILURE_RUN_MAX - 1)
+            .map(|_| vec![0u8; 5])
+            .collect();
+        pump_records(&agent, SyscallArch::X86_64, short, &sink);
+        assert_eq!(agent.decode_failure_run(), DECODE_FAILURE_RUN_MAX - 1);
+        assert!(
+            agent.terminal_fault().is_none(),
+            "a run short of the bound is still corruption"
+        );
+
+        pump_records(&agent, SyscallArch::X86_64, [vec![0u8; 5]], &sink);
+        assert_eq!(
+            agent.terminal_fault().as_deref(),
+            Some(DATAPATH_UNDECODABLE)
+        );
+        assert_eq!(agent.datapath_abi_mismatch_total(), 0, "no stamp named it");
+
+        let much_later = Instant::now() + DEGRADED_RECOVERY * 4;
+        assert!(!agent.decode_failures_recent_at(much_later));
+        assert!(agent.is_degraded());
+    }
+
+    /// The other half, and the one that keeps this from becoming the next
+    /// finding: a busy node loses records in bursts and keeps decoding the
+    /// rest. That is telemetry loss, Degraded while it recurs and clean again
+    /// once it stops - never latched, however many bad records go by.
+    #[test]
+    fn bad_records_among_good_ones_degrade_only_while_they_recur() {
+        use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER};
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+        let sink = MemorySink::new();
+
+        // Far more bad records than the run bound, but never two dozen in a
+        // row without a record that decodes.
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..DECODE_FAILURE_RUN_MAX * 4 {
+            records.push(vec![0u8; 5]);
+            records.push(vec![0u8; 5]);
+            records.push(ring_record(59, "sh", "/bin/sh", EVENT_FLAG_CONTAINER, 7));
+        }
+        let stats = pump_records(&agent, SyscallArch::X86_64, records, &sink);
+        assert_eq!(stats.handled, DECODE_FAILURE_RUN_MAX * 4);
+        assert_eq!(stats.decode_failed, DECODE_FAILURE_RUN_MAX * 8);
+        assert_eq!(agent.decode_failure_run(), 0, "the last record decoded");
+        assert_eq!(agent.datapath_abi_mismatch_total(), 0);
+        assert!(
+            agent.terminal_fault().is_none(),
+            "a node that keeps decoding records has a datapath, not a wrong ELF"
+        );
+
+        // Degraded while the losses are recent, and only while.
+        assert!(agent.decode_failures_recent());
+        assert!(agent.is_degraded());
+        let recovered = Instant::now() + DEGRADED_RECOVERY * 2;
+        assert!(!agent.decode_failures_recent_at(recovered));
+    }
+
     #[test]
     fn pump_unknown_syscall_and_garbage_do_not_panic() {
         use ferrum_ebpf::SyscallArch;
@@ -3471,6 +3798,178 @@ mod tests {
         assert_ne!(decision.action, Action::Kill);
         assert!(fake.killed().is_empty());
         assert_eq!(agent.respond_kill_total(), 0);
+    }
+
+    /// F6. `containerOnly` keys on a flag that is unset for the node's own
+    /// containerd and equally unset for a pod whose cgroup the refresher has
+    /// not scanned yet. The second is a real container running a rule that
+    /// would have killed it, and before `containerOnly` the rule matched and
+    /// the reaction was refused by name. It must not leave under the default
+    /// action with nothing said about it.
+    #[test]
+    fn a_container_only_rule_skipped_on_an_unscanned_cgroup_is_reported() {
+        const CGROUP_NEW: u64 = 8_808;
+        let (agent, fake) = respond_agent_with_fake();
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        assert!(agent.lookup_cgroup(CGROUP_NEW).is_err(), "not scanned yet");
+
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: CGROUP_NEW,
+            pid: 4242,
+            tgid: 4242,
+            in_container: false,
+            agent_self: false,
+            path_truncated: false,
+        };
+        let decision =
+            agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", false, false), &sink);
+
+        // Reported, not enforced: the flag stays the authority for a kill.
+        assert!(decision.container_unknown);
+        assert_eq!(agent.container_unproven_total(), 1);
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].respond_error.as_deref(),
+            Some(REFUSE_NOT_CONTAINER),
+            "the record must say why the rule did not decide it"
+        );
+        assert!(!events[0].executed);
+        assert_ne!(decision.action, Action::Kill);
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_kill_total(), 0);
+        // The publish window is ordinary: counted and named, never Degraded.
+        assert!(!agent.is_degraded());
+    }
+
+    /// The half that keeps the reason from becoming the permanent false stream
+    /// `containerOnly` was added to stop: once a scan that resolved after the
+    /// cgroup was first seen has landed and it is still not a pod, it is not
+    /// one. The node's own containerd settles there and stays silent.
+    #[test]
+    fn a_host_cgroup_proven_by_a_later_scan_is_silent() {
+        const CGROUP_HOST: u64 = 9_909;
+        let (agent, _fake) = respond_agent_with_fake();
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: CGROUP_HOST,
+            pid: 4242,
+            tgid: 4242,
+            in_container: false,
+            agent_self: false,
+            path_truncated: false,
+        };
+        let shell = ev("execve", "sh", "/bin/sh", false, false);
+
+        // First sighting: nothing has been resolved since, so it is unproven.
+        agent.handle_event(meta, &shell, &sink);
+        assert_eq!(agent.container_unproven_total(), 1);
+
+        // A scan resolves after that sighting and still does not know the
+        // cgroup. Every record from it after that is a host process.
+        agent.set_container_map_synced(1);
+        for _ in 0..64 {
+            agent.handle_event(meta, &shell, &sink);
+        }
+        assert_eq!(
+            agent.container_unproven_total(),
+            1,
+            "a proven host cgroup must not keep producing refused kills"
+        );
+        let events = sink.events();
+        assert_eq!(
+            events[events.len() - 1].respond_error,
+            None,
+            "and it must not keep producing reasons either"
+        );
+        assert!(!agent.is_degraded());
+    }
+
+    /// With no live publisher nothing will ever resolve, so every host process
+    /// would be unprovable forever. The node is already Degraded on the map
+    /// itself; it must not also turn its own runtime into a stream of refused
+    /// kills.
+    #[test]
+    fn without_a_synced_container_map_nothing_is_unproven() {
+        const CGROUP_HOST: u64 = 7_707;
+        let (agent, _fake) = respond_agent_with_fake();
+        agent.set_attached(true);
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: CGROUP_HOST,
+            pid: 4242,
+            tgid: 4242,
+            in_container: false,
+            agent_self: false,
+            path_truncated: false,
+        };
+        let decision =
+            agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", false, false), &sink);
+        assert!(!decision.container_unknown);
+        assert_eq!(agent.container_unproven_total(), 0);
+        assert_eq!(sink.events()[0].respond_error, None);
+        // Degraded for the reason that is true: the map is not usable.
+        assert!(!agent.container_map_ready());
+        assert!(agent.is_degraded());
+    }
+
+    /// The known-pod half of the same window: the index resolves the cgroup and
+    /// the datapath did not flag it, so the caller is not merely unproven, it
+    /// is a container. Still not killed - and still not silent.
+    #[test]
+    fn a_container_only_rule_skipped_on_a_known_pod_is_reported() {
+        let (agent, fake) = respond_agent_with_fake();
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: 7,
+            pid: 4242,
+            tgid: 4242,
+            in_container: false,
+            agent_self: false,
+            path_truncated: false,
+        };
+        let decision =
+            agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", false, false), &sink);
+        assert!(decision.container_unknown);
+        assert_eq!(agent.container_unproven_total(), 1);
+        assert_eq!(
+            sink.events()[0].respond_error.as_deref(),
+            Some(REFUSE_NOT_CONTAINER)
+        );
+        assert_ne!(decision.action, Action::Kill);
+        assert!(fake.killed().is_empty());
+    }
+
+    /// The signal must name only the records whose outcome would have differed.
+    /// A `containerOnly` rule skipped under a decision that already outranks it
+    /// changed nothing, and reporting it would be noise on every record.
+    #[test]
+    fn a_skipped_rule_that_would_not_have_changed_the_outcome_is_not_reported() {
+        const CGROUP_NEW: u64 = 8_809;
+        let (agent, _fake) = respond_agent_with_fake();
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: CGROUP_NEW,
+            pid: 4242,
+            tgid: 4242,
+            in_container: false,
+            agent_self: false,
+            path_truncated: false,
+        };
+        // `no-module` (deny, no containerOnly) decides this record; `no-shell`
+        // is not in play at all, and nothing was skipped that mattered.
+        let decision = agent.handle_event(meta, &ev("bpf", "curl", "", false, false), &sink);
+        assert_eq!(decision.action, Action::Deny);
+        assert!(!decision.container_unknown);
+        assert_eq!(agent.container_unproven_total(), 0);
     }
 
     /// Regression: even when the rule does match on the string view, a record

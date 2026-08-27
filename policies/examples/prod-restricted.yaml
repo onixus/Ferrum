@@ -61,6 +61,11 @@ spec:
       # constantly. Without it every one of those opens decides kill, gets
       # refused because the caller is not in a container, and is exported as a
       # kill that never happened — a permanent false stream on a healthy node.
+      # The flag it keys on is also unset for a pod whose cgroup the refresher
+      # has not published yet, so for a few seconds after a container starts
+      # this rule does not apply to it. That window is not silent: the agent
+      # exports those records with REFUSE_NOT_CONTAINER, the same reason the
+      # refused kill carried before, and counts them in container_unproven.
       - id: no-runtime-sock
         match:
           pathSuffix: [docker.sock, containerd.sock, crio.sock]
