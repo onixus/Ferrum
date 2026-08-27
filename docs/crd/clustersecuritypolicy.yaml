@@ -46,8 +46,12 @@ spec:
                   message: "disabled=true together with mode=enforce"
                 - rule: "!has(self.runtime) || !has(self.runtime.defaultAction) || !(self.runtime.defaultAction in ['kill', 'isolate'])"
                   message: "runtime.defaultAction kill/isolate is kill-all, not a policy"
+                - rule: "!has(self.runtime) || !has(self.runtime.defaultAction) || !(self.runtime.defaultAction in ['deny'])"
+                  message: "runtime.defaultAction deny: the runtime plane never executes it, a tracepoint fires after the syscall has already run; deny is admission's verb (admit.deny)"
                 - rule: "!has(self.runtime) || !has(self.runtime.rules) || self.runtime.rules.all(r, !has(r.action) || !(r.action in ['kill', 'isolate']) || (has(r.syscalls) && size(r.syscalls) > 0) || (has(r.match) && ((has(r.match.commIn) && size(r.match.commIn) > 0) || (has(r.match.pathPrefix) && size(r.match.pathPrefix) > 0) || (has(r.match.pathSuffix) && size(r.match.pathSuffix) > 0))))"
                   message: "runtime rule with action kill/isolate needs syscalls or match, otherwise it is kill-all"
+                - rule: "!has(self.runtime) || !has(self.runtime.rules) || self.runtime.rules.all(r, !has(r.action) || !(r.action in ['deny', 'isolate']))"
+                  message: "runtime rule action deny/isolate: the runtime plane executes allow/audit/kill only, deny is admission's verb (admit.deny) and isolate has no implementation"
                 - rule: "!has(self.supply) || !((has(self.supply.requireSigned) && self.supply.requireSigned) || (has(self.supply.denyUnsigned) && self.supply.denyUnsigned)) || (has(self.supply.trustRoots) && size(self.supply.trustRoots) > 0)"
                   message: "requireSigned/denyUnsigned without trustRoots: trust roots ride in the bundle"
               properties:

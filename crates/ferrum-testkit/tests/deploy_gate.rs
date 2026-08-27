@@ -15,6 +15,7 @@ use ferrum_testkit::{
     try_exception_from_yaml, unsigned_deny, EXCEPTION_WITHOUT_TTL_YAML,
 };
 use serde_yaml::Value;
+use std::collections::BTreeSet;
 
 const CRD_POLICY_EXCEPTION: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -71,6 +72,121 @@ fn required_fields(crd: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Every `RuntimeAction` the API type can carry. The enum is not reflective,
+/// so the list is written out; what keeps it complete is the comparison
+/// against the CRD `enum` below, which a sixth variant cannot reach without
+/// passing through here.
+const RUNTIME_ACTIONS: [RuntimeAction; 5] = [
+    RuntimeAction::Allow,
+    RuntimeAction::Audit,
+    RuntimeAction::Deny,
+    RuntimeAction::Kill,
+    RuntimeAction::Isolate,
+];
+
+/// The wire spelling, taken from serde rather than retyped: the CEL literals
+/// are compared against what the API server actually receives.
+fn action_name(action: RuntimeAction) -> String {
+    serde_yaml::to_value(action)
+        .expect("RuntimeAction serializes")
+        .as_str()
+        .expect("RuntimeAction is a scalar")
+        .to_string()
+}
+
+fn runtime_schema(crd: &str) -> Value {
+    spec_schema(crd)
+        .get("properties")
+        .and_then(|p| p.get("runtime"))
+        .and_then(|r| r.get("properties"))
+        .expect("runtime schema")
+        .clone()
+}
+
+fn schema_enum(node: &Value) -> BTreeSet<String> {
+    node.get("enum")
+        .and_then(Value::as_sequence)
+        .map(|v| {
+            v.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The literals an unconditional `!(<subject> in ['a', 'b'])` CEL ban names.
+/// Only unconditional bans: a rule that goes on to excuse the action under
+/// some condition is a different invariant, and the caller filters it out
+/// before this sees it.
+fn banned_literals(rules: &[&String], subject: &str) -> BTreeSet<String> {
+    let needle = format!("!({subject} in [");
+    let mut out = BTreeSet::new();
+    for rule in rules {
+        let mut rest = rule.as_str();
+        while let Some(at) = rest.find(&needle) {
+            rest = &rest[at + needle.len()..];
+            let end = rest.find(']').expect("unterminated CEL list literal");
+            for literal in rest[..end].split(',') {
+                out.insert(literal.trim().trim_matches('\'').to_string());
+            }
+            rest = &rest[end..];
+        }
+    }
+    out
+}
+
+/// Which actions `ferrum-policy` refuses on a rule that is otherwise
+/// well-formed and well-matched. A match cannot rescue an action no plane
+/// executes, so whatever is refused here is refused outright.
+fn refused_as_rule_action() -> BTreeSet<String> {
+    RUNTIME_ACTIONS
+        .iter()
+        .copied()
+        .filter(|action| {
+            let spec = SecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    rules: vec![RuntimeRule {
+                        id: "probe".into(),
+                        // execve/execveat travel as a pair; naming one alone
+                        // fails a different invariant and would poison the set.
+                        syscalls: vec!["execve".into(), "execveat".into()],
+                        match_on: RuntimeMatch {
+                            comm_in: vec!["sh".into()],
+                            ..Default::default()
+                        },
+                        action: *action,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            validate_namespaced_policy(&spec).is_err()
+        })
+        .map(action_name)
+        .collect()
+}
+
+/// The same question for `runtime.defaultAction`, which is a separate copy in
+/// both `ferrum-policy` and the CEL and refuses a wider set.
+fn refused_as_default_action() -> BTreeSet<String> {
+    RUNTIME_ACTIONS
+        .iter()
+        .copied()
+        .filter(|action| {
+            let spec = SecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    default_action: *action,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            validate_namespaced_policy(&spec).is_err()
+        })
+        .map(action_name)
+        .collect()
 }
 
 fn exception(requested_by: &str, approved_by: &str, days: u64) -> PolicyExceptionSpec {
@@ -260,6 +376,80 @@ fn a_rule_whose_action_the_runtime_plane_cannot_execute_does_not_validate() {
     assert!(err.to_string().contains("no-module"), "{err}");
 }
 
+/// The CEL copy of that same gate, and the one that decides whether the object
+/// is admitted at all. Without it the API server accepts a runtime rule the
+/// compiler then refuses: the policy exists, the controller cannot compile it,
+/// and the cluster enforces nothing where an operator believes it does.
+///
+/// Both halves are derived rather than remembered — the refused set by asking
+/// `ferrum-policy`, the admitted set by reading the CEL literals back out — so
+/// a changed verdict on either side fails here until the other follows.
+#[test]
+fn every_runtime_action_ferrum_policy_refuses_is_refused_by_the_cel_copy() {
+    let declared: BTreeSet<String> = RUNTIME_ACTIONS.iter().copied().map(action_name).collect();
+    let rule_actions = refused_as_rule_action();
+    let default_actions = refused_as_default_action();
+    // If nothing is refused the comparisons below hold vacuously and the gate
+    // would pass with the invariant deleted from both copies.
+    assert!(!rule_actions.is_empty(), "no rule action is refused at all");
+    assert!(!default_actions.is_empty(), "no defaultAction is refused");
+
+    for (name, crd) in [
+        ("securitypolicy", CRD_SECURITY_POLICY),
+        ("clustersecuritypolicy", CRD_CLUSTER_SECURITY_POLICY),
+    ] {
+        let runtime = runtime_schema(crd);
+        let rule_action_schema = runtime
+            .get("rules")
+            .and_then(|r| r.get("items"))
+            .and_then(|i| i.get("properties"))
+            .and_then(|p| p.get("action"))
+            .expect("rule action schema");
+        assert_eq!(
+            schema_enum(runtime.get("defaultAction").expect("defaultAction schema")),
+            declared,
+            "{name}: defaultAction enum and RuntimeAction disagree"
+        );
+        assert_eq!(
+            schema_enum(rule_action_schema),
+            declared,
+            "{name}: rule action enum and RuntimeAction disagree"
+        );
+
+        let rules = cel_rules(crd);
+        // The kill-without-match rule names actions too, but excuses them when
+        // the rule carries a match: a different invariant, not a ban.
+        let bans: Vec<&String> = rules
+            .iter()
+            .filter(|r| r.contains("r.action") && !r.contains("r.match"))
+            .collect();
+        assert_eq!(
+            bans.len(),
+            1,
+            "{name}: expected exactly one unconditional rule-action ban in CEL: {rules:?}"
+        );
+        assert_eq!(
+            banned_literals(&bans, "r.action"),
+            rule_actions,
+            "{name}: the CRD admits a rule action ferrum-policy refuses (or refuses one it accepts)"
+        );
+
+        let default_bans: Vec<&String> = rules
+            .iter()
+            .filter(|r| r.contains("defaultAction"))
+            .collect();
+        assert!(
+            !default_bans.is_empty(),
+            "{name}: CRD lost every defaultAction CEL rule"
+        );
+        assert_eq!(
+            banned_literals(&default_bans, "self.runtime.defaultAction"),
+            default_actions,
+            "{name}: the CRD admits a runtime.defaultAction ferrum-policy refuses"
+        );
+    }
+}
+
 /// The gate the negative example proves in CI, kept here so it also fails a
 /// plain `cargo test`.
 #[test]
@@ -269,6 +459,52 @@ fn a_rule_naming_an_unhooked_syscall_does_not_validate() {
     let msg = err.to_string();
     assert!(msg.contains("ptrace"), "{msg}");
     assert!(msg.contains("no-debugger"), "{msg}");
+}
+
+/// `ferrum-ebpf` hand-builds the shape of `prod-restricted` in its prefilter
+/// unit test, because that crate may not carry `serde_yaml` and so cannot read
+/// the shipped policy. Nothing there notices when the policy changes — it had
+/// already drifted to an action the policy no longer carries. Derive the image
+/// from the real compiled bundle here, where both crates are in scope, so the
+/// hand copy has something to fail against.
+#[test]
+fn the_prefilter_image_of_the_shipped_policy_is_the_one_its_unit_test_asserts() {
+    let yaml = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../policies/examples/prod-restricted.yaml"
+    ));
+    let mut policy: ferrum_api::ClusterSecurityPolicy =
+        serde_yaml::from_str(yaml).expect("prod-restricted yaml");
+    // The shipped `defaultAction: audit` makes every event mandatory on its
+    // own, which would answer the question before a rule is read. The hand
+    // copy substitutes an Allow default for exactly that reason, so the image
+    // measures the three rules; derive both, and hold both.
+    let shipped = image_of(&policy);
+    policy.spec.runtime.default_action = RuntimeAction::Allow;
+    let rules_only = image_of(&policy);
+
+    for (what, image) in [("as shipped", shipped), ("rules only", rules_only)] {
+        assert_eq!(
+            image.observed_syscalls(),
+            ferrum_ebpf::DATAPATH_SYSCALLS.to_vec(),
+            "prod-restricted {what} no longer needs every hooked syscall; ferrum-ebpf's hand copy asserts that it does"
+        );
+        assert!(
+            !image.container_only,
+            "prod-restricted {what} now narrows to container events; ferrum-ebpf's hand copy says it does not"
+        );
+        assert!(
+            !image.drop_agent_self,
+            "prod-restricted {what} now drops the agent's own events; ferrum-ebpf's hand copy says it does not"
+        );
+    }
+}
+
+fn image_of(policy: &ferrum_api::ClusterSecurityPolicy) -> ferrum_ebpf::PrefilterImage {
+    let bundle =
+        ferrum_compiler::compile_cluster_policy(&policy.spec).expect("prod-restricted compiles");
+    let compiled = ferrum_ebpf::parse_febp(&bundle.ebpf_spec).expect("FEBP decodes");
+    ferrum_ebpf::prefilter_image(&compiled)
 }
 
 /// The install tree is the fourth place an invariant is written down, and the
