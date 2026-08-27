@@ -41,6 +41,13 @@ pub fn compile_yaml(raw: &str) -> Result<(Vec<u8>, String)> {
         &bundle.wasm,
     )
     .map_err(anyhow::Error::from)?;
-    debug_assert_eq!(ferrum_crypto::bundle_digest(&frmb), bundle.digest);
+    let written = ferrum_crypto::bundle_digest(&frmb);
+    if written != bundle.digest {
+        bail!(
+            "digest расходится: compile={} material={}",
+            bundle.digest.as_str(),
+            written.as_str()
+        );
+    }
     Ok((frmb, bundle.digest.as_str().to_string()))
 }
