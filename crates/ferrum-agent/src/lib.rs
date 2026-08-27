@@ -6,6 +6,7 @@
 mod clock;
 mod pump;
 mod respond;
+mod ring;
 mod source;
 
 use chrono::{DateTime, Utc};
@@ -78,6 +79,7 @@ pub use respond::{
     REFUSE_ROLE, REFUSE_STALE_TARGET, REFUSE_TARGET_GONE, REFUSE_TGID_INIT, REFUSE_TGID_RANGE,
     REFUSE_TGID_SELF, REFUSE_TGID_ZERO, REFUSE_UNKNOWN_IDENTITY, RESPOND_NO_HOST_PIDNS,
 };
+pub use ring::{RingLoop, RingTick};
 pub use source::{
     decode_fsig, encode_fsig, extract_fsig, load_exceptions_source, load_path, load_source,
     parse_trust_root, read_exceptions_path, read_source_path, ExtractedFsig, BUNDLE_DIGEST_KEY,

@@ -316,8 +316,20 @@ fn run(
         .unwrap_or_else(|err| die(&format!("read {}: {err}", elf_path.display())));
 
     let agent = Arc::new(RwLock::new(agent));
-    let mut handle = match KernelHandle::attach(&elf) {
-        Ok(handle) => handle,
+    let mut handle = match KernelHandle::attach_for_arch(&elf, arch) {
+        Ok(handle) => {
+            if !handle.unhooked_syscalls().is_empty() {
+                // Not fatal: the remaining hooks are the datapath. But rules
+                // naming these are dead on this node, and that must be said
+                // out loud rather than looking like a clean attach.
+                eprintln!(
+                    "ferrum-agent: no tracepoint on this arch for {}; rules naming them cannot \
+                     fire on this node",
+                    handle.unhooked_syscalls().join(", ")
+                );
+            }
+            handle
+        }
         Err(err) => {
             eprintln!("ferrum-agent: kernel attach failed, datapath is Degraded: {err}");
             ctx.set_degraded(true);
@@ -352,10 +364,10 @@ fn run(
     let drop_agent = Arc::clone(&agent);
     std::thread::spawn(move || {
         let mut handle = handle;
-        let mut idle_ms = 1u64;
-        let mut seen_drops = 0u64;
-        let mut since_drop_check = Duration::ZERO;
+        let mut ring =
+            ferrum_agent::RingLoop::new(Duration::from_millis(reload_ms), Instant::now());
         let mut publisher_alive = true;
+        let mut drop_check_broken = false;
         loop {
             if publisher_alive {
                 let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
@@ -389,28 +401,29 @@ fn run(
                     eprintln!("ferrum-agent: {}", ferrum_agent::CGROUP_PUBLISHER_GONE);
                 }
             }
-            let n = reader.drain(|record| {
-                let _ = tx.send(record.to_vec());
-            });
-            if n == 0 {
-                std::thread::sleep(Duration::from_millis(idle_ms));
-                since_drop_check += Duration::from_millis(idle_ms);
-                idle_ms = (idle_ms * 2).min(10);
-            } else {
-                idle_ms = 1;
+            let tick = ring.tick(
+                Instant::now(),
+                || {
+                    reader.drain(|record| {
+                        let _ = tx.send(record.to_vec());
+                    })
+                },
+                || handle.events_dropped_total(),
+            );
+            // Once: a counter that cannot be read stays unreadable, and this
+            // runs every reload tick.
+            if tick.drop_check_failed && !drop_check_broken {
+                drop_check_broken = true;
+                eprintln!("ferrum-agent: in-kernel drop counter unreadable; ring drops are blind");
             }
-            if since_drop_check >= Duration::from_millis(reload_ms) {
-                since_drop_check = Duration::ZERO;
-                if let Ok(total) = handle.events_dropped_total() {
-                    let delta = total.saturating_sub(seen_drops);
-                    if delta > 0 {
-                        seen_drops = total;
-                        drop_agent
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .record_drop(delta);
-                    }
-                }
+            if tick.drop_delta > 0 {
+                drop_agent
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_drop(tick.drop_delta);
+            }
+            if let Some(sleep) = tick.sleep {
+                std::thread::sleep(sleep);
             }
         }
     });
