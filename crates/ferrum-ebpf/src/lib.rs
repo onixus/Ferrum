@@ -5,7 +5,6 @@
 mod envelope;
 mod eval;
 mod event;
-#[cfg(feature = "attach")]
 mod kernel;
 mod loader;
 mod spec;
@@ -17,10 +16,11 @@ pub use event::{
     EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
 };
 pub use ferrum_ebpf_progs::{
-    Event, COMM_LEN, EVENTS_DROPPED_TOTAL, EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER,
-    MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
+    Event, CGROUPS_MAX_ENTRIES, COMM_LEN, EVENTS_DROPPED_TOTAL, EVENT_FLAG_AGENT_SELF,
+    EVENT_FLAG_CONTAINER, MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
 };
 pub use ferrum_ids::AGENT_ABI;
+pub use kernel::{plan_cgroup_sync, CgroupSyncPlan, SyncStats};
 #[cfg(feature = "attach")]
 pub use kernel::{KernelHandle, RingReader};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
