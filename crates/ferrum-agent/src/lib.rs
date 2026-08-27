@@ -124,6 +124,18 @@ pub struct Agent {
     respond_stale_target: AtomicU64,
     /// Latched from the sink: export died, enforcement is no longer recorded.
     export_dead: AtomicBool,
+    /// True once the carrier has pushed the cgroup index into `ferrum_cgroups`
+    /// and the kernel accepted the whole plan.
+    container_map_synced: AtomicBool,
+    /// Entries the datapath map holds after the last successful sync.
+    container_map_entries: AtomicU64,
+    /// Last sync failure. Kept as a reason so the operator sees why the
+    /// container flag cannot be trusted.
+    container_map_error: Mutex<Option<String>>,
+    /// Records where the index knew the pod but the datapath did not set
+    /// EVENT_FLAG_CONTAINER. Every one of these is a `container_only` rule
+    /// that did not match on a real container.
+    container_flag_disagreement: AtomicU64,
 }
 
 impl Agent {
@@ -161,6 +173,10 @@ impl Agent {
             respond_failed: AtomicU64::new(0),
             respond_stale_target: AtomicU64::new(0),
             export_dead: AtomicBool::new(false),
+            container_map_synced: AtomicBool::new(false),
+            container_map_entries: AtomicU64::new(0),
+            container_map_error: Mutex::new(None),
+            container_flag_disagreement: AtomicU64::new(0),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -182,8 +198,62 @@ impl Agent {
             // An empty cgroup index is not "no pods": every lookup misses, so
             // every namespaced selector silently fails to match.
             || self.cgroups.is_empty()
+            // The index alone proves nothing about the datapath: until those
+            // cgroups are in `ferrum_cgroups`, EVENT_FLAG_CONTAINER is never
+            // set and every container_only rule (shell, docker.sock) misses.
+            || !self.container_map_ready()
             || self.export_dead.load(Ordering::Relaxed)
             || self.respond_disabled_reason().is_some()
+    }
+
+    /// The kernel container map is usable: last sync succeeded and it holds
+    /// something. An empty map is not "no pods" — it is every container_only
+    /// rule silently not matching.
+    pub fn container_map_ready(&self) -> bool {
+        self.container_map_synced.load(Ordering::Relaxed)
+            && self.container_map_entries.load(Ordering::Relaxed) > 0
+            && self.container_map_error().is_none()
+    }
+
+    pub fn container_map_synced(&self) -> bool {
+        self.container_map_synced.load(Ordering::Relaxed)
+    }
+
+    pub fn container_map_entries(&self) -> u64 {
+        self.container_map_entries.load(Ordering::Relaxed)
+    }
+
+    pub fn container_map_error(&self) -> Option<String> {
+        self.container_map_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Called by the carrier after the kernel accepted a whole sync plan.
+    pub fn set_container_map_synced(&self, entries: u64) {
+        self.container_map_entries.store(entries, Ordering::Relaxed);
+        self.container_map_synced.store(true, Ordering::Relaxed);
+        *self
+            .container_map_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// A refused, partial or impossible sync. The map is no longer known to
+    /// mirror the index, so the agent is Degraded until a sync succeeds.
+    pub fn mark_container_map_error(&self, reason: impl Into<String>) {
+        self.container_map_synced.store(false, Ordering::Relaxed);
+        *self
+            .container_map_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(reason.into());
+    }
+
+    /// Events whose cgroup is a known pod but which arrived without
+    /// EVENT_FLAG_CONTAINER.
+    pub fn container_flag_disagreement_total(&self) -> u64 {
+        self.container_flag_disagreement.load(Ordering::Relaxed)
     }
 
     /// True only while a `KernelHandle` attach is live. `Loader::attach_pins`
@@ -561,7 +631,21 @@ impl Agent {
     ) -> Decision {
         let meta: EventMeta = meta.into();
         let identity = match self.cgroups.lookup_cgroup(meta.cgroup_id) {
-            Ok(id) => id,
+            Ok(id) => {
+                if !meta.in_container {
+                    // The index says this cgroup is a pod container and the
+                    // datapath did not flag it: `ferrum_cgroups` is behind the
+                    // index, so container_only rules are missing on real
+                    // containers. Counted and Degraded — the decision is NOT
+                    // upgraded from the flags we do have, and the kill guard
+                    // in `react` still refuses: a wrong kill on the node is
+                    // worse than a missed one.
+                    self.container_flag_disagreement
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.datapath_degraded.store(true, Ordering::Relaxed);
+                }
+                id
+            }
             Err(_) => WorkloadIdentity::unknown(),
         };
         let mut decision = self.loader.decide(event, &identity);
@@ -2301,6 +2385,7 @@ mod tests {
         let mut agent = Agent::new(cfg());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         agent.set_attached(true);
+        agent.set_container_map_synced(1);
         assert_eq!(agent.cgroup_index_len(), 0);
         assert!(agent.is_degraded(), "empty index must be Degraded");
 
@@ -2314,6 +2399,99 @@ mod tests {
         index.insert(8, identity("pod-b"));
         assert_eq!(agent.lookup_cgroup(8).expect("hit").pod, "pod-b");
         assert!(!agent.is_degraded());
+    }
+
+    /// An index full of pods proves nothing about the datapath: until those
+    /// cgroups are in `ferrum_cgroups`, EVENT_FLAG_CONTAINER is never set.
+    #[test]
+    fn an_unsynced_container_map_is_degraded() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, identity("pod-a"));
+        assert!(!agent.container_map_synced());
+        assert!(
+            agent.is_degraded(),
+            "a non-empty index with an unsynced kernel map must be Degraded"
+        );
+
+        agent.set_container_map_synced(1);
+        assert!(!agent.is_degraded());
+        assert_eq!(agent.container_map_entries(), 1);
+
+        // A map that synced to nothing is not "no pods" either.
+        agent.set_container_map_synced(0);
+        assert!(agent.is_degraded());
+
+        agent.set_container_map_synced(1);
+        agent.mark_container_map_error("partial sync");
+        assert_eq!(agent.container_map_error().as_deref(), Some("partial sync"));
+        assert!(agent.is_degraded());
+        agent.set_container_map_synced(2);
+        assert!(agent.container_map_error().is_none());
+        assert!(!agent.is_degraded());
+    }
+
+    /// The index knows the pod, the record has no EVENT_FLAG_CONTAINER: the
+    /// kernel map is behind. Count it, degrade — and still refuse the kill,
+    /// because the flag is the last thing standing between a rule and a
+    /// process on the node.
+    #[test]
+    fn a_missing_container_flag_is_counted_and_still_not_killed() {
+        let (agent, fake) = respond_agent_with_fake();
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        assert!(!agent.is_degraded());
+
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: 7,
+            pid: 4242,
+            tgid: 4242,
+            in_container: false,
+            agent_self: false,
+        };
+        let decision =
+            agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", false, false), &sink);
+
+        assert!(agent.container_flag_disagreement_total() > 0);
+        assert!(agent.is_degraded());
+        // No flag, no container_only match, and no kill: the decision is not
+        // upgraded from what the datapath actually reported.
+        assert_ne!(decision.action, Action::Kill);
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_kill_total(), 0);
+    }
+
+    /// Regression: even when the rule does match on the string view, a record
+    /// without EVENT_FLAG_CONTAINER never reaches the responder.
+    #[test]
+    fn kill_is_refused_when_the_record_is_not_flagged_container() {
+        let (agent, fake) = respond_agent_with_fake();
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: 7,
+            pid: 4242,
+            tgid: 4242,
+            in_container: false,
+            agent_self: false,
+        };
+        // The string view claims a container; the record flags do not. The
+        // flags win.
+        let decision = agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+        assert_eq!(decision.action, Action::Kill);
+        assert!(fake.killed().is_empty());
+        assert_eq!(agent.respond_kill_total(), 0);
+        assert_eq!(
+            sink.events()[0].respond_error.as_deref(),
+            Some(REFUSE_NOT_CONTAINER)
+        );
+        assert!(agent.container_flag_disagreement_total() > 0);
     }
 
     /// Respond that cannot be delivered (no host pid namespace) drops to
@@ -2354,6 +2532,7 @@ mod tests {
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         agent.set_attached(true);
         agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
         assert!(!agent.is_degraded());
         agent.handle_event(
             container_meta(4242),
@@ -2369,6 +2548,7 @@ mod tests {
         let mut agent = Agent::new(cfg());
         load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
         agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
         assert!(!agent.pins_attached());
         assert!(agent.is_degraded());
         agent.set_attached(true);
