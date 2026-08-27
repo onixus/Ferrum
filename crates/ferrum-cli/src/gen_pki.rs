@@ -1,13 +1,16 @@
 //! `ferrumctl gen-webhook-pki` — the offline issuance step that turns the
 //! webhook template into something `kubectl apply` accepts.
 //!
-//! There is no cluster call and no controller here: this runs once, before the
-//! install, on the operator's machine. Rotation is not this command's job.
+//! There is no cluster call and no controller here: it runs on the operator's
+//! machine, before the install and again before the certificate expires.
+//! Rotation (`--ca-cert`/`--ca-key`) reissues only the leaf under the CA the
+//! cluster already trusts, so the caBundle — and the applied
+//! ValidatingWebhookConfiguration — stay exactly as they are.
 
 use anyhow::{bail, Context, Result};
 use ferrum_crypto::x509::{
-    base64_encode, issue_ca, issue_serving_cert, verify_chain, CaMaterial, ServingMaterial,
-    MAX_SERVING_CERT_DAYS,
+    base64_encode, days_until_expiry, issue_ca, issue_serving_cert, verify_chain, CaMaterial,
+    ServingMaterial, MAX_SERVING_CERT_DAYS,
 };
 use std::fs;
 use std::io::Write;
@@ -20,6 +23,10 @@ use crate::lint_deploy::{CA_BUNDLE_PLACEHOLDER, WEBHOOK_TLS_SECRET_SUFFIX};
 /// file that rendering writes next to it.
 pub const WEBHOOK_TEMPLATE_FILE: &str = "validatingwebhookconfiguration.tmpl.yaml";
 pub const WEBHOOK_RENDERED_FILE: &str = "validatingwebhookconfiguration.yaml";
+/// Issued CA, written next to the rendered configuration. `ca.key` is the
+/// rotation key: it never reaches a cluster and must not be committed.
+pub const CA_CERT_FILE: &str = "ca.crt";
+pub const CA_KEY_FILE: &str = "ca.key";
 
 /// Private key material on disk is owner-only, same rule as the export sink.
 #[cfg(unix)]
@@ -31,6 +38,9 @@ pub struct GenPkiArgs {
     pub days: u64,
     pub out_dir: Option<PathBuf>,
     pub template: Option<PathBuf>,
+    /// Rotation: reuse this CA instead of issuing one. Both halves or neither.
+    pub ca_cert: Option<PathBuf>,
+    pub ca_key: Option<PathBuf>,
 }
 
 pub fn gen_webhook_pki(args: &GenPkiArgs) -> Result<()> {
@@ -43,10 +53,23 @@ pub fn gen_webhook_pki(args: &GenPkiArgs) -> Result<()> {
             args.days
         );
     }
-    let not_after = SystemTime::now() + Duration::from_secs(args.days * 86_400);
+    let now = SystemTime::now();
+    let not_after = now + Duration::from_secs(args.days * 86_400);
+    // The CA gets every day the issuance rule allows, not the leaf's lifetime:
+    // a CA that ends with its own leaf can never be rotated under, which is the
+    // install this command used to produce.
+    let ca_not_after = std::cmp::max(
+        not_after,
+        now + Duration::from_secs(MAX_SERVING_CERT_DAYS * 86_400),
+    );
 
-    let ca = issue_ca(&format!("{}-ca", args.service), not_after)
-        .with_context(|| format!("issue CA for {}", args.service))?;
+    let ca = match (&args.ca_cert, &args.ca_key) {
+        (None, None) => issue_ca(&format!("{}-ca", args.service), ca_not_after)
+            .with_context(|| format!("issue CA for {}", args.service))?,
+        (Some(cert), Some(key)) => reusable_ca(cert, key, args.days)?,
+        _ => bail!("--ca-cert and --ca-key must be given together"),
+    };
+    let rotating = args.ca_cert.is_some();
     let serving = issue_serving_cert(&ca, &args.service, &args.namespace, not_after)
         .with_context(|| format!("issue serving certificate for {}", args.service))?;
     // The gate is the chain, not the fact that issuance returned.
@@ -56,20 +79,110 @@ pub fn gen_webhook_pki(args: &GenPkiArgs) -> Result<()> {
     let secret_yaml = secret_manifest(&secret_name, &args.namespace, &args.service, &serving);
     let ca_bundle = base64_encode(ca.cert_pem.as_bytes());
 
+    // Rotation exists so the ValidatingWebhookConfiguration can stay applied
+    // untouched. A rendered configuration that already trusts a different CA
+    // would keep rejecting the new leaf, so refuse before writing anything.
+    if rotating {
+        for dir in ca_dir(args).iter().chain(args.out_dir.iter()) {
+            rendered_ca_bundle_matches(dir, &ca_bundle)?;
+        }
+    }
+
     match &args.out_dir {
         None => {
             print!("{secret_yaml}");
-            println!("---");
-            print!(
-                "{}",
-                ca_bundle_note(&args.service, &ca_bundle, &secret_name, &args.namespace)
-            );
+            if rotating {
+                print!("{}", rotation_note(&secret_name, &args.namespace));
+            } else {
+                println!("---");
+                print!(
+                    "{}",
+                    ca_bundle_note(&args.service, &ca_bundle, &secret_name, &args.namespace)
+                );
+            }
             Ok(())
         }
-        Some(dir) => write_out_dir(args, dir, &secret_name, &secret_yaml, &ca_bundle, &ca),
+        Some(dir) => write_out_dir(
+            args,
+            dir,
+            &secret_name,
+            &secret_yaml,
+            &ca_bundle,
+            &ca,
+            rotating,
+        ),
     }
 }
 
+fn ca_dir(args: &GenPkiArgs) -> Option<PathBuf> {
+    let parent = args.ca_cert.as_ref()?.parent()?;
+    Some(if parent.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        parent.to_path_buf()
+    })
+}
+
+/// Load the CA the webhook's caBundle already carries. Refuses a CA that
+/// expires before the leaf would: `verify_chain` requires the leaf window to
+/// nest inside the issuer's, and a CA this close to its own end cannot be
+/// rotated under without replacing the caBundle too.
+fn reusable_ca(cert_path: &Path, key_path: &Path, days: u64) -> Result<CaMaterial> {
+    let ca = CaMaterial {
+        cert_pem: fs::read_to_string(cert_path)
+            .with_context(|| format!("read CA certificate {}", cert_path.display()))?,
+        key_pem: fs::read_to_string(key_path)
+            .with_context(|| format!("read CA key {}", key_path.display()))?,
+    };
+    let left = days_until_expiry(&ca.cert_pem)
+        .with_context(|| format!("read validity of {}", cert_path.display()))?;
+    // Strictly fewer days than the CA has left, not the same number: the two
+    // notAfter values are seconds apart, and `verify_chain` requires the leaf
+    // window to nest inside the issuer's.
+    if left < 2 {
+        bail!(
+            "{}: this CA has {left} day(s) of validity left; a leaf can no longer be rotated \
+             under it — reissue the CA, and the caBundle in the ValidatingWebhookConfiguration \
+             with it",
+            cert_path.display()
+        );
+    }
+    if i64::try_from(days).unwrap_or(i64::MAX) >= left {
+        bail!(
+            "{}: this CA has {left} day(s) left and a leaf may not outlive its issuer; rotate \
+             with --days {} or fewer, or reissue the CA and the caBundle with it",
+            cert_path.display(),
+            left - 1
+        );
+    }
+    Ok(ca)
+}
+
+/// A rendered configuration in `dir` must already trust `ca_bundle`; a missing
+/// file is not a finding, the operator may keep it elsewhere.
+fn rendered_ca_bundle_matches(dir: &Path, ca_bundle: &str) -> Result<()> {
+    let path = dir.join(WEBHOOK_RENDERED_FILE);
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Some(current) = raw
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("caBundle:"))
+        .map(str::trim)
+    else {
+        return Ok(());
+    };
+    if current != ca_bundle {
+        bail!(
+            "{}: its caBundle is not the CA given as --ca-cert. Rotating the leaf under a \
+             different CA leaves the applied webhook trusting the wrong issuer",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_out_dir(
     args: &GenPkiArgs,
     dir: &Path,
@@ -77,10 +190,27 @@ fn write_out_dir(
     secret_yaml: &str,
     ca_bundle: &str,
     ca: &CaMaterial,
+    rotating: bool,
 ) -> Result<()> {
     if !dir.is_dir() {
         bail!("{}: --out-dir must be an existing directory", dir.display());
     }
+    let secret_path = dir.join(format!("{secret_name}.secret.yaml"));
+    if rotating {
+        // No ca.crt, no rendered configuration: rotation reissues the leaf and
+        // nothing else, which is what keeps the applied webhook valid.
+        if secret_path.exists() {
+            bail!(
+                "{}: refusing to overwrite existing PKI output; rotate into an empty directory",
+                secret_path.display()
+            );
+        }
+        write_private(&secret_path, secret_yaml.as_bytes())?;
+        println!("wrote {}", secret_path.display());
+        print!("{}", rotation_note(secret_name, &args.namespace));
+        return Ok(());
+    }
+
     let template = args
         .template
         .clone()
@@ -94,12 +224,12 @@ fn write_out_dir(
         );
     }
 
-    let secret_path = dir.join(format!("{secret_name}.secret.yaml"));
     let rendered_path = dir.join(WEBHOOK_RENDERED_FILE);
-    let ca_path = dir.join("ca.crt");
+    let ca_path = dir.join(CA_CERT_FILE);
+    let ca_key_path = dir.join(CA_KEY_FILE);
     // Refuse rather than overwrite: the old key is the only thing that can
     // still serve the certificate the API server is pinned to.
-    for path in [&secret_path, &rendered_path, &ca_path] {
+    for path in [&secret_path, &rendered_path, &ca_path, &ca_key_path] {
         if path.exists() {
             bail!(
                 "{}: refusing to overwrite existing PKI output; remove it deliberately first",
@@ -116,10 +246,14 @@ fn write_out_dir(
     .with_context(|| format!("write {}", rendered_path.display()))?;
     fs::write(&ca_path, ca.cert_pem.as_bytes())
         .with_context(|| format!("write {}", ca_path.display()))?;
+    // The issuing key. Nothing applies it to a cluster; it exists so the leaf
+    // can be rotated later without moving the caBundle. Keep it offline.
+    write_private(&ca_key_path, ca.key_pem.as_bytes())?;
 
     println!("wrote {}", secret_path.display());
     println!("wrote {}", rendered_path.display());
     println!("wrote {}", ca_path.display());
+    println!("wrote {}", ca_key_path.display());
     Ok(())
 }
 
@@ -166,6 +300,16 @@ pub fn secret_manifest(
     )
 }
 
+fn rotation_note(secret_name: &str, namespace: &str) -> String {
+    format!(
+        "# Rotation: same CA, new leaf. The caBundle and the applied\n\
+         # ValidatingWebhookConfiguration do not change.\n\
+         # kubectl -n {namespace} apply -f <this Secret>, then restart the webhook Pods\n\
+         # (or wait for kubelet to refresh the mount; the server reloads it in place).\n\
+         # Secret: {secret_name}\n"
+    )
+}
+
 fn ca_bundle_note(service: &str, ca_bundle: &str, secret_name: &str, namespace: &str) -> String {
     format!(
         "# caBundle for the ValidatingWebhookConfiguration; substitutes\n\
@@ -179,7 +323,7 @@ fn ca_bundle_note(service: &str, ca_bundle: &str, secret_name: &str, namespace: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_crypto::x509::base64_decode;
+    use ferrum_crypto::x509::{base64_decode, verify_issued_pair};
 
     fn args(dir: Option<PathBuf>) -> GenPkiArgs {
         GenPkiArgs {
@@ -188,7 +332,24 @@ mod tests {
             days: 365,
             out_dir: dir,
             template: None,
+            ca_cert: None,
+            ca_key: None,
         }
+    }
+
+    fn rotation_args(dir: &Path, out: Option<PathBuf>, days: u64) -> GenPkiArgs {
+        GenPkiArgs {
+            days,
+            ca_cert: Some(dir.join(CA_CERT_FILE)),
+            ca_key: Some(dir.join(CA_KEY_FILE)),
+            ..args(out)
+        }
+    }
+
+    fn leaf_pem(secret: &Path) -> String {
+        let raw = fs::read_to_string(secret).unwrap();
+        let doc: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
+        String::from_utf8(base64_decode(doc["data"]["tls.crt"].as_str().unwrap()).unwrap()).unwrap()
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -272,6 +433,82 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, KEY_FILE_MODE);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The point of rotation: a second leaf from the same CA, and a caBundle
+    /// the ValidatingWebhookConfiguration never has to be re-applied for.
+    #[test]
+    fn rotation_reissues_only_the_leaf() {
+        let dir = temp_dir("rotate");
+        seed(&dir);
+        gen_webhook_pki(&args(Some(dir.clone()))).unwrap();
+        let rendered_before = fs::read(dir.join(WEBHOOK_RENDERED_FILE)).unwrap();
+        let ca_before = fs::read_to_string(dir.join(CA_CERT_FILE)).unwrap();
+        let first = leaf_pem(&dir.join("ferrum-admission-tls.secret.yaml"));
+
+        let out = dir.join("rotated");
+        fs::create_dir_all(&out).unwrap();
+        gen_webhook_pki(&rotation_args(&dir, Some(out.clone()), 365)).unwrap();
+
+        assert!(
+            !out.join(CA_CERT_FILE).exists(),
+            "rotation must not reissue the CA"
+        );
+        assert!(
+            !out.join(WEBHOOK_RENDERED_FILE).exists(),
+            "rotation must not re-render the webhook configuration"
+        );
+        assert_eq!(
+            fs::read(dir.join(WEBHOOK_RENDERED_FILE)).unwrap(),
+            rendered_before,
+            "the caBundle must not change byte for byte"
+        );
+
+        let second = leaf_pem(&out.join("ferrum-admission-tls.secret.yaml"));
+        assert_ne!(first, second, "rotation must issue a new leaf");
+        verify_issued_pair(&ca_before, &second).expect("leaf 2 must verify against the same CA");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The CA is issued for the maximum lifetime, so a leaf asking for more
+    /// than what is left of it is the case that has to be refused.
+    #[test]
+    fn a_leaf_outliving_the_ca_is_refused() {
+        let dir = temp_dir("rotate-short-ca");
+        seed(&dir);
+        gen_webhook_pki(&args(Some(dir.clone()))).unwrap();
+
+        let out = dir.join("rotated");
+        fs::create_dir_all(&out).unwrap();
+        let err = gen_webhook_pki(&rotation_args(&dir, Some(out), MAX_SERVING_CERT_DAYS))
+            .expect_err("a leaf may not outlive its issuer");
+        assert!(err.to_string().contains("day(s) left"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rotation_under_a_foreign_ca_is_refused() {
+        let mine = temp_dir("rotate-mine");
+        seed(&mine);
+        gen_webhook_pki(&args(Some(mine.clone()))).unwrap();
+        let other = temp_dir("rotate-other");
+        seed(&other);
+        gen_webhook_pki(&args(Some(other.clone()))).unwrap();
+
+        // The rendered configuration in `mine` trusts the CA of `mine`, not this one.
+        let err = gen_webhook_pki(&rotation_args(&other, Some(mine.clone()), 365))
+            .expect_err("a CA the applied webhook does not trust must be refused");
+        assert!(err.to_string().contains("caBundle is not the CA"), "{err}");
+        fs::remove_dir_all(&mine).ok();
+        fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn one_half_of_the_ca_is_refused() {
+        let mut a = args(None);
+        a.ca_cert = Some(PathBuf::from("ca.crt"));
+        let err = gen_webhook_pki(&a).expect_err("half a CA is not a CA");
+        assert!(err.to_string().contains("must be given together"), "{err}");
     }
 
     #[test]

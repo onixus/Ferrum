@@ -308,6 +308,8 @@ mod deploy_tree {
             days: 365,
             out_dir: Some(admission.clone()),
             template: None,
+            ca_cert: None,
+            ca_key: None,
         })
         .expect("issue webhook PKI");
 

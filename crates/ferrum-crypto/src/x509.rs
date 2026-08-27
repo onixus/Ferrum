@@ -25,6 +25,12 @@ use x509_parser::prelude::*;
 /// that outlives the rule is a certificate nobody rotates.
 pub const MAX_SERVING_CERT_DAYS: u64 = 398;
 
+/// Days before notAfter at which issued material counts as expiring: the
+/// deploy lint fails on it and the webhook logs it. Rotation has to complete
+/// inside this window, and the webhook restates the same threshold — it cannot
+/// link this module.
+pub const SERVING_CERT_WARN_DAYS: u64 = 30;
+
 const DAY_SECS: u64 = 86_400;
 
 /// notBefore is backdated by this much. A node whose clock trails the issuing
@@ -237,6 +243,45 @@ pub fn verify_chain(serving: &ServingMaterial, ca: &CaMaterial) -> Result<()> {
         .map_err(|e| {
             FerrumError::Integrity(format!("serving certificate is not signed by this CA: {e}"))
         })
+}
+
+/// [`verify_chain`] for material read back from manifests, where only the two
+/// certificates exist: the caBundle of a webhook and the `tls.crt` of the
+/// Secret it is supposed to match. The SAN comes from the leaf itself, so this
+/// checks the pairing, not what someone claims the leaf covers.
+pub fn verify_issued_pair(ca_cert_pem: &str, leaf_cert_pem: &str) -> Result<()> {
+    let der = single(pem_certificates(leaf_cert_pem)?, "serving certificate")?;
+    let (_, leaf) = X509Certificate::from_der(&der).map_err(|e| {
+        FerrumError::Integrity(format!(
+            "serving certificate is not a valid certificate: {e}"
+        ))
+    })?;
+    let dns_names = dns_san(&leaf)?;
+    verify_chain(
+        &ServingMaterial {
+            cert_pem: leaf_cert_pem.to_string(),
+            key_pem: String::new(),
+            dns_names,
+        },
+        &CaMaterial {
+            cert_pem: ca_cert_pem.to_string(),
+            key_pem: String::new(),
+        },
+    )
+}
+
+/// Whole days from now until the certificate's notAfter; negative once it has
+/// passed. Rotation needs the number, not just the boolean: a new leaf may not
+/// outlive the CA that signs it.
+pub fn days_until_expiry(cert_pem: &str) -> Result<i64> {
+    let der = single(pem_certificates(cert_pem)?, "certificate")?;
+    let (_, cert) = X509Certificate::from_der(&der)
+        .map_err(|e| FerrumError::Integrity(format!("not a valid certificate: {e}")))?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|_| FerrumError::Integrity("system clock is before the epoch".into()))?
+        .as_secs() as i64;
+    Ok((cert.validity().not_after.timestamp() - now).div_euclid(DAY_SECS as i64))
 }
 
 /// True when the certificate's notAfter has passed or falls inside `within`.
@@ -715,6 +760,24 @@ mod tests {
         let ca = issue_ca("ferrum-admission-ca", in_days(30)).unwrap();
         assert!(!expires_within(&ca.cert_pem, Duration::from_secs(DAY_SECS)).unwrap());
         assert!(expires_within(&ca.cert_pem, Duration::from_secs(31 * DAY_SECS)).unwrap());
+    }
+
+    #[test]
+    fn an_issued_pair_verifies_without_its_keys() {
+        let (ca, serving) = issued(365);
+        verify_issued_pair(&ca.cert_pem, &serving.cert_pem).expect("issued pair must verify");
+        let other = issue_ca("someone-else", in_days(365)).expect("ca");
+        let err = verify_issued_pair(&other.cert_pem, &serving.cert_pem)
+            .expect_err("a foreign CA must not verify the leaf");
+        assert!(matches!(err, FerrumError::Integrity(_)), "{err}");
+    }
+
+    #[test]
+    fn remaining_days_are_read_from_the_certificate() {
+        let ca = issue_ca("ferrum-admission-ca", in_days(30)).unwrap();
+        let left = days_until_expiry(&ca.cert_pem).unwrap();
+        assert!((29..=30).contains(&left), "{left}");
+        assert!(days_until_expiry("not a certificate").is_err());
     }
 
     #[test]
