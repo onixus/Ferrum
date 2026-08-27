@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-agent
+  namespace: ferrum
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-agent
+    spec:
+      containers:
+        - name: agent
+          image: ghcr.io/ferrum/ferrum-agent:v0.1.0
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock

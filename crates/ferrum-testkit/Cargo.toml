@@ -26,4 +26,5 @@ ferrum-ebpf.workspace = true
 ferrum-export.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+ferrum-policy.workspace = true
 serde_json.workspace = true
