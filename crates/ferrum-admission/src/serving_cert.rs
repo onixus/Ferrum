@@ -21,16 +21,45 @@ use std::time::Duration;
 
 use crate::server::{stamp_one, FileStamp};
 
-/// Days before notAfter at which the loaded certificate becomes loud. Same
-/// threshold as `ferrum_crypto::x509::SERVING_CERT_WARN_DAYS`, restated here
-/// because that module carries the issuer and the parser this binary must not
-/// link.
-pub const SERVING_CERT_WARN_DAYS: i64 = 30;
+/// Days before notAfter at which the loaded certificate becomes loud. Defined
+/// in `ferrum-common` so the deploy lint and this binary cannot drift: the
+/// lint reads it through `ferrum_crypto::x509`, which carries the parser this
+/// binary must not link.
+pub const SERVING_CERT_WARN_DAYS: i64 = ferrum_common::SERVING_CERT_WARN_DAYS as i64;
 
 const DAY_SECS: i64 = 86_400;
 
 /// subjectAltName, OID 2.5.29.17.
 const SAN_OID: &[u8] = &[0x55, 0x1d, 0x11];
+/// authorityKeyIdentifier, OID 2.5.29.35. Its keyIdentifier is a digest of the
+/// issuer's public key, which is what makes two CAs of the same name tell apart.
+const AKI_OID: &[u8] = &[0x55, 0x1d, 0x23];
+
+/// Who signed the material: the issuer Name as it appears in the certificate,
+/// plus the authorityKeyIdentifier when the issuer set one.
+///
+/// This is a pin, not a verification. Building a chain to the CA in the applied
+/// `caBundle` needs a certificate library, and `ferrum-crypto/x509` — the one
+/// this workspace has — is exactly what the `Crate boundary` stage keeps off
+/// this binary. What is affordable here is refusing material that names a
+/// different issuer than the certificate this process started with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Issuer {
+    /// DER of the issuer `Name`, element header included.
+    pub name_der: Vec<u8>,
+    /// keyIdentifier from authorityKeyIdentifier, when present.
+    pub key_id: Option<Vec<u8>>,
+}
+
+impl Issuer {
+    /// Short, stable label for a log line; the DER itself is not readable.
+    fn label(&self) -> String {
+        match &self.key_id {
+            Some(id) => format!("keyid {}", hex(id)),
+            None => format!("issuer {}", hex(&fnv1a(&self.name_der).to_be_bytes())),
+        }
+    }
+}
 
 /// What the decision path needs from a serving certificate.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,6 +68,8 @@ pub struct CertFacts {
     pub not_after: i64,
     /// DNS SAN entries, in certificate order.
     pub dns_names: Vec<String>,
+    /// The CA the certificate names as its issuer.
+    pub issuer: Issuer,
 }
 
 impl CertFacts {
@@ -51,6 +82,7 @@ impl CertFacts {
     }
 }
 
+#[derive(Clone)]
 struct Loaded {
     config: Arc<ServerConfig>,
     facts: CertFacts,
@@ -65,8 +97,17 @@ pub struct TlsSource {
     cert_path: PathBuf,
     key_path: PathBuf,
     loaded: RwLock<Loaded>,
+    /// The issuer of the certificate this process started with. The applied
+    /// caBundle names one CA and only material from it can be served, so a
+    /// rotation that changes issuer is a mistake, not a rotation.
+    pinned_issuer: Issuer,
+    /// The material that was serving before the last successful swap. Kept so
+    /// a swap can be undone: under `failurePolicy: Fail` there is no second
+    /// chance to fetch the old Secret back.
+    previous: RwLock<Option<Loaded>>,
     reload_failures: AtomicU64,
     expiry_warnings: AtomicU64,
+    rollbacks: AtomicU64,
 }
 
 impl TlsSource {
@@ -75,6 +116,7 @@ impl TlsSource {
     /// `failurePolicy: Fail`, worse than not starting.
     pub fn load(cert_path: &str, key_path: &str) -> Result<Arc<Self>, String> {
         let (config, facts) = read_material(Path::new(cert_path), Path::new(key_path))?;
+        let pinned_issuer = facts.issuer.clone();
         let source = Arc::new(Self {
             cert_path: PathBuf::from(cert_path),
             key_path: PathBuf::from(key_path),
@@ -83,8 +125,11 @@ impl TlsSource {
                 facts,
                 warned: false,
             }),
+            pinned_issuer,
+            previous: RwLock::new(None),
             reload_failures: AtomicU64::new(0),
             expiry_warnings: AtomicU64::new(0),
+            rollbacks: AtomicU64::new(0),
         });
         source.check_expiry();
         Ok(source)
@@ -113,6 +158,11 @@ impl TlsSource {
         self.expiry_warnings.load(Ordering::Relaxed)
     }
 
+    /// How many swaps were undone by [`Self::roll_back`].
+    pub fn rollbacks(&self) -> u64 {
+        self.rollbacks.load(Ordering::Relaxed)
+    }
+
     /// Re-read both files and swap on success. Errors leave the old material
     /// serving and are counted.
     pub fn reload(&self) -> Result<(), String> {
@@ -128,12 +178,51 @@ impl TlsSource {
                 facts.dns_names, previous.dns_names
             ));
         }
-        *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = Loaded {
-            config,
-            facts,
-            warned: false,
-        };
+        // A leaf from another CA parses, has a SAN and has not expired, so
+        // every other check here passes it — and the API server, which trusts
+        // one caBundle, rejects every handshake it makes. Serving it means
+        // throwing away working material for material that cannot work.
+        if facts.issuer != self.pinned_issuer {
+            self.reload_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(format!(
+                "new serving certificate was issued by {}, not by {} which signed the certificate \
+                 this process started with; the API server trusts one caBundle and would reject it",
+                facts.issuer.label(),
+                self.pinned_issuer.label()
+            ));
+        }
+        let mut loaded = self.loaded.write().unwrap_or_else(|e| e.into_inner());
+        let replaced = std::mem::replace(
+            &mut *loaded,
+            Loaded {
+                config,
+                facts,
+                warned: false,
+            },
+        );
+        drop(loaded);
+        *self.previous.write().unwrap_or_else(|e| e.into_inner()) = Some(replaced);
         self.check_expiry();
+        Ok(())
+    }
+
+    /// Put the material from before the last swap back. Only useful while that
+    /// material is still usable, so an expired one is refused: a rollback that
+    /// installs a dead certificate is the same outage as the swap it undoes.
+    pub fn roll_back(&self) -> Result<(), String> {
+        let mut slot = self.previous.write().unwrap_or_else(|e| e.into_inner());
+        let Some(candidate) = slot.take() else {
+            return Err("no previous serving material to roll back to".to_string());
+        };
+        if candidate.facts.not_after <= now_unix() {
+            return Err(format!(
+                "previous serving certificate expired at unix {}; there is nothing to roll back to",
+                candidate.facts.not_after
+            ));
+        }
+        *self.loaded.write().unwrap_or_else(|e| e.into_inner()) = candidate;
+        drop(slot);
+        self.rollbacks.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -179,16 +268,43 @@ fn poll_loop(source: Arc<TlsSource>, interval: Duration) {
             continue;
         }
         stamp = Some((cert, key));
+        let before = source.facts();
         if let Err(err) = source.reload() {
             eprintln!(
                 "ferrum-admission: serving certificate reload failed, keeping the current one \
                  (serving_cert_reload_failures_total={}): {err}",
                 source.reload_failures()
             );
-        } else {
-            eprintln!("ferrum-admission: serving certificate reloaded");
+            continue;
         }
+        let after = source.facts();
+        if is_stale_rotation(&before, &after, now_unix()) {
+            match source.roll_back() {
+                Ok(()) => eprintln!(
+                    "ferrum-admission: new serving certificate expires at unix {} (within \
+                     {SERVING_CERT_WARN_DAYS} days) while the one it replaced does not; rolled \
+                     back (serving_cert_rollbacks_total={})",
+                    after.not_after,
+                    source.rollbacks()
+                ),
+                Err(err) => eprintln!(
+                    "ferrum-admission: new serving certificate is already expiring and the \
+                     rollback failed, serving it anyway: {err}"
+                ),
+            }
+            continue;
+        }
+        eprintln!("ferrum-admission: serving certificate reloaded");
     }
+}
+
+/// A swap onto material that is already inside the rotation window, replacing
+/// material that was not: an old Secret re-applied, not a rotation. Shorter
+/// alone is not enough — a 90-day leaf legitimately replaces one with more time
+/// left than that.
+fn is_stale_rotation(before: &CertFacts, after: &CertFacts, now: i64) -> bool {
+    after.expires_within_days(now, SERVING_CERT_WARN_DAYS)
+        && !before.expires_within_days(now, SERVING_CERT_WARN_DAYS)
 }
 
 fn read_material(
@@ -269,10 +385,16 @@ pub fn certificate_facts(der: &[u8]) -> Result<CertFacts, String> {
     if first.tag == 0xa0 {
         rest = after_first;
     }
-    // serialNumber, signature, issuer.
-    for _ in 0..3 {
+    // serialNumber, signature.
+    for _ in 0..2 {
         rest = take(rest)?.1;
     }
+    let at_issuer = rest;
+    let after_issuer = take(rest)?.1;
+    // The Name as encoded, header included: a byte-for-byte pin, not a parse
+    // of the RDN sequence.
+    let issuer_name_der = at_issuer[..at_issuer.len() - after_issuer.len()].to_vec();
+    rest = after_issuer;
     let (validity, after_validity) = take(rest)?;
     expect(&validity, 0x30, "validity")?;
     let (_not_before, after_not_before) = take(validity.value)?;
@@ -285,58 +407,110 @@ pub fn certificate_facts(der: &[u8]) -> Result<CertFacts, String> {
         rest = take(rest)?.1;
     }
     let mut dns_names = Vec::new();
+    let mut key_id = None;
     while !rest.is_empty() {
         let (tlv, next) = take(rest)?;
         rest = next;
         if tlv.tag == 0xa3 {
-            dns_names = san_dns_names(tlv.value)?;
+            (dns_names, key_id) = extensions(tlv.value)?;
             break;
         }
     }
     Ok(CertFacts {
         not_after,
         dns_names,
+        issuer: Issuer {
+            name_der: issuer_name_der,
+            key_id,
+        },
     })
 }
 
-fn san_dns_names(extensions: &[u8]) -> Result<Vec<String>, String> {
-    let (seq, _) = take(extensions)?;
+/// DNS SAN entries and the authorityKeyIdentifier keyIdentifier, from one walk
+/// of the extension sequence.
+type Extensions = (Vec<String>, Option<Vec<u8>>);
+
+fn extensions(der: &[u8]) -> Result<Extensions, String> {
+    let (seq, _) = take(der)?;
     expect(&seq, 0x30, "extensions")?;
     let mut rest = seq.value;
+    let mut dns_names = Vec::new();
+    let mut key_id = None;
     while !rest.is_empty() {
         let (ext, next) = take(rest)?;
         rest = next;
         expect(&ext, 0x30, "extension")?;
         let (oid, after_oid) = take(ext.value)?;
         expect(&oid, 0x06, "extension OID")?;
-        if oid.value != SAN_OID {
+        let wanted = oid.value == SAN_OID || oid.value == AKI_OID;
+        if !wanted {
             continue;
         }
+        // The optional critical BOOLEAN sits between the OID and the value.
         let (mut payload, after) = take(after_oid)?;
         if payload.tag == 0x01 {
             payload = take(after)?.0;
         }
-        expect(&payload, 0x04, "subjectAltName value")?;
-        let (names, _) = take(payload.value)?;
-        expect(&names, 0x30, "GeneralNames")?;
-        let mut names_rest = names.value;
-        let mut out = Vec::new();
-        while !names_rest.is_empty() {
-            let (name, next) = take(names_rest)?;
-            names_rest = next;
-            // [2] IMPLICIT IA5String dNSName; other name forms are not what the
-            // API server dials the webhook by.
-            if name.tag == 0x82 {
-                out.push(
-                    std::str::from_utf8(name.value)
-                        .map_err(|_| "dNSName is not UTF-8".to_string())?
-                        .to_string(),
-                );
-            }
+        expect(&payload, 0x04, "extension value")?;
+        if oid.value == SAN_OID {
+            dns_names = san_dns_names(payload.value)?;
+        } else {
+            key_id = authority_key_id(payload.value)?;
         }
-        return Ok(out);
     }
-    Ok(Vec::new())
+    Ok((dns_names, key_id))
+}
+
+fn san_dns_names(der: &[u8]) -> Result<Vec<String>, String> {
+    let (names, _) = take(der)?;
+    expect(&names, 0x30, "GeneralNames")?;
+    let mut rest = names.value;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let (name, next) = take(rest)?;
+        rest = next;
+        // [2] IMPLICIT IA5String dNSName; other name forms are not what the
+        // API server dials the webhook by.
+        if name.tag == 0x82 {
+            out.push(
+                std::str::from_utf8(name.value)
+                    .map_err(|_| "dNSName is not UTF-8".to_string())?
+                    .to_string(),
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn authority_key_id(der: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let (seq, _) = take(der)?;
+    expect(&seq, 0x30, "AuthorityKeyIdentifier")?;
+    let mut rest = seq.value;
+    while !rest.is_empty() {
+        let (field, next) = take(rest)?;
+        rest = next;
+        // [0] IMPLICIT keyIdentifier; the issuer name and serial forms that may
+        // follow it say nothing this pin can use.
+        if field.tag == 0x80 {
+            return Ok(Some(field.value.to_vec()));
+        }
+    }
+    Ok(None)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+/// FNV-1a, only ever used to shorten a DER blob for a log line.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 fn parse_time(tlv: &Tlv<'_>) -> Result<i64, String> {
@@ -444,6 +618,26 @@ mod tests {
         assert!(wide.covers(&narrow.dns_names));
     }
 
+    /// Two leaves of the same CA pin the same issuer; the fixture from a
+    /// second CA carries the same issuer *name* and a different key id, which
+    /// is the case a name comparison alone would wave through.
+    #[test]
+    fn the_issuer_pin_follows_the_signing_key_not_the_name() {
+        const ROTATED: &str = include_str!("../tests/fixtures/pki/rotated.crt");
+        const FOREIGN: &str = include_str!("../tests/fixtures/pki/foreign.crt");
+        let serving = certificate_facts(&der(SERVING)).unwrap().issuer;
+        let rotated = certificate_facts(&der(ROTATED)).unwrap().issuer;
+        let foreign = certificate_facts(&der(FOREIGN)).unwrap().issuer;
+        assert!(serving.key_id.is_some(), "the fixtures carry an AKI");
+        assert_eq!(serving, rotated);
+        assert_eq!(
+            serving.name_der, foreign.name_der,
+            "the fixture is meant to reuse the CA's name"
+        );
+        assert_ne!(serving, foreign);
+        assert_ne!(serving.label(), foreign.label());
+    }
+
     #[test]
     fn truncated_and_junk_der_do_not_parse() {
         let der = der(SERVING);
@@ -453,10 +647,29 @@ mod tests {
     }
 
     #[test]
+    fn only_a_swap_into_the_rotation_window_is_stale() {
+        let facts = |days: i64| CertFacts {
+            not_after: (1_000 + days) * DAY_SECS,
+            dns_names: vec!["ferrum-admission".into()],
+            issuer: Issuer::default(),
+        };
+        let now = 1_000 * DAY_SECS;
+        // The rotation the README describes: 90 days replacing 200.
+        assert!(!is_stale_rotation(&facts(200), &facts(90), now));
+        // The same Secret applied twice; nothing moved.
+        assert!(!is_stale_rotation(&facts(90), &facts(90), now));
+        // An old Secret re-applied over healthy material.
+        assert!(is_stale_rotation(&facts(90), &facts(10), now));
+        // Already inside the window before the swap: nothing better to keep.
+        assert!(!is_stale_rotation(&facts(10), &facts(5), now));
+    }
+
+    #[test]
     fn the_warning_window_is_days_before_not_after() {
         let facts = CertFacts {
             not_after: 1_000 * DAY_SECS,
             dns_names: vec!["ferrum-admission".into()],
+            issuer: Issuer::default(),
         };
         let now = 970 * DAY_SECS;
         assert!(!facts.expires_within_days(now, 29));

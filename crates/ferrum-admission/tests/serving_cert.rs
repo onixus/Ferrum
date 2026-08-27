@@ -1,10 +1,12 @@
 //! Serving certificate: refuse to start on expired material, swap on rotation,
 //! keep the current certificate when the new material is unusable.
 //!
-//! Fixtures in `tests/fixtures/pki` are a test-only CA and four leaves for the
+//! Fixtures in `tests/fixtures/pki` are a test-only CA and five leaves for the
 //! Service names `ferrum-admission.ferrum`. `serving` and `rotated` are two
 //! different leaves of the same CA, `narrow` carries one SAN instead of four,
-//! and `expired` is what the cluster ends up with when nobody rotates.
+//! `expired` is what the cluster ends up with when nobody rotates, and
+//! `foreign` is a leaf from a second CA that reuses the first one's name —
+//! usable material by every other measure, and not the CA in the caBundle.
 
 mod common;
 
@@ -164,6 +166,41 @@ fn rotation_reaches_new_connections() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A swap is not final: with `failurePolicy: Fail` there is no fetching the old
+/// Secret back from the cluster, so the material it replaced stays in memory.
+#[test]
+fn a_swap_can_be_undone() {
+    let dir = temp_dir("rollback");
+    install(&dir, "serving");
+    let source = source(&dir);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let served = Arc::clone(&source);
+    std::thread::spawn(move || serve_listener(listener, state(), Some(served)));
+    let first = source.facts();
+
+    source
+        .roll_back()
+        .expect_err("nothing has been swapped yet");
+
+    install(&dir, "rotated");
+    source.reload().expect("same CA, four SANs, not expired");
+    assert_eq!(served_certificate(addr), fixture_der("rotated.crt"));
+
+    source.roll_back().expect("the replaced material is usable");
+    assert_eq!(source.rollbacks(), 1);
+    assert_eq!(source.facts(), first);
+    assert_eq!(
+        served_certificate(addr),
+        fixture_der("serving.crt"),
+        "new connections must get the material the rollback restored"
+    );
+    source
+        .roll_back()
+        .expect_err("there is only ever one step back");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn unusable_material_keeps_the_current_certificate() {
     let dir = temp_dir("broken");
@@ -193,7 +230,15 @@ fn unusable_material_keeps_the_current_certificate() {
         .expect_err("expired material must not replace the certificate");
     assert!(err.contains("expired"), "{err}");
 
-    assert_eq!(source.reload_failures(), 3);
+    // Parses, four SANs, valid for decades — and signed by a CA the applied
+    // caBundle does not name, so the API server would reject every handshake.
+    install(&dir, "foreign");
+    let err = source
+        .reload()
+        .expect_err("material from another CA must not replace the certificate");
+    assert!(err.contains("issued by"), "{err}");
+
+    assert_eq!(source.reload_failures(), 4);
     assert_eq!(source.facts(), good, "the last-known-good facts must stand");
     assert_eq!(
         served_certificate(addr),

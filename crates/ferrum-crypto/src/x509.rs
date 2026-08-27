@@ -25,11 +25,10 @@ use x509_parser::prelude::*;
 /// that outlives the rule is a certificate nobody rotates.
 pub const MAX_SERVING_CERT_DAYS: u64 = 398;
 
-/// Days before notAfter at which issued material counts as expiring: the
-/// deploy lint fails on it and the webhook logs it. Rotation has to complete
-/// inside this window, and the webhook restates the same threshold — it cannot
-/// link this module.
-pub const SERVING_CERT_WARN_DAYS: u64 = 30;
+/// Days before notAfter at which issued material counts as expiring. Defined
+/// in `ferrum-common`, the only crate both this module and the webhook link:
+/// the webhook cannot link this one.
+pub const SERVING_CERT_WARN_DAYS: u64 = ferrum_common::SERVING_CERT_WARN_DAYS as u64;
 
 const DAY_SECS: u64 = 86_400;
 
