@@ -16,13 +16,58 @@ use ferrum_export::EventSink;
 use ferrum_ids::{Digest, PolicyId, RuleId};
 use ferrum_k8smeta::{PodMetadataSource, PodRecord, SharedCgroupIndex, WorkloadIdentity};
 use ferrum_proto::{EnforcementEvent, WaiverRef};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How often the carrier re-scans the cgroup tree, re-joins it against the pod
+/// snapshot and republishes the desired set to whoever owns `ferrum_cgroups`.
+/// A container that starts between two ticks is a lookup miss, not a wrong
+/// identity.
+pub const CGROUP_REFRESH: Duration = Duration::from_secs(2);
+/// A container map that has not been reaffirmed within this is not "quiet",
+/// it is unproven: something on the publish path (pod watch, refresher, sync
+/// thread) stopped, and the map now holds an arbitrarily old snapshot — dead
+/// cgroup ids still flagged, every pod started since not flagged at all. Set
+/// to 15 refresh rounds: long enough that a slow scan or a transient apiserver
+/// error does not flap, far under the 2h last-known-good budget, which covers
+/// a remote control plane rather than a thread in this process.
+pub const CONTAINER_MAP_SYNC_BUDGET: Duration = Duration::from_secs(30);
+/// A cgroup lands in the index one refresh before the carrier publishes it to
+/// the kernel map, so every pod start has a window where its events arrive
+/// without EVENT_FLAG_CONTAINER. That window is by construction, not a fault:
+/// count it, and only call it a datapath fault once a sync that had the cgroup
+/// available has since been accepted and it is still unflagged.
+pub const CONTAINER_FLAG_GRACE: Duration = Duration::from_secs(6);
+/// Degradation signals raised by observation (unresolved labels, a datapath
+/// that keeps disagreeing) decay when the condition stops recurring. A latch
+/// that only a restart clears stops carrying information.
+pub const DEGRADED_RECOVERY: Duration = Duration::from_secs(30);
+/// The thread that publishes the desired cgroup set is gone. Nothing will
+/// update `ferrum_cgroups` again, so the map stops following the index.
+pub const CGROUP_PUBLISHER_GONE: &str =
+    "cgroup publisher gone: the container map can no longer follow the index";
+/// The carrier that applies published sets is gone; publishing is pointless.
+pub const CGROUP_CARRIER_GONE: &str = "cgroup carrier gone: nothing applies the published set";
+/// Bound on the per-cgroup disagreement window map. Beyond this the oldest
+/// windows are dropped; a cgroup that keeps disagreeing simply reopens one.
+const CONTAINER_FLAG_TRACKED_MAX: usize = 4096;
+
+fn mark_now(slot: &Mutex<Option<Instant>>, now: Instant) {
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+}
+
+fn within(slot: &Mutex<Option<Instant>>, now: Instant, window: Duration) -> bool {
+    match *slot.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(at) => now.saturating_duration_since(at) < window,
+        None => false,
+    }
+}
 
 pub use clock::{MonotonicFloor, MAX_EXCEPTION_DAYS};
 pub use pump::{pump_channel, pump_channel_host, pump_records, pump_records_host, PumpStats};
@@ -136,6 +181,19 @@ pub struct Agent {
     /// EVENT_FLAG_CONTAINER. Every one of these is a `container_only` rule
     /// that did not match on a real container.
     container_flag_disagreement: AtomicU64,
+    /// When the last whole sync plan was accepted. Freshness, not just
+    /// success: a publisher that stopped leaves `container_map_synced` true
+    /// forever otherwise.
+    container_map_synced_at: Mutex<Option<Instant>>,
+    /// First unflagged event seen per cgroup, i.e. when its publish window
+    /// opened. Bounded by `CONTAINER_FLAG_TRACKED_MAX`.
+    container_flag_window: Mutex<HashMap<u64, Instant>>,
+    /// Last disagreement that outlived its publish window. Recoverable.
+    container_flag_fault_at: Mutex<Option<Instant>>,
+    /// Decisions taken against a selector that could not be resolved because
+    /// the label caches had nothing for that namespace / SA / cluster.
+    labels_unknown: AtomicU64,
+    labels_unknown_at: Mutex<Option<Instant>>,
 }
 
 impl Agent {
@@ -177,6 +235,11 @@ impl Agent {
             container_map_entries: AtomicU64::new(0),
             container_map_error: Mutex::new(None),
             container_flag_disagreement: AtomicU64::new(0),
+            container_map_synced_at: Mutex::new(None),
+            container_flag_window: Mutex::new(HashMap::new()),
+            container_flag_fault_at: Mutex::new(None),
+            labels_unknown: AtomicU64::new(0),
+            labels_unknown_at: Mutex::new(None),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -203,6 +266,11 @@ impl Agent {
             // set and every container_only rule (shell, docker.sock) misses.
             || !self.container_map_ready()
             || self.export_dead.load(Ordering::Relaxed)
+            // A selector the agent could not resolve is not a non-match: the
+            // rules were applied fail-closed, and that is a Degraded plane
+            // until the label caches catch up.
+            || self.labels_unknown_recent()
+            || self.container_flag_degraded()
             || self.respond_disabled_reason().is_some()
     }
 
@@ -213,6 +281,31 @@ impl Agent {
         self.container_map_synced.load(Ordering::Relaxed)
             && self.container_map_entries.load(Ordering::Relaxed) > 0
             && self.container_map_error().is_none()
+            && !self.container_map_stale()
+    }
+
+    /// Nothing reaffirmed the map within `CONTAINER_MAP_SYNC_BUDGET`. The
+    /// entries may be arbitrarily old, so they prove nothing about the pods
+    /// running now.
+    pub fn container_map_stale(&self) -> bool {
+        self.container_map_stale_at(Instant::now())
+    }
+
+    pub fn container_map_stale_at(&self, now: Instant) -> bool {
+        self.container_map_synced.load(Ordering::Relaxed)
+            && !within(
+                &self.container_map_synced_at,
+                now,
+                CONTAINER_MAP_SYNC_BUDGET,
+            )
+    }
+
+    pub fn container_map_age(&self) -> Option<Duration> {
+        (*self
+            .container_map_synced_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()))
+        .map(|at| Instant::now().saturating_duration_since(at))
     }
 
     pub fn container_map_synced(&self) -> bool {
@@ -232,6 +325,14 @@ impl Agent {
 
     /// Called by the carrier after the kernel accepted a whole sync plan.
     pub fn set_container_map_synced(&self, entries: u64) {
+        self.set_container_map_synced_at(entries, Instant::now())
+    }
+
+    /// The timestamp is the point the map was known to mirror a *freshly
+    /// resolved* index. The carrier must not pass a fresh `Instant` for a plan
+    /// computed from a set it could not re-resolve, or staleness never trips.
+    pub fn set_container_map_synced_at(&self, entries: u64, at: Instant) {
+        mark_now(&self.container_map_synced_at, at);
         self.container_map_entries.store(entries, Ordering::Relaxed);
         self.container_map_synced.store(true, Ordering::Relaxed);
         *self
@@ -254,6 +355,69 @@ impl Agent {
     /// EVENT_FLAG_CONTAINER.
     pub fn container_flag_disagreement_total(&self) -> u64 {
         self.container_flag_disagreement.load(Ordering::Relaxed)
+    }
+
+    /// The datapath kept disagreeing past what the publish path can explain,
+    /// recently enough to still mean something. Not a latch: it clears once
+    /// the disagreements stop.
+    pub fn container_flag_degraded(&self) -> bool {
+        self.container_flag_degraded_at(Instant::now())
+    }
+
+    pub fn container_flag_degraded_at(&self, now: Instant) -> bool {
+        within(&self.container_flag_fault_at, now, DEGRADED_RECOVERY)
+    }
+
+    /// Count one event whose cgroup the index knows but which the datapath did
+    /// not flag as a container, and decide whether that is a fault. Returns
+    /// true when it degraded the agent.
+    pub fn note_container_flag_disagreement(&self, cgroup_id: u64, now: Instant) -> bool {
+        self.container_flag_disagreement
+            .fetch_add(1, Ordering::Relaxed);
+        let synced_at = *self
+            .container_map_synced_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut windows = self
+            .container_flag_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if windows.len() >= CONTAINER_FLAG_TRACKED_MAX && !windows.contains_key(&cgroup_id) {
+            windows
+                .retain(|_, opened| now.saturating_duration_since(*opened) < CONTAINER_FLAG_GRACE);
+        }
+        let opened = *windows.entry(cgroup_id).or_insert(now);
+        // A sync accepted after the window opened had this cgroup in the index
+        // and still did not get it flagged: that is the datapath, not the
+        // start-up race every pod goes through.
+        let missed_a_sync = synced_at.is_some_and(|at| at > opened);
+        if now.saturating_duration_since(opened) < CONTAINER_FLAG_GRACE || !missed_a_sync {
+            return false;
+        }
+        windows.remove(&cgroup_id);
+        drop(windows);
+        mark_now(&self.container_flag_fault_at, now);
+        true
+    }
+
+    /// Decisions taken against a selector whose labels were never observed.
+    pub fn labels_unknown_total(&self) -> u64 {
+        self.labels_unknown.load(Ordering::Relaxed)
+    }
+
+    /// Recoverable: an agent whose label caches filled in stops being Degraded
+    /// on its own, without a restart.
+    pub fn labels_unknown_recent(&self) -> bool {
+        self.labels_unknown_recent_at(Instant::now())
+    }
+
+    pub fn labels_unknown_recent_at(&self, now: Instant) -> bool {
+        within(&self.labels_unknown_at, now, DEGRADED_RECOVERY)
+    }
+
+    pub fn record_labels_unknown(&self, now: Instant) {
+        self.labels_unknown.fetch_add(1, Ordering::Relaxed);
+        mark_now(&self.labels_unknown_at, now);
     }
 
     /// True only while a `KernelHandle` attach is live. `Loader::attach_pins`
@@ -636,19 +800,22 @@ impl Agent {
                     // The index says this cgroup is a pod container and the
                     // datapath did not flag it: `ferrum_cgroups` is behind the
                     // index, so container_only rules are missing on real
-                    // containers. Counted and Degraded — the decision is NOT
-                    // upgraded from the flags we do have, and the kill guard
-                    // in `react` still refuses: a wrong kill on the node is
-                    // worse than a missed one.
-                    self.container_flag_disagreement
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.datapath_degraded.store(true, Ordering::Relaxed);
+                    // containers. Always counted; Degraded only once it
+                    // outlives the publish window (see
+                    // `note_container_flag_disagreement`). Either way the
+                    // decision is NOT upgraded from the flags we do have, and
+                    // the kill guard in `react` still refuses: a wrong kill on
+                    // the node is worse than a missed one.
+                    self.note_container_flag_disagreement(meta.cgroup_id, Instant::now());
                 }
                 id
             }
             Err(_) => WorkloadIdentity::unknown(),
         };
         let mut decision = self.loader.decide(event, &identity);
+        if decision.labels_unknown {
+            self.record_labels_unknown(Instant::now());
+        }
         let waiver = self
             .waiver_applies(&decision, &identity, now)
             .map(|spec| WaiverRef {
@@ -814,6 +981,41 @@ impl PodMetadataSource for SharedPodSource {
     fn snapshot(&self) -> Result<Vec<PodRecord>> {
         self.0.read().unwrap_or_else(|e| e.into_inner()).snapshot()
     }
+}
+
+/// Drain every cgroup set the publisher has queued. A disconnected channel is
+/// not an empty one: with the publisher gone the map is frozen on whatever it
+/// held, so it is marked in error instead of quietly looking healthy. Returns
+/// false once the publisher is gone.
+pub fn drain_cgroup_updates<T, F>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    agent: &Agent,
+    mut apply: F,
+) -> bool
+where
+    F: FnMut(&Agent, T),
+{
+    loop {
+        match rx.try_recv() {
+            Ok(update) => apply(agent, update),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                agent.mark_container_map_error(CGROUP_PUBLISHER_GONE);
+                return false;
+            }
+        }
+    }
+}
+
+/// Publish one desired cgroup set. A full channel drops this update on
+/// purpose: each message is the whole set, so the next one carries current
+/// truth. A disconnected channel is different in kind — nobody will ever apply
+/// another set — and returns false so the publisher stops.
+pub fn publish_cgroups<T>(tx: &std::sync::mpsc::SyncSender<T>, update: T) -> bool {
+    !matches!(
+        tx.try_send(update),
+        Err(std::sync::mpsc::TrySendError::Disconnected(_))
+    )
 }
 
 pub fn apply_role(role: AgentRole, action: Action) -> Action {
@@ -2139,6 +2341,9 @@ mod tests {
         (agent, fake)
     }
 
+    /// A step short enough to stay inside any window under test.
+    const MARGIN: Duration = Duration::from_secs(1);
+
     fn container_meta(tgid: u32) -> EventMeta {
         EventMeta {
             cgroup_id: 7,
@@ -2456,7 +2661,10 @@ mod tests {
             agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", false, false), &sink);
 
         assert!(agent.container_flag_disagreement_total() > 0);
-        assert!(agent.is_degraded());
+        // Counted, but not Degraded: the index is filled one refresh before the
+        // set reaches the kernel map, so every pod start opens this window.
+        assert!(!agent.container_flag_degraded());
+        assert!(!agent.is_degraded());
         // No flag, no container_only match, and no kill: the decision is not
         // upgraded from what the datapath actually reported.
         assert_ne!(decision.action, Action::Kill);
@@ -2492,6 +2700,175 @@ mod tests {
             Some(REFUSE_NOT_CONTAINER)
         );
         assert!(agent.container_flag_disagreement_total() > 0);
+    }
+
+    /// The label caches are cold, relisting after a 410 or dead: the pod is
+    /// known, its namespace labels are not. Empty labels are not a non-match -
+    /// admission fails closed on exactly this — so the rule must still be
+    /// applied, and the plane must say it is Degraded.
+    #[test]
+    fn unobserved_namespace_labels_do_not_skip_a_rule() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_prod_restricted_ebpf(AGENT_ABI));
+        agent.set_attached(true);
+        let mut cold = pci_identity();
+        cold.namespace_labels.clear();
+        agent.insert_cgroup(1, cold);
+        agent.set_container_map_synced(1);
+        assert!(!agent.is_degraded());
+
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: 1,
+            pid: 4242,
+            tgid: 4242,
+            in_container: true,
+            agent_self: false,
+        };
+        let decision = agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+        assert_ne!(
+            decision.action,
+            Action::Allow,
+            "a rule must not be skipped because its selector could not be resolved"
+        );
+        assert_eq!(decision.rule_id.as_deref(), Some("no-shell"));
+        assert!(decision.labels_unknown);
+        assert_eq!(agent.labels_unknown_total(), 1);
+        assert!(
+            agent.is_degraded(),
+            "unresolved labels are not a clean pass"
+        );
+
+        // Recoverable: the caches fill in, the events stop, the signal decays.
+        let now = Instant::now();
+        assert!(agent.labels_unknown_recent_at(now));
+        assert!(!agent.labels_unknown_recent_at(now + DEGRADED_RECOVERY));
+
+        // The same selector against observed labels is unaffected.
+        let mut observed = Agent::new(cfg());
+        load_signed(&mut observed, &encode_prod_restricted_ebpf(AGENT_ABI));
+        observed.insert_cgroup(1, pci_identity());
+        let hit = observed.handle_event(meta, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+        assert_eq!(hit.rule_id.as_deref(), Some("no-shell"));
+        assert!(!hit.labels_unknown);
+        assert_eq!(observed.labels_unknown_total(), 0);
+        assert!(!observed.labels_unknown_recent());
+    }
+
+    /// A sync that succeeded once is not a sync that is still happening. A
+    /// publisher, pod watch or sync thread that froze leaves the map on an
+    /// arbitrarily old snapshot: dead cgroup ids still flagged, every pod
+    /// started since not flagged at all.
+    #[test]
+    fn a_container_map_nobody_reaffirms_goes_stale() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, identity("pod-a"));
+
+        let t0 = Instant::now();
+        agent.set_container_map_synced_at(1, t0);
+        assert!(!agent.container_map_stale_at(t0));
+        assert!(!agent.container_map_stale_at(t0 + CONTAINER_MAP_SYNC_BUDGET - MARGIN));
+        assert!(agent.container_map_stale_at(t0 + CONTAINER_MAP_SYNC_BUDGET));
+
+        let Some(old) = t0.checked_sub(CONTAINER_MAP_SYNC_BUDGET * 2) else {
+            return; // machine booted moments ago; the arithmetic below is moot
+        };
+        agent.set_container_map_synced_at(1, old);
+        assert!(agent.container_map_stale());
+        assert!(!agent.container_map_ready());
+        assert!(
+            agent.is_degraded(),
+            "a map nothing has reaffirmed is not proof of anything"
+        );
+        // A sync that actually ran clears it; recovery does not need a restart.
+        agent.set_container_map_synced(1);
+        assert!(!agent.is_degraded());
+    }
+
+    /// `try_recv` cannot tell a dead publisher from an idle one unless the
+    /// carrier looks: a disconnected channel means nothing will update
+    /// `ferrum_cgroups` again.
+    #[test]
+    fn a_dead_cgroup_publisher_is_a_map_error() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+        assert!(!agent.is_degraded());
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(4);
+        tx.send(7).expect("send");
+        let mut seen = Vec::new();
+        assert!(drain_cgroup_updates(&rx, &agent, |_, v| seen.push(v)));
+        assert_eq!(seen, vec![7]);
+        assert!(agent.container_map_error().is_none());
+
+        drop(tx);
+        assert!(!drain_cgroup_updates(&rx, &agent, |_, v| seen.push(v)));
+        assert_eq!(
+            agent.container_map_error().as_deref(),
+            Some(CGROUP_PUBLISHER_GONE)
+        );
+        assert!(!agent.container_map_synced());
+        assert!(agent.is_degraded());
+    }
+
+    /// A full channel drops one update on purpose (the next carries the whole
+    /// set again); a disconnected one means nobody applies anything, ever.
+    #[test]
+    fn a_dead_carrier_stops_the_cgroup_publisher() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u64>(1);
+        assert!(publish_cgroups(&tx, 1));
+        assert!(publish_cgroups(&tx, 2));
+        drop(rx);
+        assert!(!publish_cgroups(&tx, 3));
+    }
+
+    /// The refresher fills the index, then publishes, and the carrier applies
+    /// the set a pass later: every pod start is unflagged for a moment. That
+    /// window must not latch Degraded forever — but a cgroup a completed sync
+    /// should have covered still must.
+    #[test]
+    fn the_pod_start_window_does_not_latch_degraded() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, identity("pod-a"));
+
+        let t0 = Instant::now();
+        agent.set_container_map_synced_at(1, t0);
+        // Pod just started: in the index, not yet in the kernel map.
+        assert!(!agent.note_container_flag_disagreement(7, t0));
+        assert!(!agent.note_container_flag_disagreement(7, t0 + MARGIN));
+        assert!(!agent.container_flag_degraded_at(t0 + MARGIN));
+        assert!(!agent.is_degraded());
+
+        // A sync ran with this cgroup in the index and it is STILL unflagged
+        // a whole window later: that is the datapath, not the race.
+        agent.set_container_map_synced_at(1, t0 + MARGIN);
+        let fault = t0 + CONTAINER_FLAG_GRACE + MARGIN;
+        assert!(agent.note_container_flag_disagreement(7, fault));
+        assert!(agent.container_flag_degraded_at(fault));
+        assert!(agent.is_degraded());
+        assert_eq!(agent.container_flag_disagreement_total(), 3);
+
+        // Recoverable, not a one-way latch.
+        assert!(!agent.container_flag_degraded_at(fault + DEGRADED_RECOVERY));
+    }
+
+    /// Without a sync since the window opened there is nothing to blame the
+    /// datapath for: the stale map is its own signal.
+    #[test]
+    fn an_unsynced_map_does_not_blame_the_datapath() {
+        let agent = Agent::new(cfg());
+        let t0 = Instant::now();
+        assert!(!agent.note_container_flag_disagreement(7, t0));
+        assert!(!agent.note_container_flag_disagreement(7, t0 + CONTAINER_FLAG_GRACE * 2));
+        assert!(!agent.container_flag_degraded_at(t0 + CONTAINER_FLAG_GRACE * 2));
+        assert_eq!(agent.container_flag_disagreement_total(), 2);
     }
 
     /// Respond that cannot be delivered (no host pid namespace) drops to

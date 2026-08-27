@@ -9,20 +9,25 @@ use std::path::PathBuf;
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEFAULT_EXPORT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_EXPORT_KEEP: usize = 5;
 /// Events buffered between the decision path and the file writer. Full queue
 /// drops telemetry (counted); it never blocks a decision.
 const DEFAULT_EXPORT_QUEUE: usize = 8192;
-/// How often the cgroup tree is re-scanned and re-joined against the pod
-/// snapshot. A container that starts between two ticks is a lookup miss, not
-/// a wrong identity.
-#[cfg(feature = "apiserver")]
-const CGROUP_REFRESH: Duration = Duration::from_secs(2);
 /// Poll step of the shutdown watcher; only the exit path pays it.
 const SHUTDOWN_TICK: Duration = Duration::from_millis(50);
+
+/// One published cgroup set together with the moment it was resolved from a
+/// successful scan. A set republished after a failed refresh keeps the OLD
+/// stamp: the carrier must not read a retry of stale data as proof the map is
+/// current.
+#[cfg_attr(not(feature = "attach"), allow(dead_code))]
+struct CgroupPublish {
+    cgroups: BTreeSet<u64>,
+    resolved_at: Instant,
+}
 
 /// Set from the SIGTERM/SIGINT handler, which may do nothing else.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -132,7 +137,7 @@ fn main() {
 
     // Each message is the whole desired cgroup set, so a full channel drops an
     // update instead of queueing: the next refresh carries the current truth.
-    let (cgroup_tx, cgroup_rx) = std::sync::mpsc::sync_channel::<BTreeSet<u64>>(1);
+    let (cgroup_tx, cgroup_rx) = std::sync::mpsc::sync_channel::<CgroupPublish>(1);
     spawn_cgroup_refresh(agent.cgroup_index(), node.clone(), cgroup_tx);
 
     if let Err(err) = agent.restore_last_known_good() {
@@ -193,8 +198,9 @@ fn main() {
 fn spawn_cgroup_refresh(
     index: SharedCgroupIndex,
     node: String,
-    sync_tx: std::sync::mpsc::SyncSender<BTreeSet<u64>>,
+    sync_tx: std::sync::mpsc::SyncSender<CgroupPublish>,
 ) {
+    use ferrum_agent::{CGROUP_CARRIER_GONE, CGROUP_REFRESH};
     use ferrum_k8smeta::watch::{ApiserverConfig, ApiserverWatcher};
     use ferrum_k8smeta::{CgroupResolver, StdCgroupFs, DEFAULT_CGROUP_ROOT};
 
@@ -218,14 +224,29 @@ fn spawn_cgroup_refresh(
         let source = ferrum_agent::SharedPodSource::new(cache);
         let fs = StdCgroupFs;
         let root = PathBuf::from(DEFAULT_CGROUP_ROOT);
+        let mut resolved_at: Option<Instant> = None;
         loop {
-            if let Err(err) = resolver.refresh(&fs, &root, &source) {
-                eprintln!("ferrum-agent: cgroup refresh failed, keeping the last index: {err}");
+            match resolver.refresh(&fs, &root, &source) {
+                Ok(_) => resolved_at = Some(Instant::now()),
+                Err(err) => {
+                    eprintln!("ferrum-agent: cgroup refresh failed, keeping the last index: {err}")
+                }
             }
             // Publish even after a failed refresh: the index is still the best
-            // known truth, and the kernel map must not drift away from it.
-            let next: BTreeSet<u64> = published.snapshot().into_keys().collect();
-            let _ = sync_tx.try_send(next);
+            // known truth, and the kernel map must not drift away from it. The
+            // stamp stays at the last successful resolve, so a refresher stuck
+            // on errors ages the container map out instead of renewing it.
+            if let Some(resolved_at) = resolved_at {
+                let cgroups: BTreeSet<u64> = published.snapshot().into_keys().collect();
+                let update = CgroupPublish {
+                    cgroups,
+                    resolved_at,
+                };
+                if !ferrum_agent::publish_cgroups(&sync_tx, update) {
+                    eprintln!("ferrum-agent: {CGROUP_CARRIER_GONE}");
+                    return;
+                }
+            }
             std::thread::sleep(CGROUP_REFRESH);
         }
     });
@@ -235,7 +256,7 @@ fn spawn_cgroup_refresh(
 fn spawn_cgroup_refresh(
     index: SharedCgroupIndex,
     _node: String,
-    _sync_tx: std::sync::mpsc::SyncSender<BTreeSet<u64>>,
+    _sync_tx: std::sync::mpsc::SyncSender<CgroupPublish>,
 ) {
     let _ = index;
     eprintln!(
@@ -277,7 +298,7 @@ fn run(
     bundle_path: Option<PathBuf>,
     reload_ms: u64,
     flags: &Flags,
-    cgroup_rx: std::sync::mpsc::Receiver<BTreeSet<u64>>,
+    cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
 ) -> ! {
     use ferrum_ebpf::{plan_cgroup_sync, KernelHandle, SyscallArch};
     use std::sync::mpsc::sync_channel;
@@ -334,24 +355,38 @@ fn run(
         let mut idle_ms = 1u64;
         let mut seen_drops = 0u64;
         let mut since_drop_check = Duration::ZERO;
+        let mut publisher_alive = true;
         loop {
-            while let Ok(next) = cgroup_rx.try_recv() {
+            if publisher_alive {
                 let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
-                match plan_cgroup_sync(handle.container_cgroups(), &next) {
-                    Ok(plan) if plan.is_empty() => {
-                        guard.set_container_map_synced(handle.container_map_entries() as u64);
-                    }
-                    Ok(plan) => match handle.sync_container_cgroups(&plan) {
-                        Ok(stats) => guard.set_container_map_synced(stats.entries as u64),
-                        Err(err) => {
-                            eprintln!("ferrum-agent: {err}");
-                            guard.mark_container_map_error(err.to_string());
+                publisher_alive =
+                    ferrum_agent::drain_cgroup_updates(&cgroup_rx, &guard, |agent, next| {
+                        // The health stamp is the publisher's resolve time, not
+                        // now: an unchanged set republished from a frozen index
+                        // must not reaffirm the map.
+                        match plan_cgroup_sync(handle.container_cgroups(), &next.cgroups) {
+                            Ok(plan) if plan.is_empty() => agent.set_container_map_synced_at(
+                                handle.container_map_entries() as u64,
+                                next.resolved_at,
+                            ),
+                            Ok(plan) => match handle.sync_container_cgroups(&plan) {
+                                Ok(stats) => agent.set_container_map_synced_at(
+                                    stats.entries as u64,
+                                    next.resolved_at,
+                                ),
+                                Err(err) => {
+                                    eprintln!("ferrum-agent: {err}");
+                                    agent.mark_container_map_error(err.to_string());
+                                }
+                            },
+                            Err(err) => {
+                                eprintln!("ferrum-agent: {err}");
+                                agent.mark_container_map_error(err.to_string());
+                            }
                         }
-                    },
-                    Err(err) => {
-                        eprintln!("ferrum-agent: {err}");
-                        guard.mark_container_map_error(err.to_string());
-                    }
+                    });
+                if !publisher_alive {
+                    eprintln!("ferrum-agent: {}", ferrum_agent::CGROUP_PUBLISHER_GONE);
                 }
             }
             let n = reader.drain(|record| {
@@ -438,7 +473,7 @@ fn run(
     bundle_path: Option<PathBuf>,
     reload_ms: u64,
     _flags: &Flags,
-    _cgroup_rx: std::sync::mpsc::Receiver<BTreeSet<u64>>,
+    _cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
 ) -> ! {
     let _ = sink;
     eprintln!(
