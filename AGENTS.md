@@ -6,8 +6,9 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 Источник истины по архитектуре: `docs/rfc/FERRUM-RFC-02-architecture.md`.
 Каталог CRD: `docs/crd/README.md`.
 
-Репозиторий сейчас — каркас workspace и API-типов, не готовый агент.
-Пустой crate не называть MVP.
+Control plane собран: controller → compile → Secret → admission/agent, LKG на диске.
+Датаплейна нет: aya-ebpf требует nightly, kernel attach отдаёт `Degraded`.
+Отсутствующий datapath не называть работающим runtime enforcement.
 
 ## Toolchain
 
@@ -50,7 +51,7 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 | `ferrum-agent` | eBPF + last-known-good | compiler, cluster-admin SA |
 | `ferrum-ebpf-progs` | aya-ebpf datapath | tokio, kube, `String` на syscall path |
 | `ferrum-controller` | reconcile + compile + rollout | datapath, CAP_BPF |
-| `ferrum-crypto` | подпись/проверка bundle, mTLS material | фейковый `Ok` |
+| `ferrum-crypto` | подпись/проверка bundle, mTLS material (ring, rustls-webpki) | openssl-sys, выпуск CA, сеть, фейковый `Ok` |
 | `ferrum-cli` | `ferrumctl` offline | живой кластер в MVP-1 |
 
 Версии в проде сшиваются `PolicyBundle.digest`. Несовместимый агент bundle не грузит и остаётся на last-known-good.
@@ -66,7 +67,9 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 - trust roots едут в bundle; admission не ходит в Rekor на каждый Pod;
 - `disabled=true` вместе с `mode=enforce` — ошибка валидации;
 - Kill/Isolate без match (syscall/comm/path) — ошибка валидации, это kill-all;
-- `verify_bundle_signature` и аналоги не возвращают фейковый `Ok`.
+- `verify_bundle_signature` и аналоги не возвращают фейковый `Ok`;
+- `BUNDLE_SIGNATURE_CONTEXT` и `KEY_BIND_MSG` — разные домены: Ed25519-seed
+  bundle не является TLS-ключом и не должен проходить проверку как он.
 
 Секции политики: `supply` + `admit` + `runtime`.
 
