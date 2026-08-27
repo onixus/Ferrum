@@ -181,6 +181,11 @@ pub const REFUSE_TGID_INIT: &str = "tgid 1: init is never a target";
 pub const REFUSE_TGID_SELF: &str = "tgid is this agent process";
 pub const REFUSE_TGID_RANGE: &str = "tgid outside the pid range: not a signalable process";
 pub const REFUSE_ISOLATE: &str = "isolate not implemented";
+/// A tracepoint fires after the syscall entry is recorded, so by the time the
+/// decision exists there is nothing left to refuse. Exported on every runtime
+/// Deny so the event is distinguishable from one nobody meant to act on.
+pub const REFUSE_DENY_NOT_ENFORCEABLE: &str =
+    "tracepoint does not block a syscall: it has already run and been recorded; the enforceable reaction is kill, the blocking one is admission";
 pub const REFUSE_NO_RESPONDER: &str = "no responder wired: reaction backend not installed";
 pub const REFUSE_STALE_TARGET: &str =
     "tgid left the cgroup that raised the event: pid reuse, not the workload";

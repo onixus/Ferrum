@@ -8,7 +8,7 @@ use ferrum_admission::{
 };
 use ferrum_agent::{
     apply_role, encode_fsig, Agent, AgentConfig, AgentRole, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY,
-    EXCEPTIONS_FSIG_KEY, WAIVED_ACTION,
+    EXCEPTIONS_FSIG_KEY, REFUSE_DENY_NOT_ENFORCEABLE, WAIVED_ACTION,
 };
 use ferrum_api::{PolicyExceptionSpec, PolicyMode};
 use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
@@ -350,6 +350,13 @@ fn only_signed_exceptions_are_accepted_from_the_mount() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// §D `bpf()` not from the agent → deny, and which layer carries the deny.
+///
+/// The decision layer denies; the reaction layer cannot execute it, because a
+/// tracepoint fires after the syscall has run. The agent says so explicitly
+/// instead of exporting `executed=false` with no reason, which is what an
+/// event nobody had a rule for looks like. Blocking `bpf()` before it runs is
+/// admission's job, not this plane's.
 #[test]
 fn bpf_not_from_agent_is_denied() {
     let agent = loaded_agent();
@@ -360,6 +367,27 @@ fn bpf_not_from_agent_is_denied() {
     let from_agent = agent.matched_action(&ev("bpf", "ferrum-agent", "", true));
     assert_ne!(from_agent.action, Action::Deny);
     assert_ne!(from_agent.action, Action::Kill);
+
+    agent.insert_cgroup(7, payments_identity());
+    let refused_before = agent.respond_refused_total();
+    let sink = MemorySink::new();
+    let exported = agent.handle_event_at(7, &ev("bpf", "loader", "", false), &sink, now());
+    assert_eq!(exported.action, Action::Deny);
+
+    let events = sink.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action, "deny");
+    assert_eq!(events[0].rule.as_str(), "no-module");
+    assert!(
+        !events[0].executed,
+        "a tracepoint cannot un-run the syscall"
+    );
+    assert_eq!(
+        events[0].respond_error.as_deref(),
+        Some(REFUSE_DENY_NOT_ENFORCEABLE),
+        "a deny with no reason is indistinguishable from doing nothing"
+    );
+    assert_eq!(agent.respond_refused_total(), refused_before + 1);
 }
 
 #[test]

@@ -73,10 +73,10 @@ pub use clock::{MonotonicFloor, MAX_EXCEPTION_DAYS};
 pub use pump::{pump_channel, pump_channel_host, pump_records, pump_records_host, PumpStats};
 pub use respond::{
     host_pid_namespace, host_pid_namespace_at, NoopResponder, ProcCgroupCheck, Responder,
-    SignalResponder, TargetCheck, HOST_PID_NS_INO, MAX_TGID, REFUSE_AGENT_SELF, REFUSE_ISOLATE,
-    REFUSE_NOT_CONTAINER, REFUSE_NO_RESPONDER, REFUSE_ROLE, REFUSE_STALE_TARGET,
-    REFUSE_TARGET_GONE, REFUSE_TGID_INIT, REFUSE_TGID_RANGE, REFUSE_TGID_SELF, REFUSE_TGID_ZERO,
-    REFUSE_UNKNOWN_IDENTITY, RESPOND_NO_HOST_PIDNS,
+    SignalResponder, TargetCheck, HOST_PID_NS_INO, MAX_TGID, REFUSE_AGENT_SELF,
+    REFUSE_DENY_NOT_ENFORCEABLE, REFUSE_ISOLATE, REFUSE_NOT_CONTAINER, REFUSE_NO_RESPONDER,
+    REFUSE_ROLE, REFUSE_STALE_TARGET, REFUSE_TARGET_GONE, REFUSE_TGID_INIT, REFUSE_TGID_RANGE,
+    REFUSE_TGID_SELF, REFUSE_TGID_ZERO, REFUSE_UNKNOWN_IDENTITY, RESPOND_NO_HOST_PIDNS,
 };
 pub use source::{
     decode_fsig, encode_fsig, extract_fsig, load_exceptions_source, load_path, load_source,
@@ -194,6 +194,11 @@ pub struct Agent {
     /// the label caches had nothing for that namespace / SA / cluster.
     labels_unknown: AtomicU64,
     labels_unknown_at: Mutex<Option<Instant>>,
+    /// When the ring last dropped a record. Every verdict is taken in
+    /// userspace, so a record that never arrived is an enforcement that never
+    /// happened — indistinguishable, after the fact, from an event nobody had
+    /// a rule for.
+    ring_drop_at: Mutex<Option<Instant>>,
 }
 
 impl Agent {
@@ -240,6 +245,7 @@ impl Agent {
             container_flag_fault_at: Mutex::new(None),
             labels_unknown: AtomicU64::new(0),
             labels_unknown_at: Mutex::new(None),
+            ring_drop_at: Mutex::new(None),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -270,6 +276,10 @@ impl Agent {
             // rules were applied fail-closed, and that is a Degraded plane
             // until the label caches catch up.
             || self.labels_unknown_recent()
+            // An in-kernel drop under flood bounds the CPU cost, not the
+            // policy: the dropped record carried an event no rule ever saw.
+            // That is a missed enforcement, so it is Degraded while it lasts.
+            || self.ring_drops_recent()
             || self.container_flag_degraded()
             || self.respond_disabled_reason().is_some()
     }
@@ -529,7 +539,26 @@ impl Agent {
     /// `record_decode_failure` so a burst of malformed records cannot pose as
     /// ring-buffer pressure or vice versa.
     pub fn record_drop(&self, n: u64) {
+        self.record_drop_at(n, Instant::now());
+    }
+
+    pub fn record_drop_at(&self, n: u64, now: Instant) {
+        if n == 0 {
+            return;
+        }
         self.loader.record_drop(n);
+        mark_now(&self.ring_drop_at, now);
+    }
+
+    /// Recoverable, like the other observation signals: a node that stops
+    /// dropping stops being Degraded without a restart. A latch here would
+    /// mark every agent that ever saw a burst as permanently blind.
+    pub fn ring_drops_recent(&self) -> bool {
+        self.ring_drops_recent_at(Instant::now())
+    }
+
+    pub fn ring_drops_recent_at(&self, now: Instant) -> bool {
+        within(&self.ring_drop_at, now, DEGRADED_RECOVERY)
     }
 
     pub fn records_decode_failed_total(&self) -> u64 {
@@ -878,7 +907,15 @@ impl Agent {
                 self.respond_refused.fetch_add(1, Ordering::Relaxed);
                 return (false, Some(respond::REFUSE_ISOLATE.into()));
             }
-            _ => return (false, None),
+            // Deny is a decision this layer cannot execute; saying so is the
+            // difference between a policy nobody enforces and one whose gap
+            // is on the record. Allow/Audit fall through with no reason
+            // because there was nothing to execute in the first place.
+            Action::Deny => {
+                self.respond_refused.fetch_add(1, Ordering::Relaxed);
+                return (false, Some(respond::REFUSE_DENY_NOT_ENFORCEABLE.into()));
+            }
+            Action::Allow | Action::Audit => return (false, None),
         }
         // The datapath flags are authoritative for the reaction: the string
         // view can be rebuilt by a caller, the record flags cannot.
@@ -1938,6 +1975,64 @@ mod tests {
         let agent = Agent::new(AgentConfig::default());
         agent.record_drop(2);
         assert_eq!(agent.events_dropped_total(), 2);
+    }
+
+    /// A dropped ring record is a verdict that was never taken: every rule
+    /// runs in userspace, so the kill for that event did not happen and
+    /// nothing downstream can tell. It has to show up as Degraded.
+    #[test]
+    fn ring_drops_degrade_and_then_recover() {
+        let agent = Agent::new(AgentConfig::default());
+        let now = Instant::now();
+        assert!(!agent.ring_drops_recent_at(now));
+
+        agent.record_drop_at(1, now);
+        assert_eq!(agent.events_dropped_total(), 1);
+        assert!(agent.ring_drops_recent_at(now));
+        assert!(agent.is_degraded());
+
+        // Not a latch: an agent that stops dropping heals without a restart.
+        assert!(!agent.ring_drops_recent_at(now + DEGRADED_RECOVERY));
+        agent.record_drop_at(3, now + DEGRADED_RECOVERY);
+        assert_eq!(agent.events_dropped_total(), 4);
+        assert!(agent.ring_drops_recent_at(now + DEGRADED_RECOVERY));
+
+        // Zero drops are not an event and must not re-arm the window.
+        let quiet = Agent::new(AgentConfig::default());
+        quiet.record_drop_at(0, now);
+        assert!(!quiet.ring_drops_recent_at(now));
+    }
+
+    /// A tracepoint fires after the syscall ran, so runtime Deny cannot block
+    /// anything. The event must carry the reason instead of looking like one
+    /// nobody meant to act on.
+    #[test]
+    fn runtime_deny_is_refused_with_a_reason() {
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        let before = agent.respond_refused_total();
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(7, &ev("bpf", "loader", "", true, false), &sink);
+        assert_eq!(decision.action, Action::Deny);
+        assert_eq!(decision.rule_id.as_deref(), Some("no-module"));
+
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].executed);
+        assert_eq!(
+            events[0].respond_error.as_deref(),
+            Some(REFUSE_DENY_NOT_ENFORCEABLE)
+        );
+        assert_eq!(agent.respond_refused_total(), before + 1);
+
+        // Allow/Audit are the only actions that stay silent: there was never
+        // anything to execute.
+        let quiet = MemorySink::new();
+        let audit = agent.handle_event(7, &ev("openat", "app", "/etc/passwd", true, false), &quiet);
+        assert!(matches!(audit.action, Action::Allow | Action::Audit));
+        assert!(!quiet.events()[0].executed);
+        assert_eq!(quiet.events()[0].respond_error, None);
     }
 
     fn ring_record(syscall_nr: u32, comm: &str, path: &str, flags: u8, cgroup: u64) -> Vec<u8> {
