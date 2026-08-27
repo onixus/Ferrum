@@ -10,6 +10,7 @@ use crate::source::{normalize_runtime_id, ContainerRecord, PodCache, PodRecord};
 use ferrum_common::{FerrumError, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PodWatchEvent {
@@ -95,6 +96,12 @@ pub fn parse_watch_event(line: &[u8]) -> Result<PodWatchEvent> {
 /// Fold one event into the cache. DELETE removes by UID, so every cgroup of
 /// that pod disappears from the next resolver refresh.
 pub fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOutcome {
+    // Every frame the apiserver produced is proof the watch is alive, so a
+    // bookmark on a quiet cluster and a 410 both count. An ERROR frame does
+    // not: a stream that only rejects us delivers no pod state.
+    if !matches!(event, PodWatchEvent::Error(_)) {
+        cache.mark_applied_at(Instant::now());
+    }
     match event {
         PodWatchEvent::Added(pod) | PodWatchEvent::Modified(pod) => {
             if cache.upsert(pod) {
@@ -361,6 +368,89 @@ fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
 }
 
 #[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use crate::source::{PodMetadataSource, POD_WATCH_BUDGET};
+    use std::time::Duration;
+
+    fn stale_cache() -> Option<PodCache> {
+        let mut cache = PodCache::new("node-a");
+        cache.upsert(PodRecord {
+            uid: "u1".into(),
+            namespace: "prod".into(),
+            name: "web-0".into(),
+            node_name: "node-a".into(),
+            ..Default::default()
+        });
+        cache.mark_applied_at(Instant::now().checked_sub(POD_WATCH_BUDGET * 2)?);
+        Some(cache)
+    }
+
+    #[test]
+    fn a_bookmark_refreshes_even_though_it_changes_nothing() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        assert!(cache.snapshot().is_err(), "stale before the bookmark");
+        let event = parse_watch_event(
+            br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"42"}}}"#,
+        )
+        .expect("bookmark");
+        assert_eq!(apply_watch_event(&mut cache, event), WatchOutcome::Ignored);
+        assert!(
+            cache.applied_age().expect("stamped") < Duration::from_secs(1),
+            "an Ignored outcome still proves the stream is alive"
+        );
+        cache.snapshot().expect("a bookmarked cache resolves");
+    }
+
+    #[test]
+    fn a_410_is_liveness_too_but_still_demands_a_relist() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        let event = parse_watch_event(
+            br#"{"type":"ERROR","object":{"kind":"Status","reason":"Expired","message":"too old resource version: 2 (9)","code":410}}"#,
+        )
+        .expect("gone");
+        assert_eq!(
+            apply_watch_event(&mut cache, event),
+            WatchOutcome::MustRelist
+        );
+        assert!(cache.applied_age().expect("stamped") < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_bare_error_frame_is_not_liveness() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        let event = parse_watch_event(
+            br#"{"type":"ERROR","object":{"kind":"Status","message":"boom","code":500}}"#,
+        )
+        .expect("error");
+        assert_eq!(apply_watch_event(&mut cache, event), WatchOutcome::Ignored);
+        assert!(
+            cache.snapshot().is_err(),
+            "a stream that only errors delivers no pod state"
+        );
+    }
+
+    #[test]
+    fn an_applied_stream_leaves_the_cache_usable() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        let stream = br#"{"type":"MODIFIED","object":{"metadata":{"uid":"u1","name":"web-0","namespace":"prod","resourceVersion":"77"},"spec":{"nodeName":"node-a"}}}"#;
+        assert_eq!(
+            apply_watch_stream(&mut cache, stream).expect("apply"),
+            WatchOutcome::Applied
+        );
+        assert_eq!(cache.snapshot().expect("fresh").len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod label_parse_tests {
     use super::*;
     use crate::labels::{apply_labels_event, apply_labels_stream, LabelCache};
@@ -503,7 +593,7 @@ mod client {
         parse_pod_list, parse_watch_event,
     };
     use crate::labels::{label_event_resource_version, try_apply_labels_event, LabelCache};
-    use crate::source::PodCache;
+    use crate::source::{PodCache, POD_WATCH_BUDGET};
     use crate::watch::WatchOutcome;
     use ferrum_common::{FerrumError, Result};
     use std::io::{self, BufRead, BufReader, Read, Write};
@@ -706,6 +796,7 @@ mod client {
             self.with_cache(|c| {
                 c.replace_all(pods);
                 c.set_resource_version(rv.clone());
+                c.mark_applied_at(Instant::now());
             });
             Ok(rv)
         }

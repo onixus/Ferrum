@@ -20,7 +20,7 @@ pub use labels::{
     MAX_TOTAL_LABEL_BYTES,
 };
 pub use resolver::{CgroupResolver, RefreshStats};
-pub use source::{ContainerRecord, PodCache, PodMetadataSource, PodRecord};
+pub use source::{ContainerRecord, PodCache, PodMetadataSource, PodRecord, POD_WATCH_BUDGET};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkloadIdentity {

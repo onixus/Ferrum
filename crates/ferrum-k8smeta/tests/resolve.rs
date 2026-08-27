@@ -2,7 +2,7 @@
 
 use ferrum_common::FerrumError;
 use ferrum_k8smeta::cgroupfs::{scan, CgroupFs, StdCgroupFs};
-use ferrum_k8smeta::source::{PodCache, PodMetadataSource};
+use ferrum_k8smeta::source::{PodCache, PodMetadataSource, POD_WATCH_BUDGET};
 use ferrum_k8smeta::watch::{
     apply_watch_event, apply_watch_stream, parse_labels_list, parse_pod_list, parse_watch_event,
     PodWatchEvent, WatchOutcome,
@@ -12,6 +12,7 @@ use ferrum_k8smeta::{CgroupResolver, SharedCgroupIndex};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const NODE: &str = "node-a";
 const WEB_UID: &str = "3f8a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8";
@@ -105,6 +106,8 @@ fn list_into_cache() -> PodCache {
     let mut cache = PodCache::new(NODE);
     cache.replace_all(pods);
     cache.set_resource_version(rv);
+    // A real relist stamps freshness; without it the cache is not usable.
+    cache.mark_applied_at(Instant::now());
     cache
 }
 
@@ -451,4 +454,113 @@ fn a_cold_label_cache_is_not_the_same_as_an_unlabelled_cluster() {
     let pods = cache.snapshot().expect("snapshot");
     assert!(pod_named(&pods, "web-0").namespace_labels.is_empty());
     assert_eq!(cache.labels_unknown_total(), 2);
+}
+
+/// The whole point of the freshness stamp: a watch that froze while still
+/// answering must degrade, and the last known identities must survive it.
+#[test]
+fn a_frozen_pod_watch_degrades_the_resolver_without_clearing_the_index() {
+    let fs = FakeCgroupFs::load("cgroup-systemd.paths");
+    let mut cache = list_into_cache();
+    let resolver = CgroupResolver::new(SharedCgroupIndex::new());
+    assert_eq!(
+        resolver
+            .refresh(&fs, Path::new("/fixture"), &cache)
+            .expect("fresh cache resolves")
+            .resolved,
+        2
+    );
+    let app_inode = fs.inode_of(
+        "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod3f8a1b2c_4d5e_6f70_8192_a3b4c5d6e7f8.slice/cri-containerd-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.scope",
+    );
+    let before = resolver.index().lookup_cgroup(app_inode).expect("resolved");
+
+    let Some(frozen) = Instant::now().checked_sub(POD_WATCH_BUDGET * 2) else {
+        return;
+    };
+    cache.mark_applied_at(frozen);
+    let err = resolver
+        .refresh(&fs, Path::new("/fixture"), &cache)
+        .expect_err("a frozen watch must not confirm the map");
+    match err {
+        FerrumError::Degraded(msg) => assert!(msg.contains("frozen"), "{msg}"),
+        other => panic!("expected Degraded, got {other:?}"),
+    }
+    // Identity misses forbid a kill; wiping the index would turn a visible
+    // degradation into a quiet "this node runs no containers".
+    assert_eq!(
+        resolver.index().lookup_cgroup(app_inode).expect("kept"),
+        before
+    );
+    assert!(!resolver.index().is_empty());
+}
+
+#[test]
+fn a_bookmark_alone_keeps_a_quiet_cluster_resolvable() {
+    let mut cache = list_into_cache();
+    let Some(nearly_stale) = Instant::now().checked_sub(POD_WATCH_BUDGET - Duration::from_secs(1))
+    else {
+        return;
+    };
+    cache.mark_applied_at(nearly_stale);
+    let bookmark = parse_watch_event(
+        br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"1099"}}}"#,
+    )
+    .expect("bookmark");
+    // No pod changed: the bookmark is the only proof the stream is alive.
+    assert_eq!(
+        apply_watch_event(&mut cache, bookmark),
+        WatchOutcome::Ignored
+    );
+    assert_eq!(cache.resource_version(), "1099");
+    assert!(!cache
+        .snapshot()
+        .expect("bookmark refreshed the cache")
+        .is_empty());
+}
+
+/// `PodMetadataSource` is what ferrum-agent implements; freshness had to go
+/// inside `snapshot`, not into a new method callers would have to adopt.
+#[test]
+fn pod_metadata_source_signature_is_unchanged() {
+    fn takes_source(source: &dyn PodMetadataSource) -> Vec<PodRecord> {
+        source.snapshot().unwrap_or_default()
+    }
+    struct Custom(Vec<PodRecord>);
+    impl PodMetadataSource for Custom {
+        fn snapshot(&self) -> Result<Vec<PodRecord>, FerrumError> {
+            Ok(self.0.clone())
+        }
+    }
+    let cache = list_into_cache();
+    assert_eq!(takes_source(&cache).len(), 1);
+    assert!(takes_source(&Custom(Vec::new())).is_empty());
+    // The blanket Vec impl still resolves without any freshness of its own.
+    let pods: Vec<PodRecord> = cache.snapshot().expect("snapshot");
+    assert_eq!(takes_source(&pods).len(), 1);
+}
+
+/// The labels ride the same connection, so they must survive a quiet cluster
+/// the same way the pods do: on bookmarks alone.
+#[test]
+fn a_namespace_bookmark_keeps_the_label_cache_warm() {
+    let mut cache = labelled_cache();
+    let Some(nearly_stale) =
+        Instant::now().checked_sub(cache.namespaces().max_age() - Duration::from_secs(1))
+    else {
+        return;
+    };
+    cache.namespaces_mut().mark_fresh_at(nearly_stale);
+    assert!(cache.namespaces().is_warm());
+    let bookmark = br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"2222"}}}"#;
+    assert_eq!(
+        apply_labels_stream(cache.namespaces_mut(), bookmark).expect("apply"),
+        WatchOutcome::Ignored
+    );
+    assert_eq!(cache.namespaces().resource_version(), "2222");
+    assert!(
+        cache.namespaces().age().expect("stamped") < Duration::from_secs(1),
+        "a bookmark is the only liveness a quiet cluster produces"
+    );
+    assert!(cache.namespaces().is_warm());
 }
