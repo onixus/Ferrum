@@ -132,6 +132,11 @@ fn a_far_off_expiry_does_not_warn() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The swap is driven by `reload`, not by racing the poller: what this asserts
+/// is that a completed reload reaches the *next* handshake, and a wall-clock
+/// deadline around a background thread proves that no better than one
+/// connection opened after the reload returned. The poller's own job — noticing
+/// the mount changed at all — is the test below.
 #[test]
 fn rotation_reaches_new_connections() {
     let dir = temp_dir("rotate");
@@ -141,7 +146,6 @@ fn rotation_reaches_new_connections() {
     let addr = listener.local_addr().expect("addr");
     let served = Arc::clone(&source);
     std::thread::spawn(move || serve_listener(listener, state(), Some(served)));
-    poll_serving_cert(Arc::clone(&source), Duration::from_millis(50));
 
     assert_eq!(
         served_certificate(addr),
@@ -150,18 +154,49 @@ fn rotation_reaches_new_connections() {
     );
 
     install(&dir, "rotated");
-    let rotated = fixture_der("rotated.crt");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if served_certificate(addr) == rotated {
-            break;
-        }
+    source.reload().expect("same CA, four SANs, not expired");
+    assert_eq!(
+        served_certificate(addr),
+        fixture_der("rotated.crt"),
+        "rotated material never reached a new connection"
+    );
+    assert_eq!(source.reload_failures(), 0);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The poller is what notices a kubelet-rotated mount when nobody calls
+/// `reload`. The rotation is written *before* the thread starts, so the loop
+/// below waits on one thing only — that the thread ran — and never reads a
+/// half-installed pair, which is a reload failure, not a rotation.
+#[test]
+fn the_poller_picks_up_a_rotated_mount() {
+    let dir = temp_dir("poll");
+    install(&dir, "serving");
+    let source = source(&dir);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let served = Arc::clone(&source);
+    std::thread::spawn(move || serve_listener(listener, state(), Some(served)));
+    // Two leaves of one CA with the same names and the same window have equal
+    // `facts`, so the swap is observed on the served config itself.
+    let mounted = source.config();
+
+    install(&dir, "rotated");
+    poll_serving_cert(Arc::clone(&source), Duration::from_millis(10));
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Arc::ptr_eq(&mounted, &source.config()) {
         assert!(
             Instant::now() < deadline,
-            "rotated material never reached a new connection"
+            "the poller never picked up the rotated mount"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(
+        served_certificate(addr),
+        fixture_der("rotated.crt"),
+        "what the poller loaded must be what the next handshake gets"
+    );
     assert_eq!(source.reload_failures(), 0);
     std::fs::remove_dir_all(&dir).ok();
 }
