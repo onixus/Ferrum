@@ -7,6 +7,7 @@
 
 use ferrum_ebpf::{
     encode_event, syscall_name, Event, SyscallArch, EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER,
+    EVENT_FLAG_PATH_TRUNCATED,
 };
 
 /// Upper bound of the reverse search. Every hooked nr on both arches is far
@@ -30,6 +31,10 @@ pub struct RecordBuilder {
     pub pid: u32,
     pub tgid: u32,
     pub cgroup_id: u64,
+    /// `None` follows the datapath: the flag is set exactly when the path did
+    /// not fit. `Some` forces it, which is only honest for proving that the
+    /// flag — and not the bytes — is what makes the verdict.
+    pub path_truncated: Option<bool>,
 }
 
 impl RecordBuilder {
@@ -43,6 +48,7 @@ impl RecordBuilder {
             pid: 0,
             tgid: 0,
             cgroup_id: 0,
+            path_truncated: None,
         }
     }
 
@@ -59,6 +65,13 @@ impl RecordBuilder {
 
     pub fn path(mut self, path: &str) -> Self {
         self.path = path.as_bytes().to_vec();
+        self
+    }
+
+    /// Overrides what the path length implies. Use it to build the record the
+    /// kernel cannot: the same truncated bytes without the flag.
+    pub fn path_truncated(mut self, path_truncated: bool) -> Self {
+        self.path_truncated = Some(path_truncated);
         self
     }
 
@@ -102,8 +115,13 @@ impl RecordBuilder {
         if self.agent_self {
             event.flags |= EVENT_FLAG_AGENT_SELF;
         }
-        fill(&mut event.comm, &self.comm);
-        fill(&mut event.path, &self.path);
+        // comm comes from `bpf_get_current_comm`, which has no overflow to
+        // report: only the path carries a truncation flag.
+        let _ = fill(&mut event.comm, &self.comm);
+        let path_overflow = fill(&mut event.path, &self.path);
+        if self.path_truncated.unwrap_or(path_overflow) {
+            event.flags |= EVENT_FLAG_PATH_TRUNCATED;
+        }
         event
     }
 
@@ -121,11 +139,12 @@ impl RecordBuilder {
     }
 }
 
-/// A value longer than the buffer is written the way the datapath writes it
-/// today: the buffer's worth of bytes and no NUL terminator. What the agent
-/// should do with such a record is the truncation slice's question, not this
-/// builder's.
-fn fill(dst: &mut [u8], src: &[u8]) {
+/// A value longer than the buffer is written the way the datapath writes it:
+/// the buffer's worth of bytes and no NUL terminator. Returns whether the
+/// value overflowed — a value the size of the buffer already has nowhere to
+/// put its terminator, so the datapath cannot prove it was whole either.
+fn fill(dst: &mut [u8], src: &[u8]) -> bool {
     let n = src.len().min(dst.len());
     dst[..n].copy_from_slice(&src[..n]);
+    src.len() >= dst.len()
 }
