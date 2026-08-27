@@ -15,7 +15,9 @@ pub mod watch;
 pub use cgroupfs::{scan, CgroupEntry, CgroupFs, StdCgroupFs, DEFAULT_CGROUP_ROOT};
 pub use index::SharedCgroupIndex;
 pub use labels::{
-    apply_labels_event, apply_labels_stream, label_key, LabelCache, LabelObject, LabelWatchEvent,
+    apply_labels_event, apply_labels_stream, label_key, try_apply_labels_event, LabelCache,
+    LabelObject, LabelWatchEvent, DEFAULT_MAX_AGE, MAX_LABEL_ENTRIES, MAX_OBJECT_LABEL_BYTES,
+    MAX_TOTAL_LABEL_BYTES,
 };
 pub use resolver::{CgroupResolver, RefreshStats};
 pub use source::{ContainerRecord, PodCache, PodMetadataSource, PodRecord};

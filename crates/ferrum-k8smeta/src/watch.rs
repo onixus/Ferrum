@@ -502,7 +502,7 @@ mod client {
         apply_watch_event, event_resource_version, parse_labels_list, parse_labels_watch_event,
         parse_pod_list, parse_watch_event,
     };
-    use crate::labels::{apply_labels_event, label_event_resource_version, LabelCache};
+    use crate::labels::{label_event_resource_version, try_apply_labels_event, LabelCache};
     use crate::source::PodCache;
     use crate::watch::WatchOutcome;
     use ferrum_common::{FerrumError, Result};
@@ -874,10 +874,16 @@ mod client {
             let (rv, objects) = parse_labels_list(self.kind.list_kind, &body)?;
             let mut objects = Some(objects);
             let listed_rv = rv.clone();
+            let mut stored: Result<()> = Ok(());
             self.sink.with(&mut |cache| {
-                cache.replace_all(objects.take().unwrap_or_default());
-                cache.set_resource_version(listed_rv.clone());
+                stored = cache.try_replace_all(objects.take().unwrap_or_default());
+                if stored.is_ok() {
+                    cache.set_resource_version(listed_rv.clone());
+                }
             });
+            // A list past the cache ceilings leaves it cold; relisting on the
+            // next cycle is the only honest answer.
+            stored?;
             Ok(rv)
         }
 
@@ -925,15 +931,18 @@ mod client {
                 };
                 let next_rv = label_event_resource_version(&event);
                 let mut event = Some(event);
-                let mut outcome = WatchOutcome::Ignored;
+                let mut applied: Result<WatchOutcome> = Ok(WatchOutcome::Ignored);
                 self.sink.with(&mut |cache| {
                     if let Some(next) = next_rv.clone() {
                         cache.set_resource_version(next);
                     }
                     if let Some(event) = event.take() {
-                        outcome = apply_labels_event(cache, event);
+                        applied = try_apply_labels_event(cache, event);
                     }
                 });
+                // An object the cache refuses to hold ends the stream: growing
+                // the map without a ceiling is how one apiserver OOMs us.
+                let outcome = applied?;
                 if outcome == WatchOutcome::MustRelist {
                     return Ok(outcome);
                 }
