@@ -3,6 +3,7 @@
 
 #![deny(unsafe_code)]
 
+mod pump;
 mod source;
 
 use ferrum_common::{FerrumError, Result};
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+pub use pump::{pump_channel, pump_records, PumpStats};
 pub use source::{
     decode_fsig, encode_fsig, extract_fsig, load_path, load_source, parse_trust_root,
     read_source_path, ExtractedFsig, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, KUBELET_DATA_DIR,
@@ -1160,6 +1162,96 @@ mod tests {
         let agent = Agent::new(AgentConfig::default());
         agent.record_drop(2);
         assert_eq!(agent.events_dropped_total(), 2);
+    }
+
+    fn ring_record(syscall_nr: u32, comm: &str, path: &str, flags: u8, cgroup: u64) -> Vec<u8> {
+        let mut event = ferrum_ebpf::Event::new();
+        event.cgroup_id = cgroup;
+        event.pid = 100;
+        event.tgid = 100;
+        event.syscall_nr = syscall_nr;
+        event.flags = flags;
+        event.comm[..comm.len()].copy_from_slice(comm.as_bytes());
+        event.path[..path.len()].copy_from_slice(path.as_bytes());
+        ferrum_ebpf::encode_event(&event)
+    }
+
+    #[test]
+    fn pump_ring_records_round_trip() {
+        use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER};
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        let sink = MemorySink::new();
+        // x86_64 numbers: 59 execve, 257 openat.
+        let records = vec![
+            ring_record(59, "sh", "/bin/sh", EVENT_FLAG_CONTAINER, 7),
+            ring_record(257, "app", "/var/run/docker.sock", EVENT_FLAG_CONTAINER, 7),
+        ];
+        let stats = pump_records(&agent, SyscallArch::X86_64, &records, &sink);
+        assert_eq!(
+            stats,
+            PumpStats {
+                handled: 2,
+                decode_failed: 0
+            }
+        );
+        let events = sink.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].syscall, "execve");
+        assert_eq!(events[0].comm, "sh");
+        assert_eq!(events[0].action, "kill");
+        assert_eq!(events[0].pod, "pod-a");
+        assert_eq!(events[1].syscall, "openat");
+        assert_eq!(events[1].action, "kill");
+        assert_eq!(agent.events_dropped_total(), 0);
+    }
+
+    #[test]
+    fn pump_unknown_syscall_and_garbage_do_not_panic() {
+        use ferrum_ebpf::SyscallArch;
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        let sink = MemorySink::new();
+        let records: Vec<Vec<u8>> = vec![
+            ring_record(u32::MAX, "sh", "/bin/sh", 0, 1),
+            vec![0u8; 5],
+            Vec::new(),
+        ];
+        let stats = pump_records(&agent, SyscallArch::X86_64, &records, &sink);
+        assert_eq!(
+            stats,
+            PumpStats {
+                handled: 1,
+                decode_failed: 2
+            }
+        );
+        // Unknown nr reaches the spec default action instead of a rule.
+        assert_eq!(sink.events().len(), 1);
+        assert_eq!(sink.events()[0].syscall, ferrum_ebpf::SYSCALL_UNKNOWN);
+        assert_eq!(sink.events()[0].action, "audit");
+        assert_eq!(agent.events_dropped_total(), 2);
+    }
+
+    #[test]
+    fn pump_channel_drains_until_hangup() {
+        use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER};
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        let sink = MemorySink::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ring_record(
+            59,
+            "bash",
+            "/bin/bash",
+            EVENT_FLAG_CONTAINER,
+            1,
+        ))
+        .expect("send");
+        drop(tx);
+        let stats = pump_channel(&agent, SyscallArch::X86_64, rx, &sink);
+        assert_eq!(stats.handled, 1);
+        assert_eq!(sink.events()[0].action, "kill");
     }
 
     #[test]
