@@ -1,0 +1,61 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: runtimeprofiles.ferrum.io
+spec:
+  group: ferrum.io
+  names:
+    kind: RuntimeProfile
+    listKind: RuntimeProfileList
+    plural: runtimeprofiles
+    singular: runtimeprofile
+    shortNames:
+      - rprof
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: SourcePolicy
+          type: string
+          jsonPath: .spec.sourcePolicy
+        - name: Window
+          type: string
+          jsonPath: .spec.window
+        - name: ReadyForPromote
+          type: boolean
+          jsonPath: .status.readyForPromote
+        - name: Drift
+          type: integer
+          jsonPath: .status.driftCount
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [sourcePolicy]
+              x-kubernetes-validations:
+                - rule: "!has(self.window) || self.window.matches('^[0-9]+[hd]$')"
+                  message: "window must look like 7d or 24h"
+              properties:
+                sourcePolicy:
+                  type: string
+                  minLength: 1
+                window:
+                  type: string
+                  minLength: 2
+            status:
+              type: object
+              # Promote is a human action: the controller never flips a profile
+              # into an enforcing policy on its own.
+              properties:
+                readyForPromote:
+                  type: boolean
+                driftCount:
+                  type: integer
+                  format: int32

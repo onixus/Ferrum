@@ -1,0 +1,59 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: compliancesnapshots.ferrum.io
+spec:
+  group: ferrum.io
+  names:
+    kind: ComplianceSnapshot
+    listKind: ComplianceSnapshotList
+    plural: compliancesnapshots
+    singular: compliancesnapshot
+    shortNames:
+      - csnap
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Pass
+          type: integer
+          jsonPath: .status.pass
+        - name: Fail
+          type: integer
+          jsonPath: .status.fail
+        - name: Waived
+          type: integer
+          jsonPath: .status.waived
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          # A report, not a lever: nothing here changes enforcement.
+          properties:
+            spec:
+              type: object
+              x-kubernetes-validations:
+                - rule: "!has(self.frameworks) || self.frameworks.all(f, size(f) > 0)"
+                  message: "frameworks must not contain empty entries"
+              properties:
+                frameworks:
+                  type: array
+                  items:
+                    type: string
+                    minLength: 1
+            status:
+              type: object
+              properties:
+                pass:
+                  type: integer
+                  format: int32
+                fail:
+                  type: integer
+                  format: int32
+                waived:
+                  type: integer
+                  format: int32

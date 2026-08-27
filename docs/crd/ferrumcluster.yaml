@@ -1,0 +1,70 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ferrumclusters.ferrum.io
+spec:
+  group: ferrum.io
+  names:
+    kind: FerrumCluster
+    listKind: FerrumClusterList
+    plural: ferrumclusters
+    singular: ferrumcluster
+    shortNames:
+      - fcl
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Connected
+          type: boolean
+          jsonPath: .status.connected
+        - name: Degraded
+          type: boolean
+          jsonPath: .status.degraded
+        - name: AgentAbi
+          type: integer
+          jsonPath: .status.agentAbi
+        - name: LastDigest
+          type: string
+          jsonPath: .status.lastBundleDigest
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [kubeconfigSecretRef]
+              x-kubernetes-validations:
+                # The name of a Secret, never inline credentials.
+                - rule: "!self.kubeconfigSecretRef.contains('\\n')"
+                  message: "kubeconfigSecretRef is a Secret name, not kubeconfig content"
+              properties:
+                kubeconfigSecretRef:
+                  type: string
+                  minLength: 1
+                labels:
+                  type: object
+                  additionalProperties:
+                    type: string
+            status:
+              type: object
+              x-kubernetes-validations:
+                # CP down keeps last-known-good; degraded without a digest would
+                # mean fail-open.
+                - rule: "!has(self.degraded) || !self.degraded || (has(self.lastBundleDigest) && size(self.lastBundleDigest) > 0)"
+                  message: "degraded=true without lastBundleDigest is fail-open, not last-known-good"
+              properties:
+                connected:
+                  type: boolean
+                degraded:
+                  type: boolean
+                agentAbi:
+                  type: integer
+                  format: int32
+                lastBundleDigest:
+                  type: string
