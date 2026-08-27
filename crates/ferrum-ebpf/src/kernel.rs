@@ -13,7 +13,7 @@
 //! reported as Ok.
 
 #[cfg(feature = "attach")]
-use crate::TRACEPOINTS;
+use crate::SyscallArch;
 #[cfg(feature = "attach")]
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 #[cfg(feature = "attach")]
@@ -81,15 +81,42 @@ pub struct KernelHandle {
     /// Mirror of what this handle actually wrote into `ferrum_cgroups`; the
     /// next plan is diffed against it, so a failed sync is not forgotten.
     container_cgroups: BTreeSet<u64>,
+    /// Syscalls with no tracepoint on this arch, hence unhooked here.
+    unhooked_syscalls: Vec<&'static str>,
 }
 
 #[cfg(feature = "attach")]
 impl KernelHandle {
-    /// Load a compiled `ferrum-ebpf-progs` ELF and attach all tracepoints.
-    /// Any missing program or failed attach aborts the whole handle.
+    /// Load a compiled `ferrum-ebpf-progs` ELF and attach every tracepoint
+    /// this host's arch has. A missing program or a failed attach still
+    /// aborts the whole handle.
     pub fn attach(elf: &[u8]) -> Result<Self> {
+        let arch = SyscallArch::host().ok_or_else(|| {
+            FerrumError::Degraded(
+                "no syscall decode table for this host arch; refusing to attach".into(),
+            )
+        })?;
+        Self::attach_for_arch(elf, arch)
+    }
+
+    /// Attach the tracepoints that exist on `arch`.
+    ///
+    /// A syscall that arch does not have (`open` on aarch64) has no
+    /// tracepoint to attach to, and treating that as fatal left the node with
+    /// no hooks at all — the whole runtime plane dead. It is skipped and
+    /// reported by [`Self::unhooked_syscalls`]. Every other attach failure is
+    /// still fatal: "the tracepoint is not there" must not widen into
+    /// "swallow attach errors".
+    pub fn attach_for_arch(elf: &[u8], arch: SyscallArch) -> Result<Self> {
+        let wanted = crate::tracepoints_for_arch(arch);
+        if wanted.is_empty() {
+            return Err(FerrumError::Degraded(format!(
+                "no datapath tracepoint exists on {}; the runtime plane would be blind",
+                arch.as_str()
+            )));
+        }
         let mut bpf = Bpf::load(elf).map_err(|err| degraded("load eBPF ELF", err))?;
-        for (prog, category, name) in TRACEPOINTS {
+        for (prog, category, name) in wanted {
             let program = bpf.program_mut(prog).ok_or_else(|| {
                 FerrumError::Degraded(format!("program {prog} missing from eBPF ELF"))
             })?;
@@ -103,7 +130,15 @@ impl KernelHandle {
         Ok(Self {
             bpf,
             container_cgroups: BTreeSet::new(),
+            unhooked_syscalls: crate::tracepoints_absent_on_arch(arch),
         })
+    }
+
+    /// Datapath syscalls with no hook on this node's arch. Non-empty means
+    /// rules naming them are dead here, which is a Degraded fact, not a
+    /// healthy one.
+    pub fn unhooked_syscalls(&self) -> &[&'static str] {
+        &self.unhooked_syscalls
     }
 
     /// Cgroup ids this handle has flagged as containers. Plan the next sync

@@ -63,6 +63,43 @@ pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// One entry of [`TRACEPOINTS`]: program symbol, category, tracepoint name.
+pub type Tracepoint = (&'static str, &'static str, &'static str);
+
+/// The syscall a tracepoint observes, or `None` if the name is not a
+/// `sys_enter_*` hook.
+pub fn tracepoint_syscall(tracepoint: &Tracepoint) -> Option<&'static str> {
+    tracepoint.2.strip_prefix("sys_enter_")
+}
+
+/// Tracepoints that exist on `arch`.
+///
+/// A syscall absent on an arch has no tracepoint there, and attaching to it
+/// fails with ENOENT. Attaching the whole set unconditionally therefore left
+/// the agent with no hooks at all on such a host, so the arch-restricted ones
+/// are filtered out here rather than allowed to fail: a real attach error
+/// must stay an error.
+pub fn tracepoints_for_arch(arch: SyscallArch) -> Vec<&'static Tracepoint> {
+    let observable = ferrum_ids::datapath_syscalls_for_arch(arch.as_str());
+    TRACEPOINTS
+        .iter()
+        .filter(|tp| match tracepoint_syscall(tp) {
+            Some(syscall) => observable.contains(&syscall),
+            None => true,
+        })
+        .collect()
+}
+
+/// Tracepoints skipped on `arch` because the syscall does not exist there.
+pub fn tracepoints_absent_on_arch(arch: SyscallArch) -> Vec<&'static str> {
+    let observable = ferrum_ids::datapath_syscalls_for_arch(arch.as_str());
+    TRACEPOINTS
+        .iter()
+        .filter_map(tracepoint_syscall)
+        .filter(|syscall| !observable.contains(syscall))
+        .collect()
+}
+
 /// Parse `spec` as FEBP and install it on `loader` as last-known-good.
 pub fn load_bundle(loader: &mut Loader, digest: &Digest, spec: &[u8]) -> Result<()> {
     loader.load_bundle(digest, spec)
@@ -82,20 +119,43 @@ mod tests {
     /// Third copy of the datapath's syscall set: what is attached. A hook here
     /// with no entry in `DATAPATH_SYSCALLS` is a syscall no rule may name; an
     /// entry there with no hook is a rule that validates and never fires.
+    ///
+    /// Per arch, not against the whole list: `open` has no tracepoint on
+    /// aarch64, and pinning the attach set to the full list is what made a
+    /// single missing tracepoint kill every hook there.
     #[test]
-    fn tracepoints_match_datapath_syscalls() {
-        let mut hooked: Vec<&str> = TRACEPOINTS
-            .iter()
-            .map(|(_, category, name)| {
-                assert_eq!(*category, "syscalls");
-                name.strip_prefix("sys_enter_")
-                    .expect("tracepoint name is sys_enter_<syscall>")
-            })
-            .collect();
-        hooked.sort_unstable();
-        let mut want = ferrum_ids::DATAPATH_SYSCALLS.to_vec();
-        want.sort_unstable();
-        assert_eq!(hooked, want, "TRACEPOINTS drifted from DATAPATH_SYSCALLS");
+    fn tracepoints_match_datapath_syscalls_per_arch() {
+        for arch in [SyscallArch::X86_64, SyscallArch::Aarch64] {
+            let mut hooked: Vec<&str> = tracepoints_for_arch(arch)
+                .iter()
+                .map(|tp| {
+                    assert_eq!(tp.1, "syscalls");
+                    tracepoint_syscall(tp).expect("tracepoint name is sys_enter_<syscall>")
+                })
+                .collect();
+            hooked.sort_unstable();
+            let mut want = ferrum_ids::datapath_syscalls_for_arch(arch.as_str());
+            want.sort_unstable();
+            assert_eq!(hooked, want, "TRACEPOINTS drifted on {}", arch.as_str());
+            assert!(!hooked.is_empty(), "no hooks left on {}", arch.as_str());
+        }
+    }
+
+    /// The skip list is exactly what the arch lacks, and nothing more: a
+    /// tracepoint dropped for any other reason is a silently blind hook.
+    #[test]
+    fn only_arch_missing_tracepoints_are_skipped() {
+        assert!(tracepoints_absent_on_arch(SyscallArch::X86_64).is_empty());
+        assert_eq!(
+            tracepoints_absent_on_arch(SyscallArch::Aarch64),
+            vec!["open"]
+        );
+        for arch in [SyscallArch::X86_64, SyscallArch::Aarch64] {
+            assert_eq!(
+                tracepoints_for_arch(arch).len() + tracepoints_absent_on_arch(arch).len(),
+                TRACEPOINTS.len()
+            );
+        }
     }
 
     struct Writer(Vec<u8>);
@@ -576,6 +636,69 @@ mod tests {
             }],
         );
         assert_compile(parse_febp(&spec));
+        let mut loader = Loader::new();
+        load_mvp(&mut loader);
+        let good = loader.last_good().expect("lkg").digest.clone();
+        assert_compile(loader.load_bundle(&digest_of(&spec), &spec));
+        assert_eq!(loader.last_good().expect("lkg").digest, good);
+    }
+
+    fn one_rule(id: &str, syscalls: &[&str], action: Action) -> Vec<u8> {
+        encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Audit,
+            &[RuleSpec {
+                id,
+                syscalls,
+                action,
+                comm_in: &["sh"],
+                container_only: false,
+                path_prefix: &[],
+                path_suffix: &[],
+                not_agent_self: false,
+            }],
+        )
+    }
+
+    /// The validator and the compiler compare `trim()`ed syscall names, so
+    /// `syscalls: [" execve"]` from YAML passes both gates and gets signed.
+    /// The matcher has to see the same name, or the rule is dead in a bundle
+    /// everything upstream called valid.
+    #[test]
+    fn whitespace_around_a_syscall_name_still_matches() {
+        for raw in [" execve", "execve\r", "\texecve\n", "  execve  "] {
+            let spec = parse_febp(&one_rule("no-shell", &[raw], Action::Kill))
+                .unwrap_or_else(|err| panic!("parse {raw:?}: {err}"));
+            assert_eq!(spec.rules[0].syscalls, vec!["execve".to_string()]);
+            let d = matched_action(&spec, &ev("execve", "sh", "/bin/sh", true, false));
+            assert_eq!(d.action, Action::Kill, "{raw:?} did not match");
+            assert_eq!(d.rule_id.as_deref(), Some("no-shell"));
+        }
+    }
+
+    /// Load-path copy of the compiler gate: a bundle produced by anything
+    /// that calls the encoder directly must not install a rule the datapath
+    /// never observes.
+    #[test]
+    fn unobservable_syscall_is_rejected_on_load() {
+        for name in ["ptrace", "", " ", "execve2", "sys_enter_execve"] {
+            match parse_febp(&one_rule("dead", &[name], Action::Deny)) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("not hooked by the datapath"), "{msg}")
+                }
+                other => panic!("expected Compile for {name:?}, got {other:?}"),
+            }
+        }
+        // Every hooked syscall still loads, whitespace included.
+        for name in ferrum_ids::DATAPATH_SYSCALLS {
+            parse_febp(&one_rule("ok", &[name], Action::Audit)).expect("hooked syscall loads");
+            let padded = format!(" {name}\r\n");
+            parse_febp(&one_rule("ok", &[padded.as_str()], Action::Audit)).expect("trimmed loads");
+        }
+        // Last-known-good survives the rejection.
+        let spec = one_rule("dead", &["ptrace"], Action::Deny);
         let mut loader = Loader::new();
         load_mvp(&mut loader);
         let good = loader.last_good().expect("lkg").digest.clone();

@@ -32,6 +32,14 @@ impl SyscallArch {
             None
         }
     }
+
+    /// Spelled as `ferrum_ids::datapath_syscalls_for_arch` expects it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
 }
 
 /// syscall nr → name for the syscalls the datapath programs hook.
