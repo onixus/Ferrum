@@ -6,13 +6,13 @@
 use chrono::{Days, Utc};
 use ferrum_api::{
     ExceptionTarget, FailurePolicy, PolicyExceptionSpec, PolicyMode, RuntimeAction, RuntimeMatch,
-    RuntimeRule, RuntimeSpec, SecurityPolicySpec,
+    RuntimeRule, RuntimeSpec, SecurityPolicySpec, SupplySpec, TrustRoot,
 };
 use ferrum_policy::{validate_cluster_policy, validate_exception, validate_namespaced_policy};
 use ferrum_testkit::{
     bpf_not_from_agent_audit, cluster_admin_bind_deny, docker_sock_kill, exec_sh_kill,
     privileged_deny, runtime_unexecutable_action, runtime_unobservable_syscall,
-    try_exception_from_yaml, unsigned_deny, EXCEPTION_WITHOUT_TTL_YAML,
+    try_exception_from_yaml, unsigned_deny, EXCEPTION_WITHOUT_TTL_YAML, FIXTURE_ED25519_PK,
 };
 use serde_yaml::Value;
 use std::collections::BTreeSet;
@@ -505,6 +505,298 @@ fn image_of(policy: &ferrum_api::ClusterSecurityPolicy) -> ferrum_ebpf::Prefilte
         ferrum_compiler::compile_cluster_policy(&policy.spec).expect("prod-restricted compiles");
     let compiled = ferrum_ebpf::parse_febp(&bundle.ebpf_spec).expect("FEBP decodes");
     ferrum_ebpf::prefilter_image(&compiled)
+}
+
+/// Schema node for one property of the PolicyException spec.
+fn exception_property(name: &str) -> Value {
+    spec_schema(CRD_POLICY_EXCEPTION)
+        .get("properties")
+        .and_then(|p| p.get(name))
+        .unwrap_or_else(|| panic!("PolicyException.{name} left the schema"))
+        .clone()
+}
+
+fn bound(node: &Value, key: &str) -> Option<usize> {
+    node.get(key).and_then(Value::as_u64).map(|v| v as usize)
+}
+
+/// The `rules` array schema, shared by both SecurityPolicy CRDs.
+fn rules_schema(crd: &str) -> Value {
+    runtime_schema(crd)
+        .get("rules")
+        .expect("rules schema")
+        .clone()
+}
+
+fn rule_property(crd: &str, name: &str) -> Value {
+    rules_schema(crd)
+        .get("items")
+        .and_then(|i| i.get("properties"))
+        .and_then(|p| p.get(name))
+        .unwrap_or_else(|| panic!("runtime rule .{name} left the schema"))
+        .clone()
+}
+
+fn rule_match_property(crd: &str, name: &str) -> Value {
+    rule_property(crd, "match")
+        .get("properties")
+        .and_then(|p| p.get(name))
+        .unwrap_or_else(|| panic!("runtime rule match.{name} left the schema"))
+        .clone()
+}
+
+fn string_items(node: &Value) -> Value {
+    node.get("items").expect("array items schema").clone()
+}
+
+/// A policy carrying exactly the rules given, otherwise well-formed: the
+/// syscall pair travels together and the action is one the runtime executes,
+/// so nothing but the field under test can be what fails.
+fn policy_with_rules(rules: Vec<RuntimeRule>) -> SecurityPolicySpec {
+    SecurityPolicySpec {
+        runtime: RuntimeSpec {
+            rules,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn probe_rule(id: &str) -> RuntimeRule {
+    RuntimeRule {
+        id: id.into(),
+        syscalls: vec!["execve".into(), "execveat".into()],
+        match_on: RuntimeMatch {
+            comm_in: vec!["sh".into()],
+            ..Default::default()
+        },
+        action: RuntimeAction::Audit,
+    }
+}
+
+fn policy_with_trust_root(keys: &[&str]) -> SecurityPolicySpec {
+    SecurityPolicySpec {
+        supply: SupplySpec {
+            trust_roots: vec![TrustRoot {
+                name: "internal".into(),
+                public_keys: keys.iter().map(|k| (*k).to_string()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// `ferrum-policy` demands a second approver on every waiver, and says why:
+/// `fourEyes` is set by the requester, so it cannot be the switch that decides
+/// whether anyone else had to agree. The CEL copy made it conditional on
+/// exactly that field, so the API server admitted waivers with no approver
+/// which the compiler then refused — the object exists, nothing enforces it.
+#[test]
+fn a_waiver_without_a_second_approver_is_refused_by_the_schema_too() {
+    for four_eyes in [false, true] {
+        let mut spec = exception("sre", "", 30);
+        spec.four_eyes = four_eyes;
+        validate_exception(&spec).expect_err("approvedBy is required whatever fourEyes says it is");
+    }
+    validate_exception(&exception("sre", "ib", 30)).expect("a named approver is accepted");
+
+    assert!(
+        required_fields(CRD_POLICY_EXCEPTION)
+            .iter()
+            .any(|f| f == "approvedBy"),
+        "the CRD admits a waiver with no second approver that ferrum-policy refuses"
+    );
+    assert!(
+        bound(&exception_property("approvedBy"), "minLength").unwrap_or(0) >= 1,
+        "approvedBy: '' passes `required` and is still no approver"
+    );
+    assert!(
+        !cel_rules(CRD_POLICY_EXCEPTION)
+            .iter()
+            .any(|r| r.contains("fourEyes")),
+        "a CEL rule keyed on fourEyes lets the requester decide whether a second \
+         approver was needed; that is the hole, not the gate"
+    );
+}
+
+/// Same drift, other field: `reason` carried `minLength: 1` against
+/// `MIN_REASON_LEN` in the compiler. Both sides are derived — the bound is read
+/// out of the schema and the verdicts come from `ferrum-policy` — so neither
+/// can move without the other.
+#[test]
+fn the_minimum_reason_length_is_the_same_in_the_schema_and_in_policy() {
+    let min = bound(&exception_property("reason"), "minLength").expect("reason minLength");
+    for len in 0..=ferrum_policy::MIN_REASON_LEN + 2 {
+        let mut spec = exception("sre", "ib", 30);
+        spec.reason = "a".repeat(len);
+        assert_eq!(
+            validate_exception(&spec).is_ok(),
+            len >= min,
+            "a reason of {len} characters: the schema and the compiler disagree \
+             (schema minLength {min}, ferrum_policy::MIN_REASON_LEN {})",
+            ferrum_policy::MIN_REASON_LEN
+        );
+    }
+}
+
+/// The 90-day ceiling, spelled as a duration in CEL. Derived from the same
+/// constant rather than from the literal `2160h` written above.
+#[test]
+fn the_cel_ttl_ceiling_is_the_policy_constant_in_hours() {
+    let hours = ferrum_policy::MAX_EXCEPTION_DAYS * 24;
+    assert_eq!(CEL_NINETY_DAYS, format!("{hours}h"));
+}
+
+/// A rule id names the thing an exception waives and an audit record blames.
+/// `ferrum-policy` refuses a blank one and refuses two rules that share one;
+/// the schema required the key and bounded nothing, so both passed the API
+/// server. Duplicate ids are held by a list-map key rather than CEL: the API
+/// server enforces uniqueness itself, and a quadratic `exists_one` over an
+/// unbounded list is a CEL cost estimate that can get the whole CRD rejected.
+#[test]
+fn a_blank_or_duplicated_rule_id_is_refused_by_the_schema_too() {
+    for (name, crd) in [
+        ("securitypolicy", CRD_SECURITY_POLICY),
+        ("clustersecuritypolicy", CRD_CLUSTER_SECURITY_POLICY),
+    ] {
+        let id = rule_property(crd, "id");
+        let min = bound(&id, "minLength").unwrap_or(0);
+        let pattern = id.get("pattern").and_then(Value::as_str).unwrap_or("");
+        assert_eq!(
+            pattern, r"\S",
+            "{name}: this gate reads the id pattern rather than running a regex \
+             engine, and knows only `\\S`; teach it the new one or drop it"
+        );
+        for candidate in ["", " ", "\t", "   ", "ok", " padded "] {
+            let admitted_by_schema =
+                candidate.len() >= min && candidate.bytes().any(|b| !b.is_ascii_whitespace());
+            assert_eq!(
+                validate_namespaced_policy(&policy_with_rules(vec![probe_rule(candidate)])).is_ok(),
+                admitted_by_schema,
+                "{name}: rule id {candidate:?} — the schema and the compiler disagree"
+            );
+        }
+
+        validate_namespaced_policy(&policy_with_rules(vec![probe_rule("a"), probe_rule("b")]))
+            .expect("distinct ids are fine");
+        validate_namespaced_policy(&policy_with_rules(vec![
+            probe_rule("dup"),
+            probe_rule("dup"),
+        ]))
+        .expect_err("ferrum-policy refuses two rules with one id");
+        let rules = rules_schema(crd);
+        assert_eq!(
+            rules.get("x-kubernetes-list-type").and_then(Value::as_str),
+            Some("map"),
+            "{name}: nothing in the schema stops two rules sharing an id"
+        );
+        assert_eq!(
+            rules
+                .get("x-kubernetes-list-map-keys")
+                .and_then(Value::as_sequence)
+                .map(|k| k.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+            Some(vec!["id"]),
+            "{name}: the list-map key is not the rule id"
+        );
+    }
+}
+
+/// The match predicates have the same "can never fire" bound the compiler
+/// enforces, and it is the datapath's, not a number retyped into YAML.
+#[test]
+fn the_match_length_bounds_in_the_schema_are_the_datapath_bounds() {
+    for (name, crd) in [
+        ("securitypolicy", CRD_SECURITY_POLICY),
+        ("clustersecuritypolicy", CRD_CLUSTER_SECURITY_POLICY),
+    ] {
+        let comm = string_items(&rule_match_property(crd, "commIn"));
+        assert_eq!(
+            bound(&comm, "maxLength"),
+            Some(ferrum_ids::COMM_MATCH_MAX),
+            "{name}: commIn maxLength is not TASK_COMM_LEN minus the NUL"
+        );
+        for field in ["pathPrefix", "pathSuffix"] {
+            let path = string_items(&rule_match_property(crd, field));
+            assert_eq!(
+                bound(&path, "maxLength"),
+                Some(ferrum_ids::PATH_MATCH_MAX),
+                "{name}: {field} maxLength is not the datapath path buffer"
+            );
+        }
+    }
+
+    // The other side of the same bound, so the numbers above are the ones the
+    // compiler actually applies and not a pair of matching typos.
+    for (len, admitted) in [
+        (ferrum_ids::COMM_MATCH_MAX, true),
+        (ferrum_ids::COMM_MATCH_MAX + 1, false),
+    ] {
+        let mut rule = probe_rule("comm-bound");
+        rule.match_on.comm_in = vec!["c".repeat(len)];
+        assert_eq!(
+            validate_namespaced_policy(&policy_with_rules(vec![rule])).is_ok(),
+            admitted,
+            "comm of {len} bytes"
+        );
+    }
+    for (len, admitted) in [
+        (ferrum_ids::PATH_MATCH_MAX, true),
+        (ferrum_ids::PATH_MATCH_MAX + 1, false),
+    ] {
+        let mut rule = probe_rule("path-bound");
+        rule.match_on.path_prefix = vec!["p".repeat(len)];
+        assert_eq!(
+            validate_namespaced_policy(&policy_with_rules(vec![rule])).is_ok(),
+            admitted,
+            "pathPrefix of {len} bytes"
+        );
+    }
+}
+
+/// `publicKeys` is verifying material, not a label: a trust root whose key is
+/// not 64 hex characters cannot verify anything, and the compiler says so. The
+/// schema said `type: string`, so the API server admitted a policy whose supply
+/// section could never be built — with `requireSigned` set, that is a cluster
+/// believing it demands signatures.
+#[test]
+fn a_public_key_that_is_not_ed25519_hex_is_refused_by_the_schema_too() {
+    let expected = format!(
+        "^[0-9a-fA-F]{{{}}}$",
+        ferrum_policy::ED25519_PUBLIC_KEY_HEX_LEN
+    );
+    for (name, crd) in [
+        ("securitypolicy", CRD_SECURITY_POLICY),
+        ("clustersecuritypolicy", CRD_CLUSTER_SECURITY_POLICY),
+    ] {
+        let keys = spec_schema(crd)
+            .get("properties")
+            .and_then(|p| p.get("supply"))
+            .and_then(|s| s.get("properties"))
+            .and_then(|p| p.get("trustRoots"))
+            .and_then(|t| t.get("items"))
+            .and_then(|i| i.get("properties"))
+            .and_then(|p| p.get("publicKeys"))
+            .map(string_items)
+            .expect("publicKeys items schema");
+        assert_eq!(
+            keys.get("pattern").and_then(Value::as_str),
+            Some(expected.as_str()),
+            "{name}: the schema admits a trustRoot key ferrum-policy cannot use"
+        );
+    }
+
+    // Same verdicts from the compiler, on the shapes the pattern separates.
+    validate_namespaced_policy(&policy_with_trust_root(&[FIXTURE_ED25519_PK]))
+        .expect("64 hex characters are a key");
+    for bad in ["", "abc", "zz"] {
+        validate_namespaced_policy(&policy_with_trust_root(&[bad]))
+            .expect_err("not an Ed25519 key");
+    }
+    let long = format!("{FIXTURE_ED25519_PK}00");
+    validate_namespaced_policy(&policy_with_trust_root(&[long.as_str()]))
+        .expect_err("too long is not a key either");
 }
 
 /// The install tree is the fourth place an invariant is written down, and the

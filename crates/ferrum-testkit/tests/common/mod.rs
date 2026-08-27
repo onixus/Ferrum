@@ -6,6 +6,7 @@
 //! acceptance file is the gate this harness is measured against, so it stays
 //! untouched.
 
+pub mod febp;
 pub mod wire;
 
 use ferrum_agent::{encode_fsig, Agent, AgentConfig, AgentRole, Responder, TargetCheck};
@@ -32,8 +33,19 @@ pub const TGID_WORKLOAD: u32 = 4242;
 
 /// compile → sign: FSIG over the FRMB material of `prod-restricted` (enforce).
 pub fn signed_bundle() -> (Vec<u8>, Digest) {
+    signed_bundle_mutated(|_| {})
+}
+
+/// The same bundle with the decoded spec handed to `mutate` first. For tests
+/// that need one field of the shipped policy to differ so that a verdict which
+/// is otherwise ambiguous — two rules that agree on an action, say — becomes
+/// readable again. The example file itself stays untouched.
+pub fn signed_bundle_mutated(
+    mutate: impl FnOnce(&mut ferrum_api::ClusterSecurityPolicySpec),
+) -> (Vec<u8>, Digest) {
     let mut spec = prod_restricted().spec;
     spec.mode = PolicyMode::Enforce;
+    mutate(&mut spec);
     let bundle = compile_cluster_policy(&spec).expect("compile prod-restricted");
     let frmb = bundle_digest_material(
         AGENT_ABI,
