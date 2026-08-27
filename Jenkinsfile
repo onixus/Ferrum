@@ -46,6 +46,11 @@ pipeline {
                     rustup component add clippy
                     cargo clippy --workspace --all-targets -- -D warnings
                     cargo clippy -p ferrum-ebpf --features attach --all-targets -- -D warnings
+                    # Default features hide the production paths: the k8smeta
+                    # apiserver client and the agent's real datapath are only
+                    # compiled behind these.
+                    cargo clippy -p ferrum-k8smeta --features apiserver --all-targets -- -D warnings
+                    cargo clippy -p ferrum-agent --features attach --all-targets -- -D warnings
                 '''
             }
         }
@@ -124,6 +129,16 @@ pipeline {
                         exit 1
                     fi
                     echo "ok: exception-bad-no-ticket.yaml rejected"
+                    cargo run -p ferrum-cli --quiet -- lint-deploy deploy
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- lint-deploy crates/ferrum-testkit/fixtures/deploy-bad >/tmp/ferrum-bad-deploy.out 2>/tmp/ferrum-bad-deploy.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "fixtures/deploy-bad must fail lint-deploy" >&2
+                        exit 1
+                    fi
+                    echo "ok: fixtures/deploy-bad rejected"
                 '''
             }
         }

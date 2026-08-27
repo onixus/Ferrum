@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod compile;
 mod fsig;
+mod lint_deploy;
 mod sign;
 mod validate;
 mod verify;
@@ -38,6 +39,8 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Проверить манифесты установки на инварианты threat model. Офлайн, без kube.
+    LintDeploy { dir: PathBuf },
     /// Проверить подпись FSIG пином trust root (64 hex-символа Ed25519).
     Verify {
         path: PathBuf,
@@ -60,5 +63,6 @@ fn run() -> Result<()> {
         Commands::Compile { path, output } => compile::compile_file(&path, &output),
         Commands::Sign { path, key, output } => sign::sign_file(&path, &key, &output),
         Commands::Verify { path, trust_root } => verify::verify_file(&path, &trust_root),
+        Commands::LintDeploy { dir } => lint_deploy::lint_deploy_dir(&dir),
     }
 }

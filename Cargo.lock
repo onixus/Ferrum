@@ -476,6 +476,7 @@ dependencies = [
  "ferrum-policy",
  "ferrum-proto",
  "ferrum-wasm-host",
+ "libc",
  "serde_json",
  "serde_yaml 0.8.26",
 ]
@@ -603,6 +604,9 @@ name = "ferrum-k8smeta"
 version = "0.1.0"
 dependencies = [
  "ferrum-common",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
 ]
 
 [[package]]
@@ -641,6 +645,7 @@ dependencies = [
  "ferrum-export",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-policy",
  "serde",
  "serde_json",
  "serde_yaml 0.8.26",

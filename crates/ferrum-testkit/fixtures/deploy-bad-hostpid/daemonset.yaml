@@ -1,0 +1,66 @@
+# Two ways to get the pid namespace wrong. Clean everywhere else, so the only
+# findings this tree can produce are the hostPID ones. Do not fix.
+#
+# respond without hostPID: the tgid the kernel reported is meaningless here.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-agent-respond-no-hostpid
+  namespace: ferrum
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-agent
+    spec:
+      serviceAccountName: ferrum-agent-respond
+      containers:
+        - name: agent
+          image: ghcr.io/ferrum/ferrum-agent:v0.1.0
+          args: ["--role", "respond"]
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "PERFMON", "KILL"]
+---
+# hostPID granted to an observe-only pod: every process on the node, for a
+# capability this pod never uses.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-agent-observe-hostpid
+  namespace: ferrum
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-agent
+    spec:
+      serviceAccountName: ferrum-agent-observe
+      hostPID: true
+      containers:
+        - name: agent
+          image: ghcr.io/ferrum/ferrum-agent:v0.1.0
+          args: ["--role", "observe"]
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "PERFMON"]

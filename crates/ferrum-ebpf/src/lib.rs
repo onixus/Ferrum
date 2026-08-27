@@ -11,10 +11,10 @@ mod loader;
 mod spec;
 
 pub use envelope::{extract_febp, BUNDLE_FORMAT, BUNDLE_MAGIC};
-pub use eval::{decide, matched_action, selector_matches, Decision, SyscallEvent};
+pub use eval::{decide, matched_action, selector_matches, Decision, EventMeta, SyscallEvent};
 pub use event::{
-    decode_event, encode_event, syscall_event, syscall_name, SyscallArch, EVENT_WIRE_LEN,
-    SYSCALL_UNKNOWN,
+    decode_event, encode_event, event_meta, syscall_event, syscall_name, SyscallArch,
+    EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
 };
 pub use ferrum_ebpf_progs::{
     Event, COMM_LEN, EVENTS_DROPPED_TOTAL, EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER,
@@ -22,7 +22,7 @@ pub use ferrum_ebpf_progs::{
 };
 pub use ferrum_ids::AGENT_ABI;
 #[cfg(feature = "attach")]
-pub use kernel::KernelHandle;
+pub use kernel::{KernelHandle, RingReader};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
 pub use spec::{
     parse_febp, Action, EbpfSpec, ImageSelector, LabelRequirement, LabelSelector, Mode,

@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-admission
+  labels:
+    app.kubernetes.io/part-of: ferrum
+# Deliberately empty: an admission plugin that can read the cluster is a
+# lateral-movement target. Bundle and exceptions arrive as a mounted Secret.
+rules: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-admission
+  labels:
+    app.kubernetes.io/part-of: ferrum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-admission
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-admission
+    namespace: ferrum

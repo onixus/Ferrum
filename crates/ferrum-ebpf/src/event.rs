@@ -4,7 +4,7 @@
 //! the same machine, so integers use native endianness. Decoding is
 //! field-by-field (no unsafe transmute) and fails closed on any size mismatch.
 
-use crate::eval::SyscallEvent;
+use crate::eval::{EventMeta, SyscallEvent};
 use ferrum_common::{FerrumError, Result};
 use ferrum_ebpf_progs::{Event, COMM_LEN, PATH_LEN};
 
@@ -113,6 +113,19 @@ pub fn syscall_event(event: &Event, arch: SyscallArch) -> SyscallEvent<'_> {
     }
 }
 
+/// Structural half of the same record: cgroup for identity lookup, pid/tgid
+/// for a reaction. Kept separate from `SyscallEvent`, whose shape is part of
+/// the policy-evaluation contract other crates instantiate.
+pub fn event_meta(event: &Event) -> EventMeta {
+    EventMeta {
+        cgroup_id: event.cgroup_id,
+        pid: event.pid,
+        tgid: event.tgid,
+        in_container: event.in_container(),
+        agent_self: event.agent_self(),
+    }
+}
+
 /// Bytes up to the first NUL; a non-UTF-8 tail is cut, not propagated, so a
 /// hostile comm/path cannot poison the export path.
 fn nul_trimmed_str(buf: &[u8]) -> &str {
@@ -165,6 +178,19 @@ mod tests {
                 agent_self: false,
             }
         );
+    }
+
+    #[test]
+    fn event_meta_keeps_pid_and_tgid() {
+        let event = sample();
+        let meta = event_meta(&event);
+        assert_eq!(meta.cgroup_id, event.cgroup_id);
+        assert_eq!(meta.pid, 41);
+        assert_eq!(meta.tgid, 42);
+        assert!(meta.in_container);
+        assert!(!meta.agent_self);
+        // The cgroup-only shim must never carry a killable tgid.
+        assert_eq!(EventMeta::from(7u64).tgid, 0);
     }
 
     #[test]

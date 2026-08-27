@@ -1,0 +1,17 @@
+cpu
+cpu/cgroup.procs
+cpu/kubepods
+cpu/kubepods/burstable
+cpu/kubepods/burstable/pod3f8a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8
+cpu/kubepods/burstable/pod3f8a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+cpuacct
+memory
+memory/kubepods
+memory/kubepods/burstable
+memory/kubepods/burstable/pod3f8a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8
+blkio
+devices
+freezer
+pids
+systemd
+systemd/kubepods.slice

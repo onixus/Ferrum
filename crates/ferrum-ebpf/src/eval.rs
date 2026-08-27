@@ -10,6 +10,40 @@ pub struct SyscallEvent<'a> {
     pub agent_self: bool,
 }
 
+/// Structural identity of one ring record, kept beside the string view a rule
+/// matches on. `SyscallEvent` is instantiated by other crates, so the pid/tgid
+/// a reaction needs live here instead of being bolted onto it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EventMeta {
+    pub cgroup_id: u64,
+    pub pid: u32,
+    pub tgid: u32,
+    pub in_container: bool,
+    pub agent_self: bool,
+}
+
+impl EventMeta {
+    /// Cgroup-only meta. Carries no tgid, so no reaction can fire from it.
+    pub fn from_cgroup(cgroup_id: u64) -> Self {
+        Self {
+            cgroup_id,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<u64> for EventMeta {
+    fn from(cgroup_id: u64) -> Self {
+        Self::from_cgroup(cgroup_id)
+    }
+}
+
+impl From<&EventMeta> for EventMeta {
+    fn from(meta: &EventMeta) -> Self {
+        *meta
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     pub action: Action,

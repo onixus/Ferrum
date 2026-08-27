@@ -325,6 +325,10 @@ mod tests {
             namespace: "prod".into(),
             comm: "sh".into(),
             syscall: "execve".into(),
+            pid: 0,
+            tgid: 0,
+            executed: false,
+            respond_error: None,
             waiver: None,
         }
     }

@@ -1,0 +1,143 @@
+# NOT part of the base install. Applying this turns kill/isolate from a logged
+# decision into an action the agent can take on its own. The DaemonSet below
+# carries the same name as the base one and replaces it on apply: respond needs
+# a different ServiceAccount, hostPID and CAP_KILL, and none of those belong in
+# the base install.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-agent-respond
+  labels:
+    app.kubernetes.io/part-of: ferrum
+    ferrum.io/optional: "respond"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-agent-respond
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-agent-respond
+    namespace: ferrum
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-agent
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-agent
+    app.kubernetes.io/part-of: ferrum
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-agent
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-agent
+        app.kubernetes.io/part-of: ferrum
+    spec:
+      serviceAccountName: ferrum-agent-respond
+      # bpf_get_current_pid_tgid() reports a tgid from the initial pid
+      # namespace. Without hostPID the responder would signal whatever carries
+      # that number inside its own namespace.
+      hostPID: true
+      automountServiceAccountToken: true
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 30
+      tolerations:
+        - operator: Exists
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: ghcr.io/ferrum/ferrum-agent:v0.1.0
+          args:
+            - --role
+            - respond
+            - --trust-root
+            - $(FERRUM_TRUST_ROOT)
+            - --bundle
+            - /etc/ferrum/bundle
+            - --lkg-dir
+            - /var/lib/ferrum/lkg
+            - --policy-name
+            - prod-restricted
+            - --node
+            - $(NODE_NAME)
+            - --export-dir
+            - /var/log/ferrum
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: FERRUM_TRUST_ROOT
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-trust-root
+                  key: trustRoot
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            # A ring-buffer pump that can starve the node is a DoS on the node
+            # it protects. The CPU limit is the cgroup bound from the threat
+            # model, not a scheduling hint.
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            # CAP_BPF/CAP_PERFMON instead of privileged: the agent must not be
+            # able to do everything root on the node can. Needs kernel >= 5.8.
+            privileged: false
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              # KILL on top of the observe set: signalling a process in another
+              # container is what respond is for.
+              add: ["BPF", "PERFMON", "KILL"]
+          volumeMounts:
+            - name: bpf-pins
+              mountPath: /sys/fs/bpf/ferrum
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: export
+              mountPath: /var/log/ferrum
+            - name: lkg
+              mountPath: /var/lib/ferrum/lkg
+            - name: bundle
+              mountPath: /etc/ferrum/bundle
+              readOnly: true
+      volumes:
+        # Pin path. Writable by design; protecting it from root on the node is
+        # an LSM job, see README.
+        - name: bpf-pins
+          hostPath:
+            path: /sys/fs/bpf/ferrum
+            type: DirectoryOrCreate
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: export
+          hostPath:
+            path: /var/log/ferrum
+            type: DirectoryOrCreate
+        # Last-known-good must survive a restart, so it is on the node, not in
+        # an emptyDir.
+        - name: lkg
+          hostPath:
+            path: /var/lib/ferrum/lkg
+            type: DirectoryOrCreate
+        - name: bundle
+          secret:
+            secretName: ferrum-bundle-cluster-prod-restricted
+            optional: true

@@ -3,8 +3,10 @@
 #![deny(unsafe_code)]
 
 mod file;
+mod queue;
 
 pub use file::{EnvelopeWriterSink, RotatingFileSink, SinkContext};
+pub use queue::QueueSink;
 
 use ferrum_proto::EnforcementEvent;
 use std::io::{self, Write};
@@ -16,6 +18,49 @@ pub trait EventSink {
 
     fn events_dropped_total(&self) -> u64 {
         0
+    }
+
+    /// Events lost because the export queue was full. Distinct from
+    /// `events_dropped_total` (a failed write) and from the in-kernel ring
+    /// counter: this one means the export path could not keep up.
+    fn export_queue_dropped_total(&self) -> u64 {
+        0
+    }
+
+    /// Events lost because the writer behind the queue is gone. Distinct from
+    /// a full queue: this one never recovers in this process.
+    fn export_writer_lost_total(&self) -> u64 {
+        0
+    }
+
+    /// True once the export writer has died. The agent is Degraded from here
+    /// on: enforcement still runs, but nothing records it.
+    fn export_writer_dead(&self) -> bool {
+        false
+    }
+}
+
+/// Lets a caller pick a sink at runtime (file vs stdout) and still hand one
+/// concrete type to `QueueSink`.
+impl EventSink for Box<dyn EventSink + Send + Sync> {
+    fn emit(&self, event: &EnforcementEvent) {
+        (**self).emit(event)
+    }
+
+    fn events_dropped_total(&self) -> u64 {
+        (**self).events_dropped_total()
+    }
+
+    fn export_queue_dropped_total(&self) -> u64 {
+        (**self).export_queue_dropped_total()
+    }
+
+    fn export_writer_lost_total(&self) -> u64 {
+        (**self).export_writer_lost_total()
+    }
+
+    fn export_writer_dead(&self) -> bool {
+        (**self).export_writer_dead()
     }
 }
 
@@ -125,6 +170,10 @@ mod tests {
             namespace: "prod".into(),
             comm: "sh".into(),
             syscall: "execve".into(),
+            pid: 0,
+            tgid: 0,
+            executed: false,
+            respond_error: None,
             waiver: None,
         }
     }

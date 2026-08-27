@@ -44,6 +44,8 @@ spec:
                   message: "expiresAt already in the past"
                 - rule: "self.expiresAt <= now() + duration('2160h')"
                   message: "expiresAt more than 90 days from now"
+                - rule: "!has(self.approvedBy) || self.approvedBy != self.requestedBy"
+                  message: "self-approve is forbidden: approvedBy must differ from requestedBy"
                 - rule: "!has(self.fourEyes) || !self.fourEyes || (has(self.approvedBy) && size(self.approvedBy) > 0)"
                   message: "fourEyes=true requires approvedBy"
                 - rule: "has(self.target) && size(self.target.policies) > 0 && size(self.target.rules) > 0"

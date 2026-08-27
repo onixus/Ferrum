@@ -1,0 +1,24 @@
+# An aggregated ClusterRole: `rules` is empty in the file and filled by the
+# controller from every labelled role in the cluster. Do not fix.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-agent-observe
+aggregationRule:
+  clusterRoleSelectors:
+    - matchLabels:
+        rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-agent-observe
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-agent-observe
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-agent-observe
+    namespace: ferrum

@@ -5,6 +5,15 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
+description = "cgroup inode -> pod identity. Forbidden: kube client, tokio, aya."
 
 [dependencies]
 ferrum-common.workspace = true
+serde_json.workspace = true
+# Network watch only: the default build of a crate on the decision path links no TLS.
+rustls = { version = "=0.21.11", optional = true }
+rustls-pemfile = { version = "=1.0.4", optional = true }
+
+[features]
+default = []
+apiserver = ["dep:rustls", "dep:rustls-pemfile"]

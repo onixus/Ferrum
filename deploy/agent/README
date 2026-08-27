@@ -1,0 +1,14 @@
+Pin path /sys/fs/bpf/ferrum is writable by root on the node. Protecting it
+requires BPF-LSM or an AppArmor profile applied on the node itself.
+These manifests do not provide that and cannot: root on the node is not a
+threat Kubernetes objects can fence off.
+
+Base install binds only ferrum-agent-observe. Respond stays inert until
+optional-respond.yaml is applied; that file carries both the ClusterRoleBinding
+and a DaemonSet of the same name that replaces the base one — --role respond,
+serviceAccountName ferrum-agent-respond, hostPID: true and CAP_KILL.
+
+hostPID is in the respond variant only. The kernel reports tgid from the
+initial pid namespace, so kill without hostPID would signal the wrong process;
+granting it to an observe-only install would hand over every process on the
+node for nothing.

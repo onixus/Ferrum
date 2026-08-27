@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-admission
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-admission
+    app.kubernetes.io/part-of: ferrum
+spec:
+  selector:
+    app.kubernetes.io/name: ferrum-admission
+  ports:
+    - name: https
+      port: 443
+      targetPort: 8443
+      protocol: TCP

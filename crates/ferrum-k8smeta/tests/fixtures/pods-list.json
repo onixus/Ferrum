@@ -1,0 +1,70 @@
+{
+  "kind": "PodList",
+  "apiVersion": "v1",
+  "metadata": { "resourceVersion": "1001" },
+  "items": [
+    {
+      "kind": "Pod",
+      "apiVersion": "v1",
+      "metadata": {
+        "name": "web-0",
+        "namespace": "prod",
+        "uid": "3f8a1b2c-4d5e-6f70-8192-a3b4c5d6e7f8",
+        "resourceVersion": "1001",
+        "labels": { "app": "web", "tier": "frontend" }
+      },
+      "spec": {
+        "nodeName": "node-a",
+        "serviceAccountName": "web-sa",
+        "containers": [
+          { "name": "app", "image": "registry.example.com/app:1.4" },
+          { "name": "sidecar", "image": "registry.example.com/side:0.2" }
+        ]
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "name": "app",
+            "containerID": "containerd://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "image": "registry.example.com/app:1.4",
+            "imageID": "registry.example.com/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          {
+            "name": "sidecar",
+            "containerID": "containerd://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "image": "registry.example.com/side:0.2",
+            "imageID": "registry.example.com/side@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "Pod",
+      "apiVersion": "v1",
+      "metadata": {
+        "name": "intruder",
+        "namespace": "attacker",
+        "uid": "deadbeef-0000-1111-2222-333344445555",
+        "resourceVersion": "1001",
+        "labels": { "app": "intruder" }
+      },
+      "spec": {
+        "nodeName": "node-b",
+        "serviceAccountName": "intruder-sa",
+        "containers": [{ "name": "evil", "image": "registry.example.com/evil:latest" }]
+      },
+      "status": {
+        "phase": "Running",
+        "containerStatuses": [
+          {
+            "name": "evil",
+            "containerID": "docker://dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "image": "registry.example.com/evil:latest",
+            "imageID": "registry.example.com/evil@sha256:4444444444444444444444444444444444444444444444444444444444444444"
+          }
+        ]
+      }
+    }
+  ]
+}
