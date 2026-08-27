@@ -5,9 +5,9 @@ mod common;
 use chrono::{DateTime, Days, TimeZone, Utc};
 use ferrum_admission::{
     encode_fsig, handle_review_bytes, load_bundle, load_path, load_source, parse_program,
-    poll_bundle_file, AdmissionProgram, ReviewConfig, WebhookState, ADMISSION_ABI,
-    BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, IMAGE_SIGNATURE_ANNOTATION, RULE_CLUSTER_ADMIN_BIND,
-    RULE_PRIVILEGED, RULE_UNSIGNED,
+    poll_bundle_file, poll_exceptions_file, AdmissionProgram, ReviewConfig, WebhookState,
+    ADMISSION_ABI, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, EXCEPTIONS_JSON_KEY,
+    IMAGE_SIGNATURE_ANNOTATION, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED, RULE_UNSIGNED,
 };
 use ferrum_api::{
     AdmitDeny, AdmitMutate, AdmitSpec, ClusterSecurityPolicy, ClusterSecurityPolicySpec,
@@ -787,6 +787,202 @@ fn serve_missing_bundle_exits_2() {
         .expect("spawn serve dir");
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output.status.code(), Some(2));
+}
+
+/// Exception with wall-clock expiry: `WebhookState::handle` evaluates at
+/// real `Utc::now()`, unlike the fixed-clock helpers above.
+fn wallclock_exception(
+    policy: &str,
+    rule: &str,
+    expires: DateTime<Utc>,
+    ticket: &str,
+) -> PolicyExceptionSpec {
+    PolicyExceptionSpec {
+        ticket: ticket.into(),
+        requested_by: "sre".into(),
+        approved_by: "ib".into(),
+        reason: "temporary debug sidecar after incident".into(),
+        expires_at: expires,
+        mode: PolicyMode::Audit,
+        four_eyes: true,
+        target: ExceptionTarget {
+            namespace: String::new(),
+            policies: vec![policy.into()],
+            rules: vec![rule.into()],
+        },
+    }
+}
+
+fn write_exceptions(dir: &std::path::Path, list: &[PolicyExceptionSpec]) {
+    std::fs::write(
+        dir.join(EXCEPTIONS_JSON_KEY),
+        serde_json::to_vec(list).expect("controller-format json"),
+    )
+    .expect("exceptions.json");
+}
+
+fn wait_decision(state: &WebhookState, body: &[u8], want: bool, why: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let resp = handle_json(state, body);
+        if resp["response"]["allowed"] == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{why}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn exceptions_mount_rotation_gates_scope_and_ttl() {
+    let (fsig, pk) = make_fsig(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let cfg = ReviewConfig {
+        policy_name: "prod-restricted".into(),
+        policy_namespace: String::new(),
+    };
+    let state = Arc::new(WebhookState::new(
+        load_ok(&fsig, &pk),
+        pk.clone(),
+        vec![],
+        cfg,
+    ));
+    let dir = temp_dir("exceptions-mount");
+    poll_exceptions_file(dir.clone(), Duration::from_millis(50), Arc::clone(&state));
+    let body = review(pod(IMAGE, image_annotations(IMAGE, &SK), true), "uid-exc");
+
+    // Missing exceptions.json = empty list, not an error.
+    assert_eq!(handle_json(&state, &body)["response"]["allowed"], false);
+
+    let live = Utc::now() + Days::new(7);
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-LIVE-1",
+        )],
+    );
+    wait_decision(
+        &state,
+        &body,
+        true,
+        "live in-scope exception must waive privileged deny",
+    );
+
+    std::fs::write(dir.join(EXCEPTIONS_JSON_KEY), b"{{{ not exceptions json").expect("garbage");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        true,
+        "garbage exceptions.json must keep the previous list, not deny-all"
+    );
+
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "other-policy",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-OTHER-22",
+        )],
+    );
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "out-of-scope exception must not waive the deny",
+    );
+
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-LIVE-333",
+        )],
+    );
+    wait_decision(
+        &state,
+        &body,
+        true,
+        "rotation back to in-scope must waive again",
+    );
+
+    let expired = Utc::now() - Days::new(1);
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            expired,
+            "JIRA-EXPIRED-4444",
+        )],
+    );
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "expired exception after rotation must deny again",
+    );
+
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-LIVE-55555",
+        )],
+    );
+    wait_decision(&state, &body, true, "fresh live exception must waive again");
+
+    std::fs::remove_file(dir.join(EXCEPTIONS_JSON_KEY)).expect("remove");
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "removed exceptions.json must reset to an empty list",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exceptions_reload_missing_file_is_empty_and_garbage_keeps_previous() {
+    let (fsig, pk) = make_fsig(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let cfg = ReviewConfig {
+        policy_name: "prod-restricted".into(),
+        policy_namespace: String::new(),
+    };
+    let live = wallclock_exception(
+        "prod-restricted",
+        RULE_PRIVILEGED,
+        Utc::now() + Days::new(7),
+        "JIRA-LIVE-1",
+    );
+    let state = WebhookState::new(load_ok(&fsig, &pk), pk.clone(), vec![live], cfg);
+    let body = review(pod(IMAGE, image_annotations(IMAGE, &SK), true), "uid-st");
+    assert_eq!(handle_json(&state, &body)["response"]["allowed"], true);
+
+    assert!(state.try_reload_exceptions(b"{{{ garbage").is_err());
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        true,
+        "garbage bytes keep the previous list"
+    );
+
+    let dir = temp_dir("exceptions-missing");
+    let n = state
+        .try_reload_exceptions_path(&dir)
+        .expect("missing file is empty, not an error");
+    assert_eq!(n, 0);
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "empty list restores the deny"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

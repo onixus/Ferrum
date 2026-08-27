@@ -1,17 +1,29 @@
-//! eBPF map names and ring-buffer layout.
+//! eBPF map names and ring-buffer layout, shared by the bpf-target programs
+//! in `src/main.rs` and the userspace decoder in `ferrum-ebpf`.
 //!
-//! aya-ebpf is not linked: the workspace rust-toolchain is stable 1.75, and
-//! aya-ebpf requires nightly. This crate stays `no_std` and allocation-free
-//! on the syscall path. Kernel attach lives in userspace as `Err(Degraded)`.
+//! This lib stays `no_std`, allocation-free, and buildable on stable 1.75.
+//! aya-ebpf is linked only for `target_arch = "bpf"` (see Cargo.toml), which
+//! requires nightly + build-std; the default host build never compiles it.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_code)]
 
 pub const MAP_EVENTS: &str = "ferrum_events";
 pub const MAP_RULES: &str = "ferrum_rules";
+/// Single-slot array holding the agent's own tgid; programs flag matching
+/// events `EVENT_FLAG_AGENT_SELF`. Zero means "not yet configured".
+pub const MAP_SELF: &str = "ferrum_self";
+/// cgroup ids known to belong to pod containers (fed from the userspace
+/// cgroup→pod index); programs flag matching events `EVENT_FLAG_CONTAINER`.
+pub const MAP_CGROUPS: &str = "ferrum_cgroups";
 
-/// In-kernel drop counter. Userspace must surface this; never fail-open on flood.
+/// In-kernel drop counter (per-CPU, single slot; userspace sums the CPUs).
+/// Userspace must surface this; never fail-open on flood.
 pub const EVENTS_DROPPED_TOTAL: &str = "events_dropped_total";
+
+/// Ring capacity: kernel requires a power-of-2 multiple of the page size.
+pub const EVENTS_RING_BYTES: u32 = 1 << 18;
+pub const CGROUPS_MAX_ENTRIES: u32 = 65536;
 
 pub const ACTION_ALLOW: u8 = 0;
 pub const ACTION_AUDIT: u8 = 1;
@@ -79,7 +91,10 @@ mod tests {
     fn map_names() {
         assert_eq!(MAP_EVENTS, "ferrum_events");
         assert_eq!(MAP_RULES, "ferrum_rules");
+        assert_eq!(MAP_SELF, "ferrum_self");
+        assert_eq!(MAP_CGROUPS, "ferrum_cgroups");
         assert_eq!(EVENTS_DROPPED_TOTAL, "events_dropped_total");
+        assert!(EVENTS_RING_BYTES.is_power_of_two());
     }
 
     #[test]

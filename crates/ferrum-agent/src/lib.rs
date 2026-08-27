@@ -3,6 +3,7 @@
 
 #![deny(unsafe_code)]
 
+mod pump;
 mod source;
 
 use ferrum_common::{FerrumError, Result};
@@ -13,11 +14,12 @@ use ferrum_k8smeta::{CgroupIndex, WorkloadIdentity};
 use ferrum_proto::EnforcementEvent;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+pub use pump::{pump_channel, pump_channel_host, pump_records, pump_records_host, PumpStats};
 pub use source::{
     decode_fsig, encode_fsig, extract_fsig, load_path, load_source, parse_trust_root,
     read_source_path, ExtractedFsig, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, KUBELET_DATA_DIR,
@@ -66,6 +68,12 @@ pub struct Agent {
     lkg_dir: Option<PathBuf>,
     trust_root: Vec<u8>,
     bundle_path: Option<PathBuf>,
+    decode_failed: AtomicU64,
+    unknown_syscalls: AtomicU64,
+    /// Set when the decode table and the event source disagree (unknown nr):
+    /// enforce rules can no longer be trusted to match, so the agent is
+    /// Degraded even though the loaded bundle itself is fine.
+    datapath_degraded: AtomicBool,
 }
 
 impl Agent {
@@ -82,6 +90,9 @@ impl Agent {
             lkg_dir: config.lkg_dir,
             trust_root: config.trust_root,
             bundle_path: config.bundle_path,
+            decode_failed: AtomicU64::new(0),
+            unknown_syscalls: AtomicU64::new(0),
+            datapath_degraded: AtomicBool::new(false),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -96,7 +107,10 @@ impl Agent {
     }
 
     pub fn is_degraded(&self) -> bool {
-        self.cp_down || self.loader.is_degraded() || !self.pins_attached()
+        self.cp_down
+            || self.loader.is_degraded()
+            || !self.pins_attached()
+            || self.datapath_degraded.load(Ordering::Relaxed)
     }
 
     pub fn pins_attached(&self) -> bool {
@@ -115,8 +129,32 @@ impl Agent {
         self.loader.events_dropped_total()
     }
 
+    /// In-kernel ring drops only (RFC-02 §C). Userspace decode failures go to
+    /// `record_decode_failure` so a burst of malformed records cannot pose as
+    /// ring-buffer pressure or vice versa.
     pub fn record_drop(&self, n: u64) {
         self.loader.record_drop(n);
+    }
+
+    pub fn records_decode_failed_total(&self) -> u64 {
+        self.decode_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn record_decode_failure(&self, n: u64) {
+        self.decode_failed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn unknown_syscall_total(&self) -> u64 {
+        self.unknown_syscalls.load(Ordering::Relaxed)
+    }
+
+    pub fn record_unknown_syscall(&self) {
+        self.unknown_syscalls.fetch_add(1, Ordering::Relaxed);
+        self.datapath_degraded.store(true, Ordering::Relaxed);
+    }
+
+    pub fn datapath_degraded(&self) -> bool {
+        self.datapath_degraded.load(Ordering::Relaxed)
     }
 
     /// CP down: keep LKG, never fail-open.
@@ -1160,6 +1198,104 @@ mod tests {
         let agent = Agent::new(AgentConfig::default());
         agent.record_drop(2);
         assert_eq!(agent.events_dropped_total(), 2);
+    }
+
+    fn ring_record(syscall_nr: u32, comm: &str, path: &str, flags: u8, cgroup: u64) -> Vec<u8> {
+        let mut event = ferrum_ebpf::Event::new();
+        event.cgroup_id = cgroup;
+        event.pid = 100;
+        event.tgid = 100;
+        event.syscall_nr = syscall_nr;
+        event.flags = flags;
+        event.comm[..comm.len()].copy_from_slice(comm.as_bytes());
+        event.path[..path.len()].copy_from_slice(path.as_bytes());
+        ferrum_ebpf::encode_event(&event)
+    }
+
+    #[test]
+    fn pump_ring_records_round_trip() {
+        use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER};
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        let sink = MemorySink::new();
+        // x86_64 numbers: 59 execve, 257 openat.
+        let records = vec![
+            ring_record(59, "sh", "/bin/sh", EVENT_FLAG_CONTAINER, 7),
+            ring_record(257, "app", "/var/run/docker.sock", EVENT_FLAG_CONTAINER, 7),
+        ];
+        let stats = pump_records(&agent, SyscallArch::X86_64, records, &sink);
+        assert_eq!(
+            stats,
+            PumpStats {
+                handled: 2,
+                decode_failed: 0,
+                unknown_syscall: 0
+            }
+        );
+        let events = sink.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].syscall, "execve");
+        assert_eq!(events[0].comm, "sh");
+        assert_eq!(events[0].action, "kill");
+        assert_eq!(events[0].pod, "pod-a");
+        assert_eq!(events[1].syscall, "openat");
+        assert_eq!(events[1].action, "kill");
+        assert_eq!(agent.events_dropped_total(), 0);
+    }
+
+    #[test]
+    fn pump_unknown_syscall_and_garbage_do_not_panic() {
+        use ferrum_ebpf::SyscallArch;
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        let sink = MemorySink::new();
+        let records: Vec<Vec<u8>> = vec![
+            ring_record(u32::MAX, "sh", "/bin/sh", 0, 1),
+            vec![0u8; 5],
+            Vec::new(),
+        ];
+        assert!(!agent.datapath_degraded());
+        let stats = pump_records(&agent, SyscallArch::X86_64, records, &sink);
+        assert_eq!(
+            stats,
+            PumpStats {
+                handled: 0,
+                decode_failed: 2,
+                unknown_syscall: 1
+            }
+        );
+        // The unknown nr is still exported for visibility, but the datapath is
+        // no longer trusted: the agent is Degraded, not silently auditing.
+        assert_eq!(sink.events().len(), 1);
+        assert_eq!(sink.events()[0].syscall, ferrum_ebpf::SYSCALL_UNKNOWN);
+        assert!(agent.datapath_degraded());
+        assert!(agent.is_degraded());
+        assert_eq!(agent.unknown_syscall_total(), 1);
+        // Decode failures are not in-kernel ring drops.
+        assert_eq!(agent.events_dropped_total(), 0);
+        assert_eq!(agent.records_decode_failed_total(), 2);
+    }
+
+    #[test]
+    fn pump_channel_drains_until_hangup() {
+        use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER};
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        let sink = MemorySink::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(ring_record(
+            59,
+            "bash",
+            "/bin/bash",
+            EVENT_FLAG_CONTAINER,
+            1,
+        ))
+        .expect("send");
+        drop(tx);
+        let stats = pump_channel(&agent, SyscallArch::X86_64, rx, &sink);
+        assert_eq!(stats.handled, 1);
+        assert_eq!(sink.events()[0].action, "kill");
     }
 
     #[test]

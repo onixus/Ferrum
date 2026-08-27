@@ -3,8 +3,8 @@
 #![deny(unsafe_code)]
 
 use ferrum_admission::{
-    admit_bytes, load_path, load_tls_config, parse_trust_root, poll_bundle_file, serve_listener,
-    AdmissionSubject, ReviewConfig, WebhookState,
+    admit_bytes, load_path, load_tls_config, parse_trust_root, poll_bundle_file,
+    poll_exceptions_file, serve_listener, AdmissionSubject, ReviewConfig, WebhookState,
 };
 use ferrum_api::PolicyExceptionSpec;
 use std::collections::BTreeMap;
@@ -26,7 +26,7 @@ fn cmd_eval(args: &[String]) {
     if args.len() != 3 {
         eprintln!("usage: ferrum-admission <program.fadm> <subject.json>");
         eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <json> --policy-name <name>] <admissionreview.json>");
-        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--tls-cert --tls-key] [--reload-ms 1000]");
+        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000]");
         eprintln!("missing or invalid compiled program denies the request (fail closed)");
         exit(2);
     }
@@ -135,7 +135,17 @@ fn cmd_serve(args: &[String]) {
             exit(2);
         }
     };
-    let (exceptions, cfg) = exceptions_and_config(&flags);
+    // In serve mode --exceptions is a mount, not a static file: the list is
+    // hot-reloaded alongside the bundle. Missing file = empty list.
+    let cfg = review_config(&flags);
+    let exceptions_path = flags
+        .map
+        .get("exceptions")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    if exceptions_path.is_some() && cfg.policy_name.is_empty() {
+        die("--policy-name is required when --exceptions is set");
+    }
     let tls = match (flags.map.get("tls-cert"), flags.map.get("tls-key")) {
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
             match load_tls_config(cert, key) {
@@ -158,7 +168,12 @@ fn cmd_serve(args: &[String]) {
         _ => 1000,
     };
 
-    let state = Arc::new(WebhookState::new(program, trust_root, exceptions, cfg));
+    let state = Arc::new(WebhookState::new(program, trust_root, Vec::new(), cfg));
+    if let Some(path) = &exceptions_path {
+        if let Err(err) = state.try_reload_exceptions_path(path) {
+            eprintln!("ferrum-admission: exceptions load failed, starting with empty list: {err}");
+        }
+    }
     let listener = match std::net::TcpListener::bind(&listen) {
         Ok(l) => l,
         Err(err) => {
@@ -172,6 +187,9 @@ fn cmd_serve(args: &[String]) {
         Duration::from_millis(reload_ms),
         Arc::clone(&state),
     );
+    if let Some(path) = exceptions_path {
+        poll_exceptions_file(path, Duration::from_millis(reload_ms), Arc::clone(&state));
+    }
     if let Err(err) = serve_listener(listener, state, tls) {
         eprintln!("error: serve: {err}");
         exit(2);

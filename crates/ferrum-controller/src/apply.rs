@@ -2,21 +2,166 @@
 
 use crate::bundle::{verify_signed_bundle, SignedBundle};
 use crate::{compile_status_err, ReconcileOutcome};
-use ferrum_api::PolicyStatus;
+use ferrum_api::{PolicyExceptionSpec, PolicyStatus};
 use ferrum_common::{FerrumError, Result};
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::ByteString;
-use kube::api::{Api, Patch, PatchParams, PostParams};
+use kube::api::{Api, ListParams, Patch, PatchParams, PostParams};
 use kube::Client;
 use std::collections::BTreeMap;
 
 pub const DEFAULT_NAMESPACE: &str = "ferrum";
+pub const BUNDLE_SECRET_PREFIX: &str = "ferrum-bundle-";
 pub const BUNDLE_FSIG_KEY: &str = "bundle.fsig";
 pub const BUNDLE_DIGEST_KEY: &str = "digest";
+/// Live exceptions ride in the same Secret as the FSIG so admission reads both
+/// from one mount. They are TTL'd data, not signed policy: eval re-checks
+/// scope and expiresAt on every request.
+pub const EXCEPTIONS_JSON_KEY: &str = "exceptions.json";
+
+/// Secrets carry owner labels; `upsert_secret` refuses to overwrite a Secret
+/// whose labels name a different owner, so any residual name collision
+/// (hyphens make ns/name concatenation ambiguous) fails closed instead of
+/// silently replacing another policy's bundle.
+pub const MANAGED_BY_KEY: &str = "app.kubernetes.io/managed-by";
+pub const MANAGED_BY_VALUE: &str = "ferrum-controller";
+pub const POLICY_LABEL_KEY: &str = "ferrum.io/policy";
+pub const POLICY_NAMESPACE_LABEL_KEY: &str = "ferrum.io/policy-namespace";
+/// Label value for cluster-scoped policies; a real namespace can never be it
+/// (RFC 1123 labels cannot contain a dot).
+pub const CLUSTER_SCOPE_VALUE: &str = "cluster.scope";
 
 pub fn secret_name(policy_name: &str) -> String {
-    format!("ferrum-bundle-{policy_name}")
+    format!("{BUNDLE_SECRET_PREFIX}cluster-{policy_name}")
+}
+
+/// Namespaced SecurityPolicy bundles get their own Secret in a `ns-` name
+/// space distinct from the `cluster-` one.
+pub fn namespaced_secret_name(policy_name: &str, policy_namespace: &str) -> String {
+    format!("{BUNDLE_SECRET_PREFIX}ns-{policy_namespace}-{policy_name}")
+}
+
+pub fn cluster_secret_labels(policy_name: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(MANAGED_BY_KEY.into(), MANAGED_BY_VALUE.into());
+    labels.insert(POLICY_LABEL_KEY.into(), policy_name.into());
+    labels.insert(
+        POLICY_NAMESPACE_LABEL_KEY.into(),
+        CLUSTER_SCOPE_VALUE.into(),
+    );
+    labels
+}
+
+pub fn namespaced_secret_labels(
+    policy_name: &str,
+    policy_namespace: &str,
+) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(MANAGED_BY_KEY.into(), MANAGED_BY_VALUE.into());
+    labels.insert(POLICY_LABEL_KEY.into(), policy_name.into());
+    labels.insert(POLICY_NAMESPACE_LABEL_KEY.into(), policy_namespace.into());
+    labels
+}
+
+/// A live Secret may be overwritten only when its owner labels match the
+/// planned ones exactly. Anything else — foreign Secret, other policy, other
+/// scope — is Integrity, not a merge.
+pub fn ensure_secret_ownership(live: &Secret, planned: &Secret) -> Result<()> {
+    let planned_labels = planned.metadata.labels.clone().unwrap_or_default();
+    let live_labels = live.metadata.labels.clone().unwrap_or_default();
+    for key in [MANAGED_BY_KEY, POLICY_LABEL_KEY, POLICY_NAMESPACE_LABEL_KEY] {
+        if live_labels.get(key) != planned_labels.get(key) {
+            let name = live.metadata.name.as_deref().unwrap_or("<unnamed>");
+            return Err(FerrumError::Integrity(format!(
+                "secret {name} is owned by another policy ({key} mismatch); refusing to overwrite"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Exceptions relevant to one policy's Secret: an explicit `target.policies`
+/// list must name the policy; an empty list stays global. Scope and TTL are
+/// still re-checked by eval on every request.
+pub fn exceptions_for_policy(
+    specs: &[PolicyExceptionSpec],
+    policy_name: &str,
+) -> Vec<PolicyExceptionSpec> {
+    specs
+        .iter()
+        .filter(|s| {
+            s.target.policies.is_empty() || s.target.policies.iter().any(|p| p == policy_name)
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn exceptions_json(specs: &[PolicyExceptionSpec]) -> Result<Vec<u8>> {
+    serde_json::to_vec(specs)
+        .map_err(|e| FerrumError::Validation(format!("exceptions.json encode: {e}")))
+}
+
+/// Merge-patch body that sets only `exceptions.json`; bundle.fsig and digest
+/// keys of the target Secret are left intact.
+pub fn exceptions_secret_patch(specs: &[PolicyExceptionSpec]) -> Result<Secret> {
+    let mut data = BTreeMap::new();
+    data.insert(
+        EXCEPTIONS_JSON_KEY.to_string(),
+        ByteString(exceptions_json(specs)?),
+    );
+    Ok(Secret {
+        data: Some(data),
+        ..Secret::default()
+    })
+}
+
+/// Push the current live exception list into every bundle Secret we own —
+/// selected by owner label, never by name prefix — scoping each Secret's
+/// `exceptions.json` to the exceptions that target its policy.
+pub async fn persist_exceptions(
+    client: &Client,
+    namespace: &str,
+    specs: &[PolicyExceptionSpec],
+) -> Result<()> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let selector = format!("{MANAGED_BY_KEY}={MANAGED_BY_VALUE}");
+    let list = api
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .map_err(|e| FerrumError::Degraded(format!("secret list {namespace}: {e}")))?;
+    for secret in list.items {
+        let Some(name) = secret.metadata.name.as_deref() else {
+            continue;
+        };
+        let Some(policy) = secret
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(POLICY_LABEL_KEY))
+        else {
+            continue;
+        };
+        let patch = exceptions_secret_patch(&exceptions_for_policy(specs, policy))?;
+        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .map_err(|e| FerrumError::Degraded(format!("secret patch {name}: {e}")))?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn patch_secret_exceptions(
+    client: &Client,
+    namespace: &str,
+    secret_name: &str,
+    specs: &[PolicyExceptionSpec],
+) -> Result<()> {
+    let patch = exceptions_secret_patch(specs)?;
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    api.patch(secret_name, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .map_err(|e| FerrumError::Degraded(format!("secret patch {secret_name}: {e}")))?;
+    Ok(())
 }
 
 pub fn status_patch(status: &PolicyStatus) -> serde_json::Value {
@@ -30,6 +175,22 @@ pub fn bundle_secret(
     bundle: &SignedBundle,
     trust_root: &[u8],
 ) -> Result<Secret> {
+    bundle_secret_named(
+        &secret_name(policy_name),
+        namespace,
+        cluster_secret_labels(policy_name),
+        bundle,
+        trust_root,
+    )
+}
+
+pub fn bundle_secret_named(
+    secret_name: &str,
+    namespace: &str,
+    labels: BTreeMap<String, String>,
+    bundle: &SignedBundle,
+    trust_root: &[u8],
+) -> Result<Secret> {
     verify_signed_bundle(bundle, trust_root)?;
     let fsig = bundle.encode()?;
     let mut data = BTreeMap::new();
@@ -40,8 +201,9 @@ pub fn bundle_secret(
     );
     Ok(Secret {
         metadata: ObjectMeta {
-            name: Some(secret_name(policy_name)),
+            name: Some(secret_name.to_string()),
             namespace: Some(namespace.to_string()),
+            labels: Some(labels),
             ..ObjectMeta::default()
         },
         type_: Some("Opaque".into()),
@@ -79,13 +241,12 @@ pub fn live_secret_matches(secret: &Secret, trust_root: &[u8], expected_digest: 
 pub(crate) async fn load_bundle_secret(
     client: &Client,
     namespace: &str,
-    policy_name: &str,
+    secret_name: &str,
 ) -> Result<Option<Secret>> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let name = secret_name(policy_name);
-    api.get_opt(&name)
+    api.get_opt(secret_name)
         .await
-        .map_err(|e| FerrumError::Degraded(format!("secret get {name}: {e}")))
+        .map_err(|e| FerrumError::Degraded(format!("secret get {secret_name}: {e}")))
 }
 
 #[derive(Debug, Clone)]
@@ -101,9 +262,42 @@ pub fn plan_apply(
     outcome: &ReconcileOutcome,
     trust_root: &[u8],
 ) -> ApplyPlan {
+    plan_apply_named(
+        &secret_name(policy_name),
+        namespace,
+        cluster_secret_labels(policy_name),
+        outcome,
+        trust_root,
+    )
+}
+
+/// Namespaced SecurityPolicy plan: same shape, `ns-` Secret name space.
+pub fn plan_apply_namespaced(
+    policy_name: &str,
+    policy_namespace: &str,
+    secret_namespace: &str,
+    outcome: &ReconcileOutcome,
+    trust_root: &[u8],
+) -> ApplyPlan {
+    plan_apply_named(
+        &namespaced_secret_name(policy_name, policy_namespace),
+        secret_namespace,
+        namespaced_secret_labels(policy_name, policy_namespace),
+        outcome,
+        trust_root,
+    )
+}
+
+pub fn plan_apply_named(
+    secret_name: &str,
+    namespace: &str,
+    labels: BTreeMap<String, String>,
+    outcome: &ReconcileOutcome,
+    trust_root: &[u8],
+) -> ApplyPlan {
     match outcome {
         ReconcileOutcome::Applied(applied) => {
-            match bundle_secret(policy_name, namespace, &applied.bundle, trust_root) {
+            match bundle_secret_named(secret_name, namespace, labels, &applied.bundle, trust_root) {
                 Ok(secret) => ApplyPlan {
                     status: status_patch(&applied.status),
                     secret: Some(secret),
@@ -131,10 +325,38 @@ pub async fn persist(
     namespace: &str,
     plan: &ApplyPlan,
 ) -> Result<()> {
+    persist_dynamic(
+        client,
+        &crate::watch::cluster_security_policy_resource(),
+        None,
+        policy_name,
+        namespace,
+        plan,
+    )
+    .await
+}
+
+/// Upsert the plan Secret (in `secret_namespace`), then PATCH the object status
+/// via the given ApiResource; `object_namespace = None` means cluster-scoped.
+pub(crate) async fn persist_dynamic(
+    client: &Client,
+    resource: &kube::api::ApiResource,
+    object_namespace: Option<&str>,
+    object_name: &str,
+    secret_namespace: &str,
+    plan: &ApplyPlan,
+) -> Result<()> {
     if let Some(secret) = &plan.secret {
-        upsert_secret(client, namespace, secret).await?;
+        upsert_secret(client, secret_namespace, secret).await?;
     }
-    patch_policy_status(client, policy_name, &plan.status).await
+    patch_status_dynamic(
+        client,
+        resource,
+        object_namespace,
+        object_name,
+        &plan.status,
+    )
+    .await
 }
 
 async fn upsert_secret(client: &Client, namespace: &str, secret: &Secret) -> Result<()> {
@@ -143,12 +365,12 @@ async fn upsert_secret(client: &Client, namespace: &str, secret: &Secret) -> Res
             FerrumError::Validation("bundle Secret metadata.name is missing".into())
         })?;
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let exists = api
+    let live = api
         .get_opt(name)
         .await
-        .map_err(|e| FerrumError::Degraded(format!("secret get {name}: {e}")))?
-        .is_some();
-    if exists {
+        .map_err(|e| FerrumError::Degraded(format!("secret get {name}: {e}")))?;
+    if let Some(live) = live {
+        ensure_secret_ownership(&live, secret)?;
         api.patch(name, &PatchParams::default(), &Patch::Merge(secret))
             .await
             .map_err(|e| FerrumError::Degraded(format!("secret patch {name}: {e}")))?;
@@ -160,22 +382,20 @@ async fn upsert_secret(client: &Client, namespace: &str, secret: &Secret) -> Res
     Ok(())
 }
 
-async fn patch_policy_status(
+pub(crate) async fn patch_status_dynamic(
     client: &Client,
-    policy_name: &str,
+    resource: &kube::api::ApiResource,
+    namespace: Option<&str>,
+    name: &str,
     patch: &serde_json::Value,
 ) -> Result<()> {
-    let api: Api<kube::api::DynamicObject> = Api::all_with(
-        client.clone(),
-        &crate::watch::cluster_security_policy_resource(),
-    );
-    api.patch_status(
-        policy_name,
-        &PatchParams::default(),
-        &Patch::Merge(patch.clone()),
-    )
-    .await
-    .map_err(|e| FerrumError::Degraded(format!("status patch {policy_name}: {e}")))?;
+    let api: Api<kube::api::DynamicObject> = match namespace {
+        Some(ns) => Api::namespaced_with(client.clone(), ns, resource),
+        None => Api::all_with(client.clone(), resource),
+    };
+    api.patch_status(name, &PatchParams::default(), &Patch::Merge(patch.clone()))
+        .await
+        .map_err(|e| FerrumError::Degraded(format!("status patch {name}: {e}")))?;
     Ok(())
 }
 
@@ -222,7 +442,20 @@ mod tests {
         let secret = plan.secret.expect("Secret on Applied");
         assert_eq!(
             secret.metadata.name.as_deref(),
-            Some("ferrum-bundle-prod-restricted")
+            Some("ferrum-bundle-cluster-prod-restricted")
+        );
+        let labels = secret.metadata.labels.as_ref().expect("owner labels");
+        assert_eq!(
+            labels.get(MANAGED_BY_KEY).map(String::as_str),
+            Some(MANAGED_BY_VALUE)
+        );
+        assert_eq!(
+            labels.get(POLICY_LABEL_KEY).map(String::as_str),
+            Some("prod-restricted")
+        );
+        assert_eq!(
+            labels.get(POLICY_NAMESPACE_LABEL_KEY).map(String::as_str),
+            Some(CLUSTER_SCOPE_VALUE)
         );
         assert_eq!(
             secret.metadata.namespace.as_deref(),
@@ -355,5 +588,132 @@ mod tests {
         }
         let plan = plan_apply("prod-restricted", DEFAULT_NAMESPACE, &outcome, &pk());
         assert!(plan.secret.is_some());
+    }
+
+    #[test]
+    fn exceptions_patch_touches_only_exceptions_key() {
+        let expires = chrono::Utc::now() + chrono::Days::new(7);
+        let spec = PolicyExceptionSpec {
+            ticket: "JIRA-18421".into(),
+            requested_by: "sre".into(),
+            approved_by: "ib".into(),
+            reason: "temporary debug sidecar".into(),
+            expires_at: expires,
+            mode: Default::default(),
+            four_eyes: true,
+            target: ferrum_api::ExceptionTarget {
+                namespace: "payments".into(),
+                policies: vec!["prod-restricted".into()],
+                rules: vec!["no-shell".into()],
+            },
+        };
+        let patch = exceptions_secret_patch(&[spec.clone()]).expect("patch");
+        let data = patch.data.expect("data");
+        assert_eq!(data.len(), 1);
+        let bytes = &data.get(EXCEPTIONS_JSON_KEY).expect("exceptions.json").0;
+        let decoded: Vec<PolicyExceptionSpec> = serde_json::from_slice(bytes).expect("decode");
+        assert_eq!(decoded, vec![spec]);
+        assert!(!data.contains_key(BUNDLE_FSIG_KEY));
+        assert!(!data.contains_key(BUNDLE_DIGEST_KEY));
+    }
+
+    #[test]
+    fn namespaced_secret_name_has_namespace_suffix() {
+        assert_eq!(
+            namespaced_secret_name("prod-restricted", "payments"),
+            "ferrum-bundle-ns-payments-prod-restricted"
+        );
+        assert_ne!(
+            namespaced_secret_name("p", "a"),
+            namespaced_secret_name("p", "b")
+        );
+    }
+
+    #[test]
+    fn cluster_and_namespaced_secret_names_never_collide() {
+        // SecurityPolicy foo in ns bar vs ClusterSecurityPolicy foo-bar: the
+        // old scheme collapsed both to the same name.
+        assert_ne!(namespaced_secret_name("foo", "bar"), secret_name("foo-bar"));
+        assert_eq!(secret_name("foo-bar"), "ferrum-bundle-cluster-foo-bar");
+        assert_eq!(
+            namespaced_secret_name("foo", "bar"),
+            "ferrum-bundle-ns-bar-foo"
+        );
+    }
+
+    #[test]
+    fn foreign_secret_is_not_overwritten() {
+        let planned_labels = cluster_secret_labels("prod-restricted");
+        let planned = Secret {
+            metadata: ObjectMeta {
+                name: Some("ferrum-bundle-cluster-prod-restricted".into()),
+                labels: Some(planned_labels),
+                ..ObjectMeta::default()
+            },
+            ..Secret::default()
+        };
+        // Unlabeled live Secret (pre-existing or foreign) is refused.
+        let unlabeled = Secret {
+            metadata: ObjectMeta {
+                name: Some("ferrum-bundle-cluster-prod-restricted".into()),
+                ..ObjectMeta::default()
+            },
+            ..Secret::default()
+        };
+        match ensure_secret_ownership(&unlabeled, &planned) {
+            Err(FerrumError::Integrity(_)) => {}
+            other => panic!("expected Integrity, got {other:?}"),
+        }
+        // A Secret owned by a different policy is refused.
+        let other_policy = Secret {
+            metadata: ObjectMeta {
+                labels: Some(namespaced_secret_labels("prod-restricted", "payments")),
+                ..ObjectMeta::default()
+            },
+            ..Secret::default()
+        };
+        assert!(ensure_secret_ownership(&other_policy, &planned).is_err());
+        // Same owner labels round-trip fine.
+        let same = Secret {
+            metadata: ObjectMeta {
+                labels: Some(cluster_secret_labels("prod-restricted")),
+                ..ObjectMeta::default()
+            },
+            ..Secret::default()
+        };
+        assert!(ensure_secret_ownership(&same, &planned).is_ok());
+    }
+
+    #[test]
+    fn exceptions_filtered_by_target_policies() {
+        let expires = chrono::Utc::now() + chrono::Days::new(7);
+        let mut scoped = PolicyExceptionSpec {
+            ticket: "JIRA-1".into(),
+            requested_by: "sre".into(),
+            approved_by: "ib".into(),
+            reason: "temporary debug sidecar".into(),
+            expires_at: expires,
+            mode: Default::default(),
+            four_eyes: true,
+            target: ferrum_api::ExceptionTarget {
+                namespace: "payments".into(),
+                policies: vec!["prod-restricted".into()],
+                rules: vec!["no-shell".into()],
+            },
+        };
+        let global = PolicyExceptionSpec {
+            target: ferrum_api::ExceptionTarget {
+                namespace: "payments".into(),
+                policies: vec![],
+                rules: vec![],
+            },
+            ..scoped.clone()
+        };
+        scoped.ticket = "JIRA-2".into();
+        let specs = vec![scoped.clone(), global.clone()];
+        let for_prod = exceptions_for_policy(&specs, "prod-restricted");
+        assert_eq!(for_prod, vec![scoped, global.clone()]);
+        let for_other = exceptions_for_policy(&specs, "other-policy");
+        assert_eq!(for_other, vec![global]);
     }
 }

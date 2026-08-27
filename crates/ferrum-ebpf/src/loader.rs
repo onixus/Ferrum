@@ -114,7 +114,9 @@ impl Loader {
         }
     }
 
-    /// Pins are not created. aya is not linked on this toolchain.
+    /// Pins are not created. Program attach exists only behind the opt-in
+    /// `attach` feature (`KernelHandle`), and even that does not pin at
+    /// PIN_PATH yet, so this stays Degraded instead of pretending.
     pub fn attach_pins(&self) -> Result<()> {
         Err(FerrumError::Degraded(format!(
             "kernel eBPF attach not wired; pins not loaded at {PIN_PATH}"
