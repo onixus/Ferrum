@@ -722,6 +722,7 @@ dependencies = [
  "ferrum-agent",
  "ferrum-api",
  "ferrum-cli",
+ "ferrum-common",
  "ferrum-compiler",
  "ferrum-controller",
  "ferrum-crypto",

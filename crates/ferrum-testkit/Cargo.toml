@@ -17,6 +17,9 @@ serde_yaml.workspace = true
 chrono.workspace = true
 ferrum-admission = { path = "../ferrum-admission" }
 ferrum-agent = { path = "../ferrum-agent" }
+# Only for the error type of `ferrum_agent::Responder`, which the replay
+# harness has to implement to observe a kill without CAP_KILL.
+ferrum-common.workspace = true
 # The deploy gate runs the lint and the PKI issuance the CLI ships, not a copy.
 ferrum-cli = { path = "../ferrum-cli" }
 ferrum-compiler.workspace = true
