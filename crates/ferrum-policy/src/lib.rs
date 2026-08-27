@@ -13,8 +13,12 @@ use ferrum_common::{FerrumError, Result};
 
 pub use eval::{evaluate, exception_applies, RuleHit};
 
-pub(crate) const MIN_REASON_LEN: usize = 8;
-pub(crate) const MAX_EXCEPTION_DAYS: u64 = 90;
+/// Shortest `reason` a waiver may carry. Public because the CRD schema states
+/// the same bound as `minLength` and the drift gate derives one from the other.
+pub const MIN_REASON_LEN: usize = 8;
+/// Longest TTL a waiver may carry, in days. Same reason: the CEL copy spells it
+/// as a duration and must be derivable from this.
+pub const MAX_EXCEPTION_DAYS: u64 = 90;
 
 pub fn validate_cluster_policy(spec: &ClusterSecurityPolicySpec) -> Result<()> {
     validate_common(
@@ -108,7 +112,9 @@ fn validate_common(
     Ok(())
 }
 
-const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
+/// Hex length of an Ed25519 verifying key. The CRD repeats it as an item
+/// `pattern`, and the drift gate derives that pattern from this constant.
+pub const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
 
 fn is_ed25519_public_key_hex(s: &str) -> bool {
     s.len() == ED25519_PUBLIC_KEY_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
