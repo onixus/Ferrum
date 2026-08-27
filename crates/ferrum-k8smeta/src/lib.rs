@@ -56,11 +56,6 @@ impl CgroupIndex {
     }
 }
 
-/// Empty index. Callers that need a live cache must hold [`CgroupIndex`].
-pub fn lookup_cgroup(inode: u64) -> Result<WorkloadIdentity> {
-    CgroupIndex::new().lookup_cgroup(inode)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +92,5 @@ mod tests {
             other => panic!("miss must be Degraded, got {other:?}"),
         }
         assert!(WorkloadIdentity::unknown().is_unknown());
-        assert!(lookup_cgroup(1).is_err());
     }
 }
