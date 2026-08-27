@@ -452,6 +452,7 @@ dependencies = [
  "ferrum-compiler",
  "ferrum-crypto",
  "ferrum-ids",
+ "ferrum-k8smeta",
  "ferrum-policy",
  "rustls",
  "rustls-pemfile",
