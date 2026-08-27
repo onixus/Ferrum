@@ -6,7 +6,7 @@ use chrono::{DateTime, Days, TimeZone, Utc};
 use ferrum_admission::{
     encode_fsig, handle_review_bytes, load_bundle, load_path, load_source, parse_program,
     poll_bundle_file, poll_exceptions_file, AdmissionProgram, ReviewConfig, WebhookState,
-    ADMISSION_ABI, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, EXCEPTIONS_JSON_KEY,
+    ADMISSION_ABI, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, EXCEPTIONS_FSIG_KEY,
     IMAGE_SIGNATURE_ANNOTATION, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED, RULE_UNSIGNED,
 };
 use ferrum_api::{
@@ -813,12 +813,21 @@ fn wallclock_exception(
     }
 }
 
+/// Controller-format `exceptions.fsig`: FSIG envelope over the JSON array,
+/// signed with the bundle key.
+fn exceptions_fsig_bytes(list: &[PolicyExceptionSpec], sk: &[u8; 32]) -> Vec<u8> {
+    let payload = serde_json::to_vec(list).expect("controller-format json");
+    let pk = public_key_from_secret(sk).expect("pk");
+    let sig = sign_bundle(&payload, sk).expect("sign exceptions");
+    encode_fsig(&payload, &sig, &pk).expect("exceptions fsig")
+}
+
 fn write_exceptions(dir: &std::path::Path, list: &[PolicyExceptionSpec]) {
     std::fs::write(
-        dir.join(EXCEPTIONS_JSON_KEY),
-        serde_json::to_vec(list).expect("controller-format json"),
+        dir.join(EXCEPTIONS_FSIG_KEY),
+        exceptions_fsig_bytes(list, &SK),
     )
-    .expect("exceptions.json");
+    .expect("exceptions.fsig");
 }
 
 fn wait_decision(state: &WebhookState, body: &[u8], want: bool, why: &str) {
@@ -870,12 +879,53 @@ fn exceptions_mount_rotation_gates_scope_and_ttl() {
         "live in-scope exception must waive privileged deny",
     );
 
-    std::fs::write(dir.join(EXCEPTIONS_JSON_KEY), b"{{{ not exceptions json").expect("garbage");
+    std::fs::write(dir.join(EXCEPTIONS_FSIG_KEY), b"{{{ not exceptions fsig").expect("garbage");
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "garbage exceptions.fsig must reset the list to empty, restoring the deny",
+    );
+
+    let live_list = [wallclock_exception(
+        "prod-restricted",
+        RULE_PRIVILEGED,
+        live,
+        "JIRA-UNSIGNED-2",
+    )];
+    std::fs::write(
+        dir.join(EXCEPTIONS_FSIG_KEY),
+        serde_json::to_vec(&live_list.to_vec()).expect("json"),
+    )
+    .expect("plain json");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         handle_json(&state, &body)["response"]["allowed"],
-        true,
-        "garbage exceptions.json must keep the previous list, not deny-all"
+        false,
+        "unsigned plain-JSON exceptions must be rejected, deny stays deny"
+    );
+
+    std::fs::write(
+        dir.join(EXCEPTIONS_FSIG_KEY),
+        exceptions_fsig_bytes(&live_list, &SK_OTHER),
+    )
+    .expect("foreign-key fsig");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "exceptions signed with a foreign key must be rejected"
+    );
+
+    let mut tampered = exceptions_fsig_bytes(&live_list, &SK);
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    std::fs::write(dir.join(EXCEPTIONS_FSIG_KEY), &tampered).expect("tampered fsig");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "tampered exceptions payload must be rejected"
     );
 
     write_exceptions(
@@ -938,18 +988,18 @@ fn exceptions_mount_rotation_gates_scope_and_ttl() {
     );
     wait_decision(&state, &body, true, "fresh live exception must waive again");
 
-    std::fs::remove_file(dir.join(EXCEPTIONS_JSON_KEY)).expect("remove");
+    std::fs::remove_file(dir.join(EXCEPTIONS_FSIG_KEY)).expect("remove");
     wait_decision(
         &state,
         &body,
         false,
-        "removed exceptions.json must reset to an empty list",
+        "removed exceptions.fsig must reset to an empty list",
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn exceptions_reload_missing_file_is_empty_and_garbage_keeps_previous() {
+fn exceptions_reload_missing_file_is_empty_and_unverifiable_resets() {
     let (fsig, pk) = make_fsig(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
     let cfg = ReviewConfig {
         policy_name: "prod-restricted".into(),
@@ -961,17 +1011,56 @@ fn exceptions_reload_missing_file_is_empty_and_garbage_keeps_previous() {
         Utc::now() + Days::new(7),
         "JIRA-LIVE-1",
     );
-    let state = WebhookState::new(load_ok(&fsig, &pk), pk.clone(), vec![live], cfg);
+    let state = WebhookState::new(load_ok(&fsig, &pk), pk.clone(), vec![live.clone()], cfg);
     let body = review(pod(IMAGE, image_annotations(IMAGE, &SK), true), "uid-st");
     assert_eq!(handle_json(&state, &body)["response"]["allowed"], true);
+    assert_eq!(state.exceptions_resets(), 0);
 
     assert!(state.try_reload_exceptions(b"{{{ garbage").is_err());
     assert_eq!(
         handle_json(&state, &body)["response"]["allowed"],
-        true,
-        "garbage bytes keep the previous list"
+        false,
+        "unverifiable bytes reset the list to empty, restoring the deny"
+    );
+    assert_eq!(state.exceptions_resets(), 1);
+
+    let signed = exceptions_fsig_bytes(&[live.clone()], &SK);
+    let n = state.try_reload_exceptions(&signed).expect("signed list");
+    assert_eq!(n, 1);
+    assert_eq!(handle_json(&state, &body)["response"]["allowed"], true);
+
+    assert!(state
+        .try_reload_exceptions(&serde_json::to_vec(&vec![live.clone()]).expect("json"))
+        .is_err());
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "unsigned plain JSON resets to empty; deny stays deny"
     );
 
+    state.try_reload_exceptions(&signed).expect("signed again");
+    assert!(state
+        .try_reload_exceptions(&exceptions_fsig_bytes(&[live.clone()], &SK_OTHER))
+        .is_err());
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "foreign-key envelope resets to empty"
+    );
+
+    state.try_reload_exceptions(&signed).expect("signed again");
+    let mut tampered = signed.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    assert!(state.try_reload_exceptions(&tampered).is_err());
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "tampered payload resets to empty"
+    );
+    assert_eq!(state.exceptions_resets(), 4);
+
+    state.try_reload_exceptions(&signed).expect("signed again");
     let dir = temp_dir("exceptions-missing");
     let n = state
         .try_reload_exceptions_path(&dir)
@@ -982,6 +1071,7 @@ fn exceptions_reload_missing_file_is_empty_and_garbage_keeps_previous() {
         false,
         "empty list restores the deny"
     );
+    assert_eq!(state.exceptions_resets(), 4, "missing file is not a reset");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

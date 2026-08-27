@@ -32,6 +32,32 @@ pub use spec::{
 use ferrum_common::Result;
 use ferrum_ids::Digest;
 
+/// (program symbol in the ELF, tracepoint category, tracepoint name).
+///
+/// Lives outside the `attach` gate so ELF inspection (CI symbol check,
+/// `tests/elf_inspect.rs`) can use the same list without CAP_BPF or aya.
+pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
+    ("ferrum_sys_enter_execve", "syscalls", "sys_enter_execve"),
+    (
+        "ferrum_sys_enter_execveat",
+        "syscalls",
+        "sys_enter_execveat",
+    ),
+    ("ferrum_sys_enter_open", "syscalls", "sys_enter_open"),
+    ("ferrum_sys_enter_openat", "syscalls", "sys_enter_openat"),
+    ("ferrum_sys_enter_bpf", "syscalls", "sys_enter_bpf"),
+    (
+        "ferrum_sys_enter_init_module",
+        "syscalls",
+        "sys_enter_init_module",
+    ),
+    (
+        "ferrum_sys_enter_finit_module",
+        "syscalls",
+        "sys_enter_finit_module",
+    ),
+];
+
 /// Parse `spec` as FEBP and install it on `loader` as last-known-good.
 pub fn load_bundle(loader: &mut Loader, digest: &Digest, spec: &[u8]) -> Result<()> {
     loader.load_bundle(digest, spec)

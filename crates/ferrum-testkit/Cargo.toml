@@ -18,6 +18,12 @@ chrono.workspace = true
 ferrum-admission = { path = "../ferrum-admission" }
 ferrum-agent = { path = "../ferrum-agent" }
 ferrum-compiler.workspace = true
+# Only to prove the controller's on-wire exceptions.fsig is what the agent and
+# admission actually accept; the four codec copies cannot drift silently.
+ferrum-controller = { path = "../ferrum-controller" }
 ferrum-crypto.workspace = true
 ferrum-ebpf.workspace = true
+ferrum-export.workspace = true
 ferrum-ids.workspace = true
+ferrum-k8smeta.workspace = true
+serde_json.workspace = true

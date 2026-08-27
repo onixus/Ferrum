@@ -4,7 +4,8 @@
 
 use ferrum_admission::{
     admit_bytes, load_path, load_tls_config, parse_trust_root, poll_bundle_file,
-    poll_exceptions_file, serve_listener, AdmissionSubject, ReviewConfig, WebhookState,
+    poll_exceptions_file, serve_listener, verify_exceptions_fsig, AdmissionSubject, ReviewConfig,
+    WebhookState,
 };
 use ferrum_api::PolicyExceptionSpec;
 use std::collections::BTreeMap;
@@ -25,7 +26,7 @@ fn main() {
 fn cmd_eval(args: &[String]) {
     if args.len() != 3 {
         eprintln!("usage: ferrum-admission <program.fadm> <subject.json>");
-        eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <json> --policy-name <name>] <admissionreview.json>");
+        eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <exceptions.fsig> --policy-name <name>] <admissionreview.json>");
         eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000]");
         eprintln!("missing or invalid compiled program denies the request (fail closed)");
         exit(2);
@@ -89,7 +90,7 @@ fn cmd_review(args: &[String]) {
             exit(2);
         }
     };
-    let (exceptions, cfg) = exceptions_and_config(&flags);
+    let (exceptions, cfg) = exceptions_and_config(&flags, &trust_root);
     let body = read_file(&review_path);
     let reply = cfg.handle_bytes(&body, Some(&program), &exceptions, chrono::Utc::now());
     match serde_json::from_slice::<serde_json::Value>(&reply.body) {
@@ -246,8 +247,11 @@ fn review_config(flags: &Flags) -> ReviewConfig {
     }
 }
 
-fn exceptions_and_config(flags: &Flags) -> (Vec<PolicyExceptionSpec>, ReviewConfig) {
-    let exceptions = load_exceptions(flags.map.get("exceptions"));
+fn exceptions_and_config(
+    flags: &Flags,
+    trust_root: &[u8],
+) -> (Vec<PolicyExceptionSpec>, ReviewConfig) {
+    let exceptions = load_exceptions(flags.map.get("exceptions"), trust_root);
     let cfg = review_config(flags);
     if !exceptions.is_empty() && cfg.policy_name.is_empty() {
         die("--policy-name is required when --exceptions is set");
@@ -255,7 +259,9 @@ fn exceptions_and_config(flags: &Flags) -> (Vec<PolicyExceptionSpec>, ReviewConf
     (exceptions, cfg)
 }
 
-fn load_exceptions(path: Option<&String>) -> Vec<PolicyExceptionSpec> {
+/// `--exceptions` must be a signed `exceptions.fsig` verified against the
+/// same trust root as the bundle; plain JSON is rejected (fail closed).
+fn load_exceptions(path: Option<&String>, trust_root: &[u8]) -> Vec<PolicyExceptionSpec> {
     let Some(path) = path else {
         return Vec::new();
     };
@@ -263,13 +269,17 @@ fn load_exceptions(path: Option<&String>) -> Vec<PolicyExceptionSpec> {
         return Vec::new();
     }
     let raw = read_file(path);
-    if let Ok(list) = serde_json::from_slice::<Vec<PolicyExceptionSpec>>(&raw) {
-        return list;
-    }
-    match serde_json::from_slice::<PolicyExceptionSpec>(&raw) {
-        Ok(one) => vec![one],
+    let payload = match verify_exceptions_fsig(&raw, trust_root) {
+        Ok(payload) => payload,
         Err(err) => {
-            eprintln!("error: exceptions json: {err}");
+            eprintln!("error: exceptions: {err}");
+            exit(2);
+        }
+    };
+    match serde_json::from_slice::<Vec<PolicyExceptionSpec>>(&payload) {
+        Ok(list) => list,
+        Err(err) => {
+            eprintln!("error: exceptions payload json: {err}");
             exit(2);
         }
     }

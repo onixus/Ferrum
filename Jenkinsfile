@@ -19,7 +19,8 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
-        timeout(time: 30, unit: 'MINUTES')
+        // BPF ELF stage adds nightly install + build-std + bpf-linker on a cold cache.
+        timeout(time: 45, unit: 'MINUTES')
     }
 
     environment {
@@ -44,6 +45,7 @@ pipeline {
                     set -eu
                     rustup component add clippy
                     cargo clippy --workspace --all-targets -- -D warnings
+                    cargo clippy -p ferrum-ebpf --features attach --all-targets -- -D warnings
                 '''
             }
         }
@@ -54,6 +56,52 @@ pipeline {
                     set -eu
                     cargo test --workspace
                 '''
+            }
+        }
+
+        stage('BPF ELF') {
+            steps {
+                sh '''
+                    set -eu
+                    rustup toolchain install nightly --profile minimal --component rust-src
+                    # bpf-linker (default rust-llvm feature) links -lLLVM from the
+                    # nightly rustc; the image ships no plain libLLVM.so, so shim
+                    # the versioned one and keep the sysroot on rpath.
+                    if ! command -v bpf-linker >/dev/null 2>&1; then
+                        sysroot="$(rustc +nightly --print sysroot)"
+                        shim=/tmp/ferrum-llvm-shim
+                        mkdir -p "$shim"
+                        ln -sf "$sysroot"/lib/libLLVM-*.so "$shim/libLLVM.so"
+                        RUSTFLAGS="-L $shim -L $sysroot/lib -C link-arg=-Wl,-rpath,$sysroot/lib" \
+                            cargo +nightly install bpf-linker --locked
+                    fi
+                    cargo +nightly build -p ferrum-ebpf-progs \
+                        --target bpfel-unknown-none -Z build-std=core --release
+                    elf="$CARGO_TARGET_DIR/bpfel-unknown-none/release/ferrum-ebpf-progs"
+                    readelf -sW "$elf" > /tmp/ferrum-bpf-symbols.txt
+                    for sym in \
+                        ferrum_sys_enter_execve \
+                        ferrum_sys_enter_execveat \
+                        ferrum_sys_enter_open \
+                        ferrum_sys_enter_openat \
+                        ferrum_sys_enter_bpf \
+                        ferrum_sys_enter_init_module \
+                        ferrum_sys_enter_finit_module \
+                        ferrum_events \
+                        ferrum_cgroups \
+                        ferrum_self \
+                        events_dropped_total
+                    do
+                        if ! grep -Eq "[[:space:]]$sym\$" /tmp/ferrum-bpf-symbols.txt; then
+                            echo "missing symbol $sym in bpf ELF" >&2
+                            exit 1
+                        fi
+                    done
+                    FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" cargo test -p ferrum-ebpf --test elf_inspect
+                    mkdir -p dist
+                    cp "$elf" dist/ferrum-ebpf-progs.bpf.o
+                '''
+                archiveArtifacts artifacts: 'dist/ferrum-ebpf-progs.bpf.o', fingerprint: true
             }
         }
 

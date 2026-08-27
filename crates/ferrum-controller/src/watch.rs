@@ -297,7 +297,13 @@ async fn handle_exception_event(
             }
         }
     }
-    persist_exceptions(client, &cfg.namespace, &snapshot_exceptions(exceptions)).await?;
+    persist_exceptions(
+        client,
+        &cfg.namespace,
+        &cfg.secret_key,
+        &snapshot_exceptions(exceptions),
+    )
+    .await?;
     if status_errors.is_empty() {
         Ok(())
     } else {
@@ -499,7 +505,14 @@ async fn attach_exceptions(
         }
         None => snapshot_exceptions(exceptions),
     };
-    patch_secret_exceptions(client, &cfg.namespace, secret_name, &scoped).await
+    patch_secret_exceptions(
+        client,
+        &cfg.namespace,
+        secret_name,
+        &cfg.secret_key,
+        &scoped,
+    )
+    .await
 }
 
 fn failed_outcome(generation: i64, err: &FerrumError) -> crate::ReconcileOutcome {

@@ -20,8 +20,8 @@ use ferrum_api::PolicyExceptionSpec;
 pub use bundle::{
     encode_fsig, extract_fsig, load_bundle, load_digest, load_path, load_signed, load_source,
     load_source_with_expected, parse_trust_root, read_exceptions_path, read_source_path,
-    ExtractedFsig, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, EXCEPTIONS_JSON_KEY, KUBELET_DATA_DIR,
-    SIGNED_FORMAT, SIGNED_MAGIC,
+    verify_exceptions_fsig, ExtractedFsig, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, EXCEPTIONS_FSIG_KEY,
+    KUBELET_DATA_DIR, SIGNED_FORMAT, SIGNED_MAGIC,
 };
 pub use eval::{
     admit, AdmissionDecision, AdmissionSubject, Patch, RULE_ADDED_CAPABILITIES,

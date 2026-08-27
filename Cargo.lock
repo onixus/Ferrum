@@ -464,6 +464,7 @@ dependencies = [
 name = "ferrum-agent"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ferrum-api",
  "ferrum-common",
  "ferrum-compiler",
@@ -472,8 +473,10 @@ dependencies = [
  "ferrum-export",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-policy",
  "ferrum-proto",
  "ferrum-wasm-host",
+ "serde_json",
  "serde_yaml 0.8.26",
 ]
 
@@ -582,6 +585,7 @@ dependencies = [
 name = "ferrum-export"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ferrum-ids",
  "ferrum-proto",
  "serde_json",
@@ -616,8 +620,10 @@ dependencies = [
 name = "ferrum-proto"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ferrum-ids",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -629,10 +635,14 @@ dependencies = [
  "ferrum-agent",
  "ferrum-api",
  "ferrum-compiler",
+ "ferrum-controller",
  "ferrum-crypto",
  "ferrum-ebpf",
+ "ferrum-export",
  "ferrum-ids",
+ "ferrum-k8smeta",
  "serde",
+ "serde_json",
  "serde_yaml 0.8.26",
 ]
 

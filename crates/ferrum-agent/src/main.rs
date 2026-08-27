@@ -2,10 +2,14 @@
 
 use ferrum_agent::{parse_trust_root, poll_bundle, Agent, AgentConfig, AgentRole};
 use ferrum_common::FerrumError;
+use ferrum_export::{RotatingFileSink, SinkContext};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::exit;
 use std::time::Duration;
+
+const DEFAULT_EXPORT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_EXPORT_KEEP: usize = 5;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -48,11 +52,39 @@ fn main() {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
+    let policy_name = flags.map.get("policy-name").cloned().unwrap_or_default();
+
+    let export_dir = flags
+        .map
+        .get("export-dir")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let export_max_bytes: u64 = match flags.map.get("export-max-bytes") {
+        Some(s) if !s.is_empty() => s
+            .parse()
+            .unwrap_or_else(|_| die("invalid --export-max-bytes")),
+        _ => DEFAULT_EXPORT_MAX_BYTES,
+    };
+    let export_keep: usize = match flags.map.get("export-keep") {
+        Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|_| die("invalid --export-keep")),
+        _ => DEFAULT_EXPORT_KEEP,
+    };
+    let node = flags
+        .map
+        .get("node")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "unknown-node".into());
+
     let mut agent = Agent::new(AgentConfig {
         role,
         lkg_dir,
         trust_root,
         bundle_path: bundle_path.clone(),
+        exceptions: Vec::new(),
+        policy_name,
     });
 
     if let Err(err) = agent.restore_last_known_good() {
@@ -66,6 +98,9 @@ fn main() {
                 exit(2);
             }
         }
+        if let Err(err) = agent.reload_exceptions_path(path) {
+            eprintln!("ferrum-agent: exceptions load failed, waivers dropped: {err}");
+        }
     }
 
     match agent.attach_pins() {
@@ -78,8 +113,34 @@ fn main() {
         }
     }
 
+    // The sink is the future event destination once the datapath pumps; today
+    // it pins down the export contract (node/role stamped, digest/degraded
+    // refreshed by the poll loop) without touching kernel attach.
+    let export_sink = export_dir.map(|dir| {
+        let role_name = if role.respond_enabled() {
+            "respond"
+        } else {
+            "observe"
+        };
+        let sink = RotatingFileSink::new(
+            dir,
+            export_max_bytes,
+            export_keep,
+            SinkContext::new(node, role_name),
+        );
+        sink.set_bundle_digest(agent.last_good_digest().cloned());
+        sink.set_degraded(agent.is_degraded());
+        sink
+    });
+    let export_ctx = export_sink.as_ref().map(RotatingFileSink::context);
+
     if let Some(path) = bundle_path {
-        poll_bundle(&mut agent, &path, Duration::from_millis(reload_ms));
+        poll_bundle(
+            &mut agent,
+            &path,
+            Duration::from_millis(reload_ms),
+            export_ctx,
+        );
     }
     loop {
         std::thread::sleep(Duration::from_secs(3600));
@@ -118,7 +179,7 @@ fn require_flag(flags: &Flags, name: &str) -> String {
     match flags.map.get(name) {
         Some(v) if !v.is_empty() => v.clone(),
         _ => die(
-            "usage: ferrum-agent --trust-root <32-byte-hex> [--bundle <fsig|dir>] [--lkg-dir <dir>] [--role observe|respond] [--reload-ms 1000]",
+            "usage: ferrum-agent --trust-root <32-byte-hex> [--bundle <fsig|dir>] [--lkg-dir <dir>] [--role observe|respond] [--policy-name <name>] [--reload-ms 1000] [--node <name>] [--export-dir <dir>] [--export-max-bytes 67108864] [--export-keep 5]",
         ),
     }
 }

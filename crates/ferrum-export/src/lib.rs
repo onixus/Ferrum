@@ -2,6 +2,10 @@
 
 #![deny(unsafe_code)]
 
+mod file;
+
+pub use file::{EnvelopeWriterSink, RotatingFileSink, SinkContext};
+
 use ferrum_proto::EnforcementEvent;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,6 +125,7 @@ mod tests {
             namespace: "prod".into(),
             comm: "sh".into(),
             syscall: "execve".into(),
+            waiver: None,
         }
     }
 

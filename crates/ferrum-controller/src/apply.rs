@@ -1,6 +1,6 @@
 //! Status PATCH and signed bundle Secret. Failed compile never writes a Secret.
 
-use crate::bundle::{verify_signed_bundle, SignedBundle};
+use crate::bundle::{encode_fsig_envelope, verify_signed_bundle, SignedBundle};
 use crate::{compile_status_err, ReconcileOutcome};
 use ferrum_api::{PolicyExceptionSpec, PolicyStatus};
 use ferrum_common::{FerrumError, Result};
@@ -16,8 +16,13 @@ pub const BUNDLE_SECRET_PREFIX: &str = "ferrum-bundle-";
 pub const BUNDLE_FSIG_KEY: &str = "bundle.fsig";
 pub const BUNDLE_DIGEST_KEY: &str = "digest";
 /// Live exceptions ride in the same Secret as the FSIG so admission reads both
-/// from one mount. They are TTL'd data, not signed policy: eval re-checks
-/// scope and expiresAt on every request.
+/// from one mount. The list is signed with the bundle key into an FSIG
+/// envelope: a writer with Secret access must not be able to add or strip
+/// exceptions (that would disable Kill/Deny without the signing key). Eval
+/// still re-checks scope and expiresAt on every request.
+pub const EXCEPTIONS_FSIG_KEY: &str = "exceptions.fsig";
+/// Legacy unsigned key. No longer written; the patch nulls it out so a stale
+/// unsigned list cannot linger next to the signed one.
 pub const EXCEPTIONS_JSON_KEY: &str = "exceptions.json";
 
 /// Secrets carry owner labels; `upsert_secret` refuses to overwrite a Secret
@@ -99,29 +104,43 @@ pub fn exceptions_for_policy(
 
 pub fn exceptions_json(specs: &[PolicyExceptionSpec]) -> Result<Vec<u8>> {
     serde_json::to_vec(specs)
-        .map_err(|e| FerrumError::Validation(format!("exceptions.json encode: {e}")))
+        .map_err(|e| FerrumError::Validation(format!("exceptions encode: {e}")))
 }
 
-/// Merge-patch body that sets only `exceptions.json`; bundle.fsig and digest
-/// keys of the target Secret are left intact.
-pub fn exceptions_secret_patch(specs: &[PolicyExceptionSpec]) -> Result<Secret> {
-    let mut data = BTreeMap::new();
-    data.insert(
-        EXCEPTIONS_JSON_KEY.to_string(),
-        ByteString(exceptions_json(specs)?),
-    );
-    Ok(Secret {
-        data: Some(data),
-        ..Secret::default()
-    })
+/// Sign the JSON exception array into the same FSIG envelope as bundle.fsig,
+/// with the same bundle-signing key.
+pub fn exceptions_fsig(specs: &[PolicyExceptionSpec], secret_key: &[u8]) -> Result<Vec<u8>> {
+    let payload = exceptions_json(specs)?;
+    let signature = ferrum_crypto::sign_bundle(&payload, secret_key)?;
+    let public_key = ferrum_crypto::public_key_from_secret(secret_key)?;
+    encode_fsig_envelope(&public_key, &signature, &payload)
+}
+
+/// Merge-patch body that sets only `exceptions.fsig` and deletes the legacy
+/// unsigned `exceptions.json` (null removes a key in a JSON merge patch);
+/// bundle.fsig and digest keys of the target Secret are left intact.
+pub fn exceptions_secret_patch(
+    specs: &[PolicyExceptionSpec],
+    secret_key: &[u8],
+) -> Result<serde_json::Value> {
+    let fsig = exceptions_fsig(specs, secret_key)?;
+    let fsig_b64 = serde_json::to_value(ByteString(fsig))
+        .map_err(|e| FerrumError::Validation(format!("exceptions.fsig encode: {e}")))?;
+    Ok(serde_json::json!({
+        "data": {
+            EXCEPTIONS_FSIG_KEY: fsig_b64,
+            EXCEPTIONS_JSON_KEY: serde_json::Value::Null,
+        }
+    }))
 }
 
 /// Push the current live exception list into every bundle Secret we own —
 /// selected by owner label, never by name prefix — scoping each Secret's
-/// `exceptions.json` to the exceptions that target its policy.
+/// `exceptions.fsig` to the exceptions that target its policy.
 pub async fn persist_exceptions(
     client: &Client,
     namespace: &str,
+    secret_key: &[u8],
     specs: &[PolicyExceptionSpec],
 ) -> Result<()> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
@@ -142,7 +161,7 @@ pub async fn persist_exceptions(
         else {
             continue;
         };
-        let patch = exceptions_secret_patch(&exceptions_for_policy(specs, policy))?;
+        let patch = exceptions_secret_patch(&exceptions_for_policy(specs, policy), secret_key)?;
         api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
             .map_err(|e| FerrumError::Degraded(format!("secret patch {name}: {e}")))?;
@@ -154,9 +173,10 @@ pub(crate) async fn patch_secret_exceptions(
     client: &Client,
     namespace: &str,
     secret_name: &str,
+    secret_key: &[u8],
     specs: &[PolicyExceptionSpec],
 ) -> Result<()> {
-    let patch = exceptions_secret_patch(specs)?;
+    let patch = exceptions_secret_patch(specs, secret_key)?;
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
     api.patch(secret_name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
@@ -590,10 +610,9 @@ mod tests {
         assert!(plan.secret.is_some());
     }
 
-    #[test]
-    fn exceptions_patch_touches_only_exceptions_key() {
+    fn live_exception() -> PolicyExceptionSpec {
         let expires = chrono::Utc::now() + chrono::Days::new(7);
-        let spec = PolicyExceptionSpec {
+        PolicyExceptionSpec {
             ticket: "JIRA-18421".into(),
             requested_by: "sre".into(),
             approved_by: "ib".into(),
@@ -606,15 +625,78 @@ mod tests {
                 policies: vec!["prod-restricted".into()],
                 rules: vec!["no-shell".into()],
             },
-        };
-        let patch = exceptions_secret_patch(&[spec.clone()]).expect("patch");
-        let data = patch.data.expect("data");
-        assert_eq!(data.len(), 1);
-        let bytes = &data.get(EXCEPTIONS_JSON_KEY).expect("exceptions.json").0;
-        let decoded: Vec<PolicyExceptionSpec> = serde_json::from_slice(bytes).expect("decode");
-        assert_eq!(decoded, vec![spec]);
+        }
+    }
+
+    fn b64_decode(s: &str) -> Vec<u8> {
+        serde_json::from_value::<ByteString>(serde_json::Value::String(s.to_string()))
+            .expect("base64")
+            .0
+    }
+
+    #[test]
+    fn exceptions_patch_signs_fsig_and_nulls_legacy_json_key() {
+        let spec = live_exception();
+        let patch = exceptions_secret_patch(&[spec.clone()], &RFC8032_SK).expect("patch");
+        let data = patch["data"].as_object().expect("data");
+        assert_eq!(data.len(), 2);
+        assert!(
+            data.get(EXCEPTIONS_JSON_KEY).expect("legacy key").is_null(),
+            "merge patch must delete the unsigned exceptions.json"
+        );
         assert!(!data.contains_key(BUNDLE_FSIG_KEY));
         assert!(!data.contains_key(BUNDLE_DIGEST_KEY));
+        let fsig = b64_decode(
+            data.get(EXCEPTIONS_FSIG_KEY)
+                .and_then(|v| v.as_str())
+                .expect("exceptions.fsig base64"),
+        );
+        assert_eq!(&fsig[..4], &crate::SIGNED_MAGIC);
+        let payload = crate::bundle::verify_fsig_envelope(&fsig, &pk()).expect("trust root");
+        let decoded: Vec<PolicyExceptionSpec> = serde_json::from_slice(&payload).expect("decode");
+        assert_eq!(decoded, vec![spec]);
+    }
+
+    #[test]
+    fn exceptions_fsig_rejects_wrong_root_and_tampered_payload() {
+        let fsig = exceptions_fsig(&[live_exception()], &RFC8032_SK).expect("fsig");
+        crate::bundle::verify_fsig_envelope(&fsig, &pk()).expect("bundle trust root verifies");
+
+        let mut other = RFC8032_SK;
+        other[0] ^= 1;
+        let wrong = ferrum_crypto::public_key_from_secret(&other).expect("other pk");
+        match crate::bundle::verify_fsig_envelope(&fsig, &wrong) {
+            Err(FerrumError::Integrity(_)) => {}
+            res => panic!("expected Integrity, got {res:?}"),
+        }
+
+        let mut tampered = fsig.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        match crate::bundle::verify_fsig_envelope(&tampered, &pk()) {
+            Err(FerrumError::Integrity(_)) => {}
+            res => panic!("expected Integrity, got {res:?}"),
+        }
+
+        match exceptions_fsig(&[live_exception()], &[0u8; ED25519_SECRET_KEY_LEN]) {
+            Err(_) => {}
+            Ok(_) => panic!("all-zero seed must not sign exceptions"),
+        }
+    }
+
+    #[test]
+    fn per_policy_scoping_survives_signing() {
+        let spec = live_exception();
+        let scoped = exceptions_for_policy(&[spec.clone()], "prod-restricted");
+        let fsig = exceptions_fsig(&scoped, &RFC8032_SK).expect("fsig");
+        let payload = crate::bundle::verify_fsig_envelope(&fsig, &pk()).expect("verify");
+        let decoded: Vec<PolicyExceptionSpec> = serde_json::from_slice(&payload).expect("decode");
+        assert_eq!(decoded, vec![spec]);
+
+        let other = exceptions_for_policy(&decoded, "other-policy");
+        let fsig = exceptions_fsig(&other, &RFC8032_SK).expect("fsig empty");
+        let payload = crate::bundle::verify_fsig_envelope(&fsig, &pk()).expect("verify empty");
+        assert_eq!(payload, b"[]");
     }
 
     #[test]
