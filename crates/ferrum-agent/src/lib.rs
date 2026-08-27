@@ -716,6 +716,11 @@ impl Agent {
         self.record_decode_failure_at(n, Instant::now());
     }
 
+    /// Every decode error lands here, whatever its kind: a short or garbled
+    /// record, and equally a record whose ABI stamp the decoder refuses. On a
+    /// datapath ELF that does not match the decoder that is every record, so
+    /// the honesty must not stop at a counter.
+    ///
     /// A malformed record is not telemetry: it carried a syscall that no rule
     /// ever matched against, which is the same loss as an in-kernel ring drop
     /// and degrades the agent on the same decaying terms.
@@ -3655,6 +3660,11 @@ mod tests {
             1
         );
         assert!(agent.records_decode_failed_total() >= 1);
+        // The pump routes EVERY decode error here, whatever its kind — a short
+        // record, and equally an ABI stamp the decoder rejects as Integrity.
+        // A mismatched datapath ELF fails every record, so the node degrades
+        // rather than counting quietly.
+        assert!(agent.decode_failures_recent());
 
         agent.record_decode_failure_at(4, t0);
         assert_eq!(agent.records_decode_failed_total(), 5);
