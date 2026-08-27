@@ -262,8 +262,18 @@ fn expired_resource_version_demands_a_relist() {
     let before = cache.snapshot().expect("snapshot").len();
     let outcome = apply_watch_stream(&mut cache, &bytes).expect("apply");
     assert_eq!(outcome, WatchOutcome::MustRelist);
-    // A relist demand must not silently empty the cache.
-    assert_eq!(cache.snapshot().expect("snapshot").len(), before);
+    // A relist demand must not silently empty the cache...
+    assert_eq!(cache.len(), before);
+    // ...and must not let it answer either, however recent the last frame is.
+    assert!(cache.relist_pending());
+    assert!(cache.is_fresh_at(Instant::now()), "the watch is alive");
+    match cache.snapshot() {
+        Err(FerrumError::Degraded(msg)) => assert!(msg.contains("relist"), "{msg}"),
+        other => panic!("a cache owing a relist must be Degraded, got {other:?}"),
+    }
+    // Only the list itself puts the node back to work.
+    let relisted = list_into_cache();
+    assert_eq!(relisted.snapshot().expect("relisted").len(), before);
 }
 
 /// The default `StdCgroupFs` must walk a real tree; inode values are not
@@ -443,7 +453,11 @@ fn expired_namespace_watch_demands_a_relist_and_keeps_labels() {
     let outcome = apply_labels_stream(cache.namespaces_mut(), &stream).expect("apply");
     assert_eq!(outcome, WatchOutcome::MustRelist);
     assert_eq!(cache.namespaces().len(), 2);
-    assert!(cache.namespaces().is_warm());
+    // The labels survive the 410, but stop counting as warm until a list
+    // lands: the namespace may have been relabelled inside the gap.
+    assert!(cache.namespaces().relist_pending());
+    assert!(!cache.namespaces().is_warm());
+    assert!(!cache.namespaces().labels_or_empty("", "prod").is_empty());
 }
 
 #[test]

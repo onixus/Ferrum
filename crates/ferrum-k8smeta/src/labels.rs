@@ -79,6 +79,11 @@ pub struct LabelCache {
     /// Why the last write was refused, kept so a caller that only sees the
     /// cache can tell a refusal from an empty result.
     overflow: Option<String>,
+    /// A relist the watch demanded and nobody has completed yet. Liveness and
+    /// completeness are different facts: `410 Gone` proves the stream is alive
+    /// *and* that objects changed unseen, so the labels held may already
+    /// answer a selector wrongly.
+    relist_pending: bool,
 }
 
 impl Default for LabelCache {
@@ -91,6 +96,7 @@ impl Default for LabelCache {
             max_age: DEFAULT_MAX_AGE,
             label_bytes: 0,
             overflow: None,
+            relist_pending: false,
         }
     }
 }
@@ -100,14 +106,28 @@ impl LabelCache {
         Self::default()
     }
 
-    /// Warm means listed *and* refreshed within [`LabelCache::max_age`]: a
-    /// cache nobody has managed to refresh is not a warm cache.
+    /// Warm means listed, refreshed within [`LabelCache::max_age`] *and* not
+    /// owing a relist: a cache nobody has managed to refresh, and a cache told
+    /// it missed events, are both not warm.
     pub fn is_warm(&self) -> bool {
         self.is_warm_at(Instant::now())
     }
 
     pub fn is_warm_at(&self, now: Instant) -> bool {
-        self.listed && self.age_at(now).is_some_and(|age| age <= self.max_age)
+        self.listed
+            && !self.relist_pending
+            && self.age_at(now).is_some_and(|age| age <= self.max_age)
+    }
+
+    /// The watch demanded a relist (`410 Gone`) that has not completed. Until
+    /// it does, the cache is not warm however recently the stream spoke.
+    pub fn relist_pending(&self) -> bool {
+        self.relist_pending
+    }
+
+    /// Raise the obligation on `410`, clear it only when a full list lands.
+    pub fn set_relist_pending(&mut self, pending: bool) {
+        self.relist_pending = pending;
     }
 
     /// Time since the last list, bookmark or event. `None` while cold.
@@ -261,6 +281,9 @@ impl LabelCache {
         }
         self.listed = true;
         self.fresh_at = Some(Instant::now());
+        // Only a completed list discharges the obligation; a refused one
+        // above leaves it standing.
+        self.relist_pending = false;
         Ok(())
     }
 
@@ -300,7 +323,10 @@ pub fn try_apply_labels_event(
             cache.set_resource_version(rv);
             WatchOutcome::Ignored
         }
-        LabelWatchEvent::Gone(_) => WatchOutcome::MustRelist,
+        LabelWatchEvent::Gone(_) => {
+            cache.set_relist_pending(true);
+            WatchOutcome::MustRelist
+        }
         LabelWatchEvent::Error(_) => WatchOutcome::Ignored,
     })
 }
@@ -397,6 +423,30 @@ mod tests {
         );
         assert_eq!(outcome, WatchOutcome::MustRelist);
         assert_eq!(cache.len(), 1);
+        // Kept, but no longer warm: the stream said we missed changes, and
+        // only a completed list can say what they were.
+        assert!(cache.relist_pending());
+        assert!(!cache.is_warm());
+        assert!(cache.is_stale(), "listed once, of unknown correctness");
+        cache.replace_all(vec![object("", "prod", "zone", "public")]);
+        assert!(!cache.relist_pending());
+        assert!(cache.is_warm());
+    }
+
+    #[test]
+    fn a_failed_relist_leaves_the_debt_standing() {
+        let mut cache = LabelCache::new();
+        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        apply_labels_event(&mut cache, LabelWatchEvent::Gone("expired".into()));
+        let mut fat = object("", "dev", "zone", "public");
+        fat.labels
+            .insert("bloat".into(), "x".repeat(MAX_OBJECT_LABEL_BYTES));
+        cache.try_replace_all(vec![fat]).expect_err("must refuse");
+        assert!(
+            cache.relist_pending(),
+            "a refused list did not close the gap"
+        );
+        assert!(!cache.is_warm());
     }
 
     fn degraded(err: ferrum_common::FerrumError) -> String {

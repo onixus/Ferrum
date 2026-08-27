@@ -98,7 +98,8 @@ pub fn parse_watch_event(line: &[u8]) -> Result<PodWatchEvent> {
 pub fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOutcome {
     // Every frame the apiserver produced is proof the watch is alive, so a
     // bookmark on a quiet cluster and a 410 both count. An ERROR frame does
-    // not: a stream that only rejects us delivers no pod state.
+    // not: a stream that only rejects us delivers no pod state. Liveness is
+    // not completeness: the 410 below also raises the relist obligation.
     if !matches!(event, PodWatchEvent::Error(_)) {
         cache.mark_applied_at(Instant::now());
     }
@@ -118,7 +119,10 @@ pub fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOut
             cache.set_resource_version(rv);
             WatchOutcome::Ignored
         }
-        PodWatchEvent::Gone(_) => WatchOutcome::MustRelist,
+        PodWatchEvent::Gone(_) => {
+            cache.set_relist_pending(true);
+            WatchOutcome::MustRelist
+        }
         PodWatchEvent::Error(_) => WatchOutcome::Ignored,
     }
 }
@@ -404,20 +408,67 @@ mod freshness_tests {
         cache.snapshot().expect("a bookmarked cache resolves");
     }
 
+    const GONE: &[u8] = br#"{"type":"ERROR","object":{"kind":"Status","reason":"Expired","message":"too old resource version: 2 (9)","code":410}}"#;
+
     #[test]
-    fn a_410_is_liveness_too_but_still_demands_a_relist() {
+    fn a_410_is_liveness_but_never_freshness() {
         let Some(mut cache) = stale_cache() else {
             return;
         };
-        let event = parse_watch_event(
-            br#"{"type":"ERROR","object":{"kind":"Status","reason":"Expired","message":"too old resource version: 2 (9)","code":410}}"#,
-        )
-        .expect("gone");
+        let event = parse_watch_event(GONE).expect("gone");
         assert_eq!(
             apply_watch_event(&mut cache, event),
             WatchOutcome::MustRelist
         );
+        // The stamp lands: the apiserver did answer us.
         assert!(cache.applied_age().expect("stamped") < Duration::from_secs(1));
+        assert!(cache.is_fresh_at(Instant::now()), "the watch is alive");
+        // The cache is still refused: liveness is not completeness.
+        assert!(cache.relist_pending());
+        match cache.snapshot() {
+            Err(FerrumError::Degraded(msg)) => {
+                assert!(msg.contains("relist"), "{msg}");
+                assert!(msg.contains("410"), "{msg}");
+                assert!(msg.contains("behind"), "{msg}");
+            }
+            other => panic!("a cache owing a relist must be Degraded, got {other:?}"),
+        }
+        // Not an eviction: the pods from before the gap are still there for
+        // whoever completes the relist.
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn only_a_completed_relist_clears_the_debt() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        assert_eq!(
+            apply_watch_stream(&mut cache, GONE).expect("apply"),
+            WatchOutcome::MustRelist
+        );
+        assert!(cache.snapshot().is_err());
+
+        // A later event proves the new stream is alive, and that is all: the
+        // gap the 410 left is only closed by a full list.
+        let event = parse_watch_event(
+            br#"{"type":"MODIFIED","object":{"metadata":{"uid":"u1","name":"web-0","namespace":"prod","resourceVersion":"99"},"spec":{"nodeName":"node-a"}}}"#,
+        )
+        .expect("modified");
+        assert_eq!(apply_watch_event(&mut cache, event), WatchOutcome::Applied);
+        assert!(cache.relist_pending(), "an event is not a list");
+        assert!(cache.snapshot().is_err());
+
+        let (_, pods) = parse_pod_list(
+            br#"{"kind":"PodList","metadata":{"resourceVersion":"1200"},"items":[
+                 {"metadata":{"uid":"u1","name":"web-0","namespace":"prod"},
+                  "spec":{"nodeName":"node-a"}}]}"#,
+        )
+        .expect("list");
+        cache.replace_all(pods);
+        cache.mark_applied_at(Instant::now());
+        assert!(!cache.relist_pending());
+        assert_eq!(cache.snapshot().expect("relisted").len(), 1);
     }
 
     #[test]
@@ -567,10 +618,18 @@ mod label_parse_tests {
         }
         let mut cache = LabelCache::new();
         cache.replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1);
+        assert!(cache.is_warm());
         let outcome = apply_labels_stream(&mut cache, line).expect("apply");
         assert_eq!(outcome, WatchOutcome::MustRelist);
         // A relist demand must not empty the cache we already have.
         assert_eq!(cache.len(), 2);
+        // But the labels in it are known to have moved on without us: a
+        // selector must not be decided off them until a list lands.
+        assert!(cache.relist_pending());
+        assert!(!cache.is_warm(), "410 is liveness, not warmth");
+        cache.replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1);
+        assert!(!cache.relist_pending());
+        assert!(cache.is_warm(), "a completed relist clears the debt");
     }
 
     #[test]
@@ -849,7 +908,11 @@ mod client {
             let head = read_head(&mut reader)?;
             match head.status {
                 200 => {}
-                410 => return Ok(WatchOutcome::MustRelist),
+                // Same fact as an in-band 410, only delivered as a status.
+                410 => {
+                    self.with_cache(|c| c.set_relist_pending(true));
+                    return Ok(WatchOutcome::MustRelist);
+                }
                 other => {
                     return Err(FerrumError::Degraded(format!(
                         "apiserver watch returned {other}"
@@ -1027,7 +1090,11 @@ mod client {
             let head = read_head(&mut reader)?;
             match head.status {
                 200 => {}
-                410 => return Ok(WatchOutcome::MustRelist),
+                // Same fact as an in-band 410, only delivered as a status.
+                410 => {
+                    self.sink.with(&mut |cache| cache.set_relist_pending(true));
+                    return Ok(WatchOutcome::MustRelist);
+                }
                 other => {
                     return Err(FerrumError::Degraded(format!(
                         "apiserver {} watch returned {other}",

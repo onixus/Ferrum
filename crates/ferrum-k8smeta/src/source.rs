@@ -100,6 +100,11 @@ pub struct PodCache {
     /// means no list ever completed. Without it a frozen watch that still
     /// answers `snapshot()` is indistinguishable from a quiet cluster.
     last_applied: Option<Instant>,
+    /// A relist the watch demanded and nobody has completed yet. Liveness and
+    /// completeness are different facts: a `410 Gone` proves the stream is
+    /// alive *and* that events were missed, so the freshness stamp alone would
+    /// keep answering for a cache known to be behind.
+    relist_pending: bool,
 }
 
 impl Clone for PodCache {
@@ -112,6 +117,7 @@ impl Clone for PodCache {
             service_accounts: self.service_accounts.clone(),
             labels_unknown: AtomicU64::new(self.labels_unknown_total()),
             last_applied: self.last_applied,
+            relist_pending: self.relist_pending,
         }
     }
 }
@@ -154,6 +160,18 @@ impl PodCache {
         self.last_applied = Some(at);
     }
 
+    /// The watch demanded a relist (`410 Gone`) that has not completed. The
+    /// pods held are the ones from before the gap, so this is "the cache is
+    /// behind", not "the cache is cold".
+    pub fn relist_pending(&self) -> bool {
+        self.relist_pending
+    }
+
+    /// Raise the obligation on `410`, clear it only when a full list lands.
+    pub fn set_relist_pending(&mut self, pending: bool) {
+        self.relist_pending = pending;
+    }
+
     /// Time since the last watch frame. `None` until the first list lands.
     pub fn applied_age(&self) -> Option<Duration> {
         self.applied_age_at(Instant::now())
@@ -174,6 +192,12 @@ impl PodCache {
         match self.applied_age_at(now) {
             None => Err(FerrumError::Degraded(
                 "pod watch has not delivered a list yet: no cgroup can be matched to a pod".into(),
+            )),
+            Some(_) if self.relist_pending => Err(FerrumError::Degraded(
+                "pod watch demanded a relist (410 Gone) that has not completed: the cached pods \
+                 are known to be behind, and cgroups are not matched to pods off a cache with a \
+                 hole in it"
+                    .into(),
             )),
             Some(age) if age >= POD_WATCH_BUDGET => Err(FerrumError::Degraded(format!(
                 "pod watch frozen: last frame {age:?} ago, past the {POD_WATCH_BUDGET:?} budget; \
@@ -225,7 +249,9 @@ impl PodCache {
         self.pods.remove(uid)
     }
 
+    /// Full list result: the only thing that discharges a pending relist.
     pub fn replace_all(&mut self, pods: Vec<PodRecord>) {
+        self.relist_pending = false;
         self.pods.clear();
         for pod in pods {
             self.upsert(pod);
