@@ -130,6 +130,7 @@ impl Loader {
                 action: Action::Deny,
                 rule_id: None,
                 labels_unknown: false,
+                path_unknown: false,
             },
         }
     }
@@ -141,6 +142,7 @@ impl Loader {
                 action: Action::Deny,
                 rule_id: None,
                 labels_unknown: false,
+                path_unknown: false,
             },
         }
     }

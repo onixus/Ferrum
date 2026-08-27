@@ -201,6 +201,11 @@ pub struct Agent {
     /// happened — indistinguishable, after the fact, from an event nobody had
     /// a rule for.
     ring_drop_at: Mutex<Option<Instant>>,
+    /// Decisions where a `path_suffix` predicate was accepted on a path the
+    /// datapath could not carry whole. Enforcement held, but on an assertion
+    /// rather than on the argument, so the plane is not clean.
+    path_truncated: AtomicU64,
+    path_truncated_at: Mutex<Option<Instant>>,
 }
 
 impl Agent {
@@ -248,6 +253,8 @@ impl Agent {
             labels_unknown: AtomicU64::new(0),
             labels_unknown_at: Mutex::new(None),
             ring_drop_at: Mutex::new(None),
+            path_truncated: AtomicU64::new(0),
+            path_truncated_at: Mutex::new(None),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -282,6 +289,10 @@ impl Agent {
             // policy: the dropped record carried an event no rule ever saw.
             // That is a missed enforcement, so it is Degraded while it lasts.
             || self.ring_drops_recent()
+            // A path the datapath could not carry whole is a suffix rule
+            // decided without the bytes it names. The rule still fired, but on
+            // an assertion, and a node making those is Degraded.
+            || self.path_truncated_recent()
             || self.container_flag_degraded()
             || self.respond_disabled_reason().is_some()
     }
@@ -581,7 +592,26 @@ impl Agent {
     }
 
     pub fn datapath_degraded(&self) -> bool {
-        self.datapath_degraded.load(Ordering::Relaxed)
+        self.datapath_degraded.load(Ordering::Relaxed) || self.path_truncated_recent()
+    }
+
+    pub fn path_truncated_total(&self) -> u64 {
+        self.path_truncated.load(Ordering::Relaxed)
+    }
+
+    /// Recoverable like the other observation signals: a node that stops
+    /// seeing oversize paths stops being Degraded without a restart.
+    pub fn record_path_truncated(&self, now: Instant) {
+        self.path_truncated.fetch_add(1, Ordering::Relaxed);
+        mark_now(&self.path_truncated_at, now);
+    }
+
+    pub fn path_truncated_recent(&self) -> bool {
+        self.path_truncated_recent_at(Instant::now())
+    }
+
+    pub fn path_truncated_recent_at(&self, now: Instant) -> bool {
+        within(&self.path_truncated_at, now, DEGRADED_RECOVERY)
     }
 
     /// CP down: keep LKG, never fail-open.
@@ -846,6 +876,9 @@ impl Agent {
         let mut decision = self.loader.decide(event, &identity);
         if decision.labels_unknown {
             self.record_labels_unknown(Instant::now());
+        }
+        if decision.path_unknown {
+            self.record_path_truncated(Instant::now());
         }
         let waiver = self
             .waiver_applies(&decision, &identity, now)
@@ -1381,6 +1414,7 @@ mod tests {
             path,
             in_container,
             agent_self,
+            path_truncated: false,
         }
     }
 
@@ -1983,6 +2017,25 @@ mod tests {
     /// runs in userspace, so the kill for that event did not happen and
     /// nothing downstream can tell. It has to show up as Degraded.
     #[test]
+    fn path_truncation_degrades_and_then_recovers() {
+        let agent = Agent::new(AgentConfig::default());
+        let now = Instant::now();
+        assert!(!agent.path_truncated_recent_at(now));
+        assert!(!agent.datapath_degraded());
+        agent.record_path_truncated(now);
+        assert_eq!(agent.path_truncated_total(), 1);
+        assert!(agent.path_truncated_recent_at(now));
+        assert!(agent.datapath_degraded());
+        assert!(agent.is_degraded());
+        // Recoverable: a node that stops seeing oversize paths recovers on its
+        // own, but the count does not reset.
+        assert!(!agent.path_truncated_recent_at(now + DEGRADED_RECOVERY));
+        agent.record_path_truncated(now + DEGRADED_RECOVERY);
+        assert!(agent.path_truncated_recent_at(now + DEGRADED_RECOVERY));
+        assert_eq!(agent.path_truncated_total(), 2);
+    }
+
+    #[test]
     fn ring_drops_degrade_and_then_recover() {
         let agent = Agent::new(AgentConfig::default());
         let now = Instant::now();
@@ -2112,6 +2165,55 @@ mod tests {
         // Decode failures are not in-kernel ring drops.
         assert_eq!(agent.events_dropped_total(), 0);
         assert_eq!(agent.records_decode_failed_total(), 2);
+    }
+
+    /// The whole slice, end to end, on the execution layer: a real ring record
+    /// with a 255-byte path and the truncation flag set. The workload opened
+    /// `/var/run/` + `./` * 130 + `docker.sock`; the kernel resolved it, the
+    /// buffer kept only the head, and `ends_with("docker.sock")` is false on
+    /// what arrived. With the flag the kill rule still fires and the node is
+    /// Degraded; without it the same bytes are indistinguishable from an
+    /// honest short path and the rule silently does not fire. That second half
+    /// is the regression anchor — it is the bypass this slice closes.
+    #[test]
+    fn a_truncated_docker_sock_path_still_kills_and_degrades() {
+        use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED};
+        let head = format!("/var/run/{}", "./".repeat(130));
+        let head = &head[..255];
+
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+        let sink = MemorySink::new();
+        let record = ring_record(
+            257,
+            "app",
+            head,
+            EVENT_FLAG_CONTAINER | EVENT_FLAG_PATH_TRUNCATED,
+            7,
+        );
+        let stats = pump_records(&agent, SyscallArch::X86_64, [record.clone()], &sink);
+        assert_eq!(stats.handled, 1);
+        assert_eq!(sink.events()[0].action, "kill");
+        assert_eq!(agent.path_truncated_total(), 1);
+        assert!(agent.path_truncated_recent());
+        assert!(agent.datapath_degraded());
+        assert!(agent.is_degraded());
+
+        // Same bytes, flag cleared: the head is then the whole path, no suffix
+        // matches, and the record is merely audited.
+        let mut honest = record;
+        honest[21] = EVENT_FLAG_CONTAINER;
+        let mut clean = Agent::new(cfg_respond());
+        load_signed(&mut clean, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        clean.insert_cgroup(7, identity("pod-a"));
+        clean.set_container_map_synced(1);
+        let quiet = MemorySink::new();
+        pump_records(&clean, SyscallArch::X86_64, [honest], &quiet);
+        assert_ne!(quiet.events()[0].action, "kill");
+        assert_eq!(clean.path_truncated_total(), 0);
+        assert!(!clean.path_truncated_recent());
     }
 
     #[test]
@@ -2448,6 +2550,7 @@ mod tests {
             tgid,
             in_container: true,
             agent_self: false,
+            path_truncated: false,
         }
     }
 
@@ -2753,6 +2856,7 @@ mod tests {
             tgid: 4242,
             in_container: false,
             agent_self: false,
+            path_truncated: false,
         };
         let decision =
             agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", false, false), &sink);
@@ -2785,6 +2889,7 @@ mod tests {
             tgid: 4242,
             in_container: false,
             agent_self: false,
+            path_truncated: false,
         };
         // The string view claims a container; the record flags do not. The
         // flags win.
@@ -2821,6 +2926,7 @@ mod tests {
             tgid: 4242,
             in_container: true,
             agent_self: false,
+            path_truncated: false,
         };
         let decision = agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", true, false), &sink);
         assert_ne!(

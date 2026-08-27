@@ -21,7 +21,7 @@ mod progs {
     };
     use ferrum_ebpf_progs::{
         Event, ACTION_AUDIT, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, EVENT_FLAG_AGENT_SELF,
-        EVENT_FLAG_CONTAINER,
+        EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED,
     };
 
     // The `#[map(name = ...)]` literals must stay equal to the MAP_* /
@@ -107,8 +107,17 @@ mod progs {
             }
         }
         if let Some(offset) = path_arg {
-            if let Ok(ptr) = unsafe { ctx.read_at::<*const u8>(offset) } {
-                let _ = unsafe { bpf_probe_read_user_str_bytes(ptr, &mut event.path) };
+            // Both failures set one flag. A path longer than PATH_LEN leaves a
+            // valid-looking head in the buffer, and an unreadable pointer
+            // leaves it empty; either way the recorded bytes are not the
+            // argument, and userspace must not treat them as one. Straight-line
+            // code only — no extra branching on the pointer, no loops.
+            let read_ok = match unsafe { ctx.read_at::<*const u8>(offset) } {
+                Ok(ptr) => unsafe { bpf_probe_read_user_str_bytes(ptr, &mut event.path) }.is_ok(),
+                Err(_) => false,
+            };
+            if !read_ok {
+                event.flags |= EVENT_FLAG_PATH_TRUNCATED;
             }
         }
         match FERRUM_EVENTS.reserve::<Event>(0) {

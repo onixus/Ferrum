@@ -96,6 +96,7 @@ fn ev<'a>(syscall: &'a str, comm: &'a str, path: &'a str, agent_self: bool) -> S
         path,
         in_container: true,
         agent_self,
+        path_truncated: false,
     }
 }
 

@@ -21,7 +21,8 @@ pub use event::{
 };
 pub use ferrum_ebpf_progs::{
     Event, CGROUPS_MAX_ENTRIES, COMM_LEN, EVENTS_DROPPED_TOTAL, EVENT_FLAG_AGENT_SELF,
-    EVENT_FLAG_CONTAINER, MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
+    EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELF,
+    PATH_LEN,
 };
 pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
 pub use kernel::{plan_cgroup_sync, CgroupSyncPlan, SyncStats};
@@ -324,6 +325,7 @@ mod tests {
             path,
             in_container,
             agent_self,
+            path_truncated: false,
         }
     }
 
@@ -433,6 +435,78 @@ mod tests {
         );
         assert_eq!(d.action, Action::Kill);
         assert_eq!(d.rule_id.as_deref(), Some("no-runtime-sock"));
+    }
+
+    /// The datapath buffer is 256 bytes; `open("/var/run/" + "./"*130 +
+    /// "docker.sock")` resolves fine in the kernel and arrives here as a head
+    /// that ends in neither sock name. Without the flag `ends_with` says "no
+    /// match" and the kill rule silently does not fire.
+    #[test]
+    fn a_truncated_path_cannot_talk_a_suffix_rule_out_of_firing() {
+        let spec = parse_febp(&mvp_enforce()).expect("parse");
+        let head = format!("/var/run/{}", "./".repeat(130));
+        let mut event = ev("openat", "app", &head[..255], true, false);
+        event.path_truncated = true;
+        let d = matched_action(&spec, &event);
+        assert_eq!(d.action, Action::Kill);
+        assert_eq!(d.rule_id.as_deref(), Some("no-runtime-sock"));
+        assert!(d.path_unknown);
+
+        // Same bytes without the flag: the head really is the whole path, so
+        // the suffix genuinely does not match. This is the regression anchor.
+        let mut honest = event.clone();
+        honest.path_truncated = false;
+        let d = matched_action(&spec, &honest);
+        assert_eq!(d.action, Action::Audit);
+        assert!(d.rule_id.is_none());
+        assert!(!d.path_unknown);
+    }
+
+    /// The flag says nothing about `comm` or the syscall, so it must not leak
+    /// into a decision that never consulted the path.
+    #[test]
+    fn truncation_does_not_infect_a_decision_taken_without_the_path() {
+        let spec = parse_febp(&mvp_enforce()).expect("parse");
+        let long = "x".repeat(255);
+        let mut event = ev("execve", "sh", &long, true, false);
+        event.path_truncated = true;
+        let d = matched_action(&spec, &event);
+        assert_eq!(d.action, Action::Kill);
+        assert_eq!(d.rule_id.as_deref(), Some("no-shell"));
+        assert!(!d.path_unknown);
+    }
+
+    /// Truncation must not turn a prefix rule into a guess: the head is
+    /// exactly the part a prefix looks at, and it arrived intact.
+    #[test]
+    fn a_prefix_rule_is_still_decided_on_a_truncated_path() {
+        let spec = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[RuleSpec {
+                id: "no-proc-poke",
+                syscalls: &["openat"],
+                action: Action::Deny,
+                comm_in: &[],
+                container_only: false,
+                path_prefix: &["/proc/"],
+                path_suffix: &[],
+                not_agent_self: false,
+            }],
+        );
+        let spec = parse_febp(&spec).expect("parse");
+        let deep = format!("/proc/{}", "a".repeat(249));
+        let mut hit = ev("openat", "app", &deep, true, false);
+        hit.path_truncated = true;
+        assert_eq!(matched_action(&spec, &hit).action, Action::Deny);
+        let elsewhere = "/srv/".repeat(51);
+        let mut miss = ev("openat", "app", &elsewhere, true, false);
+        miss.path_truncated = true;
+        let d = matched_action(&spec, &miss);
+        assert_eq!(d.action, Action::Allow);
+        assert!(!d.path_unknown);
     }
 
     #[test]
@@ -704,6 +778,106 @@ mod tests {
         let good = loader.last_good().expect("lkg").digest.clone();
         assert_compile(loader.load_bundle(&digest_of(&spec), &spec));
         assert_eq!(loader.last_good().expect("lkg").digest, good);
+    }
+
+    /// The other half of the same load-path gate. A bundle built by a compiler
+    /// that predates the length bound is signed and well-formed; it must still
+    /// not install a predicate no record can carry.
+    #[test]
+    fn an_unobservable_predicate_is_rejected_on_load() {
+        let over_comm = "x".repeat(ferrum_ids::COMM_MATCH_MAX + 1);
+        let over_path = "p".repeat(ferrum_ids::PATH_MATCH_MAX + 1);
+        struct Case<'a> {
+            what: &'a str,
+            comm_in: &'a [&'a str],
+            path_prefix: &'a [&'a str],
+            path_suffix: &'a [&'a str],
+            needle: &'a str,
+        }
+        let cases = [
+            Case {
+                what: "comm",
+                comm_in: &[over_comm.as_str()],
+                path_prefix: &[],
+                path_suffix: &[],
+                needle: "the kernel reports",
+            },
+            Case {
+                what: "prefix",
+                comm_in: &[],
+                path_prefix: &[over_path.as_str()],
+                path_suffix: &[],
+                needle: "path buffer",
+            },
+            Case {
+                what: "suffix",
+                comm_in: &[],
+                path_prefix: &[],
+                path_suffix: &[over_path.as_str()],
+                needle: "path buffer",
+            },
+        ];
+        for Case {
+            what,
+            comm_in,
+            path_prefix,
+            path_suffix,
+            needle,
+        } in cases
+        {
+            let spec = encode(
+                AGENT_ABI,
+                Mode::Enforce,
+                false,
+                Action::Allow,
+                &[RuleSpec {
+                    id: "too-long",
+                    syscalls: &[],
+                    action: Action::Deny,
+                    comm_in,
+                    container_only: false,
+                    path_prefix,
+                    path_suffix,
+                    not_agent_self: false,
+                }],
+            );
+            match parse_febp(&spec) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains(needle), "{what}: {msg}");
+                    // The message must name the length and the bound, not
+                    // just call the rule invalid.
+                    assert!(msg.contains("bytes"), "{what}: {msg}");
+                }
+                other => panic!("expected Compile for {what}, got {other:?}"),
+            }
+            // Last-known-good survives the rejection.
+            let mut loader = Loader::new();
+            load_mvp(&mut loader);
+            let good = loader.last_good().expect("lkg").digest.clone();
+            assert_compile(loader.load_bundle(&digest_of(&spec), &spec));
+            assert_eq!(loader.last_good().expect("lkg").digest, good);
+        }
+
+        // Exactly at the bound still loads: the NUL is the only byte lost.
+        let at_comm = "x".repeat(ferrum_ids::COMM_MATCH_MAX);
+        let at_path = "p".repeat(ferrum_ids::PATH_MATCH_MAX);
+        let spec = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[RuleSpec {
+                id: "at-bound",
+                syscalls: &[],
+                action: Action::Deny,
+                comm_in: &[at_comm.as_str()],
+                container_only: false,
+                path_prefix: &[at_path.as_str()],
+                path_suffix: &[at_path.as_str()],
+                not_agent_self: false,
+            }],
+        );
+        parse_febp(&spec).expect("a predicate the buffers can hold must load");
     }
 
     /// Enforcing program whose namespace selector is `ferrum.io/zone In

@@ -118,6 +118,7 @@ pub fn syscall_event(event: &Event, arch: SyscallArch) -> SyscallEvent<'_> {
         path: nul_trimmed_str(&event.path),
         in_container: event.in_container(),
         agent_self: event.agent_self(),
+        path_truncated: event.path_truncated(),
     }
 }
 
@@ -131,6 +132,7 @@ pub fn event_meta(event: &Event) -> EventMeta {
         tgid: event.tgid,
         in_container: event.in_container(),
         agent_self: event.agent_self(),
+        path_truncated: event.path_truncated(),
     }
 }
 
@@ -184,6 +186,7 @@ mod tests {
                 path: "/bin/sh",
                 in_container: true,
                 agent_self: false,
+                path_truncated: false,
             }
         );
     }
@@ -250,6 +253,39 @@ mod tests {
         }
         assert_eq!(syscall_name(SyscallArch::Aarch64, 2), None);
         assert!(SyscallArch::host().is_some());
+    }
+
+    /// `COMM_MATCH_MAX` / `PATH_MATCH_MAX` and `COMM_LEN` / `PATH_LEN` are two
+    /// independent spellings of one kernel fact, and this is the only place
+    /// they meet. Widening a buffer without moving the contract (or the
+    /// reverse) has to fail the build, not ship a rule that cannot match.
+    #[test]
+    fn match_bounds_track_the_datapath_buffers() {
+        assert_eq!(ferrum_ids::COMM_MATCH_MAX, COMM_LEN - 1);
+        assert_eq!(ferrum_ids::PATH_MATCH_MAX, PATH_LEN - 1);
+    }
+
+    /// A record whose path did not fit reaches userspace as a valid-looking
+    /// head. Only the flag distinguishes it, so it must survive the wire.
+    #[test]
+    fn path_truncation_survives_encode_decode() {
+        let mut event = sample();
+        event.flags |= ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED;
+        event.path = [b'a'; PATH_LEN];
+        let back = decode_event(&encode_event(&event)).expect("decode");
+        assert!(back.path_truncated());
+        let view = syscall_event(&back, SyscallArch::X86_64);
+        assert!(view.path_truncated);
+        assert_eq!(
+            view.path.len(),
+            PATH_LEN,
+            "no NUL: the whole buffer is path"
+        );
+        assert!(event_meta(&back).path_truncated);
+
+        let clean = decode_event(&encode_event(&sample())).expect("decode");
+        assert!(!syscall_event(&clean, SyscallArch::X86_64).path_truncated);
+        assert!(!event_meta(&clean).path_truncated);
     }
 
     /// The decode table is one of the three places the datapath's syscall set

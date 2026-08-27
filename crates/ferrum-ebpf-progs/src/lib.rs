@@ -36,6 +36,11 @@ pub const PATH_LEN: usize = 256;
 
 pub const EVENT_FLAG_CONTAINER: u8 = 1 << 0;
 pub const EVENT_FLAG_AGENT_SELF: u8 = 1 << 1;
+/// The `path` buffer does not hold the whole argument: the string did not fit
+/// in `PATH_LEN`, or it could not be read at all. Both failures land here, so
+/// userspace can tell "no path" from "path not proven" — a truncated head is a
+/// valid-looking path that no suffix rule matches.
+pub const EVENT_FLAG_PATH_TRUNCATED: u8 = 1 << 2;
 
 /// Ring-buffer record. No `String`; fixed buffers only.
 #[derive(Clone, Copy)]
@@ -74,6 +79,10 @@ impl Event {
     pub const fn agent_self(self) -> bool {
         self.flags & EVENT_FLAG_AGENT_SELF != 0
     }
+
+    pub const fn path_truncated(self) -> bool {
+        self.flags & EVENT_FLAG_PATH_TRUNCATED != 0
+    }
 }
 
 impl Default for Event {
@@ -102,6 +111,18 @@ mod tests {
         assert_eq!(size_of::<Event>(), 296);
         let event = Event::new();
         assert_eq!(event.action, ACTION_DENY);
+        assert!(!event.in_container());
+        assert!(!event.agent_self());
+        assert!(!event.path_truncated());
+    }
+
+    #[test]
+    fn flags_are_distinct_bits_of_one_byte() {
+        let all = EVENT_FLAG_CONTAINER | EVENT_FLAG_AGENT_SELF | EVENT_FLAG_PATH_TRUNCATED;
+        assert_eq!(all.count_ones(), 3);
+        let mut event = Event::new();
+        event.flags = EVENT_FLAG_PATH_TRUNCATED;
+        assert!(event.path_truncated());
         assert!(!event.in_container());
         assert!(!event.agent_self());
     }

@@ -8,6 +8,10 @@ pub struct SyscallEvent<'a> {
     pub path: &'a str,
     pub in_container: bool,
     pub agent_self: bool,
+    /// `path` is not the argument: the datapath buffer could not hold it, or
+    /// the pointer could not be read. What is present is a head, not a path,
+    /// so nothing about the tail is known.
+    pub path_truncated: bool,
 }
 
 /// Structural identity of one ring record, kept beside the string view a rule
@@ -20,6 +24,7 @@ pub struct EventMeta {
     pub tgid: u32,
     pub in_container: bool,
     pub agent_self: bool,
+    pub path_truncated: bool,
 }
 
 impl EventMeta {
@@ -53,6 +58,10 @@ pub struct Decision {
     /// yet. The rules were applied anyway (fail closed), and the carrier must
     /// treat this as Degraded rather than as a clean decision.
     pub labels_unknown: bool,
+    /// A `path_suffix` predicate was accepted against a truncated path, so the
+    /// match is asserted, not proven. Same contract as `labels_unknown`: the
+    /// rules were applied, and the carrier must treat this as Degraded.
+    pub path_unknown: bool,
 }
 
 /// Outcome of matching a program selector against a workload identity.
@@ -71,30 +80,32 @@ pub enum SelectorMatch {
 
 /// Raw rule match. Ignores `mode` / `disabled` / selector so tests can assert MVP effects.
 pub fn matched_action(spec: &EbpfSpec, event: &SyscallEvent<'_>) -> Decision {
-    let mut best: Option<(&Rule, u8)> = None;
+    let mut best: Option<(&Rule, bool, u8)> = None;
     for rule in &spec.rules {
-        if !rule_matches(rule, event) {
+        let Some(path_unknown) = rule_matches(rule, event) else {
             continue;
-        }
+        };
         let rank = rule.action.rank();
         let take = match best {
             None => true,
-            Some((_, best_rank)) => rank > best_rank,
+            Some((_, _, best_rank)) => rank > best_rank,
         };
         if take {
-            best = Some((rule, rank));
+            best = Some((rule, path_unknown, rank));
         }
     }
     match best {
-        Some((rule, _)) => Decision {
+        Some((rule, path_unknown, _)) => Decision {
             action: rule.action,
             rule_id: Some(rule.id.clone()),
             labels_unknown: false,
+            path_unknown,
         },
         None => Decision {
             action: spec.default_action,
             rule_id: None,
             labels_unknown: false,
+            path_unknown: false,
         },
     }
 }
@@ -110,6 +121,7 @@ pub fn decide(spec: &EbpfSpec, event: &SyscallEvent<'_>, identity: &WorkloadIden
                 action: Action::Allow,
                 rule_id: None,
                 labels_unknown: false,
+                path_unknown: false,
             }
         }
         SelectorMatch::Match => false,
@@ -239,12 +251,24 @@ fn cap_for_mode(mode: Mode, disabled: bool, action: Action) -> Action {
     }
 }
 
-fn rule_matches(rule: &Rule, event: &SyscallEvent<'_>) -> bool {
+/// `None`: the rule does not apply. `Some(path_unknown)`: it applies, with
+/// `path_unknown` true when a `path_suffix` predicate was accepted on a
+/// truncated path instead of proven.
+///
+/// A truncated path is a head with an unknown tail, so `ends_with` is
+/// undecidable in both directions and the suffix predicate may not reject.
+/// That over-enforces: any process opening a path of PATH_LEN bytes or more
+/// falls under every suffix rule. Deliberate, and the same trade already made
+/// for `LabelsUnknown` — over-enforce with an explicit signal rather than
+/// under-enforce in silence. Downgrading the action to Audit on truncation is
+/// exactly the fail-open this closes, so it is not an option here.
+/// `path_prefix` is unaffected: only the tail was lost, the head is intact.
+fn rule_matches(rule: &Rule, event: &SyscallEvent<'_>) -> Option<bool> {
     if !rule.syscalls.is_empty() && !rule.syscalls.iter().any(|s| s.as_str() == event.syscall) {
-        return false;
+        return None;
     }
     if !rule.comm_in.is_empty() && !rule.comm_in.iter().any(|c| c.as_str() == event.comm) {
-        return false;
+        return None;
     }
     if !rule.path_prefix.is_empty()
         && !rule
@@ -252,21 +276,26 @@ fn rule_matches(rule: &Rule, event: &SyscallEvent<'_>) -> bool {
             .iter()
             .any(|p| !p.is_empty() && event.path.starts_with(p.as_str()))
     {
-        return false;
+        return None;
     }
-    if !rule.path_suffix.is_empty()
-        && !rule
+    let mut path_unknown = false;
+    if !rule.path_suffix.is_empty() {
+        let hit = rule
             .path_suffix
             .iter()
-            .any(|p| !p.is_empty() && event.path.ends_with(p.as_str()))
-    {
-        return false;
+            .any(|p| !p.is_empty() && event.path.ends_with(p.as_str()));
+        if !hit {
+            if !event.path_truncated {
+                return None;
+            }
+            path_unknown = true;
+        }
     }
     if rule.container_only && !event.in_container {
-        return false;
+        return None;
     }
     if rule.not_agent_self && event.agent_self {
-        return false;
+        return None;
     }
-    true
+    Some(path_unknown)
 }
