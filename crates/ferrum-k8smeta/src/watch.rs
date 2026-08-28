@@ -147,24 +147,44 @@ pub fn apply_watch_stream(cache: &mut PodCache, body: &[u8]) -> Result<WatchOutc
     Ok(outcome)
 }
 
-/// The relist obligation, raised the same way on either cache.
+/// The relist obligation, raised and discharged the same way on either cache.
 ///
 /// Both watch streams meet the same two facts — `410 Gone`, and a frame this
 /// build cannot read — and both must answer them identically. One trait so the
 /// answer is written once.
 pub trait RelistDebt {
-    fn raise_relist_pending(&mut self);
+    fn relist_pending(&self) -> bool;
+    fn raise_relist_pending_at(&mut self, at: Instant);
+    /// The debt has stood past [`crate::labels::RELIST_DEBT_HOLDDOWN`] and the
+    /// stream should end so the relist can run.
+    fn relist_due_at(&self, now: Instant) -> bool;
 }
 
 impl RelistDebt for PodCache {
-    fn raise_relist_pending(&mut self) {
-        PodCache::raise_relist_pending(self)
+    fn relist_pending(&self) -> bool {
+        PodCache::relist_pending(self)
+    }
+
+    fn raise_relist_pending_at(&mut self, at: Instant) {
+        PodCache::raise_relist_pending_at(self, at)
+    }
+
+    fn relist_due_at(&self, now: Instant) -> bool {
+        PodCache::relist_due_at(self, now)
     }
 }
 
 impl RelistDebt for crate::labels::LabelCache {
-    fn raise_relist_pending(&mut self) {
-        crate::labels::LabelCache::raise_relist_pending(self)
+    fn relist_pending(&self) -> bool {
+        crate::labels::LabelCache::relist_pending(self)
+    }
+
+    fn raise_relist_pending_at(&mut self, at: Instant) {
+        crate::labels::LabelCache::raise_relist_pending_at(self, at)
+    }
+
+    fn relist_due_at(&self, now: Instant) -> bool {
+        crate::labels::LabelCache::relist_due_at(self, now)
     }
 }
 
@@ -175,27 +195,61 @@ impl RelistDebt for crate::labels::LabelCache {
 /// unlabelled — an unobserved label reported as an absent one, which is the
 /// fail-open this project refused in cycle 6.
 ///
-/// Deliberately not an `Err` that ends the stream. A frame this build rejects
-/// may be one a newer apiserver invented — a `type:` added in an upgrade — and
-/// reconnecting on each of them turns a rolling control-plane upgrade into a
-/// reconnect storm against the apiserver, authored by the component that is
-/// supposed to protect it. The stream keeps running, the consumer fails closed
-/// on the cold cache immediately, and the next relist discharges the debt.
-fn note_unreadable_frame<C: RelistDebt + ?Sized>(cache: &mut C, resource: &str, err: &FerrumError) {
-    eprintln!("ferrum-k8smeta: unreadable {resource} watch frame, relist pending: {err}");
-    cache.raise_relist_pending();
+/// Deliberately not an `Err` that ends the stream on the frame itself. A frame
+/// this build rejects may be one a newer apiserver invented — a `type:` added
+/// in an upgrade — and reconnecting on each of them turns a rolling
+/// control-plane upgrade into a reconnect storm against the apiserver,
+/// authored by the component that is supposed to protect it.
+///
+/// So the debt is raised and the stream reads on. It is also *scheduled*:
+/// [`RELIST_DEBT_HOLDDOWN`] after it was raised, the next frame ends the stream
+/// with [`WatchOutcome::MustRelist`] and the cycle's own relist discharges it.
+/// Nothing else would — a stream that never fails is the healthy case, and the
+/// cache would otherwise stay unwarm for the life of the connection, denying
+/// every selected Pod cluster-wide. The hold-down is what keeps that bounded in
+/// both directions: at most one reconnect per hold-down however many unreadable
+/// frames arrive, and at most one hold-down of failing closed per burst.
+///
+/// [`RELIST_DEBT_HOLDDOWN`]: crate::labels::RELIST_DEBT_HOLDDOWN
+fn note_unreadable_frame<C: RelistDebt + ?Sized>(
+    cache: &mut C,
+    resource: &str,
+    err: &FerrumError,
+    now: Instant,
+) -> WatchOutcome {
+    // Once per debt, not once per frame: the burst that raises it is exactly
+    // the burst that would fill the log.
+    let first = !cache.relist_pending();
+    cache.raise_relist_pending_at(now);
+    if cache.relist_due_at(now) {
+        eprintln!(
+            "ferrum-k8smeta: unreadable {resource} watch frame, relist debt stood past              {:?}; ending the stream to relist: {err}",
+            crate::labels::RELIST_DEBT_HOLDDOWN
+        );
+        return WatchOutcome::MustRelist;
+    }
+    if first {
+        eprintln!(
+            "ferrum-k8smeta: unreadable {resource} watch frame, relist pending within {:?};              the stream keeps reading and the cache is not warm until it lands: {err}",
+            crate::labels::RELIST_DEBT_HOLDDOWN
+        );
+    }
+    WatchOutcome::Ignored
 }
 
 /// One line of a pod `watch=1` stream, folded in. The single place a pod frame
 /// is turned into cache state, so the network loop cannot answer an unreadable
 /// frame differently from a replayed one.
 pub fn apply_watch_line(cache: &mut PodCache, line: &[u8]) -> WatchOutcome {
+    apply_watch_line_at(cache, line, Instant::now())
+}
+
+/// Same, at an explicit instant, so the relist hold-down can be exercised
+/// without sleeping through it.
+pub fn apply_watch_line_at(cache: &mut PodCache, line: &[u8], now: Instant) -> WatchOutcome {
     let event = match parse_watch_event(line) {
         Ok(event) => event,
-        Err(err) => {
-            note_unreadable_frame(cache, "pods", &err);
-            return WatchOutcome::Ignored;
-        }
+        Err(err) => return note_unreadable_frame(cache, "pods", &err, now),
     };
     if let Some(rv) = event_resource_version(&event) {
         cache.set_resource_version(rv);
@@ -211,12 +265,20 @@ pub fn apply_labels_line(
     resource: &str,
     line: &[u8],
 ) -> Result<WatchOutcome> {
+    apply_labels_line_at(cache, resource, line, Instant::now())
+}
+
+/// Same, at an explicit instant, so the relist hold-down can be exercised
+/// without sleeping through it.
+pub fn apply_labels_line_at(
+    cache: &mut crate::labels::LabelCache,
+    resource: &str,
+    line: &[u8],
+    now: Instant,
+) -> Result<WatchOutcome> {
     let event = match parse_labels_watch_event(line) {
         Ok(event) => event,
-        Err(err) => {
-            note_unreadable_frame(cache, resource, &err);
-            return Ok(WatchOutcome::Ignored);
-        }
+        Err(err) => return Ok(note_unreadable_frame(cache, resource, &err, now)),
     };
     if let Some(rv) = crate::labels::label_event_resource_version(&event) {
         cache.set_resource_version(rv);
@@ -451,6 +513,7 @@ fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod freshness_tests {
     use super::*;
+    use crate::labels::{LabelCache, RELIST_DEBT_HOLDDOWN};
     use crate::source::{PodMetadataSource, POD_WATCH_BUDGET};
     use std::time::Duration;
 
@@ -558,6 +621,85 @@ mod freshness_tests {
         );
         cache.replace_all(Vec::new());
         assert!(!cache.relist_pending(), "a relist discharges the debt");
+    }
+
+    /// The debt cycle 11 raised had nothing behind it: `Ignored` is not one of
+    /// the outcomes `cycle()` relists on, so a watch connection that stays up —
+    /// the healthy case — kept the cache unwarm for the life of the process and
+    /// `containerOnly` rules stopped firing for good. The hold-down is the
+    /// missing relist: the frames keep being read, and once the debt has stood
+    /// long enough the stream ends so the cycle's own relist can discharge it.
+    #[test]
+    fn an_unreadable_pod_frame_ends_the_stream_once_its_debt_stands() {
+        let start = Instant::now();
+        let mut cache = PodCache::new("node-a");
+        cache.replace_all(Vec::new());
+        cache.mark_applied_at(start);
+
+        let unknown = br#"{"type":"PATCHED","object":{"metadata":{}}}"#;
+        assert_eq!(
+            apply_watch_line_at(&mut cache, unknown, start),
+            WatchOutcome::Ignored,
+            "the frame that raises the debt does not cost a reconnect"
+        );
+        assert!(cache.relist_pending());
+        assert!(
+            cache.snapshot().is_err(),
+            "a cache with a hole in it denies"
+        );
+        // Still inside the hold-down: the stream reads on.
+        assert_eq!(
+            apply_watch_line_at(&mut cache, unknown, start + RELIST_DEBT_HOLDDOWN / 2),
+            WatchOutcome::Ignored
+        );
+        // Past it, and the next frame ends the stream so the relist can run.
+        assert_eq!(
+            apply_watch_line_at(&mut cache, unknown, start + RELIST_DEBT_HOLDDOWN),
+            WatchOutcome::MustRelist,
+            "nothing else in cycle() would ever relist"
+        );
+        // Which is what `cycle()` does with `MustRelist`, and it discharges.
+        cache.replace_all(Vec::new());
+        cache.mark_applied_at(start + RELIST_DEBT_HOLDDOWN);
+        assert!(!cache.relist_pending());
+        assert!(cache.snapshot().is_ok(), "the cache is warm again");
+    }
+
+    /// The other direction, which the fix must not break: a rolling
+    /// control-plane upgrade emitting a `type:` this build does not know on
+    /// every frame must not become one reconnect per frame against the
+    /// apiserver the whole cluster depends on.
+    #[test]
+    fn a_rolling_stream_of_unknown_frames_is_not_a_reconnect_per_frame() {
+        let start = Instant::now();
+        let mut cache = LabelCache::new();
+        cache.try_replace_all(Vec::new()).expect("list fits");
+
+        let unknown = br#"{"type":"PATCHED","object":{"metadata":{"name":"prod"}}}"#;
+        let span = RELIST_DEBT_HOLDDOWN * 4;
+        let frames = 400u32;
+        let step = span / frames;
+        let mut relists = 0u32;
+        let mut now = start;
+        for _ in 0..frames {
+            let outcome = apply_labels_line_at(&mut cache, "namespaces", unknown, now)
+                .expect("an unreadable frame is not a stream error");
+            if outcome == WatchOutcome::MustRelist {
+                relists += 1;
+                // What the cycle does next: reconnect and list.
+                cache.try_replace_all(Vec::new()).expect("relist fits");
+            }
+            now += step;
+        }
+        assert!(
+            relists <= 5,
+            "{frames} unreadable frames over {span:?} cost {relists} reconnects; the \
+             hold-down bounds that at one per {RELIST_DEBT_HOLDDOWN:?}"
+        );
+        assert!(
+            relists >= 3,
+            "and the debt is still discharged, repeatedly: {relists}"
+        );
     }
 
     #[test]

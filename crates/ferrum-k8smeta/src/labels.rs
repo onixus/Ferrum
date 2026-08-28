@@ -27,6 +27,17 @@ pub const MAX_TOTAL_LABEL_BYTES: usize = 16 * 1024 * 1024;
 /// that is down: past it the consumer degrades instead of deciding on labels
 /// of unknown age.
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long a relist raised by an unreadable frame may stand before the stream
+/// is ended so the relist can happen. Two costs pull against each other and
+/// this is the only number that sets both: while the debt stands the cache is
+/// not warm, so a consumer that gates on warmth is failing closed, and while
+/// unknown frames keep arriving every discharge is one more list against the
+/// apiserver. Ending the stream on the frame itself would make a rolling
+/// control-plane upgrade one reconnect per frame; waiting for the stream to
+/// fail never ends at all on a healthy cluster. A hold-down does both: the
+/// deny window is bounded by this, and so is the reconnect rate, whatever the
+/// frame rate. `410 Gone` does not wait for it — that relist is immediate.
+pub const RELIST_DEBT_HOLDDOWN: Duration = Duration::from_secs(5);
 
 fn label_bytes(labels: &BTreeMap<String, String>) -> usize {
     labels.iter().map(|(k, v)| k.len() + v.len()).sum()
@@ -84,6 +95,10 @@ pub struct LabelCache {
     /// *and* that objects changed unseen, so the labels held may already
     /// answer a selector wrongly.
     relist_pending: bool,
+    /// When `relist_pending` was first raised, and `None` while nothing is
+    /// owed. Re-raising does not move it: a stream that keeps producing frames
+    /// this build cannot read must not push its own deadline out forever.
+    debt_raised_at: Option<Instant>,
 }
 
 impl Default for LabelCache {
@@ -97,6 +112,7 @@ impl Default for LabelCache {
             label_bytes: 0,
             overflow: None,
             relist_pending: false,
+            debt_raised_at: None,
         }
     }
 }
@@ -129,7 +145,25 @@ impl LabelCache {
     /// Raise the obligation. There is deliberately no public way to lower it:
     /// only a completed [`LabelCache::try_replace_all`] discharges it.
     pub fn raise_relist_pending(&mut self) {
-        self.relist_pending = true;
+        self.raise_relist_pending_at(Instant::now());
+    }
+
+    /// Same, at an explicit instant, so a caller (or a test) can age a debt
+    /// without waiting for it.
+    pub fn raise_relist_pending_at(&mut self, at: Instant) {
+        if !self.relist_pending {
+            self.relist_pending = true;
+            self.debt_raised_at = Some(at);
+        }
+    }
+
+    /// The outstanding debt has stood for [`RELIST_DEBT_HOLDDOWN`], so the
+    /// watch feeding this cache should end its stream and relist. False while
+    /// nothing is owed, and false during the hold-down: the frames that raised
+    /// it keep being read instead of costing a reconnect each.
+    pub fn relist_due_at(&self, now: Instant) -> bool {
+        self.debt_raised_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= RELIST_DEBT_HOLDDOWN)
     }
 
     /// Time since the last list, bookmark or event. `None` while cold.
@@ -281,6 +315,7 @@ impl LabelCache {
         // Only a completed list discharges the obligation; a refused one
         // above leaves it standing.
         self.relist_pending = false;
+        self.debt_raised_at = None;
         Ok(())
     }
 

@@ -343,3 +343,45 @@ fn an_unreadable_serving_mount_is_counted_and_a_deleted_one_is_not() {
     assert_eq!(source.mount_unreadable(), 1, "counted once per transition");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// M3: `Absent => continue` kept the loaded certificate — the right policy —
+/// and said nothing. Delete `ferrum-admission-tls` for real and this process
+/// serves a certificate with no rotation source left, whose expiry takes Pod
+/// creation down cluster-wide under `failurePolicy: Fail`, with nothing logged
+/// and no counter moving.
+#[test]
+fn a_serving_key_that_vanished_is_counted_not_silent() {
+    let dir = temp_dir("absent");
+    install(&dir, "serving");
+    let source = source(&dir);
+    poll_serving_cert(Arc::clone(&source), Duration::from_millis(10));
+    // The poller starts with no stamp, so its first tick reloads; take the
+    // material to compare against after that has settled.
+    std::thread::sleep(Duration::from_millis(100));
+    let mounted = source.config();
+    assert_eq!(source.mount_absent(), 0, "nothing is missing yet");
+
+    std::fs::remove_file(dir.join("tls.crt")).expect("remove cert");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while source.mount_absent() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "a serving key that vanished must move something; this certificate now has \
+             nothing to rotate from"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        Arc::ptr_eq(&mounted, &source.config()),
+        "and the loaded material keeps serving, which is the policy that must not change"
+    );
+    assert_eq!(
+        source.mount_unreadable(),
+        0,
+        "an absent key is still not a broken mount"
+    );
+    // Transition, not tick: the same missing key does not keep filling the log.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(source.mount_absent(), 1, "counted once per transition");
+    std::fs::remove_dir_all(&dir).ok();
+}
