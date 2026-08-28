@@ -3375,6 +3375,13 @@ mod tests {
 
         // Same bytes, flag cleared: the head is then the whole path, no suffix
         // matches, and the record is merely audited.
+        //
+        // Cycle 8 measured that a pre-fix datapath writes exactly this record
+        // for an over-long path — the head, and no flag — so "the head is the
+        // whole path" is an assumption about the *producer*, not a fact about
+        // the bytes. It holds for the datapath in this tree, which now flags a
+        // read that filled the buffer; it does not hold for an object built
+        // before that. See `event::a_buffer_filling_path_is_not_yet_read_as_truncated`.
         let honest = ring_record(openat, "app", head, EVENT_FLAG_CONTAINER, 7);
         let mut clean = Agent::new(cfg_respond());
         load_signed(&mut clean, &encode_mvp(AGENT_ABI, Mode::Enforce));

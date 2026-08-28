@@ -340,10 +340,13 @@ fn run(
             if !handle.unhooked_syscalls().is_empty() {
                 // Not fatal: the remaining hooks are the datapath. But rules
                 // naming these are dead on this node, and that must be said
-                // out loud rather than looking like a clean attach.
+                // out loud rather than looking like a clean attach. Covers
+                // both absences the attach narrows the enforceable set for:
+                // the syscall is not in this arch's ABI, or this kernel was
+                // built without it (no CONFIG_MODULES, no init_module).
                 eprintln!(
-                    "ferrum-agent: no tracepoint on this arch for {}; rules naming them cannot \
-                     fire on this node",
+                    "ferrum-agent: no tracepoint on this node for {}; rules naming them cannot \
+                     fire here",
                     handle.unhooked_syscalls().join(", ")
                 );
             }

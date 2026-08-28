@@ -145,6 +145,15 @@ pub fn encode_event(event: &Event) -> Vec<u8> {
 /// Bridge a decoded record to the policy-evaluation view. Unknown syscall nrs
 /// map to [`SYSCALL_UNKNOWN`] instead of failing: the record still reaches the
 /// spec's default action.
+///
+/// `path_truncated` is the datapath's flag and nothing else. An ELF built
+/// before `emit()` learned that `bpf_probe_read_user_str` reports truncation
+/// as success does not set it, and a record whose path fills the buffer is
+/// then indistinguishable here from an honest one — see the note on
+/// [`ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED`]. Deriving the fact from
+/// the buffer shape would close that window during a rolling upgrade; it also
+/// contradicts a `ferrum-testkit` replay anchor that requires such a record to
+/// be audited, so it is not done here.
 pub fn syscall_event(event: &Event, arch: SyscallArch) -> SyscallEvent<'_> {
     SyscallEvent {
         syscall: syscall_name(arch, event.syscall_nr).unwrap_or(SYSCALL_UNKNOWN),
@@ -159,6 +168,9 @@ pub fn syscall_event(event: &Event, arch: SyscallArch) -> SyscallEvent<'_> {
 /// Structural half of the same record: cgroup for identity lookup, pid/tgid
 /// for a reaction. Kept separate from `SyscallEvent`, whose shape is part of
 /// the policy-evaluation contract other crates instantiate.
+///
+/// `path_truncated` is read the same way as in [`syscall_event`]; the two
+/// views of one record must not disagree about whether its path is whole.
 pub fn event_meta(event: &Event) -> EventMeta {
     EventMeta {
         cgroup_id: event.cgroup_id,
@@ -400,6 +412,48 @@ mod tests {
         let clean = decode_event(&encode_event(&sample())).expect("decode");
         assert!(!syscall_event(&clean, SyscallArch::X86_64).path_truncated);
         assert!(!event_meta(&clean).path_truncated);
+    }
+
+    /// The window this decoder does NOT close, pinned so it cannot widen or
+    /// be forgotten.
+    ///
+    /// The record below is what an ELF built before `emit()` flagged a short
+    /// read writes for an over-long path: the head fills the buffer and no
+    /// flag is set. Nothing here can tell it from an honest 255-byte path, so
+    /// `path_suffix` is free to reject on a tail the datapath never saw — the
+    /// measured fail-open. The datapath no longer produces this record, but a
+    /// rolling upgrade puts this decoder in front of the object that does.
+    ///
+    /// `Event::path` carries the evidence to derive it (a full buffer is a
+    /// buffer that had nowhere to put a terminator), and that derivation is
+    /// not made here: `ferrum-testkit`'s replay anchor requires exactly this
+    /// record to be audited rather than killed, and that anchor is the next
+    /// thing that has to move.
+    #[test]
+    fn a_buffer_filling_path_is_not_yet_read_as_truncated() {
+        let mut event = sample();
+        event.path = [0; PATH_LEN];
+        let head = format!("/var/run/{}", "./".repeat(130));
+        event.path[..PATH_LEN - 1].copy_from_slice(&head.as_bytes()[..PATH_LEN - 1]);
+        assert_eq!(
+            event.flags & ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED,
+            0
+        );
+
+        let back = decode_event(&encode_event(&event)).expect("decode");
+        let view = syscall_event(&back, SyscallArch::X86_64);
+        assert_eq!(view.path.len(), PATH_LEN - 1, "the head fills the buffer");
+        // Observed, not desired.
+        assert!(!view.path_truncated);
+        assert!(!event_meta(&back).path_truncated, "the two views disagree");
+
+        // The same record from the current datapath: the flag is there, and
+        // it is the only thing that changed.
+        let mut flagged = event;
+        flagged.flags |= ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED;
+        let back = decode_event(&encode_event(&flagged)).expect("decode");
+        assert!(syscall_event(&back, SyscallArch::X86_64).path_truncated);
+        assert!(event_meta(&back).path_truncated);
     }
 
     /// The decode table is one of the three places the datapath's syscall set

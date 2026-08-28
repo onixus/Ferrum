@@ -94,6 +94,40 @@ pub fn tracepoints_for_arch(arch: SyscallArch) -> Vec<&'static Tracepoint> {
         .collect()
 }
 
+/// Where the kernel exposes its tracepoint catalogue.
+const TRACEFS_ROOTS: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
+
+/// Whether *this running kernel* exposes `category:name`, read from tracefs.
+///
+/// The arch table answers a different question — which syscalls the ABI has —
+/// and a kernel can lack a tracepoint the arch does have: one built without
+/// `CONFIG_MODULES` has neither `init_module` nor `finit_module`, and so no
+/// tracepoint for either. Deriving that from the table alone made the whole
+/// attach fail and left the node's runtime plane blind.
+///
+/// `None` when no tracefs is mounted at all: absence cannot be established
+/// there, and "cannot tell" must never widen into "not there" — the attach
+/// then tries every hook and a real failure stays fatal.
+pub fn tracepoint_in_tracefs(category: &str, name: &str) -> Option<bool> {
+    let mut mounted = false;
+    for root in TRACEFS_ROOTS {
+        if !std::path::Path::new(root).join("events").is_dir() {
+            continue;
+        }
+        mounted = true;
+        if std::path::Path::new(root)
+            .join("events")
+            .join(category)
+            .join(name)
+            .join("id")
+            .exists()
+        {
+            return Some(true);
+        }
+    }
+    mounted.then_some(false)
+}
+
 /// Tracepoints skipped on `arch` because the syscall does not exist there.
 pub fn tracepoints_absent_on_arch(arch: SyscallArch) -> Vec<&'static str> {
     let observable = ferrum_ids::datapath_syscalls_for_arch(arch.as_str());
@@ -160,6 +194,30 @@ mod tests {
                 TRACEPOINTS.len()
             );
         }
+    }
+
+    /// The kernel half of "the tracepoint is not there", which the arch table
+    /// cannot answer. Every assertion is conditional on tracefs being mounted,
+    /// because that is exactly the distinction under test: with no tracefs the
+    /// answer is "cannot tell", never "not there", and the attach must then
+    /// try every hook rather than skip one.
+    #[test]
+    fn tracefs_answers_absent_present_or_cannot_tell() {
+        let openat = tracepoint_in_tracefs("syscalls", "sys_enter_openat");
+        let nonsense = tracepoint_in_tracefs("syscalls", "sys_enter_ferrum_not_a_syscall");
+        match openat {
+            None => assert_eq!(nonsense, None, "no tracefs, so nothing can be established"),
+            Some(present) => {
+                assert!(present, "tracefs is mounted but has no sys_enter_openat");
+                assert_eq!(
+                    nonsense,
+                    Some(false),
+                    "a tracepoint no kernel has must read as absent, not as unknown"
+                );
+            }
+        }
+        // A category that is not there at all is absent, not a panic.
+        assert_ne!(tracepoint_in_tracefs("ferrum", "nothing"), Some(true));
     }
 
     struct Writer(Vec<u8>);

@@ -8,12 +8,16 @@
 //!
 //! The ELF comes from `FERRUM_BPF_ELF`, and there are exactly two reasons
 //! anything here declines to run, both checked *before* the code under test:
-//! the env var is unset, so there is no ELF to load; or this kernel does not
-//! expose a tracepoint the datapath needs (read from tracefs, not inferred
-//! from a failure). `FERRUM_BPF_ELF_REQUIRED` — which the Jenkins stage sets —
-//! turns both into failures. An attach that fails for any *other* reason is
-//! always a failure: a test that returns green when the load refuses would be
-//! the fail-open this gate exists to close.
+//! the env var is unset, so there is no ELF to load; or this kernel exposes
+//! *no* datapath tracepoint at all (read from tracefs, not inferred from a
+//! failure), leaving nothing to measure. A kernel missing only *some* of them
+//! — one built without `CONFIG_MODULES` has no `init_module` — is not a
+//! reason to decline: the attach narrows the enforceable set and says which
+//! syscalls it dropped, and that report is checked here against tracefs.
+//! `FERRUM_BPF_ELF_REQUIRED` — which the Jenkins stage sets — turns both skips
+//! into failures. An attach that fails for any *other* reason is always a
+//! failure: a test that returns green when the load refuses would be the
+//! fail-open this gate exists to close.
 //!
 //! Needs CAP_BPF/root and tracefs.
 #![cfg(feature = "attach")]
@@ -21,12 +25,10 @@
 use std::ffi::CString;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use aya::maps::{Array, MapData, RingBuf};
-use aya::programs::TracePoint;
-use aya::Bpf;
 use ferrum_ebpf::{
-    decode_event, syscall_name, tracepoints_for_arch, Event, KernelHandle, RingReader, SyscallArch,
-    DATAPATH_ABI, EVENT_FLAG_AGENT_SELF, EVENT_FLAG_PATH_TRUNCATED, MAP_EVENTS, MAP_SELF, PATH_LEN,
+    decode_event, syscall_name, tracepoint_syscall, tracepoints_absent_on_arch,
+    tracepoints_for_arch, Event, KernelHandle, RingReader, SyscallArch, DATAPATH_ABI,
+    EVENT_FLAG_AGENT_SELF, EVENT_FLAG_PATH_TRUNCATED, PATH_LEN,
 };
 use ferrum_ebpf_progs::ACTION_AUDIT;
 
@@ -57,14 +59,16 @@ fn required() -> bool {
     std::env::var_os("FERRUM_BPF_ELF_REQUIRED").is_some()
 }
 
-/// Tracepoints this arch's datapath wants that the *running kernel* does not
-/// have, read straight from tracefs.
+/// The syscalls this arch's datapath wants that the *running kernel* does not
+/// expose a tracepoint for, read straight from tracefs.
 ///
 /// This is a fact about the environment, established before anything is
 /// loaded — not a failure of the code under test. A kernel built without
 /// loadable module support has no `init_module`/`finit_module` syscall and so
-/// no tracepoint for either; `KernelHandle::attach_for_arch` is all-or-nothing
-/// and cannot produce a handle there.
+/// no tracepoint for either; `KernelHandle::attach_for_arch` skips those and
+/// reports them, and this is the independent second opinion its report is
+/// checked against — read here with a different code path than the one under
+/// test, so a probe that answered "absent" for everything could not pass.
 fn absent_from_tracefs(arch: SyscallArch) -> Vec<&'static str> {
     tracepoints_for_arch(arch)
         .into_iter()
@@ -75,8 +79,17 @@ fn absent_from_tracefs(arch: SyscallArch) -> Vec<&'static str> {
                     std::path::Path::new(&format!("{root}/events/{category}/{name}/id")).exists()
                 })
         })
-        .map(|(prog, _, _)| *prog)
+        .filter_map(tracepoint_syscall)
         .collect()
+}
+
+/// Every datapath syscall with no hook on this node: absent from the arch, or
+/// absent from this kernel. What `KernelHandle::unhooked_syscalls` must name.
+fn expected_unhooked(arch: SyscallArch) -> Vec<&'static str> {
+    let mut all = tracepoints_absent_on_arch(arch);
+    all.extend(absent_from_tracefs(arch));
+    all.sort_unstable();
+    all
 }
 
 /// The kernel accounts BPF memory to the cgroup since 5.11, but older ones
@@ -95,113 +108,64 @@ fn raise_memlock() {
 
 /// A loaded datapath with its ring in hand.
 ///
-/// `handle` is `Some` whenever `KernelHandle::attach_for_arch` could produce
-/// one, which is the path production takes and the one the gate is about. It
-/// is `None` only on a kernel that does not expose a tracepoint the datapath
-/// needs — established from tracefs before anything is loaded, never inferred
-/// from a failure — and there the programs are attached here, minus the ones
-/// that have no tracepoint, so the datapath itself is still measured rather
-/// than skipped. `attach_for_arch` is asserted to refuse, and to refuse for
-/// exactly that reason, before the fallback is built.
+/// Always through `KernelHandle::attach_for_arch`, which is the path
+/// production takes and the one this gate is about. A kernel missing a
+/// tracepoint the datapath wants no longer kills the attach: the hook is
+/// skipped and named in `unhooked_syscalls`, and this file asserts the handle
+/// names exactly the set tracefs says is missing.
 struct Live {
     arch: SyscallArch,
     ring: RingReader,
-    handle: Option<KernelHandle>,
-    /// Owns the fallback programs and their links; dropping it detaches.
-    _bpf: Option<Bpf>,
+    handle: KernelHandle,
 }
 
 fn live() -> Option<Live> {
     let (path, elf) = elf_or_skip()?;
     raise_memlock();
     let arch = SyscallArch::host().expect("no syscall decode table for this arch");
-    let absent = absent_from_tracefs(arch);
+    let unhooked = expected_unhooked(arch);
 
-    if absent.is_empty() {
-        let mut handle = KernelHandle::attach_for_arch(&elf, arch)
-            .unwrap_or_else(|err| panic!("attach {path} on {}: {err}", arch.as_str()));
-        handle
-            .set_self_tgid(u64::from(std::process::id()))
-            .expect("publish self tgid into ferrum_self");
-        let ring = handle.take_ring_reader().expect("take ferrum_events");
-        return Some(Live {
-            arch,
-            ring,
-            handle: Some(handle),
-            _bpf: None,
-        });
-    }
-
-    // The refusal is expected on this kernel, but it must be *this* refusal.
-    // An error naming the ELF load or a program load would mean the verifier
-    // rejected the datapath, and that is never something to walk past.
-    let err = match KernelHandle::attach_for_arch(&elf, arch) {
-        Ok(_) => {
-            panic!("this kernel has no tracepoint for {absent:?} yet the attach reported success")
-        }
-        Err(err) => err.to_string(),
-    };
-    assert!(
-        !err.contains("load eBPF ELF"),
-        "the ELF itself would not load: {err}"
-    );
-    assert!(
-        absent.iter().any(|prog| err.contains(prog)),
-        "this kernel lacks tracepoints for {absent:?}, but the attach failed for another \
-         reason entirely: {err}"
-    );
-    if required() {
-        panic!(
-            "FERRUM_BPF_ELF_REQUIRED is set, but this kernel exposes no tracepoint for \
-             {absent:?} (a kernel built without CONFIG_MODULES has neither the init_module \
-             nor the finit_module syscall). Run this stage on a kernel that has them, or \
-             KernelHandle::attach_for_arch is not being gated at all."
+    // Nothing left to hook at all: the attach must refuse (a handle with no
+    // hooks is a blind runtime plane reported as healthy), and there is
+    // nothing for the checks below to measure.
+    if unhooked.len() == ferrum_ebpf::TRACEPOINTS.len() {
+        let err = match KernelHandle::attach_for_arch(&elf, arch) {
+            Ok(_) => panic!("this kernel has no datapath tracepoint at all, yet attach succeeded"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            !err.contains("load eBPF ELF"),
+            "the ELF itself would not load: {err}"
         );
-    }
-    println!(
-        "KernelHandle::attach_for_arch refused, correctly, because this kernel has no \
-         tracepoint for {absent:?} ({err}). The ELF loaded and the programs passed the \
-         verifier; the datapath checks below run against the rest, attached here."
-    );
-    Some(attach_available(&elf, arch, &absent))
-}
-
-/// Attach every datapath program whose tracepoint this kernel actually has.
-///
-/// Only reached on a kernel `KernelHandle` cannot serve. It exists so the
-/// record layout, the argument offsets and the truncation flag are still
-/// measured there — not so an attach failure has somewhere to go.
-fn attach_available(elf: &[u8], arch: SyscallArch, absent: &[&str]) -> Live {
-    let mut bpf = Bpf::load(elf).expect("Bpf::load");
-    for (prog, category, name) in tracepoints_for_arch(arch) {
-        if absent.contains(prog) {
-            continue;
+        if required() {
+            panic!(
+                "FERRUM_BPF_ELF_REQUIRED is set, but this kernel exposes no datapath \
+                 tracepoint at all ({err}). Run this stage on a kernel with tracefs."
+            );
         }
-        let program = bpf
-            .program_mut(prog)
-            .unwrap_or_else(|| panic!("program {prog} missing from the ELF"));
-        let tracepoint: &mut TracePoint = program.try_into().expect("not a tracepoint program");
-        tracepoint
-            .load()
-            .unwrap_or_else(|err| panic!("verifier rejected {prog}: {err}"));
-        tracepoint
-            .attach(category, name)
-            .unwrap_or_else(|err| panic!("attach {prog}: {err}"));
+        println!("skipping: no datapath tracepoint on this kernel ({err})");
+        return None;
     }
-    {
-        let map = bpf.map_mut(MAP_SELF).expect("ferrum_self");
-        let mut slot: Array<_, u64> = Array::try_from(map).expect("ferrum_self is an array");
-        slot.set(0, u64::from(std::process::id()), 0)
-            .expect("publish self tgid");
-    }
-    let map = bpf.take_map(MAP_EVENTS).expect("ferrum_events");
-    let ring: RingBuf<MapData> = RingBuf::try_from(map).expect("ferrum_events is a ring buffer");
-    Live {
-        arch,
-        ring: RingReader::new(ring),
-        handle: None,
-        _bpf: Some(bpf),
-    }
+
+    let mut handle = KernelHandle::attach_for_arch(&elf, arch)
+        .unwrap_or_else(|err| panic!("attach {path} on {}: {err}", arch.as_str()));
+    // The narrowed enforceable set is not free, and the handle is the only
+    // thing that carries it to the operator. It must name exactly what is
+    // missing: a syscall it omits is a rule silently dead on this node, and
+    // one it invents is a hook reported blind that is in fact live.
+    let mut reported = handle.unhooked_syscalls().to_vec();
+    reported.sort_unstable();
+    assert_eq!(
+        reported,
+        unhooked,
+        "the handle's unhooked set disagrees with tracefs on {}",
+        arch.as_str()
+    );
+    handle
+        .set_self_tgid(u64::from(std::process::id()))
+        .expect("publish self tgid into ferrum_self");
+    let ring = handle.take_ring_reader().expect("take ferrum_events");
+    Some(Live { arch, ring, handle })
 }
 
 /// Records left by one syscall.
@@ -337,16 +301,14 @@ fn openat_produces_one_decodable_record() {
 
     // The counter the agent surfaces as events_dropped_total is readable off a
     // loaded handle, not only from the aya type checker.
-    if let Some(handle) = &live.handle {
-        handle
-            .events_dropped_total()
-            .expect("read events_dropped_total off a live handle");
-        println!(
-            "attached through KernelHandle on {}; unhooked on this arch: {:?}",
-            arch.as_str(),
-            handle.unhooked_syscalls()
-        );
-    }
+    live.handle
+        .events_dropped_total()
+        .expect("read events_dropped_total off a live handle");
+    println!(
+        "attached through KernelHandle on {}; unhooked on this node: {:?}",
+        arch.as_str(),
+        live.handle.unhooked_syscalls()
+    );
 }
 
 /// `execve` carries its pathname in the *first* argument slot; nothing has
@@ -462,21 +424,21 @@ fn unreadable_path_pointer_is_flagged_with_an_empty_buffer() {
 /// for, and the assertions record what the kernel and aya *do*, not what the
 /// datapath comment claims.
 ///
-/// Measured on Linux 6.18/x86_64 with a 384-byte pathname: the record carries
-/// the 255-byte head and `EVENT_FLAG_PATH_TRUNCATED` is **not** set.
-/// `bpf_probe_read_user_str` returns the buffer size on truncation, which is
-/// inside the bounds `aya_ebpf`'s wrapper checks, so the wrapper returns `Ok`
-/// and `emit()` — which flags only on `Err` — sets nothing.
+/// Cycle 8 measured this on Linux 6.18/x86_64 with a 384-byte pathname: the
+/// record carried the 255-byte head and `EVENT_FLAG_PATH_TRUNCATED` was **not**
+/// set. `bpf_probe_read_user_str` returns the buffer size on truncation, which
+/// is inside the bounds `aya_ebpf`'s wrapper checks, so the wrapper returned
+/// `Ok` and `emit()` — flagging only on `Err` — set nothing. The consequence
+/// was a fail-open on an RFC §D acceptance case: a `path_suffix` rule for
+/// `/var/run/docker.sock` silently failed to match a path over `PATH_LEN`,
+/// with `is_degraded()` false and no signal anywhere.
 ///
-/// The consequence is a fail-open on an RFC §D acceptance case: a
-/// `path_suffix` rule for `/var/run/docker.sock` silently fails to match a
-/// path over `PATH_LEN`, with `is_degraded()` false and no signal anywhere.
-/// Fixing it changes the match semantics of two predicate families in
-/// `eval::rule_matches` and belongs in its own reviewed change, so this test
-/// pins the present behaviour instead of hiding it: the fix cannot land
-/// unnoticed, and the defect cannot drift further.
+/// `emit()` now decides on the length instead: a read that reached the last
+/// usable byte did not fit. This assertion is the only place that can tell
+/// whether the kernel agrees, so it asserts the corrected behaviour — the head
+/// intact, and the flag set.
 #[test]
-fn long_path_is_truncated_into_the_buffer_without_the_truncated_flag() {
+fn a_long_path_arrives_as_a_flagged_head() {
     let _serial = serialized();
     let Some(mut live) = live() else {
         return;
@@ -513,15 +475,27 @@ fn long_path_is_truncated_into_the_buffer_without_the_truncated_flag() {
         "a {}-byte path came back whole out of a {PATH_LEN}-byte buffer",
         target.len()
     );
-    // Observed, not desired. See the doc comment: the helper truncated and
-    // reported success, so no flag was set, and eval::rule_matches therefore
-    // lets a path_suffix predicate reject on a tail the datapath never saw.
     assert_eq!(
+        path.len(),
+        PATH_LEN - 1,
+        "the helper spends the last byte on a terminator, so a truncated read fills the \
+         buffer to exactly this length; anything else means the length test in emit() is \
+         comparing against the wrong bound"
+    );
+    assert_ne!(
         event.flags & EVENT_FLAG_PATH_TRUNCATED,
         0,
-        "the datapath now flags an over-long path — the path_unknown derivation in \
-         eval::rule_matches was written against the old behaviour and must be revisited \
-         together with this assertion"
+        "a path the datapath could not carry whole is unflagged: eval::rule_matches then \
+         lets a path_suffix predicate reject on a tail nobody saw, which is the fail-open \
+         on the docker.sock acceptance case"
+    );
+    // Both halves of the flag's contract, on one record: flagged, and not
+    // empty. That pair is what eval::rule_matches reads as "the head is real,
+    // the tail is unknown" — a prefix predicate still decides, a suffix one
+    // may not reject.
+    assert!(
+        !path.is_empty(),
+        "a truncated head must not read as -EFAULT"
     );
 }
 
@@ -533,10 +507,7 @@ fn cgroup_map_round_trips_on_a_live_handle() {
     let Some(mut live) = live() else {
         return;
     };
-    let Some(handle) = live.handle.as_mut() else {
-        // No KernelHandle on this kernel; live() already reported why.
-        return;
-    };
+    let handle = &mut live.handle;
     let id = 0xfe11_0000_0000_0001;
     handle
         .insert_container_cgroup(id)
