@@ -131,28 +131,16 @@ mod gate {
         unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &unlimited) };
     }
 
-    /// Where cgroup2 is mounted on this node, read from mountinfo rather than
-    /// assumed: `bpf_get_current_cgroup_id()` answers for the unified
-    /// hierarchy, and on a hybrid host that is not `/sys/fs/cgroup`. Getting it
-    /// wrong would make `ProcCgroupCheck` stat the wrong filesystem and every
-    /// reaction refuse as stale — which is why the mount point is discovered
-    /// here and the identity of the two ids asserted on a real record before
-    /// anything is signalled.
+    /// Where cgroup2 is mounted on this node: `bpf_get_current_cgroup_id()`
+    /// answers for the unified hierarchy, and on a hybrid host that is not
+    /// `/sys/fs/cgroup`. This file used to carry its own copy of the
+    /// derivation, which is how the defect stayed invisible — the test read
+    /// `mountinfo` to work here at all, and production did not. It is now the
+    /// production derivation, called from the one place that needs the root
+    /// for its own bookkeeping (creating the probe's cgroup); `join_agent`
+    /// takes none, because `ProcCgroupCheck::new()` does this itself.
     fn cgroup2_root() -> Option<PathBuf> {
-        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-        for line in mountinfo.lines() {
-            let Some((before, after)) = line.split_once(" - ") else {
-                continue;
-            };
-            if after.split_whitespace().next() != Some("cgroup2") {
-                continue;
-            }
-            // Field 5 of the pre-separator half is the mount point.
-            if let Some(point) = before.split_whitespace().nth(4) {
-                return Some(PathBuf::from(point));
-            }
-        }
-        None
+        ferrum_k8smeta::detect_cgroup2_root().ok()
     }
 
     /// A cgroup of this test's own, so the probe has an identity the index can
@@ -503,10 +491,19 @@ mod gate {
         assert_eq!(applied, digest, "the applied bundle is not the signed one");
         agent.insert_cgroup(live.cgroup.id, join_identity());
         agent.set_responder(Box::new(SignalResponder));
-        agent.set_target_check(Box::new(ProcCgroupCheck::with_roots(
-            "/proc",
-            &live.cgroup.root,
-        )));
+        // The production constructor, not `with_roots`: the root it derives is
+        // the claim under test. A test that hands it the answer proves only
+        // that the guard works once somebody else has found the hierarchy,
+        // which is the half that was never in doubt.
+        let check = ProcCgroupCheck::new();
+        assert_eq!(
+            check.cgroup_root(),
+            Ok(live.cgroup.root.as_path()),
+            "ProcCgroupCheck::new() keyed itself on a different hierarchy than the one this \
+             probe's cgroup was created in: every reaction on this node would refuse as a stale \
+             target on a workload that never moved"
+        );
+        agent.set_target_check(Box::new(check));
         agent
     }
 

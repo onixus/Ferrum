@@ -211,7 +211,7 @@ fn spawn_cgroup_refresh(
 ) {
     use ferrum_agent::{CGROUP_CARRIER_GONE, CGROUP_REFRESH};
     use ferrum_k8smeta::watch::{ApiserverConfig, ApiserverWatcher};
-    use ferrum_k8smeta::{CgroupResolver, StdCgroupFs, DEFAULT_CGROUP_ROOT};
+    use ferrum_k8smeta::{detect_cgroup2_root, CgroupResolver, StdCgroupFs, DEFAULT_CGROUP_ROOT};
 
     let config = match ApiserverConfig::from_service_account(node) {
         Ok(config) => config,
@@ -232,7 +232,22 @@ fn spawn_cgroup_refresh(
         let resolver = CgroupResolver::new(index);
         let source = ferrum_agent::SharedPodSource::new(cache);
         let fs = StdCgroupFs;
-        let root = PathBuf::from(DEFAULT_CGROUP_ROOT);
+        // The same hierarchy the pre-signal target check keys on, derived the
+        // same way. A hardcoded root on a hybrid node makes the index and the
+        // guard disagree about which filesystem an inode came from, and every
+        // reaction then refuses on a target that never moved. `scan` reports
+        // the failure it would hit here anyway; naming the root that was tried
+        // is what makes that report readable.
+        let root = match detect_cgroup2_root() {
+            Ok(root) => root,
+            Err(err) => {
+                eprintln!(
+                    "ferrum-agent: cgroup2 mount point not derivable ({err}); falling back to \
+                     {DEFAULT_CGROUP_ROOT}, where the scan below reports what it finds. Degraded."
+                );
+                PathBuf::from(DEFAULT_CGROUP_ROOT)
+            }
+        };
         let mut resolved_at: Option<Instant> = None;
         loop {
             match resolver.refresh(&fs, &root, &source) {
