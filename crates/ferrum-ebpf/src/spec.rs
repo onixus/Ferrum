@@ -192,6 +192,22 @@ pub fn parse_febp(spec: &[u8]) -> Result<EbpfSpec> {
 /// If any of the three stops holding — in particular if a `deny` match ever
 /// becomes indistinguishable from an audit one — the gate belongs here after
 /// all, and this note goes with it.
+///
+/// # Why `defaultAction` splits where a rule `action` does not
+///
+/// `default_action` is refused for `kill` and `isolate` (see `reject_kill_all`)
+/// and accepted for `deny`, and that asymmetry is the point rather than an
+/// oversight to tidy up. Both are "an action no plane executes", but they do
+/// not cost the same. A `deny` default decides nothing that is carried out:
+/// every unmatched record is exported with `REFUSE_DENY_NOT_ENFORCEABLE`, by
+/// name, exactly as a `deny` rule is — inert, visible, and the identical drift
+/// from the identical older compiler that signs a `deny` rule, so reason 3
+/// above applies to it unchanged: refusing it would strand the node on a
+/// rolling upgrade. A `kill` or `isolate` default decides *kill* on every
+/// record no rule matched, which on a respond node with `ferrum_cgroups`
+/// synced is a kill-all — the one thing `AGENTS.md` forbids outright, and the
+/// one an operator cannot walk back. Only one of the two can kill a pod, so
+/// only one of the two is worth refusing a whole fleet's bundle over.
 pub fn parse_febp_with(spec: &[u8], dead: DeadRules) -> Result<(EbpfSpec, Vec<String>)> {
     let mut r = Reader::new(spec);
     r.expect_magic(&EBPF_MAGIC)?;
@@ -212,7 +228,7 @@ pub fn parse_febp_with(spec: &[u8], dead: DeadRules) -> Result<(EbpfSpec, Vec<St
         rules.push(decode_rule(&mut r)?);
     }
     r.finish()?;
-    reject_kill_all(&rules)?;
+    reject_kill_all(default_action, &rules)?;
     let mut dropped = Vec::new();
     match dead {
         DeadRules::Reject => {
@@ -295,7 +311,26 @@ fn dead_rule_reason(rule: &Rule) -> Option<String> {
     None
 }
 
-fn reject_kill_all(rules: &[Rule]) -> Result<()> {
+/// Load-path copy of `ferrum_policy`'s kill-all invariant, on both halves.
+///
+/// This is not a dead-rule reason and [`DeadRules::Drop`] must never reach it.
+/// Dropping is admissible only for a rule no record can match; a kill-all
+/// matches every record, and substituting `Allow` for it would be the exact
+/// fail-open the last-known-good path exists to prevent. So a kill-all refuses
+/// the whole spec on both paths, live and restore.
+///
+/// `default_action` matters most of the two here and had no gate at all: the
+/// loader decoded it and never looked at it again, so a signed FEBP with
+/// `default_action = Kill` installed cleanly and every record no rule matched
+/// decided Kill. No rule-level gate can catch that, because a default is not a
+/// rule and no `match` narrows it. `Deny` is deliberately still accepted — see
+/// `parse_febp_with`'s note on why the two defaults do not cost the same.
+fn reject_kill_all(default_action: Action, rules: &[Rule]) -> Result<()> {
+    if matches!(default_action, Action::Kill | Action::Isolate) {
+        return Err(FerrumError::Compile(format!(
+            "defaultAction {default_action:?} is kill-all: it decides every record no rule matched, and no match narrows it"
+        )));
+    }
     for rule in rules {
         if matches!(rule.action, Action::Kill | Action::Isolate)
             && rule.syscalls.is_empty()
