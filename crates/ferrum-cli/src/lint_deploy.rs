@@ -41,6 +41,7 @@ const WEBHOOK_PKI_MISMATCH: &str = "FD022";
 const PRIVATE_KEY_IN_TREE: &str = "FD023";
 const POLICY_NAME_UNJOINED: &str = "FD024";
 const DUPLICATE_JOINED_FLAG: &str = "FD025";
+const BPF_ELF_WITHOUT_TRACEFS: &str = "FD026";
 
 /// Bundle Secrets the controller writes: `ferrum-bundle-cluster-<policy>` for a
 /// cluster-scoped policy, `ferrum-bundle-ns-<namespace>-<policy>` for a
@@ -79,6 +80,10 @@ const FORBIDDEN_HOST_PATH_PREFIXES: [&str; 5] = [
     "/etc/kubernetes",
     "/var/lib/docker",
 ];
+
+/// Where a kernel exposes its tracepoint catalogue. Mirrors `TRACEFS_ROOTS` in
+/// `crates/ferrum-ebpf/src/lib.rs`; change both together.
+const TRACEFS_ROOTS: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
 
 const OBSERVE_FORBIDDEN_VERBS: [&str; 3] = ["delete", "deletecollection", "*"];
 const OBSERVE_FORBIDDEN_RESOURCES: [&str; 5] =
@@ -479,9 +484,85 @@ fn check_pod_templates(docs: &[Doc], findings: &mut Vec<Finding>) {
                 check_container(doc, &owner, container, findings);
                 check_flag_ambiguity(doc, &owner, container, findings);
                 check_policy_join(doc, &owner, spec, container, findings);
+                check_tracefs(doc, &owner, spec, container, findings);
             }
         }
     }
+}
+
+/// An attach build with no tracefs to read.
+///
+/// `--bpf-elf` is what turns an agent into the datapath: an attach build
+/// refuses to start without it. Attaching a tracepoint means reading
+/// `events/<category>/<name>/id` out of tracefs, and so does the probe that
+/// decides which hooks this kernel actually has — which answers "cannot tell"
+/// rather than "absent" when no tracefs is mounted, on purpose, so that a
+/// missing filesystem never widens into a swallowed attach error.
+///
+/// tracefs is a filesystem of its own and no container runtime propagates it.
+/// So a container that passes `--bpf-elf` and mounts none has an agent that
+/// tries every hook, fails every one, and parks Degraded on every node it lands
+/// on — the four RFC section D runtime cases dead in the shipped install, with
+/// the binary, the ELF and the RBAC all correct. Nothing at runtime can repair
+/// it, and nothing before this point looks wrong.
+///
+/// A finding, never a warning: this is the same unverifiable join FD005 and
+/// FD022 were each added to stop passing. The mount must also be a `hostPath`
+/// at a tracefs root — an `emptyDir` there is a directory with no `events` in
+/// it, which is exactly the state this rule exists to catch.
+fn check_tracefs(
+    doc: &Doc,
+    owner: &str,
+    spec: &Value,
+    container: &Value,
+    findings: &mut Vec<Finding>,
+) {
+    let argv = argv_of(container);
+    if container_flag(&argv, "--bpf-elf").is_none() {
+        return;
+    }
+    let cname = container
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>");
+    let mounted = seq(container, "volumeMounts").iter().any(|m| {
+        let Some(path) = m.get("mountPath").and_then(Value::as_str) else {
+            return false;
+        };
+        TRACEFS_ROOTS.contains(&path)
+            && mounted_host_path(spec, container, path).as_deref() == Some(path)
+    });
+    if mounted {
+        return;
+    }
+    findings.push(Finding {
+        code: BPF_ELF_WITHOUT_TRACEFS,
+        file: doc.file.clone(),
+        msg: format!(
+            "{owner} container '{cname}' passes --bpf-elf but mounts no tracefs hostPath at one \
+             of {TRACEFS_ROOTS:?}; the tracepoint ids the attach reads are not in this container, \
+             so every hook fails and the datapath is Degraded on every node"
+        ),
+    });
+}
+
+/// The `hostPath.path` of the volume mounted at `mount_path` in this container.
+fn mounted_host_path(spec: &Value, container: &Value, mount_path: &str) -> Option<String> {
+    let volume_name = seq(container, "volumeMounts").iter().find_map(|m| {
+        (m.get("mountPath").and_then(Value::as_str)? == mount_path)
+            .then(|| m.get("name").and_then(Value::as_str))
+            .flatten()
+    })?;
+    seq(spec, "volumes").iter().find_map(|v| {
+        (v.get("name").and_then(Value::as_str)? == volume_name)
+            .then(|| {
+                v.get("hostPath")
+                    .and_then(|h| h.get("path"))
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+            .map(str::to_string)
+    })
 }
 
 /// `--policy-name` is an unjoined string.
@@ -653,16 +734,46 @@ fn container_flag(argv: &[String], flag: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-/// Flags whose value this lint proves something about: the FD024 join, the
-/// FD018/FD019 role, the FD021 serving paths. Nothing here about a flag it
-/// makes no claim on — the controller's `--cluster` is repeated on purpose and
-/// accumulates instead of overwriting.
-const JOINED_FLAGS: [&str; 5] = [
+/// Flags a duplicate of which silently changes what the process enforces,
+/// verifies against, or writes down — every one of them read last-wins by the
+/// `parse_flags` this file mirrors.
+///
+/// Two groups. The first is flags this lint proves a claim about: the FD024
+/// join (`--policy-name`, `--bundle`), the FD018/FD019 role, the FD021 serving
+/// paths, the FD026 datapath (`--bpf-elf`). The second is flags it proves
+/// nothing about and still cannot let a manifest state twice, because the value
+/// the binary drops is one somebody wrote down and nobody reads:
+///
+/// - `--trust-root` is the root every bundle signature is verified against. A
+///   manifest carrying the operator's key and then another one is a
+///   signature-root substitution in plain sight. This lint says nothing about
+///   which key is right — it cannot — only that one of the two is inert.
+/// - `--lkg-dir` is the policy the node falls back to when the control plane is
+///   gone, which is the one moment nothing else can correct it.
+/// - `--exceptions` is which waivers admission applies.
+/// - `--export-dir` is where the record of a kill is written; a redirected one
+///   is the repudiation case with the node still reporting healthy.
+/// - `--node` scopes the pod watch, so a second one indexes another node's pods
+///   and every identity lookup here misses.
+///
+/// Deliberately absent: the controller's flags, whose parser accumulates
+/// `--cluster` on purpose rather than overwriting, and admission's `--listen`,
+/// where a wrong port is a webhook that fails closed and says so on the first
+/// request. Inverting this into "every flag except a repeatable allowlist" was
+/// considered and not taken: it would draw findings on flags nobody here has an
+/// argument about, and this list is meant to be exactly the arguments.
+const JOINED_FLAGS: [&str; 11] = [
     "--policy-name",
     "--bundle",
     "--role",
     "--tls-cert",
     "--tls-key",
+    "--trust-root",
+    "--bpf-elf",
+    "--lkg-dir",
+    "--exceptions",
+    "--export-dir",
+    "--node",
 ];
 
 /// Mirroring the binary's last-wins parse is only half an answer: a flag
@@ -1477,6 +1588,79 @@ mod tests {
                 .collect::<BTreeSet<_>>()
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same bypass on the flag that decides what the node will trust. The
+    /// agent verifies every bundle signature against the last `--trust-root`,
+    /// so a manifest carrying the operator's key and then another one is a
+    /// signature-root substitution sitting in plain sight — and until
+    /// `--trust-root` joined `JOINED_FLAGS` the lint printed ok on it.
+    #[test]
+    fn a_trust_root_named_twice_is_a_finding() {
+        let one = "            - --trust-root\n            - $(FERRUM_TRUST_ROOT)\n";
+        let two = "            - --trust-root\n            - $(FERRUM_TRUST_ROOT)\n            - --trust-root\n            - $(ATTACKER_TRUST_ROOT)\n";
+        let dir = agent_tree_with("dup-trust-root", |raw| raw.replace(one, two));
+        assert_eq!(
+            codes_in(&dir),
+            [DUPLICATE_JOINED_FLAG]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FD026, against the shipped DaemonSet with one mount removed. tracefs is
+    /// a filesystem of its own: nothing propagates it into a container, so an
+    /// agent without this mount reads no tracepoint id, fails every attach and
+    /// parks Degraded — with the ELF, the capabilities and the RBAC all
+    /// correct. This is the state the tree shipped in until it was fixed.
+    #[test]
+    fn an_attach_build_without_tracefs_is_a_finding() {
+        let mount = "            - name: tracefs\n              mountPath: /sys/kernel/tracing\n              readOnly: true\n";
+        let dir = agent_tree_with("no-tracefs", |raw| raw.replace(mount, ""));
+        assert_eq!(
+            codes_in(&dir),
+            [BPF_ELF_WITHOUT_TRACEFS]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A mount at the right path backed by the wrong thing. An `emptyDir` at
+    /// /sys/kernel/tracing is a directory with no `events` in it: the same
+    /// blindness, wearing a mount that makes the manifest look complete.
+    #[test]
+    fn an_emptydir_where_tracefs_belongs_is_still_a_finding() {
+        let host = "        - name: tracefs\n          hostPath:\n            path: /sys/kernel/tracing\n            type: Directory\n";
+        let empty = "        - name: tracefs\n          emptyDir: {}\n";
+        let dir = agent_tree_with("fake-tracefs", |raw| raw.replace(host, empty));
+        assert_eq!(
+            codes_in(&dir),
+            [BPF_ELF_WITHOUT_TRACEFS]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The committed negative tree the Jenkins 'Validate policies' stage runs,
+    /// checked here for the exact code: an assertion of absence with no
+    /// positive control proves nothing, and a fixture that fails on an
+    /// unrelated finding is that absence again.
+    #[test]
+    fn the_tracefs_fixture_fails_on_that_rule_and_no_other() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-tracefs");
+        assert_eq!(
+            codes,
+            [BPF_ELF_WITHOUT_TRACEFS]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
     }
 
     /// The lint's argv reader must agree with `parse_flags` in

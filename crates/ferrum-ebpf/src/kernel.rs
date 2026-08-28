@@ -307,6 +307,129 @@ fn malformed(what: &str) -> FerrumError {
     FerrumError::Degraded(format!("eBPF ELF map inspection: {what}"))
 }
 
+/// What the `RLIMIT_MEMLOCK` raise before a load left this process with.
+///
+/// From 5.11 the kernel accounts BPF memory to the memcg and this limit stops
+/// deciding anything. Before that it charges the `ferrum_events` ring and the
+/// `ferrum_cgroups` hash against it, and the 8 MiB a container runtime commonly
+/// starts a process with does not fit both. The shipped DaemonSet names a floor
+/// of "kernel >= 5.8", so the releases where the limit still decides whether the
+/// datapath loads at all are inside the range this ships to: a raise that only
+/// exists in a test harness is a claim about the harness.
+///
+/// Reported, never asserted. Only the soft limit is moved, up to the hard one,
+/// which needs no capability; raising the hard limit needs CAP_SYS_RESOURCE,
+/// and handing the agent that so a limit stops mattering on three kernel
+/// releases is a worse trade than saying what happened. So the state travels to
+/// the load instead: a failed `Bpf::load` names what it ran under, rather than
+/// leaving that to be guessed from another node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Memlock {
+    /// Soft limit is now `soft` bytes (`u64::MAX` = unlimited), `was` before.
+    /// `capped` when the hard limit is finite: this is as high as the process
+    /// can go without CAP_SYS_RESOURCE.
+    Set { was: u64, soft: u64, capped: bool },
+    /// `setrlimit` refused; the process keeps `soft` under `hard`.
+    Failed { soft: u64, hard: u64, errno: i32 },
+    /// `getrlimit` refused: what this load runs under is unknown.
+    Unknown { errno: i32 },
+}
+
+impl Memlock {
+    /// One line for whoever reads the failure, in bytes and errnos rather than
+    /// a verdict: on 5.11+ every one of these states is fine.
+    pub fn describe(&self) -> String {
+        fn amount(v: u64) -> String {
+            if v == u64::MAX {
+                "unlimited".to_string()
+            } else {
+                format!("{v} bytes")
+            }
+        }
+        match *self {
+            Memlock::Set { was, soft, capped } => {
+                let ceiling = if capped {
+                    ", and the hard limit is finite: no higher without CAP_SYS_RESOURCE"
+                } else {
+                    ""
+                };
+                format!(
+                    "RLIMIT_MEMLOCK soft {} -> {}{ceiling}",
+                    amount(was),
+                    amount(soft)
+                )
+            }
+            Memlock::Failed { soft, hard, errno } => format!(
+                "RLIMIT_MEMLOCK soft {} could not be raised to hard {} (errno {errno})",
+                amount(soft),
+                amount(hard)
+            ),
+            Memlock::Unknown { errno } => {
+                format!("RLIMIT_MEMLOCK unreadable (errno {errno}): unknown to this load")
+            }
+        }
+    }
+}
+
+/// Raise the soft `RLIMIT_MEMLOCK` to the hard one and report the result.
+///
+/// Called by [`KernelHandle::attach_for_arch`] immediately before the load,
+/// because that is the only call the charge happens inside of. Anywhere else it
+/// is the caller's job to remember, which is how the raise came to live in a
+/// test file while every production attach ran without one.
+#[cfg(feature = "attach")]
+pub fn raise_memlock() -> Memlock {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: both calls read or write exactly one `rlimit` through a pointer
+    // to a live local, and touch nothing else.
+    #[allow(unsafe_code)]
+    let read = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) };
+    if read != 0 {
+        return Memlock::Unknown {
+            errno: last_errno(),
+        };
+    }
+    // No cast: `rlim_t` is u64 on every target this ships to (musl x86_64 and
+    // aarch64). Somewhere it is not, this stops compiling rather than silently
+    // truncating a limit into the message an operator reads.
+    let was = lim.rlim_cur;
+    let hard = lim.rlim_max;
+    let capped = lim.rlim_max != libc::RLIM_INFINITY;
+    if lim.rlim_cur == lim.rlim_max {
+        return Memlock::Set {
+            was,
+            soft: was,
+            capped,
+        };
+    }
+    let want = libc::rlimit {
+        rlim_cur: lim.rlim_max,
+        rlim_max: lim.rlim_max,
+    };
+    #[allow(unsafe_code)]
+    let set = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &want) };
+    if set != 0 {
+        return Memlock::Failed {
+            soft: was,
+            hard,
+            errno: last_errno(),
+        };
+    }
+    Memlock::Set {
+        was,
+        soft: hard,
+        capped,
+    }
+}
+
+#[cfg(feature = "attach")]
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
 /// Owns the loaded programs and maps; dropping it detaches everything.
 #[cfg(feature = "attach")]
 pub struct KernelHandle {
@@ -370,7 +493,20 @@ impl KernelHandle {
                 arch.as_str()
             )));
         }
-        let mut bpf = Bpf::load(elf).map_err(|err| degraded("load eBPF ELF", err))?;
+        // Raised here, not by the caller: the charge happens inside
+        // `Bpf::load`, and the state it ran under is what a failure has to
+        // name. Never fatal on its own -- on 5.11+ it decides nothing -- and
+        // never swallowed either: it rides the Degraded error the agent
+        // publishes, so a node that will not attach says why from 200 nodes
+        // away.
+        let memlock = raise_memlock();
+        let mut bpf = Bpf::load(elf).map_err(|err| {
+            FerrumError::Degraded(format!(
+                "load eBPF ELF: {err} [{}; a kernel before 5.11 charges the {MAP_EVENTS} ring \
+                 and the {MAP_CGROUPS} hash against it]",
+                memlock.describe()
+            ))
+        })?;
         for (prog, category, name) in wanted {
             let program = bpf.program_mut(prog).ok_or_else(|| {
                 FerrumError::Degraded(format!("program {prog} missing from eBPF ELF"))
@@ -551,6 +687,92 @@ mod tests {
 
     fn set(ids: &[u64]) -> BTreeSet<u64> {
         ids.iter().copied().collect()
+    }
+
+    /// The words a failed load carries. This is the whole point of the type:
+    /// on 5.11+ every state below is harmless, so the message has to report
+    /// the numbers and let the reader judge, and it has to be readable off a
+    /// node nobody is logged into.
+    #[test]
+    fn memlock_describe_reports_the_numbers_not_a_verdict() {
+        let capped = Memlock::Set {
+            was: 8 * 1024 * 1024,
+            soft: 64 * 1024 * 1024,
+            capped: true,
+        }
+        .describe();
+        assert!(
+            capped.contains("8388608 bytes -> 67108864 bytes"),
+            "{capped}"
+        );
+        assert!(capped.contains("CAP_SYS_RESOURCE"), "{capped}");
+
+        let open = Memlock::Set {
+            was: 8 * 1024 * 1024,
+            soft: u64::MAX,
+            capped: false,
+        }
+        .describe();
+        assert!(open.contains("-> unlimited"), "{open}");
+        // Nothing to say about a ceiling there is none of.
+        assert!(!open.contains("CAP_SYS_RESOURCE"), "{open}");
+
+        let failed = Memlock::Failed {
+            soft: 65536,
+            hard: 65536,
+            errno: 1,
+        }
+        .describe();
+        assert!(failed.contains("errno 1"), "{failed}");
+        assert!(failed.contains("65536 bytes"), "{failed}");
+
+        let unknown = Memlock::Unknown { errno: 13 }.describe();
+        assert!(unknown.contains("errno 13"), "{unknown}");
+        // Every state names the limit: an operator greps for one string.
+        for line in [capped, open, failed, unknown] {
+            assert!(line.contains("RLIMIT_MEMLOCK"), "{line}");
+        }
+    }
+
+    /// The raise runs on this host and leaves the process no worse off.
+    ///
+    /// It cannot assert a number: a container may start at 8 MiB, a CI runner
+    /// unlimited. What it can assert is that the call reports a state rather
+    /// than panicking or silently lowering the limit, and that the limit the
+    /// kernel holds afterwards is the one the state claims.
+    #[cfg(feature = "attach")]
+    #[test]
+    fn raise_memlock_never_lowers_the_limit_and_reports_what_it_left() {
+        let before = read_memlock();
+        let state = raise_memlock();
+        let after = read_memlock();
+        assert!(
+            after.0 >= before.0,
+            "raise lowered the soft limit: {before:?} -> {after:?}"
+        );
+        match state {
+            Memlock::Set { was, soft, capped } => {
+                assert_eq!(was, before.0);
+                assert_eq!(soft, after.0);
+                assert_eq!(capped, after.1 != u64::MAX);
+                assert_eq!(soft, before.1, "the soft limit must end at the hard one");
+            }
+            // No capability is needed to raise the soft limit to the hard one,
+            // so a failure here is a fact worth seeing rather than tolerating.
+            other => panic!("raise_memlock reported {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "attach")]
+    fn read_memlock() -> (u64, u64) {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) };
+        assert_eq!(rc, 0, "getrlimit failed");
+        (lim.rlim_cur, lim.rlim_max)
     }
 
     #[test]

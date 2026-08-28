@@ -88,6 +88,16 @@ spec:
             - name: cgroup
               mountPath: /sys/fs/cgroup
               readOnly: true
+            # The tracepoint catalogue. aya reads events/<cat>/<name>/id here
+            # before every attach, and so does the probe that decides which
+            # hooks this kernel has. tracefs is its own filesystem and no
+            # container runtime propagates it, so without this mount the probe
+            # can establish nothing, every attach is tried, every one fails and
+            # the agent parks Degraded on every node. Read-only: attaching
+            # needs the id, not a write.
+            - name: tracefs
+              mountPath: /sys/kernel/tracing
+              readOnly: true
             - name: export
               mountPath: /var/log/ferrum
             - name: lkg
@@ -105,6 +115,14 @@ spec:
         - name: cgroup
           hostPath:
             path: /sys/fs/cgroup
+            type: Directory
+        # type: Directory, not DirectoryOrCreate: /sys/kernel is sysfs and a
+        # mkdir there fails anyway. A node with tracefs somewhere else keeps
+        # the pod unschedulable and visible, rather than starting an agent that
+        # can hook nothing.
+        - name: tracefs
+          hostPath:
+            path: /sys/kernel/tracing
             type: Directory
         - name: export
           hostPath:
