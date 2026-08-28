@@ -649,6 +649,90 @@ mod gate {
         );
     }
 
+    /// `attach_for_arch` raises the soft `RLIMIT_MEMLOCK` it loads under.
+    ///
+    /// The wiring, not the function. `raise_memlock()` had two unit tests, both
+    /// calling it directly, and nothing anywhere asserted that the production
+    /// attach path calls it at all: deleting that one line left every test in
+    /// this workspace green while the boundary document went on claiming the
+    /// raise happens inside the call that charges the memory — the whole
+    /// architectural argument for the raise living in `ferrum-ebpf` rather than
+    /// in each caller.
+    ///
+    /// Measured by lowering the soft limit and reading it back afterwards, so
+    /// the observable is the raise itself and not the load. It has to be: this
+    /// kernel charges BPF memory to the cgroup, so a low `RLIMIT_MEMLOCK` does
+    /// not stop the load here and the attach succeeding proves nothing either
+    /// way. The lowered value is deliberately not zero for the same reason —
+    /// a load that failed would be a different fact.
+    ///
+    /// `live()` is not used: it raises the limit itself, before anything under
+    /// test runs.
+    #[test]
+    fn attach_raises_the_soft_memlock_it_loads_under() {
+        let _serial = serialized();
+        let Some((path, elf)) = elf_or_skip() else {
+            return;
+        };
+        let arch = SyscallArch::host().expect("no syscall decode table for this arch");
+        if expected_unhooked(arch).len() == ferrum_ebpf::TRACEPOINTS.len() {
+            if required() {
+                panic!(
+                    "FERRUM_BPF_ELF_REQUIRED is set, but this kernel exposes no datapath \
+                     tracepoint at all. Run this stage on a kernel with tracefs."
+                );
+            }
+            println!("skipping: no datapath tracepoint on this kernel");
+            return;
+        }
+
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut before) },
+            0,
+            "RLIMIT_MEMLOCK is unreadable on this node"
+        );
+        // Small enough that the raise has somewhere to go, large enough that a
+        // kernel which does charge this would still be the one reporting it.
+        let lowered = libc::rlimit {
+            rlim_cur: 64 * 1024,
+            rlim_max: before.rlim_max,
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &lowered) },
+            0,
+            "could not lower RLIMIT_MEMLOCK: this test cannot measure anything"
+        );
+
+        let attached = KernelHandle::attach_for_arch(&elf, arch);
+
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let read = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut after) };
+        // Put it back before anything can fail: every other test in this binary
+        // loads under whatever this one leaves behind.
+        unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &before) };
+
+        attached.unwrap_or_else(|err| panic!("attach {path} on {}: {err}", arch.as_str()));
+        assert_eq!(
+            read, 0,
+            "RLIMIT_MEMLOCK became unreadable across the attach"
+        );
+        assert_eq!(
+            after.rlim_cur, before.rlim_max,
+            "attach_for_arch loaded under a soft RLIMIT_MEMLOCK of {} it never raised to the hard \
+             {}. On a kernel before 5.11 the ring and the cgroup hash are charged against that \
+             soft limit, so the load an operator gets is the one this node just avoided by \
+             accident",
+            after.rlim_cur, before.rlim_max
+        );
+    }
+
     /// The cgroup map the agent rewrites on every index tick takes inserts and
     /// removals from a loaded handle, and the handle's mirror follows.
     #[test]

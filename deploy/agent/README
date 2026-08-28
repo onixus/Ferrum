@@ -28,17 +28,28 @@ and no container runtime propagates it, so without the mount the probe can
 establish nothing, every attach is tried, every one fails, and the agent parks
 with "kernel attach failed, datapath is Degraded" on every node — the ELF, the
 capabilities and the RBAC all correct. `ferrumctl lint-deploy` FD026 is a
-finding on an attach build without it. hostPath type is Directory: a node whose
-tracefs is somewhere else leaves the pod unschedulable and visible rather than
-running an agent that can hook nothing.
+finding on an attach build without it. hostPath type is Directory, and FD026
+requires that too: a node whose tracefs is somewhere else leaves the pod
+unschedulable and visible rather than running an agent that can hook nothing,
+which is what DirectoryOrCreate would produce — kubelet makes an empty
+directory, mounts it, and the pod starts blind with the manifest looking
+complete.
 
 CAP_BPF and CAP_PERFMON, and no CAP_SYS_RESOURCE. Kernels before 5.11 charge
 the event ring and the cgroup hash against RLIMIT_MEMLOCK; the agent raises its
 soft limit to the hard one before every load, which needs no capability, and
 cannot raise the hard one, which would. Where that is not enough the load fails
-and says so: the attach error names the limit it ran under, on stderr and in
-status.json (containerMapError, and the container-map reason in
-degradedReasons). It is never a silent degrade.
+and says so on stderr and in status.json (containerMapError, and the
+container-map reason in degradedReasons). It is never a silent degrade.
+
+The numbers are on one of those errors and not on all of them. `memlock.describe()`
+is attached to the failure of `Bpf::load`, which is the call the ring and the
+hash are charged inside of and the only one RLIMIT_MEMLOCK can decide. A later
+`tracepoint.load()` or `attach()` failure, and a cgroup-map failure, name the
+program and the cause and do not repeat the limit — those failures are not
+about it. So "the attach error names the limit it ran under" is true of the
+load and false of everything after it; read which call failed before reading
+the limit out of a message that may not carry one.
 
 The respond ClusterRole grants pods delete only. pods/eviction and
 networkpolicies were there for Isolate, which the agent does not implement and

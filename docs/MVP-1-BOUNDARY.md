@@ -14,9 +14,15 @@
 Держит это `crates/ferrum-testkit/tests/boundary_gate.rs`: он разбирает
 таблицы секции «Делает», требует, чтобы каждая ссылка разрешалась в `fn` под
 `crates/` или в `stage('...')` в `Jenkinsfile`, требует, чтобы список случаев
-§D был ровно `AcceptanceCase::ALL`, и требует, чтобы каждая константа `DEG_*`
-из `ferrum-agent` была здесь названа. Переименованный тест роняет строку,
-которая на него опиралась.
+§D был ровно `AcceptanceCase::ALL`, и требует, чтобы каждая причина, которую
+агент может объявить деградацией, была здесь названа — и по префиксу `DEG_`
+по всему crate, и по телу `degraded_reasons_at`, какими бы именами константы
+там ни звались. Переименованный тест роняет строку, которая на него
+опиралась. Ссылка разрешается в *определение* `fn`, а не в упоминание: до
+этого цикла хватало подстроки, и строку держал живой комментарий об удалённом
+тесте. `—` в «Делает» разрешён только тем строкам, что перечислены в
+`NOT_EXECUTED_SUBJECTS`; иначе вся секция могла бы состоять из прочерков при
+двух зелёных гейтах.
 
 **Гейт проверяет только одно направление.** Он требует, чтобы процитированное
 существовало; он не требует, чтобы существующее было процитировано. Это ровно
@@ -96,21 +102,33 @@
   — это разница между «убить workload» и «убить того, кто унаследовал его
   pid».
 - **Набор измерен, а не только код.** `crates/ferrum-agent/tests/mutations/`
-  — четыре патча и `run.sh`, каждый обязан уронить стык. Три роняют: `react`,
-  сообщающий `executed` без сигнала (внутри агента этого не видит ничто —
-  экспорт и счётчики совпадают со здоровым узлом); `SignalResponder::kill`,
-  возвращающий `Ok` без syscall — при этом **все unit-тесты `respond.rs`
-  продолжают проходить**, что и есть замеренная дыра; снятый guard устаревшей
-  цели — падает ровно четвёртый тест и только он.
-- **Четвёртая мутация выжила намеренно, и это результат, а не стыд.**
-  `04-emit-never-flags-a-truncated-path` стык не роняет: вывод усечения из
-  байтов на стороне декодера, сделанный в цикле 8 ради уже развёрнутых
-  pre-fix ELF, покрывает пропавший флаг полностью — kill на переросшем
-  `PATH_LEN` пути всё ещё срабатывает, всё ещё помечается `path_unknown`, и
-  probe всё ещё умирает. Ловит регрессию единственное утверждение, читающее
-  сырой флаг записи, и оно в файле ровно за этим: молчаливый fallback — это
-  дефект, ждущий следующего производителя, у которого fallback нет.
-  Ни один из четырёх прогонов Jenkins не делал: стадии `BPF join` и
+  — четыре патча и `run.sh`, каждый обязан уронить стык. Ронять обязаны все
+  четыре, и все четыре роняют — измерено прогоном harness на Linux 6.18.44,
+  не прочтением кода: `react`, сообщающий `executed` без сигнала (внутри
+  агента этого не видит ничто — экспорт и счётчики совпадают со здоровым
+  узлом), три килящих теста; `SignalResponder::kill`, возвращающий `Ok` без
+  syscall — при этом **все unit-тесты `respond.rs` продолжают проходить**, что
+  и есть замеренная дыра, те же три теста; снятый guard устаревшей цели —
+  падает ровно четвёртый тест и только он; `emit()`, не ставящий
+  `EVENT_FLAG_PATH_TRUNCATED`, — падает единственное в файле утверждение,
+  читающее сырой флаг записи — `assert!` на `Event::path_truncated()`.
+- **Четвёртая мутация не выживает, и один цикл здесь стояло обратное.**
+  Документ, комментарий стадии и заголовок самого патча утверждали, что
+  `04-emit-never-flags-a-truncated-path` стык проходит намеренно; `run.sh` при
+  этом любого выжившего считал жёсткой ошибкой, так что стадия
+  `BPF join mutations` по этому описанию не могла пройти никогда. Разрешено
+  измерением: `FAILED. 3 passed; 1 failed`. Утверждение писалось по чтению
+  кода и по отдельному ручному прогону, и было неверно в обе стороны.
+- **Свойство, которое та мутация описывала, живо — и живёт не здесь.** Вывод
+  усечения из байтов на стороне декодера, сделанный в цикле 8 ради уже
+  развёрнутых pre-fix ELF, покрывает пропавший флаг; исполняет это
+  `event.rs::a_buffer_filling_path_is_read_as_truncated_without_the_flag` на
+  синтезированной записи. На ядре это не показано ни разу: утверждение о сыром
+  флаге стоит в тесте **раньше** утверждений о вердикте, поэтому с патчем
+  прогон останавливается на нём и до kill, `path_unknown` и SIGKILL не
+  доходит. Кто захочет это ядерное доказательство — нужен тест, читающий ту же
+  переросшую запись с замаскированным флагом; такого в дереве нет.
+  Ни один из прогонов Jenkins не делал: стадии `BPF join` и
   `BPF join mutations` существуют, а прогонялись руками.
 - **`exception without TTL` стоит `—` намеренно.** Субъект утверждения —
   API server, а API server здесь не запускался ни разу. `serde` отказывается
@@ -145,11 +163,13 @@
 | Datapath в настоящем ядре: одна декодируемая запись на syscall, путь из первого слота, нечитаемый указатель помечен пустым буфером | K | K `attach_live.rs::openat_produces_one_decodable_record` · K `attach_live.rs::a_syscall_without_a_path_argument_is_not_flagged` · K `attach_live.rs::unreadable_path_pointer_is_flagged_with_an_empty_buffer` |
 | Карта `ferrum_cgroups` живёт на настоящем handle | K | K `attach_live.rs::cgroup_map_round_trips_on_a_live_handle` |
 | Цель, покинувшая cgroup, которая породила запись, сигнала не получает: `REFUSE_STALE_TARGET`, probe жив | K | K `attach_join.rs::a_target_that_left_the_cgroup_is_refused_and_survives` |
-| Ни стадия, трогающая ядро, ни стадия стыка не могут пройти, не исполнившись | K+U | K `attach_live.rs::the_gate_must_not_be_compiled_out` · U `Jenkinsfile::BPF attach` · U `attach_join.rs::the_gate_must_not_be_compiled_out` · U `Jenkinsfile::BPF join` |
+| Корень cgroup2 выводится из `mountinfo`, а не зашит: неоднозначность и нечитаемый `mountinfo` — `Degraded`, а не догадка, и fallback на константу нет | K+U | K `attach_join.rs::a_target_that_left_the_cgroup_is_refused_and_survives` · U `cgroupfs.rs::hybrid_node_resolves_to_the_unified_mount_not_the_tmpfs` · U `cgroupfs.rs::an_ambiguous_or_absent_hierarchy_is_degraded_never_the_default` · U `cgroupfs.rs::several_views_of_one_hierarchy_pick_one_deterministically` · U `cgroupfs.rs::the_derivation_agrees_with_this_node_if_it_has_a_cgroup2_mount` |
+| Стык проходит через продакшн-конструктор `ProcCgroupCheck::new()`, а не через свой вывод корня, и требует, чтобы выведённый корень совпал с тем, в котором создан probe | K | K `attach_join.rs::a_kernel_execve_of_a_shell_is_killed_by_the_signed_bundle` · K `attach_join.rs::a_kernel_openat_of_docker_sock_is_killed_by_the_signed_bundle` · K `attach_join.rs::a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted` · K `attach_join.rs::a_target_that_left_the_cgroup_is_refused_and_survives` |
+| Ни стадия, трогающая ядро, ни стадия стыка не могут пройти, не исполнившись: обе требуют строку-доказательство с дальнего конца attach и SIGKILL, а не только ненулевой счётчик passed | U | U `attach_live.rs::the_gate_must_not_be_compiled_out` · U `Jenkinsfile::BPF attach` · U `attach_join.rs::the_gate_must_not_be_compiled_out` · U `Jenkinsfile::BPF join` |
 | Продуктовая комбинация `attach,apiserver` линкуется под musl и не несёт program interpreter | U | U `Jenkinsfile::Agent binary` |
-| Оба поставляемых DaemonSet монтируют tracefs, и attach-манифест без него — находка FD026, а не предупреждение | U | U `lint_deploy.rs::an_attach_build_without_tracefs_is_a_finding` · U `lint_deploy.rs::an_emptydir_where_tracefs_belongs_is_still_a_finding` · U `lint_deploy.rs::the_tracefs_fixture_fails_on_that_rule_and_no_other` |
+| Оба поставляемых DaemonSet монтируют tracefs как hostPath типа `Directory`, и attach-манифест без такого монтирования — находка FD026, а не предупреждение | U | U `Jenkinsfile::Validate policies` · U `lint_deploy.rs::an_attach_build_without_tracefs_is_a_finding` · U `lint_deploy.rs::an_emptydir_where_tracefs_belongs_is_still_a_finding` · U `lint_deploy.rs::a_tracefs_hostpath_kubelet_would_create_is_still_a_finding` · U `lint_deploy.rs::the_tracefs_fixture_fails_on_that_rule_and_no_other` |
 | Манифест, называющий корень доверия дважды, — находка, а не молчаливое last-wins | U | U `lint_deploy.rs::a_trust_root_named_twice_is_a_finding` |
-| Soft `RLIMIT_MEMLOCK` поднимается до hard внутри самого `Bpf::load`, лимита не понижает и сообщает числа, а не вердикт | K+U | K `kernel.rs::raise_memlock_never_lowers_the_limit_and_reports_what_it_left` · U `kernel.rs::memlock_describe_reports_the_numbers_not_a_verdict` |
+| `attach_for_arch` поднимает soft `RLIMIT_MEMLOCK` до hard перед самим `Bpf::load` — это проверено на живом attach, а не только у функции: лимита не понижает и сообщает числа, а не вердикт | K+U | K `attach_live.rs::attach_raises_the_soft_memlock_it_loads_under` · K `kernel.rs::raise_memlock_never_lowers_the_limit_and_reports_what_it_left` · U `kernel.rs::memlock_describe_reports_the_numbers_not_a_verdict` |
 | `libc` есть в графе `ferrum-ebpf` только под `attach`, и детектор доказан в обе стороны | U | U `Jenkinsfile::Crate boundary` |
 | `rcgen` и `x509-parser` не попадают в графы admission и agent, и детектор доказан на `ferrum-cli` | U | U `Jenkinsfile::Crate boundary` |
 | Оба arch дают один вердикт на одних логических событиях, из записанных байтов | U | U `replay.rs::both_arches_reach_the_same_verdicts_on_the_same_logical_events` · U `replay.rs::recorded_fixture_records_still_produce_the_acceptance_verdicts` |
@@ -176,15 +196,37 @@
 | `DEG_DECODE_FAILURES` — записи не декодировались: их не видело ни одно правило | U | U `ferrum-agent/src/lib.rs::a_run_of_records_that_all_fail_to_decode_is_degraded_without_more_traffic` |
 | `DEG_LABELS_UNKNOWN` — неразрешённые label: правила применены fail-closed | U | U `ferrum-agent/src/lib.rs::unobserved_namespace_labels_do_not_skip_a_rule` |
 | `DEG_RING_DROPS` — дропы в ядре: записи, которых не видело ни одно правило | U | U `ferrum-agent/src/lib.rs::ring_drops_degrade_and_then_recover` |
-| `DEG_PATH_TRUNCATED` — путь не поместился: suffix-правило решено без байтов, которые называет | K+U | U `ferrum-agent/src/lib.rs::path_truncation_degrades_and_then_recovers` · U `replay.rs::a_truncated_docker_sock_path_still_kills_and_degrades` · K `attach_live.rs::a_long_path_arrives_as_a_flagged_head` |
+| `DEG_PATH_TRUNCATED` — путь не поместился: suffix-правило решено без байтов, которые называет | U | U `ferrum-agent/src/lib.rs::path_truncation_degrades_and_then_recovers` · U `replay.rs::a_truncated_docker_sock_path_still_kills_and_degrades` |
 | `DEG_IDENTITY_UNKNOWN` — cgroup, которую индекс не может назвать | U | U `replay.rs::a_cgroup_missing_from_the_index_is_counted_and_degrades` |
 | `DEG_LKG_PARTIAL` — узел энфорсит меньше, чем восстановленный подписанный снапшот | U | U `ferrum-agent/src/lib.rs::lkg_restore_drops_an_unmatchable_rule_instead_of_the_whole_snapshot` |
 | `DEG_CONTAINER_FLAG` — флаг контейнера расходится с индексом дольше окна старта пода | U | U `ferrum-agent/src/lib.rs::the_pod_start_window_does_not_latch_degraded` |
 | `DEG_STATUS_UNWRITABLE` — сама поверхность отчётности лежит | U | U `ferrum-agent/src/lib.rs::an_unwritable_status_dir_does_not_stop_the_tick` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` |
+| `SELF_TGID_UNPUBLISHED` — процесс не в host pid namespace, `notAgentSelf` не соблюсти; Degraded только под respond | U | U `ferrum-agent/src/lib.rs::a_namespaced_pid_is_not_published_as_the_agent_self` · U `ferrum-agent/src/lib.rs::the_shipped_observe_install_is_not_degraded_without_host_pid` |
+| `TARGET_CHECK_UNPROVABLE` — guard устаревшей цели вообще не построился: ни одна реакция на узле не может проверить цель | U | U `ferrum-agent/src/lib.rs::a_guard_that_cannot_be_computed_is_a_refusal_of_its_own_and_degrades` · U `ferrum-agent/src/lib.rs::an_observe_node_is_not_degraded_by_a_guard_it_never_reaches` |
+| `TARGET_NEVER_PROVEN` — respond включён и ни одна реакция ни разу не нашла цель в породившей запись cgroup | U | U `ferrum-agent/src/lib.rs::refusals_degrade_only_when_no_target_was_ever_proven` |
 
 `DEG_STATUS_UNWRITABLE` по устройству отстаёт на один тик: запись, которая
 не удалась, не может нести запись о собственном провале. Первый провалившийся
 тик всё ещё оставляет `degraded=false` на конвертах.
+
+Последние три причины намеренно не в семействе `DEG_*`: под observe guard,
+о котором они говорят, не достигается вовсе — отказ по роли возвращается
+раньше, — так что на поставляемой установке по умолчанию они были бы верны на
+каждом узле и не значили бы ни на одном ничего. `DEG_*` — это множество
+причин, верных при любой роли. Именование защитимо, а вот gate за ним не
+следовал: сканер читал только `lib.rs` и только префикс `DEG_`, поэтому эти
+три (и `SELF_TGID_UNPUBLISHED`, живущий здесь с цикла 7) были ему невидимы, а
+порог `>= 16` всё равно проходил. Теперь сканируется весь crate по префиксу и
+отдельно — тело `degraded_reasons_at` по константам, которые оно
+действительно кладёт в список, как бы они ни назывались.
+
+У `DEG_PATH_TRUNCATED` метка `K` снята. Стояла ссылка на
+`attach_live.rs::a_long_path_arrives_as_a_flagged_head`, но `ferrum-ebpf` не
+может сослаться ни на `Agent`, ни на `DEG_PATH_TRUNCATED`: тот тест measures
+запись, а не причину деградации. То же возражение уже было применено к
+цитате стыка и цитата откачена; здесь оно было пропущено. Само ядерное
+измерение усечённого пути никуда не делось — оно стоит строкой выше, в
+§D-строке `docker.sock -> kill`, где утверждение о нём и есть.
 
 ## Не делает
 
@@ -194,17 +236,38 @@
   `Agent image` теперь есть, но `docker build` не запускался ни разу: демона
   в этом контейнере нет, а достать его снаружи означало бы смонтировать
   `/var/run/docker.sock` — тот самый hostPath, на который FD006 даёт находку,
-  а runtime-правила убивают. Каждая команда *внутри* `Dockerfile` прогонялась
-  руками по отдельности; «образ собирается» — не то утверждение, которое это
+  а runtime-правила убивают. Команды *внутри* `Dockerfile` прогонялись руками
+  по отдельности — кроме проверки интерпретатора на `/ferrum-agent`,
+  добавленной в этом цикле: она читает бинарь, который существует только
+  внутри `docker build`. «Образ собирается» — не то утверждение, которое это
   дерево может сделать. `deploy/**` по-прежнему ссылается на
   `ghcr.io/ferrum/*:v0.1.0`, которых никто не публиковал.
-- **`ProcCgroupCheck::new()` зашивает корень cgroup2.** На гибридном узле
-  (cgroup2 в `/sys/fs/cgroup/unified` — как здесь) inode не сойдётся ни разу,
-  и **каждая** реакция откажет как по устаревшей цели, при том что
-  `is_degraded()` останется `false`: `REFUSE_STALE_TARGET` — не сигнал
-  деградации, потому что в здоровом случае он и есть правильное поведение.
-  Узел молча не энфорсит и способа это заметить у агента нет.
-  `attach_join.rs` читает точку монтирования из `mountinfo`; продакшн — нет.
+- **Заархивированный `dist/ferrum-agent` — не тот бинарь, что в образе.**
+  Стадия `Agent binary` линкует и фингерпринтит один; `docker build` линкует
+  внутри себя второй, из застэшенных исходников. Фингерпринт на артефакте про
+  второй не говорит ничего, поэтому проверка «musl без program interpreter»
+  теперь стоит в обоих местах, а не в одном. И `elf_inspect` в `Dockerfile`
+  никогда не открывал `/ferrum-agent` — заголовок файла год утверждал, что он
+  проверяет «две поставляемые файла»; он проверяет map layout ELF.
+  `.dockerignore` до этого цикла не стэшился: он приезжал из `checkout scm`,
+  то есть единственный файл, определяющий состав build context, приходил не из
+  того дерева, которое стадии тестировали.
+- **Гибридной иерархии cgroup здесь не было.** Прежний абзац на этом месте
+  утверждал, что `ProcCgroupCheck::new()` зашивает корень cgroup2, что на
+  гибридном узле каждая реакция откажет как по устаревшей цели при
+  `is_degraded() == false`, и что `mountinfo` читает только тест. Все три
+  утверждения теперь ложны, а последнее — обратно: вывод корня живёт в
+  `ferrum-k8smeta` (`cgroupfs.rs`), им пользуются и `ProcCgroupCheck::new()`,
+  и `spawn_cgroup_refresh` (один вывод на двоих: индекс производит те самые
+  inode, которые проверяет guard); неоднозначность и нечитаемый `mountinfo`
+  дают `Degraded`, а не догадку, и отката на константу нет; `is_degraded()`
+  больше не молчит — `TARGET_CHECK_UNPROVABLE` и `TARGET_NEVER_PROVEN`
+  разделяют «guard не построился» и «guard построился и ни разу не
+  подтвердился»; частная копия чтения `mountinfo` из `attach_join.rs` удалена.
+  Строки об этом стоят в «Делает». **Не проверено** ровно одно: сам гибридный
+  узел. Здесь cgroup2 — единственная иерархия, поэтому на ядре измерен только
+  unified-случай, а гибридный, разные суперблоки и нечитаемый `mountinfo` —
+  unit-тесты над синтетическим `mountinfo`.
 - **Ничего никогда не пинится.** `Loader::attach_pins` возвращает `Degraded`
   по построению. **Строка Tampering из RFC-02 §C отсутствует целиком, а не
   частично**: нет pin, нет LSM на pin path, нет self-watch вне процесса. Это
