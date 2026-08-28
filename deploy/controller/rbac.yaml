@@ -15,15 +15,25 @@ rules:
       - ferrumclusters
       - compliancesnapshots
     verbs: ["get", "list", "watch"]
+  # Only the status subresources something in this workspace actually writes.
+  # `policylibraries/status`, `ferrumclusters/status` and
+  # `compliancesnapshots/status` were granted here and written by nothing:
+  # `PolicyLibraryStatus`, `FerrumClusterStatus` and `ComplianceSnapshotStatus`
+  # are declared in `ferrum-api` and named by no source file of the controller,
+  # and `FerrumCluster` is not named anywhere in it at all. A granted status a
+  # controller never writes is not a quiet no-op — it reports the zero value of
+  # its own struct forever (`degraded: false` on a cluster that is down) and is
+  # indistinguishable from a healthy one, while the grant carrying it is a
+  # permission with no purpose, which this project's threat model calls a
+  # lateral-movement target. The alternative repair — giving `.degraded` its
+  # first writer — is not one function but an API-server client this workspace
+  # has never had.
   - apiGroups: ["ferrum.io"]
     resources:
       - clustersecuritypolicies/status
       - securitypolicies/status
       - policyexceptions/status
-      - policylibraries/status
       - runtimeprofiles/status
-      - ferrumclusters/status
-      - compliancesnapshots/status
     verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

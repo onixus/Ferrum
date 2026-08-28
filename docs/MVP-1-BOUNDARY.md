@@ -24,15 +24,28 @@
 `NOT_EXECUTED_SUBJECTS`; иначе вся секция могла бы состоять из прочерков при
 двух зелёных гейтах.
 
-**Гейт проверяет только одно направление.** Он требует, чтобы процитированное
-существовало; он не требует, чтобы существующее было процитировано. Это ровно
-то направление, в котором документ гниёт молча: слайс, который что-то доказал
-и не переписал свою строку, оставляет документ *занижающим* дерево, и ни одна
-сборка от этого не покраснеет. Цикл 9 наступил на это дважды — два слайса
-закрыли то, что здесь стояло в «Верим, но не доказано», и строки остались
-лежать. Единственный читатель этого направления — человек с `git log`, и он
-обязан быть таким же подозрительным к занижению, как к завышению: документ,
-который врёт в меньшую сторону, учит не верить документу.
+**Второе направление закрыто наполовину, и это первый цикл, когда оно вообще
+закрыто.** Гейт требовал, чтобы процитированное существовало, и не требовал,
+чтобы существующее было процитировано, — ровно то направление, в котором
+документ гниёт молча: слайс, который что-то доказал и не переписал свою строку,
+оставляет документ *занижающим* дерево, и ни одна сборка от этого не
+покраснеет. Цикл 9 наступил на это дважды.
+
+Механическую форму имеет один случай этого направления, и теперь он держится
+гейтом: каждый `#[test]` в `crates/ferrum-testkit/tests` и
+`crates/ferrum-agent/tests` обязан быть процитирован строкой «Делает» или
+назван в списке исключений с причиной. Эти два каталога выбраны не наугад: в
+них нет ничего, кроме гейтов, поэтому каждый тест там — утверждение о продукте,
+а не о функции. Тридцать пять тестов оказались непроцитированными в момент, когда
+гейт написали, и на все тридцать пять написаны строки; список исключений
+приземлился пустым и должен таким оставаться — засеять его тем, что не сходится,
+значит получить зелёное, ничего не проверив.
+
+Всё остальное в этом направлении по-прежнему не закрыто: «всё верное про этот
+продукт записано» механической формы не имеет. Единственный его читатель —
+человек с `git log`, и он обязан быть таким же подозрительным к занижению, как
+к завышению: документ, который врёт в меньшую сторону, учит не верить
+документу.
 
 ## Как читать колонку «Исполняется»
 
@@ -255,6 +268,96 @@
 измерение усечённого пути никуда не делось — оно стоит строкой выше, в
 §D-строке `docker.sock -> kill`, где утверждение о нём и есть.
 
+### Инвентарь субъектов
+
+Не перепись. Каждое перечисление в этом дереве — скан по префиксу `DEG_`,
+скан тела `degraded_reasons_at`, скан аргументов `mark_terminal_fault`,
+перепись счётчиков, `status.json` и таблица деградаций выше — идёт по
+`ferrum_agent::Agent`. У двух из трёх поставляемых бинарей нет ни
+`is_degraded()`, ни списка причин, ни поверхности статуса, поэтому попасть в
+любое из этих перечислений — в любую сторону — они не могут **по построению**.
+Перепись по списку, которого нет, полна пусто: это самое опасное состояние
+гейта, зелёное потому, что проверять нечего, и неотличимое от зелёного потому,
+что всё сходится.
+
+Завести `is_degraded()` у webhook, чтобы перепись стала возможной, было бы
+хуже дыры: это создало бы список причин, которому этому процессу негде
+публиковаться. Цикл 10 отказался ровно от этого хода, когда не стал привязывать
+`COUNTERS_WITHOUT_A_REASON` к этому документу. Поэтому здесь инвентарь: по
+строке на поставляемый бинарь, и ровно один канал в каждой — тот, по которому
+оператор узнаёт, что этот субъект сломан.
+
+Держат его три утверждения, а не скан: у каждого субъекта ровно один канал,
+канал достижим (строка цитирует то, что исполнялось), и канал несёт причину, а
+не константу — в единственной форме, которая решаема по дереву: ни один субъект
+не держит право записи в `<kind>/status`, которого ничто в нём не пишет.
+
+| Субъект | Канал | Метка | Исполняется |
+|---|---|---|---|
+| `ferrum-agent` | `status.json` и флаг `degraded` в конверте экспорта | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::a_degraded_node_that_changes_why_says_so` |
+| `ferrum-admission` | текст `message` в отказе — то, что видит человек, запустивший `kubectl` | U | U `webhook.rs::a_warm_watch_decides_and_a_cold_one_denies_with_the_cold_reason` · U `webhook.rs::unsigned_image_deny` |
+| `ferrum-controller` | код выхода и строка `error: <причина>` в stderr | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` |
+
+Строка контроллера — единственная, которая до этого цикла не проходила третье
+утверждение, и не тем каналом, который в ней стоит: `deploy/controller/rbac.yaml`
+выдавал право записи в `ferrumclusters/status`, а `FerrumCluster` не назван ни
+в одном файле контроллера. Починок было две — дать `.degraded` первого писателя
+или удалить грант. Удалён грант, и вместе с ним ещё два той же формы
+(`policylibraries/status`, `compliancesnapshots/status`): писатель — это не
+функция, а клиент к API server, которого в этом workspace не было никогда (см.
+«Ничто и никогда не обращалось к API server» ниже), а грант, которым никто не
+пользуется, — право без назначения, то есть цель бокового движения по threat
+model этого проекта. Канал контроллера — тот, который у него действительно
+есть: `run()` возвращает `Err(String)`, `main` печатает его как
+`error: <причина>` и выходит с 1.
+
+Чего инвентарь не делает: он не утверждает, что канал субъекта достаточен.
+У webhook нет ни последнего-известного-хорошего, ни списка причин; у
+контроллера канал существует ровно на время процесса и ничего не сообщает о
+том, что происходит между запусками. Строка «одна» здесь — это про то, что
+канал один и он назван, а не про то, что его хватает.
+
+### Гейты этого дерева
+
+Каждый `#[test]` в `crates/ferrum-testkit/tests` и `crates/ferrum-agent/tests`
+обязан стоять в какой-то строке этого документа. Это обратное направление
+гейта, закрытое впервые: раньше он требовал, чтобы процитированное
+существовало, и не мог потребовать, чтобы существующее было процитировано, —
+то направление, в котором документ гниёт молча. Оно закрыто только для этих
+двух каталогов, и это не произвол: в них нет ничего, кроме гейтов, поэтому
+каждый тест там — утверждение о продукте, а не о функции. Тридцать пять тестов
+были не процитированы в момент, когда гейт написали; ниже — строки, которыми
+на них ответили.
+
+| Утверждение | Метка | Исполняется |
+|---|---|---|
+| Набор §D закрыт с обеих сторон: случай нельзя уронить, оставив его без приёмочного теста или без сценария реплея | U | U `acceptance.rs::every_acceptance_case_has_a_test` · U `replay.rs::every_runtime_acceptance_case_has_a_replay_scenario` |
+| Каждый runtime-случай §D переигрывается из записанных байтов на обеих arch | U | U `replay.rs::runtime_acceptance_cases_replay_from_recorded_bytes` |
+| Освобождает агента от реакции на собственный `bpf()` флаг записи, а не строка `comm`: workload, назвавшийся `ferrum-agent`, освобождения не получает | U | U `replay.rs::agent_self_bpf_is_neither_denied_nor_signalled` |
+| Bundle с действием, которого runtime-плоскость не исполняет, грузится, и каждый матч экспортируется как неисполненное решение с причиной; `defaultAction: deny` тоже грузится | U | U `replay.rs::a_pre_gate_deny_bundle_loads_and_every_match_is_recorded` · U `action_gate.rs::a_signed_deny_default_still_installs` |
+| Хост-процесс, не помеченный контейнерным, мимо индекса cgroup — не деградация, а контейнерный — деградация | U | U `replay.rs::a_host_process_missing_from_the_index_is_not_a_degradation` · U `replay.rs::a_cgroup_missing_from_the_index_is_counted_and_degrades` |
+| Незнакомый syscall nr и битые записи считаются, деградируют узел и не останавливают цикл enforcement | U | U `replay.rs::an_unknown_syscall_nr_degrades_the_agent_without_stopping_the_loop` · U `replay.rs::corrupt_records_are_counted_and_the_loop_keeps_enforcing` |
+| Кодировщик bundle принимает ровно то, что принимает `ferrum-policy`, в обе стороны, и оба enum действий — одно множество | U | U `action_gate.rs::the_encoder_accepts_exactly_what_ferrum_policy_accepts` · U `action_gate.rs::the_two_action_enums_are_the_same_set` |
+| Loader отвергает kill-all и на живом пути, и на восстановлении LKG, и отказ не стирает уже работающую политику | U | U `action_gate.rs::the_loader_refuses_every_kill_all_and_keeps_the_inert_deny` · U `action_gate.rs::a_kill_all_default_refuses_the_snapshot_on_the_restore_path_too` · U `action_gate.rs::a_signed_kill_all_default_does_not_install_and_keeps_last_known_good` |
+| Self-approve waiver отвергают и CEL, и `ferrum-policy` | U | U `deploy_gate.rs::self_approve_is_rejected_in_cel_and_in_policy` |
+| Второй апрувер обязателен независимо от `fourEyes`, а минимальная длина `reason` в схеме — константа компилятора | U | U `deploy_gate.rs::a_waiver_without_a_second_approver_is_refused_by_the_schema_too` · U `deploy_gate.rs::the_minimum_reason_length_is_the_same_in_the_schema_and_in_policy` |
+| Потолок TTL в CEL — та же константа `ferrum-policy`, переведённая в часы, а не число, переписанное в YAML | U | U `deploy_gate.rs::the_cel_ttl_ceiling_is_the_policy_constant_in_hours` |
+| Пустой и дублированный id правила отвергает и схема: id — то, что waiver освобождает, а audit-запись обвиняет | U | U `deploy_gate.rs::a_blank_or_duplicated_rule_id_is_refused_by_the_schema_too` |
+| Границы длин `commIn`/`pathPrefix`/`pathSuffix` в схеме — границы datapath | U | U `deploy_gate.rs::the_match_length_bounds_in_the_schema_are_the_datapath_bounds` |
+| Ключ trust root, не являющийся 64 hex-символами Ed25519, отвергает и схема | U | U `deploy_gate.rs::a_public_key_that_is_not_ed25519_hex_is_refused_by_the_schema_too` |
+| Все шесть §D-фикстур проходят инвариантную копию, и bpf-строка называет только те syscall, которые datapath действительно цепляет | U | U `deploy_gate.rs::acceptance_fixtures_agree_with_the_invariant_copy` |
+| Поставляемое дерево проходит лит; плейсхолдер caBundle вне шаблона его роняет; выпущенный `gen-webhook-pki` PKI делает дерево применимым, а оставленный в нём `ca.key` — нет | U | U `deploy_gate.rs::deploy_tree_passes_the_lint` · U `deploy_gate.rs::a_committed_placeholder_ca_bundle_fails_the_lint` · U `deploy_gate.rs::issued_pki_makes_the_tree_applicable` |
+| Каждый crate с бинарём линкуется стадией, которая выдаёт объектный код; `cargo clippy` доказательством не считается | U | U `deploy_gate.rs::every_crate_with_a_binary_is_linked_by_a_stage_that_emits_object_code` |
+| Тег-половина замыкания образов открыта, и обе посылки, делающие её незакрываемой здесь, держатся тестом, а не doc-комментарием | U | U `deploy_gate.rs::the_tag_half_of_the_closure_is_open_and_says_why` |
+| Флаг, который даёт только cargo feature, вкомпилирован в образ, которому манифест его передаёт | U | U `deploy_gate.rs::a_flag_only_a_feature_provides_is_built_into_the_image_that_is_passed_it` |
+| Каждый non-default feature, который выбирает argv поставляемого манифеста, компилируется и как lint-таргет (`clippy --all-targets`), и как test-таргет: `cargo build` этого не засчитывает, потому что не компилирует ни одного тестового таргета, а `cargo tree` не компилирует вообще ничего | U | U `deploy_gate.rs::every_feature_a_manifest_selects_is_a_lint_and_test_target` · U `deploy_gate.rs::a_build_is_not_a_test_and_a_tree_is_not_a_compile` · U `Jenkinsfile::Clippy` · U `Jenkinsfile::Test` |
+| Манифест не может объявить `optional: true` на томе, обслуживающем путь, без которого бинарь не стартует, — FD028, находка, а не предупреждение; том, который бинарь действительно терпит, находкой не является | U | U `lint_deploy.rs::a_required_mount_declared_optional_is_a_finding` · U `lint_deploy.rs::the_webhooks_bundle_mount_is_the_same_finding` · U `lint_deploy.rs::an_optional_serving_certificate_is_a_finding_too` · U `lint_deploy.rs::a_mount_the_binary_tolerates_may_be_optional` · U `lint_deploy.rs::a_file_is_served_by_the_longest_mount_that_covers_it` |
+| Каждая цитата «Делает» разрешается в определение `fn` или в стадию, а список §D здесь — ровно `AcceptanceCase::ALL` | U | U `boundary_gate.rs::every_claim_in_the_does_section_cites_something_that_exists` · U `boundary_gate.rs::the_document_lists_exactly_the_rfc_d_cases` |
+| Каждая причина деградации, которую агент может объявить, названа здесь — по префиксу `DEG_`, по телу `degraded_reasons_at` и по аргументам `mark_terminal_fault` | U | U `boundary_gate.rs::every_degraded_reason_the_agent_can_raise_is_named_in_the_document` |
+| Обратное направление: каждый `#[test]` в `ferrum-testkit/tests` и `ferrum-agent/tests` процитирован строкой или назван в списке исключений с причиной, а список исключений пуст | U | U `boundary_gate.rs::every_gate_in_this_tree_is_cited_by_a_row` · U `boundary_gate.rs::a_test_is_found_under_its_attributes_and_a_plain_fn_is_not` · U `boundary_gate.rs::an_exemption_from_citation_is_named_one_at_a_time` |
+| У каждого поставляемого бинаря ровно один канал отказа, он достижим и несёт причину, а не константу | U | U `boundary_gate.rs::every_shipped_subject_has_one_reachable_channel_that_carries_a_cause` |
+| Грамматика ячейки закрыта: проза не доказательство, цитата разрешается в определение, а не в упоминание, прочерк — только у названного субъекта, а метка суммирует все цитаты строки | U | U `boundary_gate.rs::prose_is_not_evidence` · U `boundary_gate.rs::a_mention_of_a_test_is_not_a_definition_of_one` · U `boundary_gate.rs::only_a_named_subject_may_cite_nothing` · U `boundary_gate.rs::a_marker_summarises_every_citation_it_covers` |
+
 ## Не делает
 
 Плоские утверждения. Каждое проверено по дереву на этом коммите.
@@ -322,9 +425,16 @@
   частично**: нет pin, нет LSM на pin path, нет self-watch вне процесса. Это
   единственный класс threat model, у которого нет ни одной контрмеры.
 - **У `FerrumClusterStatus.degraded` нет ни одного писателя во всём
-  workspace**, при том что `deploy/controller/rbac.yaml` выдаёт права на
-  `ferrumclusters` и `ferrumclusters/status` — API, к которому никто не
-  обращается.
+  workspace**, и `FerrumCluster` не назван ни в одном файле контроллера. Грант
+  на `ferrumclusters/status` из `deploy/controller/rbac.yaml` убран — вместе с
+  `policylibraries/status` и `compliancesnapshots/status`, у которых та же
+  форма, — потому что статус, который никто не пишет, вечно сообщает нулевое
+  значение своей структуры (`degraded: false` на упавшем кластере) и неотличим
+  от здорового, а право, которым никто не пользуется, — цель бокового движения.
+  Право на чтение `ferrumclusters` и `compliancesnapshots` оставлено и тоже
+  никем не используется: это следующая находка той же формы, и она здесь
+  названа, а не починена. Держит это
+  `boundary_gate.rs::every_shipped_subject_has_one_reachable_channel_that_carries_a_cause`.
 - **`.status.rollout` на любой настоящей установке навсегда сообщает
   `clustersReady: 0`**: `deploy/controller/deployment.yaml` не передаёт
   `--cluster`, и `plan_rollout` всегда получает пустой срез. `deliver` и
@@ -359,7 +469,7 @@
 | API server отвергает `PolicyException` без `expiresAt` | envtest или kind с применённым CRD: применить объект и потребовать отказ | Не начато. Ближайшее исполненное — `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode`: он читает CRD из дерева, а не ответ apiserver |
 | Агент сам обнаруживает падение CP и переходит на last-known-good | Тест на watch-клиент с оборванным соединением, не `mark_control_plane_down()` | Не начато |
 | `--policy-name` действительно джойнит waiver с политикой | Имя политики в FRMB — смена формата, бамп ABI и bundle, который откажется грузить каждый развёрнутый агент | **Заявлено, не закрыто.** Агент объявляет себя Degraded, если держит waiver, ни один из которых не называет его политику, а FD024 проверяет развёрнутые объекты. Джойн в рантайме остаётся недоказанным |
-| `parse_flags` в `ferrum-agent` и `ferrum-admission` — одна и та же функция, а читатель в `lint_deploy` читает то же самое | Поднять в `ferrum-common` и оставить одну копию | **Заявлено, не закрыто.** Функция троирована: две копии дословные, третья повторяет их doc-комментарием и табличным тестом, механической связи нет. Архитектор оценил, что подъём в `ferrum-common` стоит зависимости в графе каждого crate ради связи, которую FD025 и так делает видимой как находку лита раньше |
+| Разбор argv в этом дереве — одна грамматика | Поднять разбор в `ferrum-common` и оставить одну копию | **Заявлено, не закрыто, и прежняя формулировка этой строки была неверна в трёх местах.** (1) «Стоит зависимости в графе каждого crate» — платить нечем: `ferrum-common` уже существует и уже стоит в зависимостях `ferrum-agent`, `ferrum-admission` **и** `ferrum-controller`. (2) «Две копии дословные» — нет: admission собирает позиционные аргументы для `review <file>` и несёт второе поле в `Flags`; совпадает только ветка флагов. (3) Грамматик не три, а четыре: `ferrum-controller/src/main.rs::parse_run` — не last-wins вовсе (`--cluster` накапливается, флаг на месте значения — ошибка, а не пустая строка, разбор возвращает `Result`, а не карту), при этом FD027 читает argv контроллера через `container_flag`, то есть семантикой агента. Сам рефакторинг всё равно не работа этого цикла: за ним не стоит дефекта, FD025 делает удвоенный флаг находкой раньше, а копия, которая имела бы значение, — в `ferrum-cli`, который от `ferrum-common` не зависит |
 | Пинов нет — и это заметно тому, кто снимет enforcement | LSM на pin path и self-watch вне процесса (RFC-02 §C, Tampering) | Не начато. Строка threat model закрыта нулём контрмер, и ни один сигнал `DEG_*` этого не назовёт |
 | `status.json` кто-то читает | Scrape config или acceptance-прогон, который делает `cat` | Файл — контракт, читателя в дереве нет |
 | Поведение на `aarch64` совпадает с измеренным на x86_64 | Стадия `BPF attach` на arm64-раннере | Не начато. Реплей обоих arch идёт из записанных байтов, не из ядра |

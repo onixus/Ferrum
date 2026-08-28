@@ -37,13 +37,20 @@
 //! could be resolved by the prose describing the test that used to carry it.
 //! The match is now anchored at the start of a line.
 //!
-//! And it is one-directional. It requires that what is cited exists; it does
-//! not — cannot — require that what exists is cited. So the document rots
-//! silently downward: a slice that proves something and does not rewrite its
-//! row leaves the boundary understating the tree, and no build turns red. That
-//! happened twice in cycle 9, to two rows this file had no way to notice. The
-//! only reader of that direction is a person with `git log`, which is why the
-//! document says so in its own words as well.
+//! It used to be one-directional, and that was the hole: requiring that what
+//! is cited exists says nothing about what exists and is not cited, so the
+//! document rotted silently *downward* — a slice that proved something and did
+//! not rewrite its row left the boundary understating the tree, and no build
+//! turned red. That happened twice in cycle 9, to two rows this file had no way
+//! to notice.
+//!
+//! One case of that direction is now closed, and only one: every `#[test]`
+//! under `CITED_TEST_DIRS` must be cited by a row or named in
+//! `UNCITED_TESTS` with a reason. Those two directories hold nothing but
+//! gates, so each test in them is a claim about the product — the kind of thing
+//! this document is a list of. The general form ("everything true about this
+//! product is written down") has no mechanical form and is still a human duty,
+//! which is why the document says so in its own words as well.
 
 use ferrum_testkit::AcceptanceCase;
 use std::collections::BTreeMap;
@@ -384,6 +391,384 @@ fn every_claim_in_the_does_section_cites_something_that_exists() {
     assert!(failures.is_empty(), "\n{}\n", failures.join("\n"));
 }
 
+/// The directories whose every `#[test]` the document must account for.
+///
+/// Not "every test in the workspace". A unit test beside the code it tests is
+/// an implementation detail of a crate, and requiring the boundary document to
+/// name each one would turn it into a test index nobody reads — the failure
+/// mode this file's own header warns about, arrived at from the other side.
+/// These two directories are different: they hold nothing but gates. Every
+/// file in them exists to establish a claim about the product rather than
+/// about a function, which is exactly the kind of claim this document is a
+/// list of. A test here that no row cites is either a claim the document is
+/// missing or a test that has stopped being about the product.
+const CITED_TEST_DIRS: [&str; 2] = ["crates/ferrum-testkit/tests", "crates/ferrum-agent/tests"];
+
+/// Tests in those directories that no row cites, each with the reason it is
+/// not a boundary claim.
+///
+/// Empty, and landed empty on purpose. Seeding this with everything currently
+/// uncited would make the gate pass on the day it was written and prove
+/// nothing afterwards — "green having run almost nothing", the shape cycle 10
+/// closed twice for the kernel stages, aimed at a document. Making the rule a
+/// warning instead would be the same thing wearing a different hat. So the
+/// thirty-five tests this gate found uncited were answered with rows, and this
+/// list is what a *future* test that genuinely is not a boundary claim goes
+/// into — with a sentence, one entry at a time, the way `NOT_EXECUTED_SUBJECTS`
+/// works above.
+const UNCITED_TESTS: [(&str, &str); 0] = [];
+
+/// Every `#[test]` in `text`, by the name of the function under the attribute.
+///
+/// Attributes stack — `#[test]` then `#[ignore]`, or a `#[cfg_attr(...)]`
+/// between them — so the scan walks forward to the first `fn` rather than
+/// assuming the next line is one.
+fn tests_in(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim() != "#[test]" {
+            continue;
+        }
+        for candidate in lines.iter().skip(i + 1) {
+            let mut rest = candidate.trim_start();
+            if rest.starts_with('#') {
+                continue;
+            }
+            while let Some(modifier) = FN_MODIFIERS.iter().find(|m| rest.starts_with(**m)) {
+                rest = &rest[modifier.len()..];
+            }
+            let Some(rest) = rest.strip_prefix("fn ") else {
+                break;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.push(name);
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// The other direction, closed for the first time: every gate in this tree is
+/// cited by a row.
+///
+/// The header of this file says the gate is one-directional and says why that
+/// matters — a slice that proves something and does not rewrite its row leaves
+/// the document *understating* the tree, and no build turns red. That is not
+/// closable in general: "everything true about this product is written down"
+/// has no mechanical form. One case of it is. A `#[test]` under
+/// `CITED_TEST_DIRS` is a claim about the product that somebody executed, and
+/// requiring each one to appear in a row converts "the document understates the
+/// tree" from a human duty into a build failure — the same trick
+/// `COUNTERS_WITHOUT_A_REASON` plays on the counters, aimed at the document.
+///
+/// What it still cannot do, and this is the same limit as the forward
+/// direction: it checks that the *name* appears in a citation, not that the row
+/// carrying it describes what the test asserts. A row that cites a test and
+/// then says something else about it satisfies both directions. And it says
+/// nothing at all about the unit tests beside the code, which is most of them.
+#[test]
+fn every_gate_in_this_tree_is_cited_by_a_row() {
+    let doc = document();
+    let root = repo_root();
+    let crates = root.join("crates");
+    let mut sources = Vec::new();
+    rs_files(&crates, &mut sources);
+
+    // What the document cites, resolved to the file each citation names, so a
+    // name cited against another file does not answer for this one.
+    let mut cited: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    for row in rows(&doc).iter().filter(|r| r.section == DOES_HEADING) {
+        let Some(evidence) = row.cells.last() else {
+            continue;
+        };
+        let Ok(citations) = parse_evidence(evidence) else {
+            // The forward gate is what reports an unparseable cell; reporting
+            // it twice would name the same defect from two tests.
+            continue;
+        };
+        for citation in citations {
+            if citation.source == "Jenkinsfile" {
+                continue;
+            }
+            if let Ok(path) = resolve(&citation.source, &sources, &crates) {
+                cited.entry(path).or_default().push(citation.name);
+            }
+        }
+    }
+
+    let mut found = 0usize;
+    let mut orphans: Vec<String> = Vec::new();
+    for dir in CITED_TEST_DIRS {
+        let dir = root.join(dir);
+        assert!(
+            dir.is_dir(),
+            "{} is not a directory: this gate would scan nothing and pass",
+            dir.display()
+        );
+        let mut files = Vec::new();
+        rs_files(&dir, &mut files);
+        files.sort();
+        for file in files {
+            let body = fs::read_to_string(&file).expect("test source");
+            let empty = Vec::new();
+            let names = cited.get(&file).unwrap_or(&empty);
+            for test in tests_in(&body) {
+                found += 1;
+                if names.contains(&test) || UNCITED_TESTS.iter().any(|(n, _)| *n == test) {
+                    continue;
+                }
+                orphans.push(format!(
+                    "  {}::{test}",
+                    file.strip_prefix(&root).unwrap_or(&file).display()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        found > 40,
+        "this gate found {found} #[test] items under {CITED_TEST_DIRS:?}; there were \
+         seventy-seven when the floor was written, so the scan is broken rather than the \
+         tree, and 'nothing is uncited' would be true for the wrong reason"
+    );
+    assert!(
+        orphans.is_empty(),
+        "these gates exist and no row of «Делает» cites them:\n{}\n\
+         A test nobody cites is a claim the document does not make: the boundary then \
+         understates the tree, which is the direction it rots in silently and the one no \
+         other check here can see. Write the row. If a test genuinely is not a claim about \
+         the product, name it in UNCITED_TESTS with the sentence saying why — one at a \
+         time, never as a batch to get this green.",
+        orphans.join("\n")
+    );
+}
+
+/// The heading of the subject inventory table, and the one column that is not
+/// evidence.
+const INVENTORY_HEADING: &str = "### Инвентарь субъектов";
+
+/// A `<resource>/status` a manifest may grant, and the type in `ferrum-api`
+/// whose presence in a subject's sources is what writing it looks like here.
+///
+/// Both policy kinds share `PolicyStatus`, which is why this is a table and
+/// not a name transformation.
+const STATUS_TYPES: [(&str, &str); 7] = [
+    ("clustersecuritypolicies/status", "PolicyStatus"),
+    ("securitypolicies/status", "PolicyStatus"),
+    ("policyexceptions/status", "PolicyExceptionStatus"),
+    ("policylibraries/status", "PolicyLibraryStatus"),
+    ("runtimeprofiles/status", "RuntimeProfileStatus"),
+    ("ferrumclusters/status", "FerrumClusterStatus"),
+    ("compliancesnapshots/status", "ComplianceSnapshotStatus"),
+];
+
+/// Every crate a manifest under `deploy/` asks the cluster to run, by the
+/// `image:` lines that name them.
+fn shipped_subjects(root: &Path) -> BTreeMap<String, ()> {
+    let mut files = Vec::new();
+    yaml_files(&root.join("deploy"), &mut files);
+    let mut out = BTreeMap::new();
+    for file in files {
+        let body = fs::read_to_string(&file).expect("manifest");
+        for line in body.lines() {
+            let Some(reference) = line.trim().strip_prefix("image:") else {
+                continue;
+            };
+            let reference = reference.trim().trim_matches('"');
+            let repo = match reference.rfind(':') {
+                Some(colon) if colon > reference.rfind('/').unwrap_or(0) => &reference[..colon],
+                _ => reference,
+            };
+            if let Some(name) = repo.rsplit('/').next() {
+                out.insert(name.to_string(), ());
+            }
+        }
+    }
+    out
+}
+
+fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            yaml_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "yaml") {
+            out.push(path);
+        }
+    }
+}
+
+/// Every shipped binary has exactly one channel through which an operator
+/// learns it is broken, that channel is reached by something executed, and no
+/// subject holds a grant on a second channel it never writes.
+///
+/// Deliberately not a census. Every other enumeration in this tree — the
+/// `DEG_*` prefix scan, the `degraded_reasons_at` body scan, the
+/// `mark_terminal_fault` argument scan, the counter census, `status.json`, the
+/// degradation table above — runs over `ferrum_agent::Agent`. Two of the three
+/// shipped binaries have no `is_degraded()`, no reason list and no status
+/// surface, so they cannot appear in any of those in either direction, *by
+/// construction*: a census over a list that does not exist is vacuously
+/// complete, which is the most dangerous state a gate can be in — green because
+/// there is nothing to check, and indistinguishable from green because
+/// everything checks out.
+///
+/// Inventing `is_degraded()` for the webhook to make a census possible would be
+/// worse than the gap: it would create a reason list that process has nowhere
+/// to publish, and cycle 10 was right to refuse the same move when it declined
+/// to tie `COUNTERS_WITHOUT_A_REASON` to this document. So the instrument is an
+/// inventory, and three assertions that need no reason list:
+///
+/// 1. one row per shipped binary, and exactly one — a subject with two channels
+///    has one an operator does not read, and a subject with none is invisible;
+/// 2. the channel is reachable — the row cites something that ran;
+/// 3. the channel carries a cause rather than a constant, in the one form that
+///    is decidable from the tree: no subject may hold a write grant on a
+///    `<kind>/status` that nothing in it writes. A granted status subresource
+///    with no writer is a second channel that reports the zero value of its own
+///    struct forever, and it is indistinguishable from a healthy one.
+///
+/// `FerrumClusterStatus.degraded` was exactly that: `deploy/controller/rbac.yaml`
+/// granted `ferrumclusters/status` and no source file in the workspace names
+/// `FerrumCluster` at all. Two repairs were available — give `.degraded` its
+/// first writer, or delete the grant — and the grant was deleted: the writer is
+/// not one function but an API-server client this workspace has never had (see
+/// «Ничто и никогда не обращалось к API server» in the document), while a grant
+/// nobody exercises is a permission with no purpose, which this project's threat
+/// model calls a lateral-movement target.
+#[test]
+fn every_shipped_subject_has_one_reachable_channel_that_carries_a_cause() {
+    let doc = document();
+    let root = repo_root();
+    let subjects = shipped_subjects(&root);
+    assert!(
+        subjects.len() >= 3,
+        "found {} image: references under deploy/; this gate would compare the inventory \
+         against nothing",
+        subjects.len()
+    );
+
+    // 1. One row per shipped binary, and no others.
+    let mut listed: BTreeMap<String, usize> = BTreeMap::new();
+    for row in rows(&doc) {
+        if row.section != DOES_HEADING {
+            continue;
+        }
+        let Some(first) = row.cells.first() else {
+            continue;
+        };
+        let subject = first.trim().trim_matches('`').to_string();
+        if subjects.contains_key(&subject) {
+            *listed.entry(subject).or_insert(0) += 1;
+        }
+    }
+    let missing: Vec<&String> = subjects
+        .keys()
+        .filter(|s| !listed.contains_key(*s))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{INVENTORY_HEADING} names no channel for {missing:?}. A binary with no row is a \
+         subject nobody can learn is broken, and the degradation table above cannot see it: \
+         every scan behind that table runs over ferrum_agent::Agent, which these processes \
+         are not."
+    );
+    let twice: Vec<&String> = listed
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(s, _)| s)
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "{twice:?} carry more than one row in «Делает» keyed on the subject name. One \
+         channel per subject: a second one is a channel an operator does not read."
+    );
+
+    // 2. Reachable: the inventory row cites something. The forward gate is
+    //    what resolves the citation; this is what refuses a dash.
+    let mut in_inventory = false;
+    let mut checked = 0usize;
+    for line in doc.lines() {
+        if line.starts_with("###") {
+            in_inventory = line.trim_end() == INVENTORY_HEADING;
+            continue;
+        }
+        if !in_inventory || !is_table_line(line) {
+            continue;
+        }
+        let cells = cells_of(line);
+        if is_separator_row(&cells) || cells.len() < 4 {
+            continue;
+        }
+        let subject = cells[0].trim().trim_matches('`').to_string();
+        if !subjects.contains_key(&subject) {
+            continue;
+        }
+        let citations = parse_evidence(&cells[cells.len() - 1])
+            .unwrap_or_else(|why| panic!("{subject}: {why}"));
+        assert!(
+            !citations.is_empty(),
+            "{subject} names a channel and cites nothing that reaches it. A channel nothing \
+             has ever produced is a channel an operator will read for the first time during \
+             an incident."
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked,
+        subjects.len(),
+        "the inventory table under {INVENTORY_HEADING} was read for {checked} of the \
+         {} shipped subjects; either the heading moved or the table shape changed, and \
+         this half asserted nothing",
+        subjects.len()
+    );
+
+    // 3. A cause rather than a constant: no granted status subresource that
+    //    nothing writes.
+    let rbac = fs::read_to_string(root.join("deploy/controller/rbac.yaml")).expect("rbac.yaml");
+    let mut sources = Vec::new();
+    rs_files(&root.join("crates/ferrum-controller/src"), &mut sources);
+    let written: String = sources
+        .iter()
+        .map(|p| fs::read_to_string(p).expect("controller source"))
+        .collect();
+    let mut dead = Vec::new();
+    for (resource, status_type) in STATUS_TYPES {
+        let granted = rbac
+            .lines()
+            .any(|l| l.trim().trim_start_matches("- ").trim_matches('"') == resource);
+        if granted && !written.contains(status_type) {
+            dead.push(format!("  {resource} (nothing names {status_type})"));
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "deploy/controller/rbac.yaml grants write on these status subresources and no source \
+         file of ferrum-controller writes one:\n{}\nA status nobody writes reports the zero \
+         value of its own struct forever — `degraded: false` on a cluster that is down — and \
+         the grant that carries it is a permission with no purpose, which the threat model \
+         calls a lateral-movement target. Either write it, or delete the grant.",
+        dead.join("\n")
+    );
+    // The positive control. Every check above is an absence, and an absence is
+    // also what a renamed resource list, a reworked rbac.yaml or a typo in
+    // STATUS_TYPES produces.
+    assert!(
+        rbac.contains("policyexceptions/status") && written.contains("PolicyExceptionStatus"),
+        "the pair this scan is calibrated on is gone: it can no longer tell a granted \
+         status with a writer from one without, so the loop above proved nothing"
+    );
+}
+
 /// The §D case list in the document is `AcceptanceCase::ALL` and nothing else.
 /// Same gate `acceptance.rs` and `replay.rs` already run against their own
 /// coverage, applied to the document: a case cannot be quietly dropped from
@@ -667,6 +1052,55 @@ mod grammar {
             "adding a subject that may claim nothing is a deliberate act; state the reason \
              beside the constant and update this count"
         );
+    }
+
+    /// The reader under the reverse direction, on a file whose answer is
+    /// known. "No test is uncited" is also what a `tests_in` that has stopped
+    /// finding tests reports, and that failure is invisible: the gate goes
+    /// green having scanned nothing.
+    #[test]
+    fn a_test_is_found_under_its_attributes_and_a_plain_fn_is_not() {
+        let body = "#[test]\nfn plain() {}\n\
+                    \x20   #[test]\n    #[ignore = \"needs a kernel\"]\n    fn indented_and_ignored() {}\n\
+                    #[test]\n#[cfg_attr(miri, ignore)]\npub fn attributed() {}\n\
+                    fn not_a_test() {}\n\
+                    // #[test] in a comment\n";
+        assert_eq!(
+            tests_in(body),
+            vec!["plain", "indented_and_ignored", "attributed"]
+        );
+        assert!(
+            !tests_in(body).contains(&"not_a_test".to_string()),
+            "a bare fn is not a test, and counting one would let this gate demand a row \
+             for every helper in the file"
+        );
+        // `#[ignore]` does not exempt a test from needing a row. A gate whose
+        // claim is written down and never runs is worse than one that is
+        // absent: the document says the tree proves something and nothing does.
+        assert!(tests_in("#[test]\n#[ignore]\nfn skipped() {}\n").contains(&"skipped".to_string()));
+    }
+
+    /// Adding an exemption is a deliberate act, like `NOT_EXECUTED_SUBJECTS`.
+    ///
+    /// The list landed empty and must not be filled to make the gate pass:
+    /// seeding it with everything currently uncited is the "green having run
+    /// almost nothing" shape, and this count is what makes growing it show up
+    /// in a diff as its own decision.
+    #[test]
+    fn an_exemption_from_citation_is_named_one_at_a_time() {
+        assert!(
+            UNCITED_TESTS.len() <= 3,
+            "{} tests are exempt from needing a row. The exemption list is for the rare \
+             test that is not a claim about the product; a list this long means the \
+             document stopped tracking the tree and this gate stopped noticing.",
+            UNCITED_TESTS.len()
+        );
+        for (name, why) in UNCITED_TESTS {
+            assert!(
+                why.len() > 30,
+                "{name} is exempt with no reason worth reading: {why:?}"
+            );
+        }
     }
 
     #[test]

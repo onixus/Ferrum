@@ -1189,17 +1189,25 @@ mod build_closure {
         out
     }
 
-    /// One cargo invocation that leaves object code behind, and the features it
-    /// leaves it under.
-    struct CargoLink {
+    /// One cargo invocation naming one package: what it does to that package,
+    /// under which features, and whether it was asked for every target.
+    ///
+    /// The subcommand is kept rather than filtered away at parse time because
+    /// the difference between them *is* the finding this file exists for.
+    /// `build` links a `[[bin]]` and compiles no test target; `clippy` stops at
+    /// `.rmeta` and links nothing; `tree` resolves a graph and compiles
+    /// nothing at all. A crate can be named by all three and still have never
+    /// had a test compiled under the feature it ships in.
+    struct CargoRun {
+        subcommand: String,
         package: String,
         features: BTreeSet<String>,
+        all_targets: bool,
     }
 
-    /// `build` and `run` link; `clippy`, `check`, `tree` and `fmt` do not, and
-    /// `test` links a harness rather than the `[[bin]]` a manifest names. Only
-    /// the first two are evidence that a shipped binary exists.
-    fn cargo_links(script: &str, lang: Lang) -> Vec<CargoLink> {
+    /// Every `cargo <subcommand> ... -p <package>` in a script, one entry per
+    /// package named.
+    fn cargo_runs(script: &str, lang: Lang) -> Vec<CargoRun> {
         let mut out = Vec::new();
         for line in joined_lines(script, lang) {
             let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -1207,12 +1215,13 @@ mod build_closure {
                 continue;
             };
             // `cargo +nightly build`: the toolchain sits between the two.
-            let subcommand = tokens[start + 1..].iter().find(|t| !t.starts_with('+'));
-            if !matches!(subcommand, Some(&"build") | Some(&"run")) {
+            let Some(subcommand) = tokens[start + 1..].iter().find(|t| !t.starts_with('+')) else {
                 continue;
-            }
+            };
+            let subcommand = (*subcommand).to_string();
             let mut packages = Vec::new();
             let mut features = BTreeSet::new();
+            let mut all_targets = false;
             let mut i = start;
             while i < tokens.len() {
                 let token = tokens[i];
@@ -1228,17 +1237,42 @@ mod build_closure {
                     }
                 } else if let Some(value) = token.strip_prefix("--features=") {
                     add_features(value, &mut features);
+                } else if token == "--all-targets" {
+                    all_targets = true;
                 }
                 i += 1;
             }
             for package in packages {
-                out.push(CargoLink {
+                out.push(CargoRun {
+                    subcommand: subcommand.clone(),
                     package,
                     features: features.clone(),
+                    all_targets,
                 });
             }
         }
         out
+    }
+
+    /// One cargo invocation that leaves object code behind, and the features it
+    /// leaves it under.
+    struct CargoLink {
+        package: String,
+        features: BTreeSet<String>,
+    }
+
+    /// `build` and `run` link; `clippy`, `check`, `tree` and `fmt` do not, and
+    /// `test` links a harness rather than the `[[bin]]` a manifest names. Only
+    /// the first two are evidence that a shipped binary exists.
+    fn cargo_links(script: &str, lang: Lang) -> Vec<CargoLink> {
+        cargo_runs(script, lang)
+            .into_iter()
+            .filter(|run| run.subcommand == "build" || run.subcommand == "run")
+            .map(|run| CargoLink {
+                package: run.package,
+                features: run.features,
+            })
+            .collect()
     }
 
     fn add_features(value: &str, out: &mut BTreeSet<String>) {
@@ -1858,6 +1892,204 @@ mod build_closure {
         assert!(payload_of(&unbuilt, "ferrum-admission").is_err());
     }
 
+    /// The flags a shipped manifest passes that only a non-default cargo
+    /// feature answers, and the feature each one selects.
+    ///
+    /// Read as: applying `deploy/` asks for a binary built with this feature.
+    /// Both gates below start here — the image must be built with it, and the
+    /// crate must be linted and tested with it — because the two failures are
+    /// the same one seen from different ends.
+    ///
+    /// - `--apiserver` (`ferrum-admission`) reaches a `die()` without the
+    ///   feature: the webhook CrashLoopBackOffs on a node.
+    /// - `--bpf-elf` (`ferrum-agent`) is *quieter* without `attach`, and worse
+    ///   for it: the flag is simply not read, and the agent runs with no
+    ///   datapath rather than refusing to start.
+    /// - `--node` (`ferrum-agent`) opens the pod watch that fills the cgroup
+    ///   index. Without `apiserver` the index stays empty, nothing is flagged
+    ///   as a container and no kill can pass its guards.
+    const FEATURE_FLAGS: [(&str, &str); 3] = [
+        ("--apiserver", "apiserver"),
+        ("--bpf-elf", "attach"),
+        ("--node", "apiserver"),
+    ];
+
+    /// The crate a manifest's `image:` names, by the convention this file
+    /// already rests on twice above: the last path segment of the repository is
+    /// the crate name, and
+    /// `each_image_is_built_from_a_dockerfile_that_links_its_own_crate` is what
+    /// holds that convention to the Dockerfiles.
+    fn crate_of(image: &str) -> String {
+        let repo = image_repo(image);
+        repo.rsplit('/').next().unwrap_or(&repo).to_string()
+    }
+
+    /// Every non-default feature a shipped manifest selects is compiled as a
+    /// lint target and as a test target.
+    ///
+    /// The `.rmeta` finding one notch further down. Cycle 9 established that
+    /// `cargo clippy` is not a link; this establishes that `cargo build` is not
+    /// a test, and that neither of them is the other. Three subcommands name a
+    /// crate in this pipeline and each proves a different, smaller thing:
+    ///
+    ///   * `cargo tree` resolves a dependency graph and compiles nothing;
+    ///   * `cargo build --features X` links the `[[bin]]` and compiles no test
+    ///     target — `#[cfg(test)]` code and `tests/*.rs` are not in that build
+    ///     at all;
+    ///   * `cargo clippy --features X` without `--all-targets` skips the test
+    ///     targets for the same reason, and stops at `.rmeta` besides.
+    ///
+    /// `ferrum-admission --features apiserver` was named by two `cargo build`
+    /// stages and one `cargo tree` loop, and by no clippy line and no test
+    /// line. `cargo test --workspace` runs default features and `apiserver` is
+    /// `default = []`. So the crate carrying three of the eight section D
+    /// acceptance cases had, in the only configuration it ships in, zero tests
+    /// compiled and zero lints run — which is how `WatchedLabels`, the whole
+    /// subject of cycle 10's admission slice, reached the end of that cycle
+    /// with no test at all. A binary that links is not a crate that is tested.
+    ///
+    /// What this cannot do, said here rather than left to be read into it: a
+    /// `cargo test -p X --features Y --test one_target` satisfies the test
+    /// half, which is narrower than the whole target set — and that is exactly
+    /// how `ferrum-agent --features attach,apiserver` is satisfied, by the
+    /// kernel stage. The gate requires that *a* test target is compiled under
+    /// the feature, not that every one is.
+    #[test]
+    fn every_feature_a_manifest_selects_is_a_lint_and_test_target() {
+        let root = repo_root();
+        let containers = deploy_containers(&root);
+        assert!(
+            !containers.is_empty(),
+            "no container with an image: was found under deploy/, so this gate cannot see \
+             which features the install asks for and proves nothing"
+        );
+        let runs = cargo_runs(&jenkinsfile(&root), Lang::Groovy);
+        assert!(
+            !runs.is_empty(),
+            "no `cargo ... -p <crate>` was found in the Jenkinsfile, so this gate cannot \
+             see what the pipeline compiles and proves nothing"
+        );
+
+        // What the install asks for: (crate, feature), from the manifests' own
+        // argv and the image each container names.
+        let mut wanted: BTreeSet<(String, String)> = BTreeSet::new();
+        for container in &containers {
+            for (flag, feature) in FEATURE_FLAGS {
+                if container.args.iter().any(|a| a == flag) {
+                    wanted.insert((crate_of(&container.image), feature.to_string()));
+                }
+            }
+        }
+        assert!(
+            !wanted.is_empty(),
+            "no container in deploy/ passes any of the feature-gated flags in FEATURE_FLAGS, \
+             so this gate asserted nothing. Either the flags moved, or the manifest scan \
+             stopped seeing argv."
+        );
+
+        let satisfies = |run: &CargoRun, krate: &str, feature: &str| {
+            run.package == krate && run.features.contains(feature)
+        };
+        let mut missing = Vec::new();
+        for (krate, feature) in &wanted {
+            let linted = runs.iter().any(|run| {
+                run.subcommand == "clippy" && run.all_targets && satisfies(run, krate, feature)
+            });
+            let tested = runs
+                .iter()
+                .any(|run| run.subcommand == "test" && satisfies(run, krate, feature));
+            if !linted {
+                missing.push(format!(
+                    "  {krate} --features {feature}: no `cargo clippy -p {krate} --features \
+                     ...{feature}... --all-targets` line. Without --all-targets clippy skips \
+                     every test target, and a `cargo build` of the same combination compiles \
+                     none of them at all."
+                ));
+            }
+            if !tested {
+                missing.push(format!(
+                    "  {krate} --features {feature}: no `cargo test -p {krate} --features \
+                     ...{feature}...` line. `cargo test --workspace` is default features and \
+                     this feature is not one; `cargo build --features {feature}` links the \
+                     binary and compiles no test target; `cargo tree` compiles nothing."
+                ));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "deploy/ asks for these features and the pipeline neither lints nor tests \
+             them:\n{}\nA binary that links is not a crate that is tested: \
+             `ferrum-admission --features apiserver` passed CI for cycles on two `cargo \
+             build` stages and a `cargo tree` loop, with no test ever compiled under the \
+             feature it ships in.",
+            missing.join("\n")
+        );
+    }
+
+    /// The reader under the gate above, on inputs whose answer is known.
+    ///
+    /// "Nothing is missing" is also what a `cargo_runs` that has stopped
+    /// telling the subcommands apart reports, and telling them apart is the
+    /// entire claim. `build` and `tree` must not be able to satisfy either
+    /// half, and a clippy line without `--all-targets` must not satisfy the
+    /// lint half.
+    #[test]
+    fn a_build_is_not_a_test_and_a_tree_is_not_a_compile() {
+        let one = |line: &str| {
+            let runs = cargo_runs(line, Lang::Groovy);
+            assert_eq!(runs.len(), 1, "{line:?} parsed as {} runs", runs.len());
+            runs.into_iter().next().expect("one run")
+        };
+
+        let built = one("cargo build --release -p ferrum-admission --features apiserver");
+        assert_eq!(built.subcommand, "build");
+        assert!(built.features.contains("apiserver"));
+        assert!(
+            !built.all_targets,
+            "a `cargo build` compiles no test target, and reading one as --all-targets would \
+             let the finding this gate exists for pass again"
+        );
+
+        let treed = one("cargo tree -p ferrum-admission -e normal --features apiserver");
+        assert_eq!(
+            treed.subcommand, "tree",
+            "`cargo tree` resolves a graph and compiles nothing; counting it as either half \
+             is a gate that is green because nothing ran"
+        );
+
+        let checked = one("cargo clippy -p ferrum-admission --features apiserver -- -D warnings");
+        assert_eq!(checked.subcommand, "clippy");
+        assert!(
+            !checked.all_targets,
+            "without --all-targets clippy skips the test targets, which is the half of this \
+             finding that is not about linking"
+        );
+
+        let full = one(
+            "cargo clippy -p ferrum-admission --features apiserver --all-targets -- -D warnings",
+        );
+        assert!(full.all_targets);
+
+        let tested = one("cargo test -p ferrum-admission --features apiserver");
+        assert_eq!(tested.subcommand, "test");
+        assert!(tested.features.contains("apiserver"));
+
+        // The comment forms the rest of this file already refuses, on this
+        // reader too: prose about a test is not a test.
+        assert!(
+            cargo_runs(
+                "// cargo test -p ferrum-admission --features apiserver",
+                Lang::Groovy
+            )
+            .is_empty(),
+            "a commented-out test line must not satisfy this gate"
+        );
+        // The `--features=a,b` spelling, which the Jenkinsfile does not use
+        // today and which must not silently stop being read if it starts to.
+        let joined = one("cargo test -p ferrum-agent --features=attach,apiserver");
+        assert!(joined.features.contains("attach") && joined.features.contains("apiserver"));
+    }
+
     /// A flag a manifest passes that only a cargo feature provides is built into
     /// the image that is passed it.
     ///
@@ -1870,8 +2102,6 @@ mod build_closure {
     /// Dockerfile that builds the image the manifest names.
     #[test]
     fn a_flag_only_a_feature_provides_is_built_into_the_image_that_is_passed_it() {
-        const FEATURE_FLAGS: [(&str, &str); 1] = [("--apiserver", "apiserver")];
-
         let root = repo_root();
         let containers = deploy_containers(&root);
         let builds = docker_builds(&jenkinsfile(&root), Lang::Groovy);
