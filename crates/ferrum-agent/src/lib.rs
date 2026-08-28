@@ -289,6 +289,49 @@ pub const DEG_LKG_PARTIAL: &str =
 pub const DEG_CONTAINER_FLAG: &str =
     "container flag disagreement outlived its publish window: the datapath is not flagging \
      containers the index knows";
+/// The bundle mount is there and will not stat: EACCES after a remount, EIO,
+/// ELOOP, a `..data` symlink that resolves to nothing, or a directory where
+/// the file belongs.
+///
+/// Not `DEG_LOADER`, which is "a bundle was offered and refused" — a signature
+/// that did not verify, an ABI this build does not speak — and whose repair is
+/// to republish the PolicyBundle. This is "no bundle has been offered at all
+/// since the stat started failing", and its repair is on the node: the mount.
+/// The two share nothing but the word bundle, and a node that answers them
+/// with one name sends the operator to the wrong half of the system. Until
+/// this reason existed the second fault had no surface at all: the poll loop
+/// read an unreadable mount as an unchanged one, so the node stopped taking
+/// policy for the rest of the process lifetime while every counter it
+/// publishes read healthy.
+///
+/// Not latched: the next stat that answers — with a bundle or with ENOENT —
+/// clears it, so a remount recovers the node without a restart.
+pub const DEG_BUNDLE_UNREADABLE: &str =
+    "bundle mount unreadable: the bundle path is present and will not stat, so no policy update \
+     can reach this node and none has been refused either";
+/// The node clock moved backwards under the monotonic floor.
+///
+/// Its own reason, not `DEG_DATAPATH`. That one is "a record carried a syscall
+/// nr this build cannot name" — a decision path that refuses records — and an
+/// operator who reads it goes to look at the ring buffer. A rollback is a
+/// different fault with a different repair: the input to every `expiresAt`
+/// comparison on this node moved, so expired waivers can come back and live
+/// ones can expire early, and what is broken is the node's time source. Two
+/// unrelated faults may not share one name.
+pub const DEG_CLOCK_ROLLBACK: &str =
+    "node clock moved backwards under the monotonic floor: waiver expiry is decided on a time \
+     source this node cannot trust";
+/// The monotonic floor cannot be written to disk.
+///
+/// `DEG_STATUS_UNWRITABLE` is the same shape for a surface that only reports;
+/// this is enforcement state. A floor that never persists means every restart
+/// resets the anti-rollback defence to whatever the wall clock then says, so a
+/// node that is restarted — a DaemonSet rollout, an OOM kill — accepts a clock
+/// that was moved back while it was down, and every waiver that expired during
+/// that window is live again.
+pub const DEG_CLOCK_FLOOR_UNPERSISTED: &str =
+    "monotonic clock floor not persisted: the anti-rollback floor is in memory only and a restart \
+     will take whatever the wall clock says";
 /// `status.json` could not be written. The node still enforces and still
 /// stamps every envelope, but the file a collector reads is gone: this reason
 /// is the only thing left that says the surface itself is down, and it rides
@@ -495,6 +538,10 @@ pub struct Agent {
     /// enforce rules can no longer be trusted to match, so the agent is
     /// Degraded even though the loaded bundle itself is fine.
     datapath_degraded: AtomicBool,
+    /// The wall clock read below the monotonic floor at least once. Latched:
+    /// nothing in this process can prove the time source came back, and every
+    /// waiver decision since is one taken against a clock that moved.
+    clock_rollback: AtomicBool,
     /// True only after a real `KernelHandle::attach`; never inferred from a
     /// successful userspace bundle load.
     attached: AtomicBool,
@@ -564,6 +611,16 @@ pub struct Agent {
     /// `containerOnly` rules that would have decided a record and were skipped
     /// on a caller the agent could not prove was not a container.
     container_unproven: AtomicU64,
+    /// The last stat of the bundle mount refused: the path is there and cannot
+    /// be read. Not latched — the next stat that answers clears it — and kept
+    /// apart from the loader's own degraded state, which is about a bundle
+    /// that WAS offered. See `DEG_BUNDLE_UNREADABLE`.
+    bundle_unreadable: AtomicBool,
+    /// How many poll ticks the bundle stat has refused on. The flag says the
+    /// mount is unreadable now; this says for how long it has been, which is
+    /// the difference between a rotate caught mid-flight and a node that has
+    /// not been offered policy since it started.
+    bundle_stat_failed: AtomicU64,
     /// The last attempt to publish `status.json` failed, so this node's state
     /// is not readable from the node. Not latched: it clears on the first
     /// write that succeeds.
@@ -644,6 +701,7 @@ impl Agent {
             datapath_abi_mismatch: AtomicU64::new(0),
             unknown_syscalls: AtomicU64::new(0),
             datapath_degraded: AtomicBool::new(false),
+            clock_rollback: AtomicBool::new(false),
             attached: AtomicBool::new(false),
             responder: None,
             target_check: Box::new(ProcCgroupCheck::new()),
@@ -668,6 +726,8 @@ impl Agent {
             container_flag_fault_at: Mutex::new(None),
             container_unproven_window: Mutex::new(HashMap::new()),
             container_unproven: AtomicU64::new(0),
+            bundle_unreadable: AtomicBool::new(false),
+            bundle_stat_failed: AtomicU64::new(0),
             status_write_failed: AtomicBool::new(false),
             status_write_failed_count: AtomicU64::new(0),
             labels_unknown: AtomicU64::new(0),
@@ -722,6 +782,24 @@ impl Agent {
         }
         if self.datapath_degraded.load(Ordering::Relaxed) {
             out.push(DEG_DATAPATH.to_string());
+        }
+        // A clock that moved backwards is not a datapath that refuses records,
+        // and the two were published under the same name until now. Every
+        // `expiresAt` on this node is compared against this reading.
+        if self.clock_rollback.load(Ordering::Relaxed) {
+            out.push(DEG_CLOCK_ROLLBACK.to_string());
+        }
+        // The floor that catches that rollback is in memory only, so the next
+        // restart takes whatever the wall clock says. Enforcement state, not a
+        // reporting surface: `DEG_STATUS_UNWRITABLE` is the same shape for the
+        // surface, and this had nothing.
+        if self.clock.persist_failing() {
+            out.push(DEG_CLOCK_FLOOR_UNPERSISTED.to_string());
+        }
+        // A mount that will not stat offers no bundle and refuses none, so
+        // `DEG_LOADER` - raised on rejection - stays false through it.
+        if self.bundle_unreadable.load(Ordering::Relaxed) {
+            out.push(DEG_BUNDLE_UNREADABLE.to_string());
         }
         // An empty cgroup index is not "no pods": every lookup misses, so
         // every namespaced selector silently fails to match.
@@ -1482,8 +1560,10 @@ impl Agent {
         &self.clock
     }
 
-    /// Wall clock guarded by the monotonic floor. A backwards jump marks the
-    /// datapath Degraded: waiver expiry is decided on this reading.
+    /// Wall clock guarded by the monotonic floor. A backwards jump degrades
+    /// the node under its own reason: waiver expiry is decided on this
+    /// reading, and `DEG_DATAPATH` - which this used to raise - sends the
+    /// operator to the ring buffer for a fault that is in the node's clock.
     pub fn now(&self) -> DateTime<Utc> {
         self.now_from(Utc::now())
     }
@@ -1492,9 +1572,46 @@ impl Agent {
         let before = self.clock.clock_rollback_total();
         let now = self.clock.now_from(wall);
         if self.clock.clock_rollback_total() != before {
-            self.datapath_degraded.store(true, Ordering::Relaxed);
+            self.clock_rollback.store(true, Ordering::Relaxed);
         }
         now
+    }
+
+    /// The wall clock has read below the monotonic floor on this node.
+    pub fn clock_rolled_back(&self) -> bool {
+        self.clock_rollback.load(Ordering::Relaxed)
+    }
+
+    /// Writes of the monotonic floor that failed. See
+    /// `DEG_CLOCK_FLOOR_UNPERSISTED`.
+    pub fn clock_persist_failed_total(&self) -> u64 {
+        self.clock.persist_failed_total()
+    }
+
+    /// The floor is configured to persist and the last write did not land.
+    pub fn clock_floor_unpersisted(&self) -> bool {
+        self.clock.persist_failing()
+    }
+
+    /// Record the answer of one bundle stat. A stat that refused is the state
+    /// this raises; the other two answers clear it, because a stat that says
+    /// ENOENT is an answer too.
+    pub fn note_bundle_stat(&self, readable: bool) {
+        if readable {
+            self.bundle_unreadable.store(false, Ordering::Relaxed);
+        } else {
+            self.bundle_unreadable.store(true, Ordering::Relaxed);
+            self.bundle_stat_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The bundle mount is present and unreadable. See `DEG_BUNDLE_UNREADABLE`.
+    pub fn bundle_unreadable(&self) -> bool {
+        self.bundle_unreadable.load(Ordering::Relaxed)
+    }
+
+    pub fn bundle_stat_failed_total(&self) -> u64 {
+        self.bundle_stat_failed.load(Ordering::Relaxed)
     }
 
     pub fn using_last_known_good(&self) -> bool {
@@ -2432,12 +2549,33 @@ fn poll_once(
     stamps: &mut PollStamps,
     out: &StatusOutput<'_>,
 ) -> StatusTick {
-    if let Some(next) = source::source_stamp(path) {
-        if Some(next) != stamps.bundle {
-            stamps.bundle = Some(next);
-            if let Err(err) = agent.apply_path(path) {
-                eprintln!("ferrum-agent: bundle reload failed, keeping last-known-good: {err}");
+    // Three answers, not two. `Option<SourceStamp>` read a mount that will not
+    // stat as a mount that had not changed, so a node whose bundle Secret went
+    // unreadable stopped taking policy for the rest of the process lifetime
+    // with nothing anywhere that moved: `DEG_LOADER` is raised on a bundle
+    // that was offered and refused, never on one that was never offered. The
+    // comment below, which cycle 10 wrote for the exceptions half of this
+    // function, is the same argument about the same collapse.
+    match source::bundle_stamp(path) {
+        source::BundleStamp::Present(next) => {
+            agent.note_bundle_stat(true);
+            if stamps.bundle != Some(next) {
+                stamps.bundle = Some(next);
+                if let Err(err) = agent.apply_path(path) {
+                    eprintln!("ferrum-agent: bundle reload failed, keeping last-known-good: {err}");
+                }
             }
+        }
+        // ENOENT is an answer: a node before its first policy, or a Secret a
+        // human has not created yet. Last-known-good stands and nothing is
+        // claimed about it.
+        source::BundleStamp::Absent => agent.note_bundle_stat(true),
+        source::BundleStamp::Unreadable => {
+            agent.note_bundle_stat(false);
+            eprintln!(
+                "ferrum-agent: bundle mount {} will not stat; no policy update can reach this node",
+                path.display()
+            );
         }
     }
     // Every change of answer goes through `reload_exceptions_path`, including
@@ -4976,6 +5114,154 @@ mod tests {
         );
     }
 
+    /// The poll loop's answer to "is there a bundle", which is the same
+    /// collapse the exceptions test below is about, on the other half of the
+    /// same function: `source_stamp` returned `Option<SourceStamp>`, so EACCES
+    /// after a remount, EIO, ELOOP, a dangling `..data` and a directory where
+    /// the file was all came back as `None` - the value the loop reads as
+    /// "unchanged, nothing to do".
+    ///
+    /// A node whose bundle mount goes unreadable therefore stops taking policy
+    /// for the rest of the process lifetime and says nothing: `DEG_LOADER` is
+    /// raised when a bundle is offered and refused, never when none is offered
+    /// at all, and no counter in `status.json` moves.
+    ///
+    /// A directory stands in for the unreadable file because this suite runs
+    /// as root, where a mode-000 file is still readable.
+    #[test]
+    fn a_bundle_mount_that_cannot_be_stat_ed_is_not_a_bundle_that_has_not_changed() {
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("temp dir");
+        let good = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let fsig = encode_fsig(&good, &sign(&good), &pk()).expect("fsig");
+        let digest = ferrum_crypto::bundle_digest(&good);
+        fs::write(dir.join(BUNDLE_FSIG_KEY), &fsig).expect("bundle.fsig");
+        fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_str().as_bytes()).expect("digest");
+
+        let mut agent = healthy_respond_agent();
+        let out = StatusOutput {
+            ctx: None,
+            sink: None,
+            status_dir: None,
+        };
+        let mut stamps = PollStamps::default();
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert!(!agent.bundle_unreadable());
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+
+        // The mount stays there and stops being readable. Nothing was
+        // republished and nothing was refused.
+        fs::remove_file(dir.join(BUNDLE_FSIG_KEY)).expect("remove");
+        fs::create_dir(dir.join(BUNDLE_FSIG_KEY)).expect("directory where the file was");
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert!(agent.bundle_unreadable());
+        assert_eq!(agent.bundle_stat_failed_total(), 1);
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == DEG_BUNDLE_UNREADABLE),
+            "a node that can no longer be offered policy reports: {reasons:?}"
+        );
+        // Not the loader's reason: no bundle was offered and none was refused,
+        // and sending the operator to republish the PolicyBundle would be
+        // sending them to the wrong half of the system.
+        assert!(
+            !reasons.iter().any(|r| r == DEG_LOADER),
+            "an unreadable mount is not a refused bundle: {reasons:?}"
+        );
+        // And something in the file a collector reads moves.
+        let value = status_json(&agent, None, None, &agent.degraded_state_at(Instant::now()));
+        assert_eq!(value["bundleUnreadable"], true);
+        assert_eq!(value["bundleStatFailedTotal"], 1);
+
+        // A remount clears it without a restart, and the bundle that was there
+        // all along still loads.
+        fs::remove_dir(dir.join(BUNDLE_FSIG_KEY)).expect("rmdir");
+        fs::write(dir.join(BUNDLE_FSIG_KEY), &fsig).expect("bundle.fsig back");
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert!(!agent.bundle_unreadable());
+        assert_eq!(agent.bundle_stat_failed_total(), 1, "the count is history");
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+
+        // ENOENT is an answer, not a failure: a node before its first policy
+        // must not report a mount fault.
+        fs::remove_file(dir.join(BUNDLE_FSIG_KEY)).expect("remove");
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert!(!agent.bundle_unreadable());
+        assert_eq!(agent.bundle_stat_failed_total(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The monotonic floor is the anti-rollback defence, and it reached disk
+    /// through `let _ = write_observed(..)`. On a node where
+    /// `/var/lib/ferrum/lkg` is unwritable the floor then lives exactly as long
+    /// as the process: every restart resets it to whatever the wall clock says,
+    /// so a clock moved back while the agent was down is accepted on the way up
+    /// and every waiver that expired in that window is live again.
+    ///
+    /// `DEG_STATUS_UNWRITABLE` exists for a surface that only reports. This is
+    /// enforcement state and had nothing.
+    #[test]
+    fn a_clock_floor_that_cannot_be_written_is_a_reason() {
+        let dir = temp_lkg();
+        let lkg = dir.join("lkg");
+        fs::create_dir_all(&lkg).expect("temp dir");
+        let mut agent = Agent::new(AgentConfig {
+            lkg_dir: Some(lkg.clone()),
+            ..cfg_respond_named("p1")
+        });
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
+        agent.now();
+        agent.clock().persist();
+        assert!(!agent.clock_floor_unpersisted(), "the floor is on disk");
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+
+        // The directory the floor lives in stops being one: `create_dir_all`
+        // in the write path then fails, which is the shape a hostPath that did
+        // not mount leaves behind.
+        fs::remove_dir_all(&lkg).expect("rm dir");
+        fs::write(&lkg, b"not a directory").expect("file where the dir goes");
+        agent.clock().persist();
+        assert!(agent.clock_floor_unpersisted());
+        assert!(agent.clock_persist_failed_total() >= 1);
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == DEG_CLOCK_FLOOR_UNPERSISTED),
+            "a floor that never reaches disk reports: {reasons:?}"
+        );
+        let value = status_json(&agent, None, None, &agent.degraded_state_at(Instant::now()));
+        assert_eq!(value["clockFloorUnpersisted"], true);
+        assert!(value["clockFloorUnpersistedTotal"].as_u64().unwrap_or(0) >= 1);
+
+        // A directory that comes back recovers the node without a restart.
+        fs::remove_file(&lkg).expect("rm");
+        agent.clock().persist();
+        assert!(!agent.clock_floor_unpersisted());
+        assert!(
+            !agent
+                .degraded_reasons_at(Instant::now())
+                .iter()
+                .any(|r| r == DEG_CLOCK_FLOOR_UNPERSISTED),
+            "the floor is on disk again"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// The poll loop's own answer to "is there an exceptions file", which is
     /// the branch neither waiver test above reaches: one drives
     /// `try_reload_exceptions`, the other `reload_exceptions_path`, and
@@ -5795,8 +6081,22 @@ mod tests {
         let observed = agent.now_from(back);
         assert_eq!(observed, t0);
         assert_eq!(agent.clock_rollback_total(), 1);
-        assert!(agent.datapath_degraded());
+        assert!(agent.clock_rolled_back());
         assert!(agent.is_degraded());
+        // Under its own name. `DEG_DATAPATH` is "a record carried a syscall nr
+        // this build cannot name", and publishing a clock rollback under it
+        // sent the operator to read the ring buffer for a fault in the node's
+        // time source. No record was refused here.
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == DEG_CLOCK_ROLLBACK),
+            "{reasons:?}"
+        );
+        assert!(
+            !reasons.iter().any(|r| r == DEG_DATAPATH),
+            "a clock rollback is not a datapath that refuses records: {reasons:?}"
+        );
+        assert!(!agent.datapath_degraded());
 
         let sink = MemorySink::new();
         let decision = agent.handle_event_at(
@@ -6870,7 +7170,7 @@ mod tests {
         /// problem, not a gate problem — which is why the rows are written to
         /// be read, and why each says where the state goes instead of that it
         /// is fine.
-        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 19] = [
+        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 20] = [
             (
                 "respond_refused",
                 "the aggregate of every guard that said no. A refusal is the guards working, and \
@@ -6931,6 +7231,12 @@ mod tests {
                 "lkg_rules_dropped",
                 "the count beside `lkg_partial`, set in the same branch, which raises \
                  `DEG_LKG_PARTIAL`.",
+            ),
+            (
+                "bundle_stat_failed",
+                "the count beside `bundle_unreadable`, set in the same call - `note_bundle_stat` \
+                 - and that flag is what raises `DEG_BUNDLE_UNREADABLE`. The count says how long \
+                 the mount has been unreadable, which the flag alone cannot.",
             ),
             (
                 "status_write_failed_count",
@@ -7186,7 +7492,7 @@ mod tests {
             );
         }
 
-        /// A write is not a read. `now_from` writes `datapath_degraded` and
+        /// A write is not a read. `now_from` writes `clock_rollback` and
         /// reads nothing, and it is on the walk only because `waivers_unjoined`
         /// calls `self.now()`: any counter a later slice increments inside a
         /// walked helper was reported as reaching a reason on the strength of
@@ -7322,9 +7628,12 @@ mod tests {
             ),
             (
                 "MonotonicFloor",
-                "the clock, which owns its own state and its own rollback counter; the agent \
-                 reads that counter in `now_from` and marks `datapath_degraded` from it, so the \
-                 rollback does reach a reason and it is not read here.",
+                "the clock, which owns its own state, its own rollback counter and its own \
+                 count of floor writes that failed. Both reach reasons: `now_from` marks \
+                 `clock_rollback` from the first and that raises `DEG_CLOCK_ROLLBACK`, and \
+                 `degraded_reasons_at` reads `persist_failing` for \
+                 `DEG_CLOCK_FLOOR_UNPERSISTED`. A census of this struct cannot see inside it, so \
+                 the reasons are named here and can be checked rather than believed.",
             ),
         ];
 
@@ -7591,7 +7900,7 @@ mod tests {
 
         /// Methods that only write the state they are called on. A census that
         /// counts these as reads reports a field as reaching a reason on the
-        /// strength of a `fetch_add`: `now_from` writes `datapath_degraded`
+        /// strength of a `fetch_add`: `now_from` writes `clock_rollback`
         /// and reads nothing, and is on the walk at all only because
         /// `waivers_unjoined` calls `self.now()`.
         const WRITE_ONLY: [&str; 12] = [

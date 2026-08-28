@@ -128,6 +128,23 @@ pub fn status_json(
             "statusWriteFailedTotal".into(),
             json!(agent.status_write_failed_total()),
         );
+        map.insert(
+            "clockFloorUnpersisted".into(),
+            json!(agent.clock_floor_unpersisted()),
+        );
+        map.insert(
+            "clockFloorUnpersistedTotal".into(),
+            json!(agent.clock_persist_failed_total()),
+        );
+        // The two halves of the bundle stat. Without them a node whose mount
+        // went unreadable published nothing that moves: the digest stays the
+        // one it loaded long ago and every counter beside it stands still,
+        // which is indistinguishable from a cluster nobody has republished.
+        map.insert("bundleUnreadable".into(), json!(agent.bundle_unreadable()));
+        map.insert(
+            "bundleStatFailedTotal".into(),
+            json!(agent.bundle_stat_failed_total()),
+        );
     }
     out
 }

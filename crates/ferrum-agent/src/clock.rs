@@ -13,7 +13,7 @@
 use chrono::{DateTime, Days, Utc};
 use ferrum_api::PolicyExceptionSpec;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// Policy cap on exception TTL (`ferrum-policy`); the clock anchor is derived
@@ -35,6 +35,14 @@ pub struct MonotonicFloor {
     dir: Option<PathBuf>,
     state: Mutex<FloorState>,
     rollbacks: AtomicU64,
+    /// Writes of `observed-time` that failed. The floor is the anti-rollback
+    /// defence itself, so a floor that cannot reach the disk is enforcement
+    /// state that does not survive a restart - not a reporting surface, and
+    /// the agent gives it `DEG_CLOCK_FLOOR_UNPERSISTED` for that reason.
+    persist_failed: AtomicU64,
+    /// Whether the last attempt failed. Cleared by the next write that lands,
+    /// so a directory that comes back readable recovers the node.
+    persist_failing: AtomicBool,
 }
 
 struct FloorState {
@@ -58,6 +66,8 @@ impl MonotonicFloor {
                 persisted: DateTime::<Utc>::MIN_UTC,
             }),
             rollbacks: AtomicU64::new(0),
+            persist_failed: AtomicU64::new(0),
+            persist_failing: AtomicBool::new(false),
         }
     }
 
@@ -82,11 +92,26 @@ impl MonotonicFloor {
                 persisted: stored,
             }),
             rollbacks: AtomicU64::new(0),
+            persist_failed: AtomicU64::new(0),
+            persist_failing: AtomicBool::new(false),
         }
     }
 
     pub fn clock_rollback_total(&self) -> u64 {
         self.rollbacks.load(Ordering::Relaxed)
+    }
+
+    /// Writes of the floor that failed. A floor that never reaches disk is an
+    /// anti-rollback defence that lasts exactly as long as the process.
+    pub fn persist_failed_total(&self) -> u64 {
+        self.persist_failed.load(Ordering::Relaxed)
+    }
+
+    /// The floor is configured to persist and the last write did not land.
+    /// False when no directory was configured at all: that is how the agent
+    /// was started, not a failure of it.
+    pub fn persist_failing(&self) -> bool {
+        self.persist_failing.load(Ordering::Relaxed)
     }
 
     pub fn floor(&self) -> DateTime<Utc> {
@@ -134,10 +159,12 @@ impl MonotonicFloor {
         }
         state.floor = wall;
         if (wall - state.persisted).num_seconds() >= PERSIST_STEP_SECS {
+            // Advanced whether or not the write lands, so a directory that
+            // refuses does not put a file write on every reading of the clock.
+            // The next step retries; `persist_failing` carries the answer in
+            // the meantime.
             state.persisted = wall;
-            if let Some(dir) = &self.dir {
-                let _ = write_observed(dir, wall);
-            }
+            self.write_floor(wall);
         }
         wall
     }
@@ -150,8 +177,27 @@ impl MonotonicFloor {
             return;
         }
         state.persisted = floor;
-        if let Some(dir) = &self.dir {
-            let _ = write_observed(dir, floor);
+        self.write_floor(floor);
+    }
+
+    /// The one place the floor reaches disk. A discarded `Result` here is the
+    /// whole defence going unwritten in silence: `/var/lib/ferrum/lkg`
+    /// unwritable meant every restart reset the floor to whatever the wall
+    /// clock then said, and nothing on the node said so.
+    fn write_floor(&self, when: DateTime<Utc>) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        match write_observed(dir, when) {
+            Ok(()) => self.persist_failing.store(false, Ordering::Relaxed),
+            Err(err) => {
+                self.persist_failed.fetch_add(1, Ordering::Relaxed);
+                self.persist_failing.store(true, Ordering::Relaxed);
+                eprintln!(
+                    "ferrum-agent: monotonic clock floor not persisted to {}: {err}",
+                    dir.display()
+                );
+            }
         }
     }
 
