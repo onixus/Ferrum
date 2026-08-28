@@ -79,6 +79,17 @@ pipeline {
                     # cgroup sync into ferrum_cgroups is compiled out of every
                     # other one.
                     cargo clippy -p ferrum-agent --features attach,apiserver --all-targets -- -D warnings
+                    # The webhook's production combination. It was on no clippy
+                    # line and on no test line: `apiserver` is `default = []`,
+                    # so `cargo test --workspace` ran without it, and the two
+                    # stages that did name it — 'Admission binary' and
+                    # 'Admission image' — are `cargo build`, which links the
+                    # [[bin]] and compiles no test target at all. The crate
+                    # carrying three of the eight section D cases was therefore
+                    # lint-checked by nothing and tested by nothing in the one
+                    # configuration it ships in, which is how `WatchedLabels`
+                    # reached a cycle with zero tests.
+                    cargo clippy -p ferrum-admission --features apiserver --all-targets -- -D warnings
                 '''
             }
         }
@@ -88,6 +99,14 @@ pipeline {
                 sh '''
                     set -eu
                     cargo test --workspace
+                    # --workspace is default features, and every production
+                    # feature in this tree is off by default. A `cargo build`
+                    # of the same combination is not a substitute: it links the
+                    # binary and never compiles a test target, so a crate can
+                    # ship a feature no test has ever been compiled under.
+                    # `deploy_gate.rs::every_feature_a_manifest_selects_is_a_lint_and_test_target`
+                    # requires this line and the clippy line above for each one.
+                    cargo test -p ferrum-admission --features apiserver
                 '''
             }
         }

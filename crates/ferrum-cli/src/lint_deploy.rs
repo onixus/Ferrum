@@ -43,6 +43,7 @@ const POLICY_NAME_UNJOINED: &str = "FD024";
 const DUPLICATE_JOINED_FLAG: &str = "FD025";
 const BPF_ELF_WITHOUT_TRACEFS: &str = "FD026";
 const LABEL_SOURCE_UNJOINED: &str = "FD027";
+const OPTIONAL_REQUIRED_MOUNT: &str = "FD028";
 
 /// Bundle Secrets the controller writes: `ferrum-bundle-cluster-<policy>` for a
 /// cluster-scoped policy, `ferrum-bundle-ns-<namespace>-<policy>` for a
@@ -522,9 +523,138 @@ fn check_pod_templates(docs: &[Doc], findings: &mut Vec<Finding>) {
                 check_flag_ambiguity(doc, &owner, container, findings);
                 check_policy_join(doc, &owner, spec, container, findings);
                 check_tracefs(doc, &owner, spec, container, findings);
+                check_optional_required_mount(doc, &owner, spec, container, findings);
             }
         }
     }
+}
+
+/// A tolerance the manifest declares and the binary does not have.
+///
+/// `optional: true` on a Secret or ConfigMap volume is a statement to kubelet:
+/// start the Pod with the mount empty if the object is absent. It is the right
+/// answer for a file the process treats as absent-is-fine, and it is a lie
+/// about a file the process cannot start without — and the two are written far
+/// apart, the tolerance in `volumes:` and the requirement in the binary that
+/// the argv above names.
+///
+/// Both agent manifests and the webhook's Deployment carried it on the bundle
+/// mount while all three binaries `exit(2)` on a bundle they cannot load. The
+/// result is not a missing file: kubelet starts the Pod, the process exits,
+/// and the whole install CrashLoopBackOffs until a human creates the Secret —
+/// with `failurePolicy: Fail` on the webhook denying every Pod outside
+/// `ferrum` and `kube-system` throughout, and readiness being a TCP connect,
+/// so nothing reports the cause. Without the tolerance kubelet leaves the Pod
+/// in `ContainerCreating` and `kubectl describe` names the Secret it is
+/// waiting for: the same failure, said once, in the place an operator looks.
+///
+/// A finding rather than a warning, on the project's own rule: nothing else
+/// in the tree can catch it. Both cycle-11 slices removed the three instances
+/// by hand, which is a repair with no gate under it.
+///
+/// The rule is the requirement, not the file name. It reads the container's
+/// own argv for a flag whose value the process must be able to open, follows
+/// that path to the volume that serves it, and refuses a tolerance declared
+/// there. A volume serving a path the binary genuinely tolerates — the
+/// webhook's `--exceptions`, whose absent arm starts with an empty waiver
+/// list on purpose, the agent's `--lkg-dir` and `--export-dir` — is not a
+/// finding and must not become one: `optional: true` is the honest declaration
+/// for those, and a rule that refused them would push the tree toward the less
+/// accurate manifest.
+fn check_optional_required_mount(
+    doc: &Doc,
+    owner: &str,
+    spec: &Value,
+    container: &Value,
+    findings: &mut Vec<Finding>,
+) {
+    let argv = argv_of(container);
+    let cname = container
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>");
+    for (flag, consequence) in REQUIRED_PATH_FLAGS {
+        let Some(path) = container_flag(&argv, flag).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let Some((mount_path, volume)) = volume_serving(spec, container, &path) else {
+            continue;
+        };
+        let Some(source) = declared_optional(volume) else {
+            continue;
+        };
+        findings.push(Finding {
+            code: OPTIONAL_REQUIRED_MOUNT,
+            file: doc.file.clone(),
+            msg: format!(
+                "{owner} container '{cname}' passes {flag} {path}, served by the volume mounted \
+                 at {mount_path}, and that volume declares the {source} `optional: true`. {consequence} \
+                 So the manifest promises a tolerance the process does not have: kubelet starts \
+                 the Pod with an empty mount, the process exits, and the Pod CrashLoopBackOffs \
+                 until a human creates the object. Without `optional: true` it stays in \
+                 ContainerCreating with the missing object named on it"
+            ),
+        });
+    }
+}
+
+/// The volume that serves `path` in this container, and the mount path it
+/// arrives on.
+///
+/// Longest matching mount wins, which is Kubernetes' own resolution: a
+/// container may mount `/etc/ferrum` and `/etc/ferrum/tls`, and a file under
+/// the second is served by the second.
+fn volume_serving<'a>(
+    spec: &'a Value,
+    container: &'a Value,
+    path: &str,
+) -> Option<(String, &'a Value)> {
+    let mount = seq(container, "volumeMounts")
+        .iter()
+        .filter_map(|m| {
+            let at = m.get("mountPath").and_then(Value::as_str)?;
+            let serves = path == at || path.starts_with(&format!("{}/", at.trim_end_matches('/')));
+            serves.then_some((at, m.get("name").and_then(Value::as_str)?))
+        })
+        .max_by_key(|(at, _)| at.len())?;
+    let volume = seq(spec, "volumes")
+        .iter()
+        .find(|v| v.get("name").and_then(Value::as_str) == Some(mount.1))?;
+    Some((mount.0.to_string(), volume))
+}
+
+/// The volume source that declares itself optional, if any.
+///
+/// `projected` is read too: a projected Secret marked optional is the same
+/// statement written one level in, and the token projections this tree already
+/// carries are projected volumes.
+fn declared_optional(volume: &Value) -> Option<&'static str> {
+    for (key, label) in [("secret", "Secret"), ("configMap", "ConfigMap")] {
+        if volume
+            .get(key)
+            .and_then(|s| s.get("optional"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Some(label);
+        }
+    }
+    for source in seq(volume.get("projected")?, "sources") {
+        for (key, label) in [
+            ("secret", "projected Secret"),
+            ("configMap", "projected ConfigMap"),
+        ] {
+            if source
+                .get(key)
+                .and_then(|s| s.get("optional"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return Some(label);
+            }
+        }
+    }
+    None
 }
 
 /// An attach build with no tracefs to read.
@@ -1240,6 +1370,49 @@ fn container_flag(argv: &[String], flag: &str) -> Option<String> {
         .get(flag.trim_start_matches("--"))
         .map(|(_, v)| v.clone())
 }
+
+/// Flags whose value is a path the process must be able to open before it can
+/// do its job, paired with what the binary does when it cannot — quoted into
+/// the finding, because the whole rule is that the manifest and the binary
+/// disagree about that sentence.
+///
+/// Deliberately absent, and this is the argument rather than an oversight:
+/// `--exceptions`, `--lkg-dir` and `--export-dir` name paths whose absence
+/// every binary here handles on purpose. The webhook starts with an empty
+/// waiver list and says so; the agent restores no last-known-good and runs;
+/// an export directory that will not open is a degradation reason, not an
+/// exit. `optional: true` on a volume serving one of those is the *accurate*
+/// declaration, and a rule that refused it would push this tree toward the
+/// less honest manifest — the FD027 mistake, which read `automount` and
+/// punished the more hardened shape.
+const REQUIRED_PATH_FLAGS: [(&str, &str); 5] = [
+    (
+        "--bundle",
+        "A binary handed a bundle it cannot load exits 2 — the agent unless a last-known-good \
+         is already on the node, the webhook unconditionally — before the poll loop that would \
+         pick a later one up.",
+    ),
+    (
+        "--bpf-elf",
+        "An attach build reads this ELF once at startup and dies if it cannot: there is no \
+         datapath without it.",
+    ),
+    (
+        "--tls-cert",
+        "The webhook loads its serving certificate before it binds and exits 2 if it cannot, \
+         and under failurePolicy: Fail a webhook that never serves denies every Pod it gates.",
+    ),
+    (
+        "--tls-key",
+        "The webhook loads its serving key before it binds and exits 2 if it cannot, and under \
+         failurePolicy: Fail a webhook that never serves denies every Pod it gates.",
+    ),
+    (
+        "--seed-file",
+        "The controller loads the bundle signing seed before it reconciles anything and exits \
+         if the file is not there, so nothing signs policy at all.",
+    ),
+];
 
 /// Flags a duplicate of which silently changes what the process enforces,
 /// verifies against, or writes down — every one of them read last-wins by the
@@ -2286,6 +2459,140 @@ mod tests {
 
     fn shipped(rel: &str) -> String {
         fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    }
+
+    /// FD028, against the shipped DaemonSet with the one line put back that
+    /// both cycle-11 slices removed by hand. This is byte for byte the tree
+    /// this repository shipped: the agent `exit(2)`s on a bundle it cannot
+    /// load with no last-known-good beside it, and the manifest told kubelet to
+    /// start it anyway.
+    const OPTIONAL_BUNDLE_SECRET: (&str, &str) = (
+        "        - name: bundle\n          secret:\n            secretName: \
+         ferrum-bundle-cluster-prod-restricted\n",
+        "        - name: bundle\n          secret:\n            secretName: \
+         ferrum-bundle-cluster-prod-restricted\n            optional: true\n",
+    );
+
+    #[test]
+    fn a_required_mount_declared_optional_is_a_finding() {
+        let (plain, tolerant) = OPTIONAL_BUNDLE_SECRET;
+        let dir = agent_tree_with("optional-bundle", |raw| {
+            assert!(raw.contains(plain), "the bundle volume moved");
+            raw.replace(plain, tolerant)
+        });
+        assert_eq!(
+            codes_in(&dir),
+            code_set([OPTIONAL_REQUIRED_MOUNT].as_slice())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same line on the other plane, and the worse half of it: the webhook
+    /// has no last-known-good at all, readiness is a TCP connect so two
+    /// CrashLoopBackOff replicas still report Ready, and `failurePolicy: Fail`
+    /// denies every Pod outside `ferrum` and `kube-system` while they do.
+    #[test]
+    fn the_webhooks_bundle_mount_is_the_same_finding() {
+        let (plain, tolerant) = OPTIONAL_BUNDLE_SECRET;
+        let dir = admission_tree_with("optional-webhook-bundle", |raw| {
+            raw.replace(plain, tolerant)
+        });
+        assert_eq!(
+            codes_in(&dir),
+            code_set([OPTIONAL_REQUIRED_MOUNT].as_slice())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Not a rule about the word `bundle`. The serving certificate is a
+    /// different volume, named by two different flags, and it is required for
+    /// a different reason: `TlsSource::load` runs before the listener binds,
+    /// and a webhook that never serves denies every Pod it gates.
+    #[test]
+    fn an_optional_serving_certificate_is_a_finding_too() {
+        let plain = "        - name: tls\n          secret:\n            secretName: ferrum-admission-tls\n";
+        let tolerant = "        - name: tls\n          secret:\n            secretName: ferrum-admission-tls\n            optional: true\n";
+        let dir = admission_tree_with("optional-tls", |raw| raw.replace(plain, tolerant));
+        assert!(
+            fs::read_to_string(dir.join("deployment.yaml"))
+                .expect("deployment.yaml")
+                .contains(tolerant),
+            "the tls volume moved and this test edited nothing"
+        );
+        assert_eq!(
+            codes_in(&dir),
+            code_set([OPTIONAL_REQUIRED_MOUNT].as_slice())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The other half, without which this rule would be "no volume may be
+    /// optional" — a rule that makes every manifest less accurate.
+    ///
+    /// `--exceptions` names a mount the webhook genuinely tolerates: the absent
+    /// arm starts with an empty waiver list and logs, on purpose, and
+    /// `optional: true` on the volume that serves it is the true statement.
+    /// Here it is given a volume of its own so that the two flags stop sharing
+    /// one mount, and the tree must stay clean.
+    #[test]
+    fn a_mount_the_binary_tolerates_may_be_optional() {
+        let dir = admission_tree_with("optional-waivers", |raw| {
+            let moved = raw.replace(
+                "            - /etc/ferrum/bundle/exceptions.fsig\n",
+                "            - /etc/ferrum/waivers/exceptions.fsig\n",
+            );
+            let mounted = moved.replace(
+                "            - name: bundle\n              mountPath: /etc/ferrum/bundle\n              readOnly: true\n",
+                "            - name: bundle\n              mountPath: /etc/ferrum/bundle\n              readOnly: true\n            - name: waivers\n              mountPath: /etc/ferrum/waivers\n              readOnly: true\n",
+            );
+            let (plain, _) = OPTIONAL_BUNDLE_SECRET;
+            mounted.replace(
+                plain,
+                &format!(
+                    "{plain}        - name: waivers\n          secret:\n            secretName: \
+                     ferrum-exceptions\n            optional: true\n"
+                ),
+            )
+        });
+        let written = fs::read_to_string(dir.join("deployment.yaml")).expect("deployment.yaml");
+        assert!(
+            written.contains("/etc/ferrum/waivers/exceptions.fsig")
+                && written.contains("            optional: true\n"),
+            "this test edited nothing, so an empty finding set proves nothing"
+        );
+        assert!(
+            codes_in(&dir).is_empty(),
+            "a volume serving a path the binary tolerates must not be a finding: \
+             `optional: true` is the accurate declaration there, and a rule that \
+             refused it would push this tree toward the less honest manifest"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The resolver under the rule. A container may mount a directory and a
+    /// subdirectory of it; the file is served by the longer mount, which is
+    /// Kubernetes' own answer and not this lint's convenience. Without this,
+    /// `an_optional_serving_certificate_is_a_finding_too` would be equally
+    /// satisfied by a resolver that returned the first mount it saw.
+    #[test]
+    fn a_file_is_served_by_the_longest_mount_that_covers_it() {
+        let spec: Value = serde_yaml::from_str(
+            "containers:\n  - name: c\n    volumeMounts:\n      - name: outer\n        mountPath: /etc/ferrum\n      - name: inner\n        mountPath: /etc/ferrum/tls\nvolumes:\n  - name: outer\n    secret:\n      secretName: a\n  - name: inner\n    secret:\n      secretName: b\n      optional: true\n",
+        )
+        .expect("fixture spec");
+        let container = &seq(&spec, "containers")[0];
+        let (at, volume) =
+            volume_serving(&spec, container, "/etc/ferrum/tls/tls.crt").expect("a mount serves it");
+        assert_eq!(at, "/etc/ferrum/tls");
+        assert_eq!(declared_optional(volume), Some("Secret"));
+        // The outer mount still serves what the inner one does not cover, and
+        // a prefix that is not a path boundary is not a mount: `/etc/ferrumx`
+        // is a different directory.
+        let (at, volume) =
+            volume_serving(&spec, container, "/etc/ferrum/bundle").expect("the outer mount");
+        assert_eq!(at, "/etc/ferrum");
+        assert_eq!(declared_optional(volume), None);
+        assert!(volume_serving(&spec, container, "/etc/ferrumx/tls.crt").is_none());
     }
 
     /// The committed negative tree for FD027, checked for the exact code: a
