@@ -321,7 +321,7 @@ fn image_signature_ok(
     let unique: Vec<&String> = {
         let mut u = Vec::new();
         for img in all_images {
-            if !u.iter().any(|e: &&String| *e == img) {
+            if !u.contains(&img) {
                 u.push(img);
             }
         }

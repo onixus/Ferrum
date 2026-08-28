@@ -278,7 +278,7 @@ fn append_len_prefixed(out: &mut Vec<u8>, blob: &[u8], name: &str) -> Result<()>
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(FerrumError::Integrity(
             "hex string must have even length".into(),
         ));

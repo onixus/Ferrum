@@ -11,11 +11,9 @@
 // Константы держим внутри метода: `def` на верхнем уровне — локальная переменная
 // скрипта, из метода она не видна (MissingPropertyException, билд #9).
 def rust(String script) {
-    rust('rust:1.75-bookworm', script)
+    rust('rust:1-bookworm', script)
 }
 
-// Supply chain гоняется на свежем rustc: cargo-deny 0.20 требует >=1.88, а тулчейн
-// проекта пришпилен на 1.75 (билд #10). Аудиту нужен только Cargo.lock, не тулчейн.
 def rust(String image, String script) {
     def args = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
                ' -v ferrum-cargo-target:/build-target' +
@@ -162,16 +160,11 @@ pipeline {
         stage('Security: supply chain') {
             steps {
                 script {
-                    rust 'rust:1-bookworm', '''
+                    rust '''
                         set -eu
-                        # Не пачкать общий /build-target чужим rustc: иначе следующая
-                        # сборка на 1.75 переедет по фингерпринтам и пересоберётся с нуля.
+                        # Сборка cargo-deny/cargo-audit не должна пачкать общий
+                        # /build-target: иначе рабочие артефакты вытесняются впустую.
                         export CARGO_TARGET_DIR=/tmp/ferrum-tools-target
-                        # rust-toolchain.toml в воркспейсе перебивает образ, и rustup
-                        # уводит обратно на 1.75 (билд #11). Берём тулчейн образа.
-                        RUSTUP_TOOLCHAIN=$(rustup toolchain list | head -1 | cut -d' ' -f1)
-                        export RUSTUP_TOOLCHAIN
-                        rustc --version
                         command -v cargo-deny  >/dev/null || cargo install --locked cargo-deny
                         command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
                         cargo deny check licenses bans sources advisories

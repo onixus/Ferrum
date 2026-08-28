@@ -1,8 +1,10 @@
-//! HTTP/1.1 webhook. std::net only; TLS optional via rustls 0.21.
+//! HTTP/1.1 webhook. std::net only; TLS optional via rustls 0.23 (ring provider).
 
 use chrono::Utc;
 use ferrum_api::PolicyExceptionSpec;
 use ferrum_ids::Digest;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -117,8 +119,7 @@ fn handle_connection(
     let _ = stream.set_nodelay(true);
     match tls {
         Some(cfg) => {
-            let conn = rustls::ServerConnection::new(cfg)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let conn = rustls::ServerConnection::new(cfg).map_err(io::Error::other)?;
             let mut tls_stream = rustls::StreamOwned::new(conn, stream);
             serve_http(&mut tls_stream, state)
         }
@@ -220,33 +221,25 @@ fn write_response<W: Write>(w: &mut W, status: u16, reason: &str, body: &[u8]) -
 pub fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<ServerConfig>, String> {
     let cert_file = std::fs::File::open(cert_path).map_err(|e| format!("tls cert: {e}"))?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .map_err(|e| format!("tls cert parse: {e}"))?
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect::<Vec<_>>();
+    let certs = CertificateDer::pem_reader_iter(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("tls cert parse: {e}"))?;
     if certs.is_empty() {
         return Err("tls cert file contains no certificates".into());
     }
     let key_file = std::fs::File::open(key_path).map_err(|e| format!("tls key: {e}"))?;
     let mut key_reader = BufReader::new(key_file);
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+    // Разбор PEM живёт в pki-types: rustls-pemfile объявлен unmaintained (RUSTSEC-2025-0134).
+    // pkcs8/rsa/sec1 распознаются сами, отдельная ветка под RSA не нужна.
+    let key = PrivateKeyDer::from_pem_reader(&mut key_reader)
         .map_err(|e| format!("tls key parse: {e}"))?;
-    if keys.is_empty() {
-        let key_file = std::fs::File::open(key_path).map_err(|e| format!("tls key: {e}"))?;
-        let mut key_reader = BufReader::new(key_file);
-        keys = rustls_pemfile::rsa_private_keys(&mut key_reader)
-            .map_err(|e| format!("tls key parse: {e}"))?;
-    }
-    let key = keys
-        .into_iter()
-        .next()
-        .ok_or_else(|| "tls key file contains no private key".to_string())?;
-    let cfg = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, rustls::PrivateKey(key))
-        .map_err(|e| format!("tls config: {e}"))?;
+    let cfg =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("tls config: {e}"))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("tls config: {e}"))?;
     Ok(Arc::new(cfg))
 }
 

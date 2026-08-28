@@ -42,7 +42,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn b64_encode(data: &[u8]) -> String {
     const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i < data.len() {
         let rem = data.len() - i;

@@ -17,7 +17,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 
 pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(FerrumError::Integrity(
             "hex string must have even length".into(),
         ));
@@ -44,7 +44,7 @@ fn hex_nibble(b: u8) -> Result<u8> {
 }
 
 pub fn b64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i < data.len() {
         let rem = data.len() - i;
@@ -74,7 +74,7 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
-    if s.len() % 4 != 0 {
+    if !s.len().is_multiple_of(4) {
         return Err(FerrumError::Integrity(
             "base64 length must be a multiple of 4".into(),
         ));

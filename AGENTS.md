@@ -11,8 +11,9 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 
 ## Toolchain
 
-- Workspace: Rust 1.75, edition 2021, GPL-3.0-only (`rust-toolchain.toml`).
-- `kube-derive` не подключать на 1.75: транзитивные crate требуют edition2024.
+- Workspace: Rust 1.97.1, edition 2021, GPL-3.0-only (`rust-toolchain.toml`).
+- kube 1.x + k8s-openapi 0.25 (`v1_33`). Тулчейн поднят с 1.75 ради advisories: старый
+  стек тянул rustls 0.21 с тремя CVE и пять unmaintained crate.
 - Nightly только у `ferrum-ebpf-progs`. Userspace — stable + musl.
 - Перед сдачей: `cargo fmt`, `cargo clippy -p <crate> -- -D warnings` на затронутых crate.
 - Тесты точечно: `cargo test -p <crate>`. Не гонять весь workspace без нужды.
