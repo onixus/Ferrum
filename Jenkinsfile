@@ -605,12 +605,22 @@ pipeline {
                         # configuration and gains nothing by naming it; the default
                         # build must still carry neither. Both halves, because an
                         # absence with no positive control proves nothing.
-                        if cargo tree -p ferrum-ebpf -e normal | grep -qE "(^| )libc v"; then
+                        #
+                        # `--depth 1`, и это не сужение проверки, а её починка.
+                        # Утверждение здесь — про то, что линкует сам ferrum-ebpf;
+                        # полный граф несёт libc транзитивно через ferrum-crypto и
+                        # ring в любой конфигурации, так что форма без --depth
+                        # утверждала то, что перестало быть правдой в тот день,
+                        # когда ferrum-ebpf получил зависимость на ferrum-crypto.
+                        # Заметить это было некому: стадия не исполнялась ни разу
+                        # до билда #26.
+                        if cargo tree -p ferrum-ebpf -e normal --depth 1 \
+                            | grep -qE "(^| )libc v"; then
                             echo "crate boundary: ferrum-ebpf links libc with default features;" >&2
                             echo "the stable offline build must stay free of it" >&2
                             exit 1
                         fi
-                        if ! cargo tree -p ferrum-ebpf -e normal --features attach \
+                        if ! cargo tree -p ferrum-ebpf -e normal --depth 1 --features attach \
                             | grep -qE "(^| )libc v"; then
                             echo "crate boundary: libc is absent from ferrum-ebpf --features attach," >&2
                             echo "so the check above cannot detect anything and the memlock raise" >&2
