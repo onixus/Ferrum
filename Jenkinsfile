@@ -119,21 +119,49 @@ pipeline {
         // Bpf::load, and nothing else in this pipeline executes a single one of
         // its instructions.
         //
-        // Requires of the agent: CAP_BPF (or root), tracefs mounted at
-        // /sys/kernel/tracing, and a kernel with CONFIG_MODULES=y: without
-        // loadable modules there is no init_module/finit_module tracepoint and
-        // KernelHandle::attach_for_arch, which is all-or-nothing, cannot
-        // produce a handle. FERRUM_BPF_ELF_REQUIRED turns every one of those
-        // into a stage failure instead of a silent skip: a green no-op here is
-        // exactly the fail-open the stage exists to close.
+        // Requires of the agent: CAP_BPF (or root) and tracefs mounted at
+        // /sys/kernel/tracing. CONFIG_MODULES=y is not required: a kernel
+        // without loadable modules has no init_module/finit_module tracepoint,
+        // and KernelHandle::attach_for_arch narrows the enforceable set and
+        // names what it dropped instead of refusing, which this stage checks
+        // against tracefs. FERRUM_BPF_ELF_REQUIRED turns every remaining skip
+        // into a stage failure: a green no-op here is exactly the fail-open
+        // the stage exists to close.
+        //
+        // The one no-op FERRUM_BPF_ELF_REQUIRED cannot catch by itself is this
+        // line losing `--features attach`: attach_live.rs is `cfg`-gated on it,
+        // so the binary would run zero tests and exit 0 with the env var never
+        // read. Two independent things now stop that. In the test file,
+        // `the_gate_must_not_be_compiled_out` lives outside the cfg and fails
+        // when the feature is off and FERRUM_BPF_ELF_REQUIRED is on. Here, the
+        // run is required to report a non-zero number of passed tests, which
+        // also covers dropping the env var and the flag together.
         stage('BPF attach') {
             steps {
                 sh '''
                     set -eu
                     elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
                     test -f "$elf"
-                    FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
-                        cargo test -p ferrum-ebpf --features attach --test attach_live
+                    out=/tmp/ferrum-attach-live.out
+                    # Not a pipeline: /bin/sh here is dash, which has no
+                    # pipefail, and `| tee` would hand `set -e` tee's status
+                    # and swallow a failing cargo test.
+                    if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
+                        cargo test -p ferrum-ebpf --features attach --test attach_live \
+                        > "$out" 2>&1
+                    then
+                        cat "$out"
+                        exit 1
+                    fi
+                    cat "$out"
+                    passed="$(sed -n 's/^test result: ok\\. \\([0-9][0-9]*\\) passed.*/\\1/p' "$out" | head -1)"
+                    if [ "${passed:-0}" -lt 1 ]; then
+                        echo "BPF attach ran ${passed:-no} tests: the only stage that puts" >&2
+                        echo "the datapath in a kernel proved nothing. Check that" >&2
+                        echo "--features attach is still on the cargo test line." >&2
+                        exit 1
+                    fi
+                    echo "ok: $passed attach_live tests executed against this kernel"
                 '''
             }
         }
@@ -175,7 +203,23 @@ pipeline {
                         echo "the admission/agent dependency graph must not carry ferrum-crypto/x509" >&2
                         exit 1
                     fi
+                    # Everything above is an assertion of absence, and absence is
+                    # what a typo in $forbidden, a renamed crate, or a changed
+                    # `cargo tree` output format also produce. ferrum-cli is the
+                    # one member that must link both, so it is the positive
+                    # control: if the greps cannot find them here, they were
+                    # never capable of finding them anywhere and the loop above
+                    # proved nothing.
+                    cli="$(cargo tree -p ferrum-cli -e normal)"
+                    for expected in rcgen x509-parser; do
+                        if ! printf '%s\n' "$cli" | grep -qE "(^| )$expected v"; then
+                            echo "crate boundary: ferrum-cli does not link $expected, so the" >&2
+                            echo "absence checks above cannot detect anything" >&2
+                            exit 1
+                        fi
+                    done
                     echo "ok: rcgen and x509-parser stay off the admission and agent graphs"
+                    echo "ok: and are still detectable on ferrum-cli, which must carry them"
                 '''
             }
         }
