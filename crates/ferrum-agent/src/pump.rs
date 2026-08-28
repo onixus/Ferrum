@@ -2,15 +2,26 @@
 //!
 //! The record source is abstract (any iterator or an mpsc channel), so tests
 //! and a future kernel ring reader share one path. A record that fails to
-//! decode is counted separately from in-kernel ring drops — it is telemetry
-//! loss, never a reason to stop the loop or to fail open. A record whose
-//! syscall nr is outside the decode table marks the agent Degraded: the table
-//! and the event source disagree, so enforce matching can no longer be
-//! trusted; the event is still exported for visibility.
+//! decode is counted separately from in-kernel ring drops — same loss, other
+//! side of the ring: it carried a syscall that no rule ever matched against,
+//! so it degrades the agent on the same decaying terms rather than being
+//! written off as telemetry. It is never a reason to stop the loop or to fail
+//! open. A record whose syscall nr is outside the decode table marks the agent
+//! Degraded: the table and the event source disagree, so enforce matching can
+//! no longer be trusted; the event is still exported for visibility.
+//!
+//! This loop is also the only place that sees successes and failures side by
+//! side, which is what tells a node losing the odd record from a node whose
+//! datapath decodes nothing at all. The decaying window cannot: it says
+//! "recently" and a node that stops receiving syscalls stops refreshing it,
+//! so a wrong ELF plus a quiet minute reported healthy. Every decoded record
+//! is reported, so a run of failures with none in between is a real run.
 
 use crate::Agent;
 use ferrum_common::{FerrumError, Result};
-use ferrum_ebpf::{decode_event, event_meta, syscall_event, syscall_name, SyscallArch};
+use ferrum_ebpf::{
+    abi_stamp_mismatch, decode_event, event_meta, syscall_event, syscall_name, SyscallArch,
+};
 use ferrum_export::EventSink;
 use std::sync::mpsc::Receiver;
 
@@ -19,7 +30,8 @@ pub struct PumpStats {
     /// Records decoded, named, and pushed through `handle_event`.
     pub handled: u64,
     /// Malformed records, counted in `records_decode_failed_total`, not in
-    /// `events_dropped_total` (that one is the in-kernel ring counter).
+    /// `events_dropped_total` (that one is the in-kernel ring counter). Each
+    /// one is an event no rule saw, and degrades the agent while it recurs.
     pub decode_failed: u64,
     /// Records with a syscall nr outside the decode table; each marks the
     /// agent Degraded via `record_unknown_syscall`.
@@ -37,6 +49,11 @@ where
     for record in records {
         match decode_event(record.as_ref()) {
             Ok(event) => {
+                // Reported before anything else is done with it: the agent
+                // separates "some records are malformed" from "nothing
+                // decodes" by whether any record in between decoded at all,
+                // and only this loop sees both sides.
+                agent.record_decode_success(1);
                 let view = syscall_event(&event, arch);
                 if syscall_name(arch, event.syscall_nr).is_none() {
                     stats.unknown_syscall += 1;
@@ -48,7 +65,16 @@ where
             }
             Err(_) => {
                 stats.decode_failed += 1;
-                agent.record_decode_failure(1);
+                // A stamp this decoder does not know is not a malformed
+                // record: it is a full-length record from an ELF that is not
+                // this build, so every record it writes will be refused the
+                // same way. Told apart here because the ELF cannot be asked -
+                // the stamp is an instruction immediate, invisible to the
+                // attach-time map check.
+                match abi_stamp_mismatch(record.as_ref()) {
+                    Some(stamp) => agent.record_datapath_abi_mismatch(stamp),
+                    None => agent.record_decode_failure(1),
+                }
             }
         }
     }

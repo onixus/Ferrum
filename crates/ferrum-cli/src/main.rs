@@ -50,6 +50,18 @@ enum Commands {
         /// Шаблон вебхука; по умолчанию берётся из --out-dir.
         #[arg(long)]
         template: Option<PathBuf>,
+        /// Ротация: переиспользовать этот CA вместо выпуска нового; caBundle не меняется.
+        #[arg(long)]
+        ca_cert: Option<PathBuf>,
+        /// Ключ CA для ротации; задаётся вместе с --ca-cert.
+        #[arg(long)]
+        ca_key: Option<PathBuf>,
+        /// Применённая в кластере ValidatingWebhookConfiguration: её caBundle —
+        /// единственное свидетельство того, какому CA кластер доверяет.
+        /// Обязательна при ротации, если рядом с --ca-cert или --out-dir
+        /// отрендеренной конфигурации нет.
+        #[arg(long)]
+        webhook_config: Option<PathBuf>,
     },
     /// Проверить подпись FSIG пином trust root (64 hex-символа Ed25519).
     Verify {
@@ -80,12 +92,18 @@ fn run() -> Result<()> {
             days,
             out_dir,
             template,
+            ca_cert,
+            ca_key,
+            webhook_config,
         } => gen_pki::gen_webhook_pki(&gen_pki::GenPkiArgs {
             service,
             namespace,
             days,
             out_dir,
             template,
+            ca_cert,
+            ca_key,
+            webhook_config,
         }),
     }
 }

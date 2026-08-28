@@ -1,0 +1,21 @@
+# Negative fixture: this policy MUST fail `ferrumctl validate`.
+#
+# `open` and `openat` are the same operation split across architectures: naming
+# only one leaves the rule dead on the arches that lack it, or bypassable on the
+# arches that still serve the other form. One signed bundle ships to every node,
+# so half a pair is enforcement that depends on which node the workload lands on.
+apiVersion: ferrum.io/v1
+kind: ClusterSecurityPolicy
+metadata:
+  name: arch-split-syscall
+spec:
+  mode: enforce
+  runtime:
+    defaultAction: audit
+    rules:
+      - id: no-runtime-sock
+        syscalls: [openat]
+        match:
+          pathSuffix: [docker.sock]
+          containerOnly: true
+        action: kill

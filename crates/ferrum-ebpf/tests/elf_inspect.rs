@@ -7,16 +7,18 @@
 //! Parsing is hand-rolled ELF64LE (headers + symtab) to keep ferrum-ebpf
 //! free of ELF crates.
 
-use ferrum_ebpf::{CGROUPS_MAX_ENTRIES, MAP_CGROUPS, MAP_EVENTS, MAP_SELF, TRACEPOINTS};
+use ferrum_ebpf::{
+    elf_map_def, verify_map_defs, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_DEF_LEN,
+    MAP_EVENTS, MAP_SELF, REQUIRED_MAPS, TRACEPOINTS,
+};
 
 const SHT_SYMTAB: u32 = 2;
 const STT_FUNC: u8 = 2;
 const STT_OBJECT: u8 = 1;
 
-/// `bpf_map_def` as aya-ebpf emits it into the `maps` section: seven u32s
-/// (type, key_size, value_size, max_entries, map_flags, id, pinning).
-const MAP_DEF_LEN: usize = 28;
 const BPF_MAP_TYPE_HASH: u32 = 1;
+const BPF_MAP_TYPE_ARRAY: u32 = 2;
+const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 
 struct Sym {
     name: String,
@@ -170,6 +172,30 @@ fn elf_contains_all_tracepoints() {
     }
 }
 
+/// Read one map definition with this test's own ELF parser, so the crate's
+/// `elf_map_def` — which the agent runs before every attach — is checked
+/// against a second implementation rather than only against itself.
+fn map_def_here(elf: &[u8], path: &str, name: &str) -> [u32; 4] {
+    let syms = symbols(elf);
+    let sym = syms
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("map symbol {name} missing from {path}"));
+    assert_eq!(
+        sym.size, MAP_DEF_LEN,
+        "{name} is {} bytes, expected a {MAP_DEF_LEN}-byte bpf_map_def",
+        sym.size
+    );
+    let data = section_data(elf, sym);
+    let def = &data[sym.value..sym.value + MAP_DEF_LEN];
+    [
+        u32_field(def, 0),
+        u32_field(def, 1),
+        u32_field(def, 2),
+        u32_field(def, 3),
+    ]
+}
+
 /// Static ABI check of `ferrum_cgroups`, NOT a check that attach works: the
 /// map definition compiled into the ELF must match what
 /// `KernelHandle::sync_container_cgroups` writes (u64 -> u8) and what
@@ -180,33 +206,82 @@ fn cgroups_map_definition_matches_the_userspace_abi() {
     let Some((path, elf)) = elf_or_skip() else {
         return;
     };
-    let syms = symbols(&elf);
-    let sym = syms
-        .iter()
-        .find(|s| s.name == MAP_CGROUPS)
-        .unwrap_or_else(|| panic!("map symbol {MAP_CGROUPS} missing from {path}"));
+    let def = map_def_here(&elf, &path, MAP_CGROUPS);
+    assert_eq!(def[0], BPF_MAP_TYPE_HASH, "{MAP_CGROUPS} is not a hash map");
+    assert_eq!(def[1], 8, "{MAP_CGROUPS} key is not a u64 cgroup id");
+    assert_eq!(def[2], 1, "{MAP_CGROUPS} value is not a u8 flag");
     assert_eq!(
-        sym.size, MAP_DEF_LEN,
-        "{MAP_CGROUPS} is {} bytes, expected a {MAP_DEF_LEN}-byte bpf_map_def",
-        sym.size
-    );
-    let data = section_data(&elf, sym);
-    let def = &data[sym.value..sym.value + MAP_DEF_LEN];
-    assert_eq!(
-        u32_field(def, 0),
-        BPF_MAP_TYPE_HASH,
-        "{MAP_CGROUPS} is not BPF_MAP_TYPE_HASH"
-    );
-    assert_eq!(
-        u32_field(def, 1),
-        8,
-        "{MAP_CGROUPS} key is not a u64 cgroup id"
-    );
-    assert_eq!(u32_field(def, 2), 1, "{MAP_CGROUPS} value is not a u8 flag");
-    assert_eq!(
-        u32_field(def, 3),
-        CGROUPS_MAX_ENTRIES,
+        def[3], CGROUPS_MAX_ENTRIES,
         "{MAP_CGROUPS} max_entries disagrees with CGROUPS_MAX_ENTRIES, which is what \
          plan_cgroup_sync refuses to overflow"
     );
+}
+
+/// `ferrum_events` is the only path records take out of the kernel. A type
+/// that is no longer a ring buffer, or a byte size that is not the one the
+/// reader expects, means `take_ring` fails or the ring silently drops under a
+/// load the drop counter was sized for.
+#[test]
+fn events_map_definition_matches_the_userspace_abi() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
+    let def = map_def_here(&elf, &path, MAP_EVENTS);
+    assert_eq!(
+        def[0], BPF_MAP_TYPE_RINGBUF,
+        "{MAP_EVENTS} is not a ring buffer; RingBuf::try_from would fail at attach"
+    );
+    assert_eq!(def[1], 0, "{MAP_EVENTS} ring buffers carry no key");
+    assert_eq!(def[2], 0, "{MAP_EVENTS} ring buffers carry no value size");
+    assert_eq!(
+        def[3], EVENTS_RING_BYTES,
+        "{MAP_EVENTS} byte size disagrees with EVENTS_RING_BYTES"
+    );
+}
+
+/// `ferrum_self` carries the agent's own tgid. If its value width drifts, the
+/// datapath compares against a truncated tgid, `EVENT_FLAG_AGENT_SELF` stops
+/// being set, and the agent can be told to kill itself.
+#[test]
+fn self_map_definition_matches_the_userspace_abi() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
+    let def = map_def_here(&elf, &path, MAP_SELF);
+    assert_eq!(def[0], BPF_MAP_TYPE_ARRAY, "{MAP_SELF} is not an array map");
+    assert_eq!(def[1], 4, "{MAP_SELF} key is not a u32 array index");
+    assert_eq!(
+        def[2], 8,
+        "{MAP_SELF} value is not the u64 set_self_tgid writes"
+    );
+    assert_eq!(
+        def[3], 1,
+        "{MAP_SELF} is not the single slot Array::get(0) reads"
+    );
+}
+
+/// The gate the agent itself runs: `KernelHandle::attach` refuses to load an
+/// ELF whose maps do not match, so the shipped ELF must pass the same check
+/// here, before it reaches a node.
+#[test]
+fn the_shipped_elf_passes_the_attach_time_map_check() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
+    verify_map_defs(&elf).unwrap_or_else(|err| panic!("{path} would be refused at attach: {err}"));
+    for expected in REQUIRED_MAPS {
+        let found = elf_map_def(&elf, expected.name).expect("map def");
+        assert_eq!(&found, expected);
+        assert_eq!(
+            map_def_here(&elf, &path, expected.name),
+            [
+                expected.map_type,
+                expected.key_size,
+                expected.value_size,
+                expected.max_entries
+            ],
+            "{} read differently by the two parsers",
+            expected.name
+        );
+    }
 }

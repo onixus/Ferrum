@@ -4,7 +4,8 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use ferrum_admission::{
-    admit, load_bundle, AdmissionSubject, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED, RULE_UNSIGNED,
+    admit, load_bundle, AdmissionSubject, RULE_ADDED_CAPABILITIES, RULE_CLUSTER_ADMIN_BIND,
+    RULE_PRIVILEGED, RULE_UNSIGNED,
 };
 use ferrum_agent::{
     apply_role, encode_fsig, Agent, AgentConfig, AgentRole, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY,
@@ -18,7 +19,8 @@ use ferrum_export::MemorySink;
 use ferrum_ids::{Digest, ADMISSION_ABI, AGENT_ABI};
 use ferrum_k8smeta::WorkloadIdentity;
 use ferrum_testkit::{
-    exception_ok, prod_restricted, try_exception_from_yaml, EXCEPTION_WITHOUT_TTL_YAML,
+    exception_ok, prod_restricted, try_exception_from_yaml, AcceptanceCase,
+    EXCEPTION_WITHOUT_TTL_YAML,
 };
 use std::path::PathBuf;
 
@@ -96,6 +98,7 @@ fn ev<'a>(syscall: &'a str, comm: &'a str, path: &'a str, agent_self: bool) -> S
         path,
         in_container: true,
         agent_self,
+        path_truncated: false,
     }
 }
 
@@ -108,6 +111,48 @@ fn temp_lkg() -> PathBuf {
             .expect("time")
             .as_nanos()
     ))
+}
+
+/// Which test carries which §D case, checked against the shared case list
+/// rather than against prose. The entries are the real test functions, so a
+/// case whose test is renamed away stops compiling, and a case added to
+/// `AcceptanceCase` fails this gate until something here covers it. The
+/// functions are not called: `#[test]` already runs each exactly once.
+#[test]
+fn every_acceptance_case_has_a_test() {
+    let covered: [(AcceptanceCase, fn()); 8] = [
+        (AcceptanceCase::UnsignedDeny, unsigned_image_is_denied),
+        (AcceptanceCase::PrivilegedDeny, privileged_pod_is_denied),
+        (
+            AcceptanceCase::ClusterAdminBindDeny,
+            cluster_admin_bind_is_denied,
+        ),
+        (
+            AcceptanceCase::ExceptionWithoutTtlReject,
+            exception_without_ttl_is_rejected_and_scoped_exception_waives,
+        ),
+        (
+            AcceptanceCase::ExecShellKill,
+            exec_shell_in_container_is_killed,
+        ),
+        (AcceptanceCase::DockerSockKill, docker_sock_access_is_killed),
+        (
+            AcceptanceCase::BpfNotFromAgentDeny,
+            bpf_not_from_agent_is_denied,
+        ),
+        (
+            AcceptanceCase::ControlPlaneDownLkg,
+            cp_down_keeps_last_known_good_not_fail_open,
+        ),
+    ];
+    for case in AcceptanceCase::ALL {
+        assert_eq!(
+            covered.iter().filter(|(c, _)| c == case).count(),
+            1,
+            "no acceptance test registered for §D case: {}",
+            case.label()
+        );
+    }
 }
 
 #[test]
@@ -350,16 +395,67 @@ fn only_signed_exceptions_are_accepted_from_the_mount() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// §D `bpf()` not from the agent → deny, and which layer carries the deny.
+///
+/// Admission carries it: it refuses the pod that could load a module before it
+/// runs at all (`admit.deny` privileged / SYS_MODULE, asserted here and in the
+/// admission cases above). The runtime plane cannot: its tracepoint fires
+/// after the syscall has already returned, so a runtime `deny` would be a
+/// verdict decided and never executed — a permanent export stream of denials
+/// that never happened. What this plane can honestly execute is the audit
+/// record naming the caller, and `ferrum-policy` now refuses to compile the
+/// dishonest version.
 #[test]
 fn bpf_not_from_agent_is_denied() {
+    // The deny half, before the syscall exists to observe.
+    let program = program();
+    let mut privileged_loader = compliant_subject();
+    privileged_loader.privileged = true;
+    privileged_loader.added_capabilities = vec!["SYS_MODULE".into()];
+    let denied = admit(&program, &privileged_loader, &[], now());
+    assert!(!denied.allowed);
+    assert!(denied.rule_ids.iter().any(|r| r == RULE_PRIVILEGED));
+    assert!(denied.rule_ids.iter().any(|r| r == RULE_ADDED_CAPABILITIES));
+
+    // The runtime half: the caller is named, and the record does not claim a
+    // reaction that never ran.
     let agent = loaded_agent();
     let decision = agent.matched_action(&ev("bpf", "loader", "", false));
-    assert_eq!(decision.action, Action::Deny);
+    assert_eq!(decision.action, Action::Audit);
     assert_eq!(decision.rule_id.as_deref(), Some("no-module"));
 
     let from_agent = agent.matched_action(&ev("bpf", "ferrum-agent", "", true));
+    assert_eq!(
+        from_agent.rule_id, None,
+        "the agent's own bpf() is not a hit"
+    );
     assert_ne!(from_agent.action, Action::Deny);
     assert_ne!(from_agent.action, Action::Kill);
+
+    agent.insert_cgroup(7, payments_identity());
+    let refused_before = agent.respond_refused_total();
+    let sink = MemorySink::new();
+    let exported = agent.handle_event_at(7, &ev("bpf", "loader", "", false), &sink, now());
+    assert_eq!(exported.action, Action::Audit);
+
+    let events = sink.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action, "audit");
+    assert_eq!(events[0].rule.as_str(), "no-module");
+    assert_eq!(events[0].comm, "loader");
+    assert!(
+        !events[0].executed,
+        "an audit record executes nothing, and must not claim otherwise"
+    );
+    assert_eq!(
+        events[0].respond_error, None,
+        "nothing was refused: there was nothing to execute"
+    );
+    assert_eq!(
+        agent.respond_refused_total(),
+        refused_before,
+        "a rule the plane can execute must not feed the refusal counter"
+    );
 }
 
 #[test]
@@ -425,6 +521,20 @@ fn controller_signed_exceptions_are_accepted_by_agent_and_admission() {
     let decoded: Vec<PolicyExceptionSpec> =
         serde_json::from_slice(&payload).expect("payload is the spec array");
     assert_eq!(decoded, specs);
+
+    // The fourth copy. `ferrumctl` is the offline half of the same channel —
+    // it is what an operator runs to look at bytes a cluster is serving — and
+    // until this line the row in docs/MVP-1-BOUNDARY.md said "four copies"
+    // while the test under it exercised three. A codec copy that nothing
+    // compares is the drift this test exists to catch, one crate over.
+    let (cli_key, cli_sig, cli_raw) =
+        ferrum_cli::fsig::decode_fsig(&sealed).expect("ferrumctl decodes controller bytes");
+    assert_eq!(cli_raw, payload, "the CLI reads a different payload");
+    assert_eq!(
+        cli_key, trust_root,
+        "the CLI reads a different embedded key"
+    );
+    assert_eq!(cli_sig.len(), 64, "an Ed25519 signature is 64 bytes");
 
     // The agent takes it from the mount and the waiver demotes the kill.
     let dir = temp_lkg();

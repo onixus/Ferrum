@@ -89,13 +89,31 @@ impl Responder for NoopResponder {
 pub trait TargetCheck: Send + Sync {
     /// `None` when the process is gone or its cgroup cannot be read.
     fn cgroup_id(&self, tgid: u32) -> Option<u64>;
+
+    /// Why this check cannot be computed on this node at all, if it cannot.
+    ///
+    /// `cgroup_id` answers a question *about a target*: `None` there means
+    /// that process is gone, which is an ordinary and healthy answer. This
+    /// answers a question about the *check itself*, and the two must not be
+    /// confused. A check that cannot be evaluated for any target returns
+    /// nothing that is evidence about a target, so a caller reading `None`
+    /// from `cgroup_id` would be treating a predicate it could not compute as
+    /// proof that its subject moved.
+    ///
+    /// Defaults to `None`: an implementation that always answers is always
+    /// provable, so only one that can fail to be constructed overrides it.
+    fn unprovable(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Reads `/proc/<tgid>/cgroup` and stats the unified cgroup directory it
 /// names: the same inode `bpf_get_current_cgroup_id()` reports.
 pub struct ProcCgroupCheck {
     proc_root: PathBuf,
-    cgroup_root: PathBuf,
+    /// Where cgroup2 is mounted, or why that could not be established. The
+    /// error is kept rather than defaulted away: see [`Self::with_proc_root`].
+    cgroup_root: std::result::Result<PathBuf, String>,
 }
 
 impl Default for ProcCgroupCheck {
@@ -105,24 +123,66 @@ impl Default for ProcCgroupCheck {
 }
 
 impl ProcCgroupCheck {
+    /// The node's real `/proc`, with the cgroup2 root derived from it.
     pub fn new() -> Self {
-        Self::with_roots(PROC_ROOT, ferrum_k8smeta::DEFAULT_CGROUP_ROOT)
+        Self::with_proc_root(PROC_ROOT)
     }
 
+    /// The same derivation against an explicit `/proc`.
+    ///
+    /// The root used to be `ferrum_k8smeta::DEFAULT_CGROUP_ROOT`, which is
+    /// right only where cgroup2 is mounted at the top of `/sys/fs/cgroup`. On
+    /// a hybrid node that path is a tmpfs of v1 controller directories with
+    /// cgroup2 below it, so every path built here named a file that was not
+    /// there, every reaction refused as a stale target, and nothing said so.
+    ///
+    /// A failed derivation is kept, not replaced by the constant. Falling back
+    /// would answer every call with an inode from the wrong filesystem or with
+    /// none at all, and the caller would read that as "the target left its
+    /// cgroup" — treating a predicate that could not be computed as proof of a
+    /// non-match, which is the defect rather than the fix. [`Self::unprovable`]
+    /// reports it, and the reaction path refuses under its own name.
+    pub fn with_proc_root(proc_root: impl Into<PathBuf>) -> Self {
+        let proc_root = proc_root.into();
+        let mountinfo = proc_root.join("self").join("mountinfo");
+        let cgroup_root = match std::fs::read_to_string(&mountinfo) {
+            Ok(raw) => ferrum_k8smeta::cgroup2_root_from_mountinfo(&raw).map_err(|e| e.to_string()),
+            Err(err) => Err(format!("{} unreadable: {err}", mountinfo.display())),
+        };
+        Self {
+            proc_root,
+            cgroup_root,
+        }
+    }
+
+    /// Roots the caller has already established.
     pub fn with_roots(proc_root: impl Into<PathBuf>, cgroup_root: impl Into<PathBuf>) -> Self {
         Self {
             proc_root: proc_root.into(),
-            cgroup_root: cgroup_root.into(),
+            cgroup_root: Ok(cgroup_root.into()),
+        }
+    }
+
+    /// The cgroup2 root this check is keyed on, or why there is none.
+    pub fn cgroup_root(&self) -> std::result::Result<&Path, &str> {
+        match &self.cgroup_root {
+            Ok(root) => Ok(root.as_path()),
+            Err(why) => Err(why.as_str()),
         }
     }
 }
 
 impl TargetCheck for ProcCgroupCheck {
     fn cgroup_id(&self, tgid: u32) -> Option<u64> {
+        let root = self.cgroup_root.as_ref().ok()?;
         let raw =
             std::fs::read_to_string(self.proc_root.join(tgid.to_string()).join("cgroup")).ok()?;
         let rel = unified_cgroup_path(&raw)?;
-        inode_of(&self.cgroup_root.join(rel.trim_start_matches('/')))
+        inode_of(&root.join(rel.trim_start_matches('/')))
+    }
+
+    fn unprovable(&self) -> Option<String> {
+        self.cgroup_root.as_ref().err().cloned()
     }
 }
 
@@ -181,10 +241,23 @@ pub const REFUSE_TGID_INIT: &str = "tgid 1: init is never a target";
 pub const REFUSE_TGID_SELF: &str = "tgid is this agent process";
 pub const REFUSE_TGID_RANGE: &str = "tgid outside the pid range: not a signalable process";
 pub const REFUSE_ISOLATE: &str = "isolate not implemented";
+/// A tracepoint fires after the syscall entry is recorded, so by the time the
+/// decision exists there is nothing left to refuse. Exported on every runtime
+/// Deny so the event is distinguishable from one nobody meant to act on.
+pub const REFUSE_DENY_NOT_ENFORCEABLE: &str =
+    "tracepoint does not block a syscall: it has already run and been recorded; the enforceable reaction is kill, the blocking one is admission";
 pub const REFUSE_NO_RESPONDER: &str = "no responder wired: reaction backend not installed";
 pub const REFUSE_STALE_TARGET: &str =
     "tgid left the cgroup that raised the event: pid reuse, not the workload";
 pub const REFUSE_TARGET_GONE: &str = "target process is gone before the signal";
+/// Deliberately not one of the two above. Those say something about the
+/// target; this says the guard could not be evaluated at all, so nothing is
+/// known about the target and the refusal is the agent declining to signal
+/// blind rather than a workload that moved. A node in this state can never
+/// react, which is why it is also a degradation reason and they are not.
+pub const REFUSE_TARGET_UNPROVABLE: &str =
+    "stale-target guard cannot be computed on this node: nothing is proven about the target, and \
+     that is not evidence the target moved";
 
 /// Respond cannot be honoured outside the initial pid namespace; the agent
 /// says so and runs in observe instead of signalling blind.
@@ -331,6 +404,137 @@ mod tests {
             .expect("v1 cgroup file");
         assert_eq!(check.cgroup_id(4242), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The whole of finding 1's first half, over a fake `/proc` whose
+    /// `mountinfo` is this host's hybrid layout: cgroup2 under `unified`, and
+    /// `/sys/fs/cgroup` a tmpfs of v1 controllers.
+    ///
+    /// Before the fix `new()` hardcoded `/sys/fs/cgroup`, so the path stat'ed
+    /// here was `<tmpfs>/kubepods/...`, which does not exist: `cgroup_id`
+    /// returned `None` for a process that had never moved, and the reaction
+    /// path read that as a stale target. Pointing the derivation at the wrong
+    /// root is exactly the defect, so this asserts the *derived* root, not a
+    /// passed-in one.
+    #[test]
+    fn a_hybrid_node_keys_on_the_unified_mount_it_actually_has() {
+        let root = temp_dir("hybrid");
+        let proc_root = root.join("proc");
+        let tmpfs = root.join("sys/fs/cgroup");
+        let unified = tmpfs.join("unified");
+        let live = unified.join("kubepods/pod-1/container-a");
+        std::fs::create_dir_all(&live).expect("cgroup dir");
+        // The v1 tmpfs really does hold directories; none of them is the
+        // hierarchy /proc/<pid>/cgroup names.
+        std::fs::create_dir_all(tmpfs.join("memory")).expect("v1 dir");
+        std::fs::create_dir_all(proc_root.join("self")).expect("proc self");
+        std::fs::create_dir_all(proc_root.join("4242")).expect("proc dir");
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            format!(
+                "35 23 0:27 / {} rw,relatime - tmpfs tmpfs rw\n\
+                 39 35 0:31 / {}/memory rw,relatime - cgroup cgroup rw,memory\n\
+                 45 35 0:37 / {} rw,relatime - cgroup2 cgroup2 rw\n",
+                tmpfs.display(),
+                tmpfs.display(),
+                unified.display()
+            ),
+        )
+        .expect("mountinfo");
+        std::fs::write(
+            proc_root.join("4242/cgroup"),
+            "0::/kubepods/pod-1/container-a\n",
+        )
+        .expect("cgroup file");
+
+        let check = ProcCgroupCheck::with_proc_root(&proc_root);
+        assert_eq!(check.cgroup_root(), Ok(unified.as_path()));
+        assert_eq!(check.unprovable(), None, "the root was derivable");
+        assert_eq!(
+            check.cgroup_id(4242),
+            inode_of(&live),
+            "the derived root must name the same inode bpf_get_current_cgroup_id() reports; \
+             a check keyed on {} answers None for a target that never moved",
+            tmpfs.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A root that cannot be derived is reported as such and never guessed.
+    /// `cgroup_id` still refuses — not signalling is the safe direction — but
+    /// the caller can tell that refusal apart from "this target is gone",
+    /// which is the difference between a busy node and a node that has stopped
+    /// enforcing.
+    #[test]
+    fn an_underivable_root_is_unprovable_not_a_default() {
+        let root = temp_dir("unprovable");
+        let proc_root = root.join("proc");
+        std::fs::create_dir_all(proc_root.join("self")).expect("proc self");
+        std::fs::create_dir_all(proc_root.join("4242")).expect("proc dir");
+        std::fs::write(proc_root.join("4242/cgroup"), "0::/kubepods/pod-1\n").expect("cgroup file");
+
+        // No cgroup2 line at all: a v1-only node.
+        std::fs::write(
+            proc_root.join("self/mountinfo"),
+            "35 23 0:27 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n",
+        )
+        .expect("mountinfo");
+        let check = ProcCgroupCheck::with_proc_root(&proc_root);
+        let why = check.unprovable().expect("v1-only node is unprovable");
+        assert!(why.contains("no cgroup2 mount"), "{why}");
+        assert!(check.cgroup_root().is_err());
+        assert_eq!(check.cgroup_id(4242), None);
+
+        // No mountinfo to read at all.
+        std::fs::remove_file(proc_root.join("self/mountinfo")).expect("rm");
+        let check = ProcCgroupCheck::with_proc_root(&proc_root);
+        let why = check.unprovable().expect("no mountinfo is unprovable");
+        assert!(why.contains("unreadable"), "{why}");
+
+        // An explicit root is the caller's own proof: it is never unprovable.
+        assert_eq!(
+            ProcCgroupCheck::with_roots(&proc_root, root.join("cgroup")).unprovable(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The production constructor is keyed on the derivation and on nothing
+    /// else. The test above proves the derivation is right over a fake `/proc`;
+    /// this one proves `new()` uses it, which is the half that was wrong — and
+    /// it is the only assertion here that can fail without a kernel, an ELF
+    /// and CAP_BPF. On a node where cgroup2 is at `/sys/fs/cgroup` the old
+    /// constant and the derived root agree and this says nothing; on the
+    /// hybrid node it is the whole defect.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_production_check_is_keyed_on_the_derived_root() {
+        let check = ProcCgroupCheck::new();
+        match ferrum_k8smeta::detect_cgroup2_root() {
+            Ok(root) => assert_eq!(
+                check.cgroup_root(),
+                Ok(root.as_path()),
+                "ProcCgroupCheck::new() is not keyed on this node's cgroup2 mount; on a hybrid \
+                 node that is every reaction refusing on a target that never moved"
+            ),
+            Err(_) => assert!(
+                check.unprovable().is_some(),
+                "no cgroup2 mount on this node, and the check claims it can still prove a target"
+            ),
+        }
+    }
+
+    /// The default a check that can always answer gets, so implementations
+    /// that cannot fail need say nothing.
+    #[test]
+    fn a_check_that_always_answers_is_provable_by_default() {
+        struct Always;
+        impl TargetCheck for Always {
+            fn cgroup_id(&self, _tgid: u32) -> Option<u64> {
+                Some(7)
+            }
+        }
+        assert_eq!(Always.unprovable(), None);
     }
 
     #[test]

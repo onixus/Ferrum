@@ -9,9 +9,20 @@
 use crate::cgroupfs::{container_id_matches, strip_container_scheme};
 use crate::labels::LabelCache;
 use crate::WorkloadIdentity;
-use ferrum_common::Result;
+use ferrum_common::{FerrumError, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+/// How long the pod cache may go without a frame from the watch before its
+/// contents stop counting as this node's current identity. Two expected
+/// bookmark intervals: the apiserver bookmarks a quiet watch about once a
+/// minute, so five minutes is several missed heartbeats, not one late one.
+/// Deliberately not the two hours of the last-known-good bundle: that budget
+/// buys a control plane outage the enforcement rules survive, while pod
+/// identity older than a few minutes describes containers that may no longer
+/// exist on this node.
+pub const POD_WATCH_BUDGET: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContainerRecord {
@@ -85,6 +96,19 @@ pub struct PodCache {
     namespaces: LabelCache,
     service_accounts: LabelCache,
     labels_unknown: AtomicU64,
+    /// Last frame the pod watch delivered (list, event or bookmark). `None`
+    /// means no list ever completed. Without it a frozen watch that still
+    /// answers `snapshot()` is indistinguishable from a quiet cluster.
+    last_applied: Option<Instant>,
+    /// A relist the watch demanded and nobody has completed yet. Liveness and
+    /// completeness are different facts: a `410 Gone` proves the stream is
+    /// alive *and* that events were missed, so the freshness stamp alone would
+    /// keep answering for a cache known to be behind.
+    relist_pending: bool,
+    /// When `relist_pending` was first raised, and `None` while nothing is
+    /// owed. Re-raising does not move it: a stream that keeps producing frames
+    /// this build cannot read must not push its own deadline out forever.
+    debt_raised_at: Option<Instant>,
 }
 
 impl Clone for PodCache {
@@ -96,6 +120,9 @@ impl Clone for PodCache {
             namespaces: self.namespaces.clone(),
             service_accounts: self.service_accounts.clone(),
             labels_unknown: AtomicU64::new(self.labels_unknown_total()),
+            last_applied: self.last_applied,
+            relist_pending: self.relist_pending,
+            debt_raised_at: self.debt_raised_at,
         }
     }
 }
@@ -130,6 +157,80 @@ impl PodCache {
     /// instead of looking like a deliberate non-match.
     pub fn labels_unknown_total(&self) -> u64 {
         self.labels_unknown.load(Ordering::Relaxed)
+    }
+
+    /// Record that the watch delivered something. Takes the instant so a
+    /// caller (or a test) can place it in the past without waiting.
+    pub fn mark_applied_at(&mut self, at: Instant) {
+        self.last_applied = Some(at);
+    }
+
+    /// The watch owes a relist that has not completed — `410 Gone`, or a frame
+    /// the parser could not read, which is the same fact arriving in a
+    /// different shape. The pods held are the ones from before the gap, so this
+    /// is "the cache is behind", not "the cache is cold".
+    pub fn relist_pending(&self) -> bool {
+        self.relist_pending
+    }
+
+    /// Raise the obligation. There is deliberately no public way to lower it:
+    /// only a completed [`PodCache::replace_all`] discharges it.
+    pub fn raise_relist_pending(&mut self) {
+        self.raise_relist_pending_at(Instant::now());
+    }
+
+    /// Same, at an explicit instant, so a caller (or a test) can age a debt
+    /// without waiting for it.
+    pub fn raise_relist_pending_at(&mut self, at: Instant) {
+        if !self.relist_pending {
+            self.relist_pending = true;
+            self.debt_raised_at = Some(at);
+        }
+    }
+
+    /// The outstanding debt has stood for
+    /// [`crate::labels::RELIST_DEBT_HOLDDOWN`], so the watch feeding this cache
+    /// should end its stream and relist. False during the hold-down: the frames
+    /// that raised it keep being read instead of costing a reconnect each.
+    pub fn relist_due_at(&self, now: Instant) -> bool {
+        self.debt_raised_at.is_some_and(|at| {
+            now.saturating_duration_since(at) >= crate::labels::RELIST_DEBT_HOLDDOWN
+        })
+    }
+
+    /// Time since the last watch frame. `None` until the first list lands.
+    pub fn applied_age(&self) -> Option<Duration> {
+        self.applied_age_at(Instant::now())
+    }
+
+    pub fn applied_age_at(&self, now: Instant) -> Option<Duration> {
+        self.last_applied
+            .map(|at| now.saturating_duration_since(at))
+    }
+
+    /// Fresh means a frame arrived within [`POD_WATCH_BUDGET`].
+    pub fn is_fresh_at(&self, now: Instant) -> bool {
+        self.applied_age_at(now)
+            .is_some_and(|age| age < POD_WATCH_BUDGET)
+    }
+
+    fn freshness(&self, now: Instant) -> Result<()> {
+        match self.applied_age_at(now) {
+            None => Err(FerrumError::Degraded(
+                "pod watch has not delivered a list yet: no cgroup can be matched to a pod".into(),
+            )),
+            Some(_) if self.relist_pending => Err(FerrumError::Degraded(
+                "pod watch owes a relist that has not completed (410 Gone, or a frame this build \
+                 could not read): the cached pods are known to be behind, and cgroups are not \
+                 matched to pods off a cache with a hole in it"
+                    .into(),
+            )),
+            Some(age) if age >= POD_WATCH_BUDGET => Err(FerrumError::Degraded(format!(
+                "pod watch frozen: last frame {age:?} ago, past the {POD_WATCH_BUDGET:?} budget; \
+                 cgroups are not matched to pods off a cache of that age"
+            ))),
+            Some(_) => Ok(()),
+        }
     }
 
     pub fn node_name(&self) -> &str {
@@ -174,11 +275,16 @@ impl PodCache {
         self.pods.remove(uid)
     }
 
+    /// Full list result: the only thing that discharges a pending relist.
     pub fn replace_all(&mut self, pods: Vec<PodRecord>) {
         self.pods.clear();
         for pod in pods {
             self.upsert(pod);
         }
+        // Last, so that a future ceiling that can refuse the list above leaves
+        // the obligation standing rather than discharging it on a partial cache.
+        self.relist_pending = false;
+        self.debt_raised_at = None;
     }
 
     fn owns(&self, pod: &PodRecord) -> bool {
@@ -191,6 +297,7 @@ impl PodMetadataSource for PodCache {
     /// `PodRecord` gets namespace/ServiceAccount labels without knowing they
     /// come from two other watches.
     fn snapshot(&self) -> Result<Vec<PodRecord>> {
+        self.freshness(Instant::now())?;
         Ok(self
             .pods
             .values()
@@ -225,6 +332,7 @@ pub fn normalize_runtime_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_common::FerrumError;
 
     fn pod(uid: &str, node: &str) -> PodRecord {
         PodRecord {
@@ -243,6 +351,60 @@ mod tests {
         assert!(!cache.upsert(pod("u2", "node-b")));
         assert_eq!(cache.len(), 1);
         assert!(cache.get("u2").is_none());
+    }
+
+    #[test]
+    fn a_filled_cache_with_no_stamp_is_degraded() {
+        let mut cache = PodCache::new("node-a");
+        cache.replace_all(vec![pod("u1", "node-a")]);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.applied_age().is_none());
+        match cache.snapshot() {
+            Err(FerrumError::Degraded(msg)) => {
+                assert!(msg.contains("list"), "{msg}");
+                assert!(msg.contains("matched"), "{msg}");
+            }
+            other => panic!("unstamped cache must be Degraded, got {other:?}"),
+        }
+        cache.mark_applied_at(Instant::now());
+        assert_eq!(cache.snapshot().expect("fresh").len(), 1);
+    }
+
+    #[test]
+    fn a_stamp_past_the_budget_names_the_age() {
+        let mut cache = PodCache::new("node-a");
+        cache.replace_all(vec![pod("u1", "node-a")]);
+        let Some(old) = Instant::now().checked_sub(POD_WATCH_BUDGET * 3) else {
+            return;
+        };
+        cache.mark_applied_at(old);
+        assert!(cache.applied_age().expect("stamped") >= POD_WATCH_BUDGET);
+        assert!(!cache.is_fresh_at(Instant::now()));
+        match cache.snapshot() {
+            Err(FerrumError::Degraded(msg)) => {
+                assert!(msg.contains("frozen"), "{msg}");
+                assert!(msg.contains("900") || msg.contains("ago"), "{msg}");
+                assert!(msg.contains("matched"), "{msg}");
+            }
+            other => panic!("stale cache must be Degraded, got {other:?}"),
+        }
+        // The pods themselves are untouched: this is a freshness verdict, not
+        // an eviction.
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn budget_is_watch_scale_not_bundle_scale() {
+        assert_eq!(POD_WATCH_BUDGET, Duration::from_secs(300));
+        assert!(POD_WATCH_BUDGET < crate::labels::DEFAULT_MAX_AGE);
+    }
+
+    #[test]
+    fn clone_carries_the_stamp() {
+        let mut cache = PodCache::new("node-a");
+        cache.replace_all(vec![pod("u1", "node-a")]);
+        cache.mark_applied_at(Instant::now());
+        assert_eq!(cache.clone().snapshot().expect("clone is fresh").len(), 1);
     }
 
     #[test]

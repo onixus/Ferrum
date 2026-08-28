@@ -16,12 +16,16 @@ use std::sync::Mutex;
 pub trait EventSink {
     fn emit(&self, event: &EnforcementEvent);
 
-    fn events_dropped_total(&self) -> u64 {
+    /// Events the sink accepted and could not write out (serialisation, a
+    /// full disk, a torn file). Deliberately NOT named `events_dropped_total`:
+    /// that name belongs to the in-kernel ring counter on `Agent`, and an
+    /// operator reading one must never be shown the other.
+    fn export_write_failed_total(&self) -> u64 {
         0
     }
 
     /// Events lost because the export queue was full. Distinct from
-    /// `events_dropped_total` (a failed write) and from the in-kernel ring
+    /// `export_write_failed_total` (a failed write) and from the in-kernel ring
     /// counter: this one means the export path could not keep up.
     fn export_queue_dropped_total(&self) -> u64 {
         0
@@ -47,8 +51,8 @@ impl EventSink for Box<dyn EventSink + Send + Sync> {
         (**self).emit(event)
     }
 
-    fn events_dropped_total(&self) -> u64 {
-        (**self).events_dropped_total()
+    fn export_write_failed_total(&self) -> u64 {
+        (**self).export_write_failed_total()
     }
 
     fn export_queue_dropped_total(&self) -> u64 {
@@ -98,7 +102,7 @@ impl<W: Write> EventSink for WriterSink<W> {
         }
     }
 
-    fn events_dropped_total(&self) -> u64 {
+    fn export_write_failed_total(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
@@ -150,7 +154,7 @@ impl EventSink for MemorySink {
             .push(event.clone());
     }
 
-    fn events_dropped_total(&self) -> u64 {
+    fn export_write_failed_total(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
@@ -173,6 +177,9 @@ mod tests {
             pid: 0,
             tgid: 0,
             executed: false,
+            labels_unknown: false,
+            path_unknown: false,
+            container_unknown: false,
             respond_error: None,
             waiver: None,
         }
@@ -186,7 +193,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].rule.to_string(), "no-shell");
         assert_eq!(events[0].action, "kill");
-        assert_eq!(sink.events_dropped_total(), 0);
+        assert_eq!(sink.export_write_failed_total(), 0);
     }
 
     #[test]
@@ -198,13 +205,13 @@ mod tests {
         assert!(line.contains("\"rule\":\"no-shell\""));
         assert!(line.contains("\"action\":\"kill\""));
         assert!(line.ends_with('\n'));
-        assert_eq!(sink.events_dropped_total(), 0);
+        assert_eq!(sink.export_write_failed_total(), 0);
     }
 
     #[test]
     fn drops_are_counted() {
         let sink = MemorySink::new();
         sink.record_drop(4);
-        assert_eq!(sink.events_dropped_total(), 4);
+        assert_eq!(sink.export_write_failed_total(), 4);
     }
 }

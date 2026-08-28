@@ -176,9 +176,23 @@ fn parse_u32(flag: &str, raw: &str) -> Result<u32, String> {
         .map_err(|_| format!("{flag}: expected u32, got {raw}"))
 }
 
+/// The next token, once it has been shown not to be a flag.
+///
+/// No value in this grammar starts with `--`: a seed path, a namespace, a
+/// `name:agentAbi:admissionAbi` triple, a u32, a hex key. Without this check
+/// `run --namespace --cluster` swallows the flag as the namespace, passes the
+/// emptiness test, and the controller reconciles a namespace that does not
+/// exist. Most mis-orderings die on the following token instead, so this bites
+/// only where the swallowed flag is last — which is the shape a truncated argv
+/// or a Helm template with a trailing comma produces.
 fn require_val(flag: &str, val: Option<String>) -> Result<String, String> {
-    val.filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("{flag} requires a value"))
+    match val {
+        Some(v) if v.starts_with("--") => Err(format!(
+            "{flag} requires a value, got the flag {v}: no value in this grammar starts with --"
+        )),
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => Err(format!("{flag} requires a value")),
+    }
 }
 
 fn load_spec(path: &Path) -> Result<ClusterSecurityPolicySpec, String> {
@@ -214,4 +228,93 @@ fn yaml_kind(raw: &str) -> Result<String, String> {
 
 fn usage() -> String {
     "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--cluster name:agentAbi:admissionAbi]...".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A seed file good enough for `parse_run` to reach the end of the parse.
+    /// Without one the argv below fails on the missing seed and says nothing
+    /// about which namespace it was going to reconcile.
+    fn seed_file() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ferrum-controller-seed-{}-{}",
+            process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::write(&path, "11".repeat(ED25519_SECRET_KEY_LEN)).expect("seed file");
+        path
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A flag is never a value.
+    ///
+    /// `run --namespace --cluster` is what a truncated argv or a Helm template
+    /// with a trailing comma produces. Before the guard the parser took
+    /// `--cluster` as the namespace: non-empty, so the `trim().is_empty()`
+    /// check passed, and the controller went on to reconcile a namespace no
+    /// cluster has. Every other parser in the tree already refuses this.
+    #[test]
+    fn a_flag_is_never_taken_as_the_value_of_the_flag_before_it() {
+        let seed = seed_file();
+        let seed = seed.to_string_lossy().into_owned();
+
+        // The exact shape: the swallowed flag is the last token, so nothing
+        // downstream trips over it.
+        let err = parse_run(argv(&["--seed-file", &seed, "--namespace", "--cluster"]).into_iter())
+            .expect_err("--cluster is not a namespace");
+        assert!(err.contains("--namespace requires a value"), "{err}");
+        assert!(err.contains("--cluster"), "{err}");
+
+        // Every flag that takes a value, not just the one the report named.
+        for flag in [
+            "--seed-file",
+            "--namespace",
+            "--cluster",
+            "--min-agent-abi",
+            "--min-admission-abi",
+            "--trust-root",
+        ] {
+            let err = parse_run(argv(&[flag, "--trust-root"]).into_iter())
+                .err()
+                .unwrap_or_else(|| panic!("{flag} took a flag as its value"));
+            assert!(
+                err.contains(&format!("{flag} requires a value")),
+                "{flag}: {err}"
+            );
+        }
+
+        // And the well-formed argv still parses, with `--cluster`
+        // accumulating rather than replacing.
+        let cfg = parse_run(
+            argv(&[
+                "--seed-file",
+                &seed,
+                "--namespace",
+                "ferrum",
+                "--cluster",
+                "east:3:2",
+                "--cluster",
+                "west:4:2",
+            ])
+            .into_iter(),
+        )
+        .expect("well-formed run argv");
+        assert_eq!(cfg.namespace, "ferrum");
+        assert_eq!(
+            cfg.clusters
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["east", "west"]
+        );
+        let _ = fs::remove_file(&seed);
+    }
 }

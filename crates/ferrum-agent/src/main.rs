@@ -3,7 +3,6 @@
 use ferrum_agent::{parse_trust_root, Agent, AgentConfig, AgentRole, RESPOND_NO_HOST_PIDNS};
 use ferrum_common::FerrumError;
 use ferrum_export::{EventSink, QueueSink, RotatingFileSink, SinkContext};
-use ferrum_k8smeta::SharedCgroupIndex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::exit;
@@ -138,7 +137,7 @@ fn main() {
     // Each message is the whole desired cgroup set, so a full channel drops an
     // update instead of queueing: the next refresh carries the current truth.
     let (cgroup_tx, cgroup_rx) = std::sync::mpsc::sync_channel::<CgroupPublish>(1);
-    spawn_cgroup_refresh(agent.cgroup_index(), node.clone(), cgroup_tx);
+    spawn_cgroup_refresh(&agent, node.clone(), cgroup_tx);
 
     if let Err(err) = agent.restore_last_known_good() {
         eprintln!("ferrum-agent: {err}");
@@ -172,7 +171,7 @@ fn main() {
         "observe"
     };
     let ctx = SinkContext::new(node, role_name);
-    let inner: Box<dyn EventSink + Send + Sync> = match export_dir {
+    let inner: Box<dyn EventSink + Send + Sync> = match export_dir.clone() {
         Some(dir) => Box::new(RotatingFileSink::new(
             dir,
             export_max_bytes,
@@ -187,7 +186,16 @@ fn main() {
     install_signal_handlers();
     spawn_shutdown_watcher(Arc::clone(&sink));
 
-    run(agent, sink, ctx, bundle_path, reload_ms, &flags, cgroup_rx)
+    run(
+        agent,
+        sink,
+        ctx,
+        bundle_path,
+        export_dir,
+        reload_ms,
+        &flags,
+        cgroup_rx,
+    )
 }
 
 /// Fills the cgroup→pod index and publishes its key set to whoever owns the
@@ -196,13 +204,27 @@ fn main() {
 /// container. Both are Degraded.
 #[cfg(feature = "apiserver")]
 fn spawn_cgroup_refresh(
-    index: SharedCgroupIndex,
+    agent: &Agent,
     node: String,
     sync_tx: std::sync::mpsc::SyncSender<CgroupPublish>,
 ) {
     use ferrum_agent::{CGROUP_CARRIER_GONE, CGROUP_REFRESH};
     use ferrum_k8smeta::watch::{ApiserverConfig, ApiserverWatcher};
-    use ferrum_k8smeta::{CgroupResolver, StdCgroupFs, DEFAULT_CGROUP_ROOT};
+    use ferrum_k8smeta::{detect_cgroup2_root, CgroupResolver, StdCgroupFs};
+
+    let index = agent.cgroup_index();
+    // Derived here, before the thread exists, so a failure is the agent's
+    // reason rather than a line on stderr from a thread that then loops
+    // forever over the wrong filesystem. The scan needs a root and there is
+    // exactly one right answer for it; where that answer cannot be had, the
+    // index is left empty and said so, not filled from a guess.
+    let Some(root) = ferrum_agent::cgroup_scan_root(agent, detect_cgroup2_root()) else {
+        eprintln!(
+            "ferrum-agent: {}",
+            agent.terminal_fault().unwrap_or_default()
+        );
+        return;
+    };
 
     let config = match ApiserverConfig::from_service_account(node) {
         Ok(config) => config,
@@ -223,7 +245,6 @@ fn spawn_cgroup_refresh(
         let resolver = CgroupResolver::new(index);
         let source = ferrum_agent::SharedPodSource::new(cache);
         let fs = StdCgroupFs;
-        let root = PathBuf::from(DEFAULT_CGROUP_ROOT);
         let mut resolved_at: Option<Instant> = None;
         loop {
             match resolver.refresh(&fs, &root, &source) {
@@ -254,11 +275,11 @@ fn spawn_cgroup_refresh(
 
 #[cfg(not(feature = "apiserver"))]
 fn spawn_cgroup_refresh(
-    index: SharedCgroupIndex,
+    agent: &Agent,
     _node: String,
     _sync_tx: std::sync::mpsc::SyncSender<CgroupPublish>,
 ) {
-    let _ = index;
+    let _ = agent.cgroup_index();
     eprintln!(
         "ferrum-agent: built without the apiserver feature: no pod metadata, the cgroup index \
          stays empty and namespaced policies cannot match. Degraded."
@@ -291,11 +312,13 @@ fn spawn_shutdown_watcher(sink: Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>
 }
 
 #[cfg(feature = "attach")]
+#[allow(clippy::too_many_arguments)]
 fn run(
     agent: Agent,
     sink: std::sync::Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>,
     ctx: SinkContext,
     bundle_path: Option<PathBuf>,
+    export_dir: Option<PathBuf>,
     reload_ms: u64,
     flags: &Flags,
     cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
@@ -316,19 +339,68 @@ fn run(
         .unwrap_or_else(|err| die(&format!("read {}: {err}", elf_path.display())));
 
     let agent = Arc::new(RwLock::new(agent));
-    let mut handle = match KernelHandle::attach(&elf) {
-        Ok(handle) => handle,
+    // The node's own state surface: envelopes, `status.json` beside them, and
+    // the transition line. It reports and never acts — nothing here is a
+    // probe, and no probe may be wired to it.
+    let out = ferrum_agent::StatusOutput {
+        ctx: Some(&ctx),
+        sink: Some(sink.as_ref()),
+        status_dir: export_dir.as_deref(),
+    };
+    let mut handle = match KernelHandle::attach_for_arch(&elf, arch) {
+        Ok(handle) => {
+            if !handle.unhooked_syscalls().is_empty() {
+                // Not fatal: the remaining hooks are the datapath. But rules
+                // naming these are dead on this node, and that must be said
+                // out loud rather than looking like a clean attach. Covers
+                // both absences the attach narrows the enforceable set for:
+                // the syscall is not in this arch's ABI, or this kernel was
+                // built without it (no CONFIG_MODULES, no init_module).
+                eprintln!(
+                    "ferrum-agent: no tracepoint on this node for {}; rules naming them cannot \
+                     fire here",
+                    handle.unhooked_syscalls().join(", ")
+                );
+            }
+            handle
+        }
         Err(err) => {
             eprintln!("ferrum-agent: kernel attach failed, datapath is Degraded: {err}");
+            // The stderr line is on one node's console; status.json is what is
+            // read from off the node, and until now it said only "no kernel
+            // attach" with no cause anywhere in it. The container map is not
+            // ready for exactly one reason here — there is no handle to sync
+            // it through — so that reason is the attach failure itself,
+            // RLIMIT_MEMLOCK state and all.
+            agent
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .mark_container_map_error(format!("kernel attach failed: {err}"));
             ctx.set_degraded(true);
-            park_degraded(&agent, ctx, bundle_path, reload_ms);
+            park_degraded(&agent, &out, bundle_path, reload_ms);
         }
     };
-    if let Err(err) = handle.set_self_tgid(std::process::id() as u64) {
-        // Without the self tgid the datapath cannot flag agent-self events,
-        // and the agent could be told to kill itself. Refuse to run attached.
-        eprintln!("ferrum-agent: {err}");
-        exit(2);
+    // The datapath writes `bpf_get_current_pid_tgid()`, an initial-pid-namespace
+    // tgid. Without hostPID this process's pid names a different, arbitrary
+    // process there — publishing it would leave EVENT_FLAG_AGENT_SELF unset for
+    // the agent and set for whoever holds that number (typically init), so every
+    // notAgentSelf rule would exempt the wrong process and apply to the agent.
+    // Leave `ferrum_self` unconfigured instead, and say why.
+    let self_tgid = ferrum_agent::self_tgid_to_publish(
+        &agent.read().unwrap_or_else(|e| e.into_inner()),
+        std::process::id() as u64,
+    );
+    match self_tgid {
+        Some(tgid) => {
+            if let Err(err) = handle.set_self_tgid(tgid) {
+                // Without the self tgid the datapath cannot flag agent-self
+                // events, and the agent could be told to kill itself. Refuse
+                // to run attached.
+                eprintln!("ferrum-agent: {err}");
+                exit(2);
+            }
+        }
+        None => eprintln!("ferrum-agent: {}", ferrum_agent::SELF_TGID_UNPUBLISHED),
     }
     let mut reader = match handle.take_ring_reader() {
         Ok(reader) => reader,
@@ -352,10 +424,11 @@ fn run(
     let drop_agent = Arc::clone(&agent);
     std::thread::spawn(move || {
         let mut handle = handle;
-        let mut idle_ms = 1u64;
-        let mut seen_drops = 0u64;
-        let mut since_drop_check = Duration::ZERO;
+        let mut ring =
+            ferrum_agent::RingLoop::new(Duration::from_millis(reload_ms), Instant::now());
         let mut publisher_alive = true;
+        let mut drop_check_broken = false;
+        let mut records_alive = true;
         loop {
             if publisher_alive {
                 let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
@@ -389,28 +462,42 @@ fn run(
                     eprintln!("ferrum-agent: {}", ferrum_agent::CGROUP_PUBLISHER_GONE);
                 }
             }
-            let n = reader.drain(|record| {
-                let _ = tx.send(record.to_vec());
-            });
-            if n == 0 {
-                std::thread::sleep(Duration::from_millis(idle_ms));
-                since_drop_check += Duration::from_millis(idle_ms);
-                idle_ms = (idle_ms * 2).min(10);
-            } else {
-                idle_ms = 1;
+            let tick = ring.tick(
+                Instant::now(),
+                || {
+                    reader.drain(|record| {
+                        if !records_alive {
+                            return;
+                        }
+                        // No guard on the shared agent is taken here: `send`
+                        // blocks while the channel is full, and a guard held
+                        // across that block parks this thread, the poller and
+                        // the pump forever. See `publish_record`.
+                        if !ferrum_agent::publish_record(&drop_agent, &tx, record.to_vec()) {
+                            // Keep draining so a full ring does not stall the
+                            // kernel, but stop pretending these records reach
+                            // a rule.
+                            eprintln!("ferrum-agent: {}", ferrum_agent::RECORD_CHANNEL_GONE);
+                            records_alive = false;
+                        }
+                    })
+                },
+                || handle.events_dropped_total(),
+            );
+            // Once: a counter that cannot be read stays unreadable, and this
+            // runs every reload tick.
+            if tick.drop_check_failed && !drop_check_broken {
+                drop_check_broken = true;
+                eprintln!("ferrum-agent: in-kernel drop counter unreadable; ring drops are blind");
             }
-            if since_drop_check >= Duration::from_millis(reload_ms) {
-                since_drop_check = Duration::ZERO;
-                if let Ok(total) = handle.events_dropped_total() {
-                    let delta = total.saturating_sub(seen_drops);
-                    if delta > 0 {
-                        seen_drops = total;
-                        drop_agent
-                            .read()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .record_drop(delta);
-                    }
-                }
+            if tick.drop_delta > 0 {
+                drop_agent
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_drop(tick.drop_delta);
+            }
+            if let Some(sleep) = tick.sleep {
+                std::thread::sleep(sleep);
             }
         }
     });
@@ -425,40 +512,27 @@ fn run(
     });
 
     match bundle_path {
-        Some(path) => ferrum_agent::poll_bundle_shared(
-            &agent,
-            &path,
-            Duration::from_millis(reload_ms),
-            Some(&ctx),
-        ),
-        None => loop {
-            std::thread::sleep(Duration::from_millis(reload_ms));
-            let degraded = agent
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_degraded();
-            ctx.set_degraded(degraded);
-        },
+        Some(path) => {
+            ferrum_agent::poll_bundle_shared(&agent, &path, Duration::from_millis(reload_ms), &out)
+        }
+        None => ferrum_agent::poll_status(&agent, Duration::from_millis(reload_ms), &out),
     }
 }
 
 #[cfg(feature = "attach")]
 fn park_degraded(
     agent: &std::sync::Arc<std::sync::RwLock<Agent>>,
-    ctx: SinkContext,
+    out: &ferrum_agent::StatusOutput<'_>,
     bundle_path: Option<PathBuf>,
     reload_ms: u64,
 ) -> ! {
     match bundle_path {
-        Some(path) => ferrum_agent::poll_bundle_shared(
-            agent,
-            &path,
-            Duration::from_millis(reload_ms),
-            Some(&ctx),
-        ),
-        None => loop {
-            std::thread::sleep(Duration::from_millis(reload_ms));
-        },
+        // A parked agent still publishes: a node whose ELF will not attach is
+        // exactly the node whose state has to be readable from outside it.
+        Some(path) => {
+            ferrum_agent::poll_bundle_shared(agent, &path, Duration::from_millis(reload_ms), out)
+        }
+        None => ferrum_agent::poll_status(agent, Duration::from_millis(reload_ms), out),
     }
 }
 
@@ -466,31 +540,38 @@ fn park_degraded(
 /// verified and hot-reloaded, but nothing feeds `handle_event`. That is a
 /// Degraded agent, and it says so instead of sleeping quietly.
 #[cfg(not(feature = "attach"))]
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut agent: Agent,
     sink: std::sync::Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>,
     ctx: SinkContext,
     bundle_path: Option<PathBuf>,
+    export_dir: Option<PathBuf>,
     reload_ms: u64,
     _flags: &Flags,
     _cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
 ) -> ! {
-    let _ = sink;
     eprintln!(
         "ferrum-agent: built without the attach feature: no kernel datapath, \
          no syscall events, no reaction. Degraded."
     );
     ctx.set_degraded(true);
+    let out = ferrum_agent::StatusOutput {
+        ctx: Some(&ctx),
+        sink: Some(sink.as_ref()),
+        status_dir: export_dir.as_deref(),
+    };
     match bundle_path {
-        Some(path) => ferrum_agent::poll_bundle(
-            &mut agent,
-            &path,
-            Duration::from_millis(reload_ms),
-            Some(&ctx),
-        ),
-        None => loop {
-            std::thread::sleep(Duration::from_millis(reload_ms));
-        },
+        Some(path) => {
+            ferrum_agent::poll_bundle(&mut agent, &path, Duration::from_millis(reload_ms), &out)
+        }
+        None => {
+            let mut publisher = ferrum_agent::StatusPublisher::default();
+            loop {
+                std::thread::sleep(Duration::from_millis(reload_ms));
+                publisher.publish(&agent, &out);
+            }
+        }
     }
 }
 

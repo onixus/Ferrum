@@ -1,0 +1,20 @@
+# Negative fixture: this policy MUST fail `ferrumctl validate`.
+#
+# `ptrace` is not one of the syscalls the datapath hooks, so this rule would
+# compile, sign, load and never fire — enforcement that exists only on paper.
+# Kept next to the working examples so the CI stage proves the gate is live.
+apiVersion: ferrum.io/v1
+kind: ClusterSecurityPolicy
+metadata:
+  name: unobservable-syscall
+spec:
+  mode: enforce
+  runtime:
+    defaultAction: audit
+    rules:
+      - id: no-debugger
+        syscalls: [ptrace]
+        match:
+          commIn: [gdb, strace]
+          containerOnly: true
+        action: kill

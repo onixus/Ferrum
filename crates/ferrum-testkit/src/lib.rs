@@ -21,6 +21,18 @@ pub const FERRUM_CLUSTER_YAML: &str =
     include_str!("../../../policies/examples/ferrum-cluster.yaml");
 pub const COMPLIANCE_SNAPSHOT_YAML: &str =
     include_str!("../../../policies/examples/compliance-snapshot.yaml");
+/// Negative fixture: a runtime rule naming a syscall the datapath never hooks.
+/// It must fail validation; the CI stage runs `ferrumctl validate` on the same
+/// file so the gate cannot exist only in a unit test.
+pub const RUNTIME_UNOBSERVABLE_SYSCALL_YAML: &str =
+    include_str!("../../../policies/examples/runtime-unobservable-syscall.yaml");
+pub const RUNTIME_ARCH_SPLIT_SYSCALL_YAML: &str =
+    include_str!("../../../policies/examples/runtime-arch-split-syscall.yaml");
+/// Negative fixture: a runtime rule whose action the runtime plane cannot
+/// execute. Same CI stage, same reason: the gate must exist where a policy
+/// author meets it, not only in a unit test.
+pub const RUNTIME_UNEXECUTABLE_ACTION_YAML: &str =
+    include_str!("../../../policies/examples/runtime-unexecutable-action.yaml");
 
 /// RFC §D: `expiresAt` is omitted on purpose so the API rejects the object.
 pub const EXCEPTION_WITHOUT_TTL_YAML: &str = include_str!("../fixtures/exception-without-ttl.yaml");
@@ -87,6 +99,18 @@ pub fn ferrum_cluster() -> FerrumCluster {
     ferrum_cluster_from_yaml(FERRUM_CLUSTER_YAML)
 }
 
+pub fn runtime_unobservable_syscall() -> ClusterSecurityPolicy {
+    cluster_policy_from_yaml(RUNTIME_UNOBSERVABLE_SYSCALL_YAML)
+}
+
+pub fn runtime_arch_split_syscall() -> ClusterSecurityPolicy {
+    cluster_policy_from_yaml(RUNTIME_ARCH_SPLIT_SYSCALL_YAML)
+}
+
+pub fn runtime_unexecutable_action() -> ClusterSecurityPolicy {
+    cluster_policy_from_yaml(RUNTIME_UNEXECUTABLE_ACTION_YAML)
+}
+
 pub fn compliance_snapshot() -> ComplianceSnapshot {
     compliance_snapshot_from_yaml(COMPLIANCE_SNAPSHOT_YAML)
 }
@@ -101,6 +125,68 @@ pub fn try_exception_from_yaml(yaml: &str) -> Result<PolicyException, serde_yaml
 
 fn decode<T: DeserializeOwned>(yaml: &str) -> T {
     serde_yaml::from_str(yaml).expect("fixture yaml")
+}
+
+/// Which plane decides a case. Nothing that never reaches the ring can be
+/// replayed, so the split is what lets the replay harness gate its own subset
+/// without hand-copying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptancePlane {
+    Admission,
+    Runtime,
+}
+
+/// Declares the §D case list once and derives everything from it. A variant
+/// that exists but is not in `ALL` is unrepresentable: both come from the same
+/// invocation, so a case cannot be added to the enum and forgotten by a gate.
+macro_rules! acceptance_cases {
+    ($($variant:ident => ($plane:ident, $label:literal),)+) => {
+        /// The RFC §D MVP-1 acceptance cases, as one source both the
+        /// acceptance suite and the replay harness gate themselves against.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum AcceptanceCase {
+            $($variant,)+
+        }
+
+        impl AcceptanceCase {
+            pub const ALL: &'static [AcceptanceCase] = &[$(AcceptanceCase::$variant,)+];
+
+            pub fn plane(self) -> AcceptancePlane {
+                match self {
+                    $(AcceptanceCase::$variant => AcceptancePlane::$plane,)+
+                }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self {
+                    $(AcceptanceCase::$variant => $label,)+
+                }
+            }
+        }
+    };
+}
+
+acceptance_cases! {
+    UnsignedDeny => (Admission, "unsigned image -> deny"),
+    PrivilegedDeny => (Admission, "privileged -> deny"),
+    ClusterAdminBindDeny => (Admission, "cluster-admin bind -> deny"),
+    ExceptionWithoutTtlReject => (Admission, "exception without TTL -> API reject"),
+    ExecShellKill => (Runtime, "kubectl exec + /bin/sh -> kill"),
+    DockerSockKill => (Runtime, "docker.sock -> kill"),
+    BpfNotFromAgentDeny => (Runtime, "bpf() not from the agent -> deny"),
+    ControlPlaneDownLkg => (Runtime, "CP down -> last-known-good"),
+}
+
+impl AcceptanceCase {
+    /// The subset a ring record can carry, i.e. what the replay harness must
+    /// cover. The admission cases produce no record and cannot be replayed.
+    pub fn runtime() -> Vec<AcceptanceCase> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|c| c.plane() == AcceptancePlane::Runtime)
+            .collect()
+    }
 }
 
 fn fixture_trust_roots() -> Vec<TrustRoot> {
@@ -193,6 +279,7 @@ pub fn docker_sock_kill() -> ClusterSecurityPolicySpec {
                         "containerd.sock".into(),
                         "crio.sock".into(),
                     ],
+                    container_only: true,
                     ..Default::default()
                 },
                 action: RuntimeAction::Kill,
@@ -203,8 +290,11 @@ pub fn docker_sock_kill() -> ClusterSecurityPolicySpec {
     }
 }
 
-/// RFC §D: `bpf()` not from the agent → deny.
-pub fn bpf_deny() -> ClusterSecurityPolicySpec {
+/// RFC §D: `bpf()` not from the agent. The deny is admission's (`admit.deny`
+/// carries SYS_MODULE and privileged); what the runtime plane can execute is
+/// the audit record that names the caller, because a tracepoint fires after
+/// the syscall has already run.
+pub fn bpf_not_from_agent_audit() -> ClusterSecurityPolicySpec {
     ClusterSecurityPolicySpec {
         runtime: RuntimeSpec {
             rules: vec![RuntimeRule {
@@ -214,7 +304,7 @@ pub fn bpf_deny() -> ClusterSecurityPolicySpec {
                     not_agent_self: true,
                     ..Default::default()
                 },
-                action: RuntimeAction::Deny,
+                action: RuntimeAction::Audit,
             }],
             ..Default::default()
         },
@@ -251,13 +341,17 @@ mod tests {
             obj.spec.runtime.rules[1].match_on.path_suffix,
             vec!["docker.sock", "containerd.sock", "crio.sock"]
         );
+        assert!(
+            obj.spec.runtime.rules[1].match_on.container_only,
+            "the node's own containerd opens these sockets; without containerOnly              every one of those opens is exported as a kill that never happened"
+        );
         assert_eq!(obj.spec.runtime.rules[2].id, "no-module");
         assert!(obj.spec.runtime.rules[2]
             .syscalls
             .iter()
             .any(|s| s == "bpf"));
         assert!(obj.spec.runtime.rules[2].match_on.not_agent_self);
-        assert_eq!(obj.spec.runtime.rules[2].action, RuntimeAction::Deny);
+        assert_eq!(obj.spec.runtime.rules[2].action, RuntimeAction::Audit);
     }
 
     #[test]
@@ -354,21 +448,62 @@ mod tests {
         let rule = &spec.runtime.rules[0];
         assert!(rule.match_on.path_suffix.iter().any(|p| p == "docker.sock"));
         assert_eq!(rule.action, RuntimeAction::Kill);
+        assert!(rule.match_on.container_only);
         let prod = &prod_restricted().spec.runtime.rules[1];
         assert_eq!(prod.id, "no-runtime-sock");
         assert_eq!(prod.action, RuntimeAction::Kill);
+        assert!(prod.match_on.container_only);
     }
 
+    /// §D `bpf()` not from the agent. The deny is carried by admission, which
+    /// refuses the pod before it runs; the runtime rule is the audit record
+    /// that names the caller. A runtime `deny` would be a verdict this plane
+    /// decides and never executes.
     #[test]
-    fn rfc_d_bpf_deny() {
-        let spec = bpf_deny();
+    fn rfc_d_bpf_not_from_agent() {
+        let spec = bpf_not_from_agent_audit();
         let rule = &spec.runtime.rules[0];
         assert!(rule.syscalls.iter().any(|s| s == "bpf"));
         assert!(rule.match_on.not_agent_self);
-        assert_eq!(rule.action, RuntimeAction::Deny);
+        assert_eq!(rule.action, RuntimeAction::Audit);
         let prod = &prod_restricted().spec.runtime.rules[2];
         assert!(prod.syscalls.iter().any(|s| s == "bpf"));
-        assert_eq!(prod.action, RuntimeAction::Deny);
+        assert_eq!(prod.action, RuntimeAction::Audit);
+        // The deny half of the case: admission refuses the module-loading pod.
+        let admit = &prod_restricted().spec.admit.deny;
+        assert!(admit.added_capabilities.iter().any(|c| c == "SYS_MODULE"));
+        assert!(admit.privileged);
+    }
+
+    #[test]
+    fn unexecutable_action_fixture_decodes_and_names_deny() {
+        let obj = runtime_unexecutable_action();
+        assert_eq!(obj.kind, "ClusterSecurityPolicy");
+        let rule = &obj.spec.runtime.rules[0];
+        assert_eq!(rule.id, "no-module");
+        assert_eq!(rule.action, RuntimeAction::Deny);
+    }
+
+    #[test]
+    fn unobservable_syscall_fixture_decodes_and_names_ptrace() {
+        let obj = runtime_unobservable_syscall();
+        assert_eq!(obj.kind, "ClusterSecurityPolicy");
+        let rule = &obj.spec.runtime.rules[0];
+        assert_eq!(rule.syscalls, vec!["ptrace"]);
+        assert_eq!(rule.action, RuntimeAction::Kill);
+    }
+
+    #[test]
+    fn arch_split_fixture_decodes_and_names_only_openat() {
+        let obj = runtime_arch_split_syscall();
+        assert_eq!(obj.kind, "ClusterSecurityPolicy");
+        let rule = &obj.spec.runtime.rules[0];
+        assert_eq!(
+            rule.syscalls,
+            vec!["openat"],
+            "half of the open/openat pair"
+        );
+        assert_eq!(rule.action, RuntimeAction::Kill);
     }
 
     #[test]
@@ -405,12 +540,25 @@ mod tests {
             cluster_admin_bind_deny(),
             exec_sh_kill(),
             docker_sock_kill(),
-            bpf_deny(),
+            bpf_not_from_agent_audit(),
         ];
         for spec in specs {
             let yaml = serde_yaml::to_string(&spec).expect("spec yaml");
             let back: ClusterSecurityPolicySpec = serde_yaml::from_str(&yaml).expect("roundtrip");
             assert_eq!(spec, back);
         }
+    }
+
+    /// The case list is the gate both suites measure themselves against, so a
+    /// silent shrink here would weaken them without failing anything.
+    #[test]
+    fn the_rfc_d_case_list_is_the_eight_mvp_cases() {
+        assert_eq!(AcceptanceCase::ALL.len(), 8);
+        assert_eq!(AcceptanceCase::runtime().len(), 4);
+        let mut labels: Vec<&str> = AcceptanceCase::ALL.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "two cases share a label");
     }
 }

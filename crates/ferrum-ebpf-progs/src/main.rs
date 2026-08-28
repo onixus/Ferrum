@@ -2,9 +2,16 @@
 //!
 //! Built only for `target_arch = "bpf"` (bpfel-unknown-none, nightly +
 //! build-std); the host build compiles to an empty stub so the stable-1.75
-//! workspace gates stay green. There is no kernel CI here: these programs are
-//! not verifier-tested in this repository, and userspace attach stays behind
-//! the opt-in `attach` feature of `ferrum-ebpf`.
+//! workspace gates stay green. Userspace attach stays behind the opt-in
+//! `attach` feature of `ferrum-ebpf`.
+//!
+//! The object this crate produces is not a build artefact of the workspace:
+//! the `Dockerfile` copies it in from the build context, at the path
+//! `--bpf-elf` names in both shipped DaemonSets, and re-runs the map-ABI
+//! inspection against the binary it is being put in the image beside. The
+//! Jenkins 'BPF attach' stage is where these programs meet a verifier — that
+//! stage, and nothing else in this repository, executes one of their
+//! instructions.
 
 #![cfg_attr(target_arch = "bpf", no_std, no_main)]
 
@@ -21,7 +28,7 @@ mod progs {
     };
     use ferrum_ebpf_progs::{
         Event, ACTION_AUDIT, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, EVENT_FLAG_AGENT_SELF,
-        EVENT_FLAG_CONTAINER,
+        EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, PATH_LEN,
     };
 
     // The `#[map(name = ...)]` literals must stay equal to the MAP_* /
@@ -107,8 +114,31 @@ mod progs {
             }
         }
         if let Some(offset) = path_arg {
-            if let Ok(ptr) = unsafe { ctx.read_at::<*const u8>(offset) } {
-                let _ = unsafe { bpf_probe_read_user_str_bytes(ptr, &mut event.path) };
+            // Both failures set one flag: the buffer already distinguishes
+            // them. A path longer than PATH_LEN leaves a valid-looking head,
+            // and an unreadable pointer (the helper cannot fault in a
+            // non-resident page) leaves the buffer as `Event::new` left it —
+            // empty. Either way the recorded bytes are not the argument.
+            // Straight-line code only — no extra branching on the pointer, no
+            // loops.
+            //
+            // Truncation is not an Err. `bpf_probe_read_user_str` truncates
+            // and returns the buffer size, which is inside the bounds aya's
+            // wrapper checks, so it answers Ok with a PATH_LEN-1 byte slice —
+            // measured on 6.18/x86_64, a 384-byte pathname came back as a
+            // 255-byte head and nothing was flagged. So the length decides:
+            // anything that reached the last usable byte did not fit.
+            let read_len = match unsafe { ctx.read_at::<*const u8>(offset) } {
+                Ok(ptr) => unsafe { bpf_probe_read_user_str_bytes(ptr, &mut event.path) }
+                    .map(|read| read.len()),
+                Err(err) => Err(err),
+            };
+            let fits = match read_len {
+                Ok(len) => len < PATH_LEN - 1,
+                Err(_) => false,
+            };
+            if !fits {
+                event.flags |= EVENT_FLAG_PATH_TRUNCATED;
             }
         }
         match FERRUM_EVENTS.reserve::<Event>(0) {

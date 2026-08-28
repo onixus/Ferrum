@@ -5,9 +5,17 @@ Self-hosted Kubernetes enforcement plane на Rust.
 Не CNAPP. Не «единое окно видимости». Admission + runtime enforcement,
 подписанные policy bundle, last-known-good вместо fail-open.
 
-Репозиторий сейчас — каркас workspace и API-типов (RFC-02), а не готовый агент.
-Если кто-то назовёт пустые crate MVP на статус-встрече — поправьте его
-до того, как это уедет в Jira.
+Что именно MVP-1 делает, чего он не делает и что про него верят без
+доказательства — [docs/MVP-1-BOUNDARY.md](docs/MVP-1-BOUNDARY.md). Три колонки,
+четвёртой нет: в «Делает» не попадает ничего, что не было исполнено названным
+`#[test]` или названной стадией Jenkins. Гейт
+`crates/ferrum-testkit/tests/boundary_gate.rs` роняет сборку, когда строка
+переживает свою ссылку.
+
+Читайте его до статус-встречи, а не после. Запись из ядра доходит до правила
+подписанного bundle и до настоящего `SIGKILL` — это исполнено. `docker build`
+здесь не запускался ни разу, пинов агент не ставит, к API server не обращался
+никто.
 
 ## Workspace
 
@@ -33,6 +41,7 @@ cargo run -p ferrum-cli -- validate policies/examples/prod-restricted.yaml
 
 ## Документы
 
+- [MVP-1 boundary](docs/MVP-1-BOUNDARY.md) — что исполнено, что нет, что заявлено
 - [RFC-02](docs/rfc/FERRUM-RFC-02-architecture.md) — crate-границы, CRD, threat model агента, CIS/MITRE
 - [CRD catalog](docs/crd/README.md)
 

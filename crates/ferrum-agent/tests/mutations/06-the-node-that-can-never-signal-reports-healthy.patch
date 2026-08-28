@@ -1,0 +1,43 @@
+# Mutation: `degraded_reasons_at` loses the arm for a node that decides kills
+# and has never once been able to send one.
+#
+# Must fail: `a_kill_this_kernel_refuses_is_degraded_and_named`.
+#
+# This is the defect the reason was built for, restored. Every other path in
+# `react` that does not signal returns a named refusal; the one path that *is*
+# the signal being attempted and failing incremented `respond_failed` and
+# stopped. A respond DaemonSet whose `capabilities.add` lost `KILL` gets EPERM
+# from every kill(2), `respond_kill_total` stays 0, `executed=false` rides the
+# export with the errno on it, and with this patch applied nothing in the agent
+# is Degraded.
+#
+# What makes it worth a patch of its own is that no neighbouring signal can
+# stand in. The guard *succeeded* on the step before the syscall, so
+# `respond_target_confirmed` is non-zero and `TARGET_NEVER_PROVEN` is cleared
+# for the life of the process by the very step that precedes the failure;
+# `TARGET_CHECK_UNPROVABLE` is about a guard that could not be built, and this
+# one was. Mutation 02 — a `SignalResponder` claiming a kill it never sent — is
+# the exact inverse of this defect and cannot see it either. So the join has to
+# carry a kill this kernel really refuses, which is what the test above does
+# with a tgid one past `pid_max`.
+#
+# Measured on Linux 6.18.44: `FAILED. 5 passed; 1 failed`, and the failing
+# assertion prints the reasons the node did give — `no kernel attach` and
+# `container map not ready`, neither of which is about the signal.
+
+diff --git a/crates/ferrum-agent/src/lib.rs b/crates/ferrum-agent/src/lib.rs
+index c23007b..74c2703 100644
+--- a/crates/ferrum-agent/src/lib.rs
++++ b/crates/ferrum-agent/src/lib.rs
+@@ -840,11 +840,6 @@ impl Agent {
+             // beside `TARGET_CHECK_UNPROVABLE` anyway, because a guard that
+             // cannot run refuses before anything is signalled and
+             // `respond_failed` then cannot move at all.
+-            if self.respond_kill.load(Ordering::Relaxed) == 0
+-                && self.respond_failed.load(Ordering::Relaxed) >= RESPOND_SIGNAL_FAILING_MIN
+-            {
+-                out.push(RESPOND_SIGNAL_FAILING.to_string());
+-            }
+         }
+         out
+     }

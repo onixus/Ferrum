@@ -555,6 +555,7 @@ dependencies = [
  "ferrum-k8smeta",
  "ferrum-policy",
  "ferrum-proto",
+ "ferrum-testkit",
  "ferrum-wasm-host",
  "libc",
  "serde_json",
@@ -655,6 +656,7 @@ dependencies = [
  "ferrum-ebpf-progs",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "libc",
 ]
 
 [[package]]
@@ -698,6 +700,7 @@ dependencies = [
  "chrono",
  "ferrum-api",
  "ferrum-common",
+ "ferrum-ids",
  "serde_yaml 0.8.26",
  "thiserror 1.0.58",
 ]
@@ -721,6 +724,7 @@ dependencies = [
  "ferrum-agent",
  "ferrum-api",
  "ferrum-cli",
+ "ferrum-common",
  "ferrum-compiler",
  "ferrum-controller",
  "ferrum-crypto",

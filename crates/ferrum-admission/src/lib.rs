@@ -13,6 +13,7 @@ mod labels;
 mod program;
 mod review;
 mod server;
+mod serving_cert;
 mod subject;
 
 use chrono::{DateTime, Utc};
@@ -33,11 +34,12 @@ pub use eval::{
 pub use ferrum_ids::Digest;
 #[cfg(feature = "apiserver")]
 pub use labels::WatchedLabels;
-pub use labels::{ColdLabels, LabelSource, StaticLabels};
+pub use labels::{ColdLabels, LabelSource, LabelWarmth, LabelWarmthCheck, StaticLabels};
 pub use program::{parse_program, AdmissionProgram, ADMISSION_ABI, ADMISSION_MAGIC};
 pub use review::{handle_review_bytes, ReviewConfig, ReviewReply};
-pub use server::{
-    load_tls_config, poll_bundle_file, poll_exceptions_file, serve, serve_listener, WebhookState,
+pub use server::{poll_bundle_file, poll_exceptions_file, serve, serve_listener, WebhookState};
+pub use serving_cert::{
+    certificate_facts, poll_serving_cert, CertFacts, Issuer, TlsSource, SERVING_CERT_WARN_DAYS,
 };
 pub use subject::{subject_from_object, IMAGE_SIGNATURES_ANNOTATION, IMAGE_SIGNATURE_ANNOTATION};
 

@@ -27,6 +27,17 @@ pub const MAX_TOTAL_LABEL_BYTES: usize = 16 * 1024 * 1024;
 /// that is down: past it the consumer degrades instead of deciding on labels
 /// of unknown age.
 pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long a relist raised by an unreadable frame may stand before the stream
+/// is ended so the relist can happen. Two costs pull against each other and
+/// this is the only number that sets both: while the debt stands the cache is
+/// not warm, so a consumer that gates on warmth is failing closed, and while
+/// unknown frames keep arriving every discharge is one more list against the
+/// apiserver. Ending the stream on the frame itself would make a rolling
+/// control-plane upgrade one reconnect per frame; waiting for the stream to
+/// fail never ends at all on a healthy cluster. A hold-down does both: the
+/// deny window is bounded by this, and so is the reconnect rate, whatever the
+/// frame rate. `410 Gone` does not wait for it — that relist is immediate.
+pub const RELIST_DEBT_HOLDDOWN: Duration = Duration::from_secs(5);
 
 fn label_bytes(labels: &BTreeMap<String, String>) -> usize {
     labels.iter().map(|(k, v)| k.len() + v.len()).sum()
@@ -79,6 +90,15 @@ pub struct LabelCache {
     /// Why the last write was refused, kept so a caller that only sees the
     /// cache can tell a refusal from an empty result.
     overflow: Option<String>,
+    /// A relist the watch demanded and nobody has completed yet. Liveness and
+    /// completeness are different facts: `410 Gone` proves the stream is alive
+    /// *and* that objects changed unseen, so the labels held may already
+    /// answer a selector wrongly.
+    relist_pending: bool,
+    /// When `relist_pending` was first raised, and `None` while nothing is
+    /// owed. Re-raising does not move it: a stream that keeps producing frames
+    /// this build cannot read must not push its own deadline out forever.
+    debt_raised_at: Option<Instant>,
 }
 
 impl Default for LabelCache {
@@ -91,6 +111,8 @@ impl Default for LabelCache {
             max_age: DEFAULT_MAX_AGE,
             label_bytes: 0,
             overflow: None,
+            relist_pending: false,
+            debt_raised_at: None,
         }
     }
 }
@@ -100,14 +122,48 @@ impl LabelCache {
         Self::default()
     }
 
-    /// Warm means listed *and* refreshed within [`LabelCache::max_age`]: a
-    /// cache nobody has managed to refresh is not a warm cache.
+    /// Warm means listed, refreshed within [`LabelCache::max_age`] *and* not
+    /// owing a relist: a cache nobody has managed to refresh, and a cache told
+    /// it missed events, are both not warm.
     pub fn is_warm(&self) -> bool {
         self.is_warm_at(Instant::now())
     }
 
     pub fn is_warm_at(&self, now: Instant) -> bool {
-        self.listed && self.age_at(now).is_some_and(|age| age <= self.max_age)
+        self.listed
+            && !self.relist_pending
+            && self.age_at(now).is_some_and(|age| age <= self.max_age)
+    }
+
+    /// The watch owes a relist that has not completed — `410 Gone`, or a frame
+    /// the parser could not read. Until it does, the cache is not warm however
+    /// recently the stream spoke.
+    pub fn relist_pending(&self) -> bool {
+        self.relist_pending
+    }
+
+    /// Raise the obligation. There is deliberately no public way to lower it:
+    /// only a completed [`LabelCache::try_replace_all`] discharges it.
+    pub fn raise_relist_pending(&mut self) {
+        self.raise_relist_pending_at(Instant::now());
+    }
+
+    /// Same, at an explicit instant, so a caller (or a test) can age a debt
+    /// without waiting for it.
+    pub fn raise_relist_pending_at(&mut self, at: Instant) {
+        if !self.relist_pending {
+            self.relist_pending = true;
+            self.debt_raised_at = Some(at);
+        }
+    }
+
+    /// The outstanding debt has stood for [`RELIST_DEBT_HOLDDOWN`], so the
+    /// watch feeding this cache should end its stream and relist. False while
+    /// nothing is owed, and false during the hold-down: the frames that raised
+    /// it keep being read instead of costing a reconnect each.
+    pub fn relist_due_at(&self, now: Instant) -> bool {
+        self.debt_raised_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= RELIST_DEBT_HOLDDOWN)
     }
 
     /// Time since the last list, bookmark or event. `None` while cold.
@@ -243,11 +299,6 @@ impl LabelCache {
         }
     }
 
-    /// Full list result. Replaces everything and marks the cache warm.
-    pub fn replace_all(&mut self, objects: Vec<LabelObject>) {
-        let _ = self.try_replace_all(objects);
-    }
-
     /// A list that does not fit leaves the cache empty and cold rather than
     /// half applied: a partial map answers selectors with labels the object
     /// does not have, and cold is the state consumers already fail closed on.
@@ -261,6 +312,10 @@ impl LabelCache {
         }
         self.listed = true;
         self.fresh_at = Some(Instant::now());
+        // Only a completed list discharges the obligation; a refused one
+        // above leaves it standing.
+        self.relist_pending = false;
+        self.debt_raised_at = None;
         Ok(())
     }
 
@@ -300,7 +355,10 @@ pub fn try_apply_labels_event(
             cache.set_resource_version(rv);
             WatchOutcome::Ignored
         }
-        LabelWatchEvent::Gone(_) => WatchOutcome::MustRelist,
+        LabelWatchEvent::Gone(_) => {
+            cache.raise_relist_pending();
+            WatchOutcome::MustRelist
+        }
         LabelWatchEvent::Error(_) => WatchOutcome::Ignored,
     })
 }
@@ -352,17 +410,19 @@ mod tests {
     fn cold_cache_is_not_an_empty_cluster() {
         let mut cache = LabelCache::new();
         assert!(!cache.is_warm());
-        cache.replace_all(Vec::new());
+        cache.try_replace_all(Vec::new()).expect("list fits");
         assert!(cache.is_warm(), "a completed list of zero objects is warm");
     }
 
     #[test]
     fn same_service_account_name_does_not_leak_across_namespaces() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![
-            object("prod", "default", "zone", "pci"),
-            object("dev", "default", "zone", "public"),
-        ]);
+        cache
+            .try_replace_all(vec![
+                object("prod", "default", "zone", "pci"),
+                object("dev", "default", "zone", "public"),
+            ])
+            .expect("list fits");
         assert_eq!(
             cache.labels_or_empty("prod", "default").get("zone"),
             Some(&"pci".to_string())
@@ -377,7 +437,9 @@ mod tests {
     #[test]
     fn delete_drops_labels_instead_of_keeping_stale_ones() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         let outcome = apply_labels_event(
             &mut cache,
             LabelWatchEvent::Deleted(object("", "prod", "zone", "pci")),
@@ -390,13 +452,43 @@ mod tests {
     #[test]
     fn gone_demands_a_relist_and_keeps_the_cache() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         let outcome = apply_labels_event(
             &mut cache,
             LabelWatchEvent::Gone("too old resource version".into()),
         );
         assert_eq!(outcome, WatchOutcome::MustRelist);
         assert_eq!(cache.len(), 1);
+        // Kept, but no longer warm: the stream said we missed changes, and
+        // only a completed list can say what they were.
+        assert!(cache.relist_pending());
+        assert!(!cache.is_warm());
+        assert!(cache.is_stale(), "listed once, of unknown correctness");
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "public")])
+            .expect("list fits");
+        assert!(!cache.relist_pending());
+        assert!(cache.is_warm());
+    }
+
+    #[test]
+    fn a_failed_relist_leaves_the_debt_standing() {
+        let mut cache = LabelCache::new();
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
+        apply_labels_event(&mut cache, LabelWatchEvent::Gone("expired".into()));
+        let mut fat = object("", "dev", "zone", "public");
+        fat.labels
+            .insert("bloat".into(), "x".repeat(MAX_OBJECT_LABEL_BYTES));
+        cache.try_replace_all(vec![fat]).expect_err("must refuse");
+        assert!(
+            cache.relist_pending(),
+            "a refused list did not close the gap"
+        );
+        assert!(!cache.is_warm());
     }
 
     fn degraded(err: ferrum_common::FerrumError) -> String {
@@ -477,7 +569,9 @@ mod tests {
     #[test]
     fn a_cache_nobody_refreshed_stops_reporting_warm() {
         let mut cache = LabelCache::new();
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         assert!(cache.is_warm());
         assert!(cache.age().expect("listed") < Duration::from_secs(60));
 
@@ -524,7 +618,9 @@ mod tests {
     fn a_shorter_budget_expires_sooner() {
         let mut cache = LabelCache::new();
         cache.set_max_age(Duration::from_secs(30));
-        cache.replace_all(vec![object("", "prod", "zone", "pci")]);
+        cache
+            .try_replace_all(vec![object("", "prod", "zone", "pci")])
+            .expect("list fits");
         let t0 = Instant::now();
         cache.mark_fresh_at(t0);
         assert!(cache.is_warm_at(t0 + Duration::from_secs(29)));

@@ -10,6 +10,7 @@ use crate::source::{normalize_runtime_id, ContainerRecord, PodCache, PodRecord};
 use ferrum_common::{FerrumError, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PodWatchEvent {
@@ -95,6 +96,13 @@ pub fn parse_watch_event(line: &[u8]) -> Result<PodWatchEvent> {
 /// Fold one event into the cache. DELETE removes by UID, so every cgroup of
 /// that pod disappears from the next resolver refresh.
 pub fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOutcome {
+    // Every frame the apiserver produced is proof the watch is alive, so a
+    // bookmark on a quiet cluster and a 410 both count. An ERROR frame does
+    // not: a stream that only rejects us delivers no pod state. Liveness is
+    // not completeness: the 410 below also raises the relist obligation.
+    if !matches!(event, PodWatchEvent::Error(_)) {
+        cache.mark_applied_at(Instant::now());
+    }
     match event {
         PodWatchEvent::Added(pod) | PodWatchEvent::Modified(pod) => {
             if cache.upsert(pod) {
@@ -111,7 +119,10 @@ pub fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOut
             cache.set_resource_version(rv);
             WatchOutcome::Ignored
         }
-        PodWatchEvent::Gone(_) => WatchOutcome::MustRelist,
+        PodWatchEvent::Gone(_) => {
+            cache.raise_relist_pending();
+            WatchOutcome::MustRelist
+        }
         PodWatchEvent::Error(_) => WatchOutcome::Ignored,
     }
 }
@@ -134,6 +145,145 @@ pub fn apply_watch_stream(cache: &mut PodCache, body: &[u8]) -> Result<WatchOutc
         }
     }
     Ok(outcome)
+}
+
+/// The relist obligation, raised and discharged the same way on either cache.
+///
+/// Both watch streams meet the same two facts — `410 Gone`, and a frame this
+/// build cannot read — and both must answer them identically. One trait so the
+/// answer is written once.
+pub trait RelistDebt {
+    fn relist_pending(&self) -> bool;
+    fn raise_relist_pending_at(&mut self, at: Instant);
+    /// The debt has stood past [`crate::labels::RELIST_DEBT_HOLDDOWN`] and the
+    /// stream should end so the relist can run.
+    fn relist_due_at(&self, now: Instant) -> bool;
+}
+
+impl RelistDebt for PodCache {
+    fn relist_pending(&self) -> bool {
+        PodCache::relist_pending(self)
+    }
+
+    fn raise_relist_pending_at(&mut self, at: Instant) {
+        PodCache::raise_relist_pending_at(self, at)
+    }
+
+    fn relist_due_at(&self, now: Instant) -> bool {
+        PodCache::relist_due_at(self, now)
+    }
+}
+
+impl RelistDebt for crate::labels::LabelCache {
+    fn relist_pending(&self) -> bool {
+        crate::labels::LabelCache::relist_pending(self)
+    }
+
+    fn raise_relist_pending_at(&mut self, at: Instant) {
+        crate::labels::LabelCache::raise_relist_pending_at(self, at)
+    }
+
+    fn relist_due_at(&self, now: Instant) -> bool {
+        crate::labels::LabelCache::relist_due_at(self, now)
+    }
+}
+
+/// A frame the parser cannot read is a change that happened and was not
+/// applied: exactly the fact `410 Gone` carries, and it reaches the cache the
+/// same way. Skipping it and reading on leaves the cache `listed`, fresh and
+/// owing nothing while a namespace it never saw answers a selector as
+/// unlabelled — an unobserved label reported as an absent one, which is the
+/// fail-open this project refused in cycle 6.
+///
+/// Deliberately not an `Err` that ends the stream on the frame itself. A frame
+/// this build rejects may be one a newer apiserver invented — a `type:` added
+/// in an upgrade — and reconnecting on each of them turns a rolling
+/// control-plane upgrade into a reconnect storm against the apiserver,
+/// authored by the component that is supposed to protect it.
+///
+/// So the debt is raised and the stream reads on. It is also *scheduled*:
+/// [`RELIST_DEBT_HOLDDOWN`] after it was raised, the next frame ends the stream
+/// with [`WatchOutcome::MustRelist`] and the cycle's own relist discharges it.
+/// Nothing else would — a stream that never fails is the healthy case, and the
+/// cache would otherwise stay unwarm for the life of the connection, denying
+/// every selected Pod cluster-wide. The hold-down is what keeps that bounded in
+/// both directions: at most one reconnect per hold-down however many unreadable
+/// frames arrive, and at most one hold-down of failing closed per burst.
+///
+/// [`RELIST_DEBT_HOLDDOWN`]: crate::labels::RELIST_DEBT_HOLDDOWN
+fn note_unreadable_frame<C: RelistDebt + ?Sized>(
+    cache: &mut C,
+    resource: &str,
+    err: &FerrumError,
+    now: Instant,
+) -> WatchOutcome {
+    // Once per debt, not once per frame: the burst that raises it is exactly
+    // the burst that would fill the log.
+    let first = !cache.relist_pending();
+    cache.raise_relist_pending_at(now);
+    if cache.relist_due_at(now) {
+        eprintln!(
+            "ferrum-k8smeta: unreadable {resource} watch frame, relist debt stood past              {:?}; ending the stream to relist: {err}",
+            crate::labels::RELIST_DEBT_HOLDDOWN
+        );
+        return WatchOutcome::MustRelist;
+    }
+    if first {
+        eprintln!(
+            "ferrum-k8smeta: unreadable {resource} watch frame, relist pending within {:?};              the stream keeps reading and the cache is not warm until it lands: {err}",
+            crate::labels::RELIST_DEBT_HOLDDOWN
+        );
+    }
+    WatchOutcome::Ignored
+}
+
+/// One line of a pod `watch=1` stream, folded in. The single place a pod frame
+/// is turned into cache state, so the network loop cannot answer an unreadable
+/// frame differently from a replayed one.
+pub fn apply_watch_line(cache: &mut PodCache, line: &[u8]) -> WatchOutcome {
+    apply_watch_line_at(cache, line, Instant::now())
+}
+
+/// Same, at an explicit instant, so the relist hold-down can be exercised
+/// without sleeping through it.
+pub fn apply_watch_line_at(cache: &mut PodCache, line: &[u8], now: Instant) -> WatchOutcome {
+    let event = match parse_watch_event(line) {
+        Ok(event) => event,
+        Err(err) => return note_unreadable_frame(cache, "pods", &err, now),
+    };
+    if let Some(rv) = event_resource_version(&event) {
+        cache.set_resource_version(rv);
+    }
+    apply_watch_event(cache, event)
+}
+
+/// Same for one line of a namespaces/serviceaccounts stream. `Err` is reserved
+/// for an object the cache refuses to hold, which does end the stream: an
+/// unbounded map is how one apiserver OOMs the node.
+pub fn apply_labels_line(
+    cache: &mut crate::labels::LabelCache,
+    resource: &str,
+    line: &[u8],
+) -> Result<WatchOutcome> {
+    apply_labels_line_at(cache, resource, line, Instant::now())
+}
+
+/// Same, at an explicit instant, so the relist hold-down can be exercised
+/// without sleeping through it.
+pub fn apply_labels_line_at(
+    cache: &mut crate::labels::LabelCache,
+    resource: &str,
+    line: &[u8],
+    now: Instant,
+) -> Result<WatchOutcome> {
+    let event = match parse_labels_watch_event(line) {
+        Ok(event) => event,
+        Err(err) => return Ok(note_unreadable_frame(cache, resource, &err, now)),
+    };
+    if let Some(rv) = crate::labels::label_event_resource_version(&event) {
+        cache.set_resource_version(rv);
+    }
+    crate::labels::try_apply_labels_event(cache, event)
 }
 
 fn event_resource_version(event: &PodWatchEvent) -> Option<String> {
@@ -361,6 +511,261 @@ fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
 }
 
 #[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use crate::labels::{LabelCache, RELIST_DEBT_HOLDDOWN};
+    use crate::source::{PodMetadataSource, POD_WATCH_BUDGET};
+    use std::time::Duration;
+
+    fn stale_cache() -> Option<PodCache> {
+        let mut cache = PodCache::new("node-a");
+        cache.upsert(PodRecord {
+            uid: "u1".into(),
+            namespace: "prod".into(),
+            name: "web-0".into(),
+            node_name: "node-a".into(),
+            ..Default::default()
+        });
+        cache.mark_applied_at(Instant::now().checked_sub(POD_WATCH_BUDGET * 2)?);
+        Some(cache)
+    }
+
+    #[test]
+    fn a_bookmark_refreshes_even_though_it_changes_nothing() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        assert!(cache.snapshot().is_err(), "stale before the bookmark");
+        let event = parse_watch_event(
+            br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"42"}}}"#,
+        )
+        .expect("bookmark");
+        assert_eq!(apply_watch_event(&mut cache, event), WatchOutcome::Ignored);
+        assert!(
+            cache.applied_age().expect("stamped") < Duration::from_secs(1),
+            "an Ignored outcome still proves the stream is alive"
+        );
+        cache.snapshot().expect("a bookmarked cache resolves");
+    }
+
+    const GONE: &[u8] = br#"{"type":"ERROR","object":{"kind":"Status","reason":"Expired","message":"too old resource version: 2 (9)","code":410}}"#;
+
+    #[test]
+    fn a_410_is_liveness_but_never_freshness() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        let event = parse_watch_event(GONE).expect("gone");
+        assert_eq!(
+            apply_watch_event(&mut cache, event),
+            WatchOutcome::MustRelist
+        );
+        // The stamp lands: the apiserver did answer us.
+        assert!(cache.applied_age().expect("stamped") < Duration::from_secs(1));
+        assert!(cache.is_fresh_at(Instant::now()), "the watch is alive");
+        // The cache is still refused: liveness is not completeness.
+        assert!(cache.relist_pending());
+        match cache.snapshot() {
+            Err(FerrumError::Degraded(msg)) => {
+                assert!(msg.contains("relist"), "{msg}");
+                assert!(msg.contains("410"), "{msg}");
+                assert!(msg.contains("behind"), "{msg}");
+            }
+            other => panic!("a cache owing a relist must be Degraded, got {other:?}"),
+        }
+        // Not an eviction: the pods from before the gap are still there for
+        // whoever completes the relist.
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// A watch frame this build cannot parse is a change that happened and was
+    /// not applied. Skipping it and reading on left the cache listed, fresh and
+    /// owing nothing — warm, with a hole in it — so every consumer that gates on
+    /// warmth proceeded off pods it had never been told about.
+    #[test]
+    fn a_frame_this_build_cannot_read_leaves_the_cache_owing_a_relist() {
+        let mut cache = PodCache::new("node-a");
+        cache.replace_all(vec![PodRecord {
+            uid: "u1".into(),
+            namespace: "prod".into(),
+            name: "web-0".into(),
+            node_name: "node-a".into(),
+            ..Default::default()
+        }]);
+        cache.mark_applied_at(Instant::now());
+        cache.snapshot().expect("a listed cache resolves");
+
+        // A `type:` a newer apiserver invented, mid rolling upgrade.
+        assert_eq!(
+            apply_watch_line(
+                &mut cache,
+                br#"{"type":"PATCHED","object":{"metadata":{}}}"#
+            ),
+            WatchOutcome::Ignored
+        );
+        // The stream keeps running: the very next frame still applies.
+        assert_eq!(
+            apply_watch_line(
+                &mut cache,
+                br#"{"type":"ADDED","object":{"metadata":{"uid":"u2","name":"web-1","namespace":"prod","resourceVersion":"9"},"spec":{"nodeName":"node-a"}}}"#
+            ),
+            WatchOutcome::Applied
+        );
+        assert_eq!(cache.len(), 2, "the frames we can read are still applied");
+        assert!(cache.is_fresh_at(Instant::now()), "the watch is alive");
+        // And the cache says what it is: behind, not complete.
+        assert!(cache.relist_pending());
+        assert!(
+            cache.snapshot().is_err(),
+            "a cache with a hole in it does not name cgroups"
+        );
+        cache.replace_all(Vec::new());
+        assert!(!cache.relist_pending(), "a relist discharges the debt");
+    }
+
+    /// The debt cycle 11 raised had nothing behind it: `Ignored` is not one of
+    /// the outcomes `cycle()` relists on, so a watch connection that stays up —
+    /// the healthy case — kept the cache unwarm for the life of the process and
+    /// `containerOnly` rules stopped firing for good. The hold-down is the
+    /// missing relist: the frames keep being read, and once the debt has stood
+    /// long enough the stream ends so the cycle's own relist can discharge it.
+    #[test]
+    fn an_unreadable_pod_frame_ends_the_stream_once_its_debt_stands() {
+        let start = Instant::now();
+        let mut cache = PodCache::new("node-a");
+        cache.replace_all(Vec::new());
+        cache.mark_applied_at(start);
+
+        let unknown = br#"{"type":"PATCHED","object":{"metadata":{}}}"#;
+        assert_eq!(
+            apply_watch_line_at(&mut cache, unknown, start),
+            WatchOutcome::Ignored,
+            "the frame that raises the debt does not cost a reconnect"
+        );
+        assert!(cache.relist_pending());
+        assert!(
+            cache.snapshot().is_err(),
+            "a cache with a hole in it denies"
+        );
+        // Still inside the hold-down: the stream reads on.
+        assert_eq!(
+            apply_watch_line_at(&mut cache, unknown, start + RELIST_DEBT_HOLDDOWN / 2),
+            WatchOutcome::Ignored
+        );
+        // Past it, and the next frame ends the stream so the relist can run.
+        assert_eq!(
+            apply_watch_line_at(&mut cache, unknown, start + RELIST_DEBT_HOLDDOWN),
+            WatchOutcome::MustRelist,
+            "nothing else in cycle() would ever relist"
+        );
+        // Which is what `cycle()` does with `MustRelist`, and it discharges.
+        cache.replace_all(Vec::new());
+        cache.mark_applied_at(start + RELIST_DEBT_HOLDDOWN);
+        assert!(!cache.relist_pending());
+        assert!(cache.snapshot().is_ok(), "the cache is warm again");
+    }
+
+    /// The other direction, which the fix must not break: a rolling
+    /// control-plane upgrade emitting a `type:` this build does not know on
+    /// every frame must not become one reconnect per frame against the
+    /// apiserver the whole cluster depends on.
+    #[test]
+    fn a_rolling_stream_of_unknown_frames_is_not_a_reconnect_per_frame() {
+        let start = Instant::now();
+        let mut cache = LabelCache::new();
+        cache.try_replace_all(Vec::new()).expect("list fits");
+
+        let unknown = br#"{"type":"PATCHED","object":{"metadata":{"name":"prod"}}}"#;
+        let span = RELIST_DEBT_HOLDDOWN * 4;
+        let frames = 400u32;
+        let step = span / frames;
+        let mut relists = 0u32;
+        let mut now = start;
+        for _ in 0..frames {
+            let outcome = apply_labels_line_at(&mut cache, "namespaces", unknown, now)
+                .expect("an unreadable frame is not a stream error");
+            if outcome == WatchOutcome::MustRelist {
+                relists += 1;
+                // What the cycle does next: reconnect and list.
+                cache.try_replace_all(Vec::new()).expect("relist fits");
+            }
+            now += step;
+        }
+        assert!(
+            relists <= 5,
+            "{frames} unreadable frames over {span:?} cost {relists} reconnects; the \
+             hold-down bounds that at one per {RELIST_DEBT_HOLDDOWN:?}"
+        );
+        assert!(
+            relists >= 3,
+            "and the debt is still discharged, repeatedly: {relists}"
+        );
+    }
+
+    #[test]
+    fn only_a_completed_relist_clears_the_debt() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        assert_eq!(
+            apply_watch_stream(&mut cache, GONE).expect("apply"),
+            WatchOutcome::MustRelist
+        );
+        assert!(cache.snapshot().is_err());
+
+        // A later event proves the new stream is alive, and that is all: the
+        // gap the 410 left is only closed by a full list.
+        let event = parse_watch_event(
+            br#"{"type":"MODIFIED","object":{"metadata":{"uid":"u1","name":"web-0","namespace":"prod","resourceVersion":"99"},"spec":{"nodeName":"node-a"}}}"#,
+        )
+        .expect("modified");
+        assert_eq!(apply_watch_event(&mut cache, event), WatchOutcome::Applied);
+        assert!(cache.relist_pending(), "an event is not a list");
+        assert!(cache.snapshot().is_err());
+
+        let (_, pods) = parse_pod_list(
+            br#"{"kind":"PodList","metadata":{"resourceVersion":"1200"},"items":[
+                 {"metadata":{"uid":"u1","name":"web-0","namespace":"prod"},
+                  "spec":{"nodeName":"node-a"}}]}"#,
+        )
+        .expect("list");
+        cache.replace_all(pods);
+        cache.mark_applied_at(Instant::now());
+        assert!(!cache.relist_pending());
+        assert_eq!(cache.snapshot().expect("relisted").len(), 1);
+    }
+
+    #[test]
+    fn a_bare_error_frame_is_not_liveness() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        let event = parse_watch_event(
+            br#"{"type":"ERROR","object":{"kind":"Status","message":"boom","code":500}}"#,
+        )
+        .expect("error");
+        assert_eq!(apply_watch_event(&mut cache, event), WatchOutcome::Ignored);
+        assert!(
+            cache.snapshot().is_err(),
+            "a stream that only errors delivers no pod state"
+        );
+    }
+
+    #[test]
+    fn an_applied_stream_leaves_the_cache_usable() {
+        let Some(mut cache) = stale_cache() else {
+            return;
+        };
+        let stream = br#"{"type":"MODIFIED","object":{"metadata":{"uid":"u1","name":"web-0","namespace":"prod","resourceVersion":"77"},"spec":{"nodeName":"node-a"}}}"#;
+        assert_eq!(
+            apply_watch_stream(&mut cache, stream).expect("apply"),
+            WatchOutcome::Applied
+        );
+        assert_eq!(cache.snapshot().expect("fresh").len(), 1);
+    }
+}
+
+#[cfg(test)]
 mod label_parse_tests {
     use super::*;
     use crate::labels::{apply_labels_event, apply_labels_stream, LabelCache};
@@ -411,7 +816,7 @@ mod label_parse_tests {
         }"#;
         let (_, objects) = parse_labels_list("ServiceAccountList", raw).expect("list");
         let mut cache = LabelCache::new();
-        cache.replace_all(objects);
+        cache.try_replace_all(objects).expect("list fits");
         assert_eq!(
             cache.labels_or_empty("prod", "default").get("tier"),
             Some(&"front".to_string())
@@ -425,7 +830,7 @@ mod label_parse_tests {
     #[test]
     fn watch_events_add_modify_delete_and_bookmark() {
         let mut cache = LabelCache::new();
-        cache.replace_all(Vec::new());
+        cache.try_replace_all(Vec::new()).expect("list fits");
         let added = parse_labels_watch_event(
             br#"{"type":"ADDED","object":{"metadata":{"name":"prod","resourceVersion":"5",
                  "labels":{"ferrum.io/zone":"pci"}}}}"#,
@@ -476,11 +881,67 @@ mod label_parse_tests {
             other => panic!("410 must be Gone, got {other:?}"),
         }
         let mut cache = LabelCache::new();
-        cache.replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1);
+        cache
+            .try_replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1)
+            .expect("list fits");
+        assert!(cache.is_warm());
         let outcome = apply_labels_stream(&mut cache, line).expect("apply");
         assert_eq!(outcome, WatchOutcome::MustRelist);
         // A relist demand must not empty the cache we already have.
         assert_eq!(cache.len(), 2);
+        // But the labels in it are known to have moved on without us: a
+        // selector must not be decided off them until a list lands.
+        assert!(cache.relist_pending());
+        assert!(!cache.is_warm(), "410 is liveness, not warmth");
+        cache
+            .try_replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1)
+            .expect("list fits");
+        assert!(!cache.relist_pending());
+        assert!(cache.is_warm(), "a completed relist clears the debt");
+    }
+
+    /// The same fact on the label caches, where it is a fail-open: the
+    /// namespace whose ADDED frame was eaten has labels, the cache does not
+    /// have them, and `labels_or_empty` cannot tell that apart from a namespace
+    /// that carries none. An unobserved label is not a non-match, so the cache
+    /// must stop calling itself warm the moment it misses a frame.
+    #[test]
+    fn an_eaten_namespace_frame_is_not_a_namespace_without_labels() {
+        let mut cache = LabelCache::new();
+        cache.try_replace_all(Vec::new()).expect("empty list fits");
+        assert!(cache.is_warm(), "a completed list of zero objects is warm");
+
+        // prod is created with the label a namespaceSelector matches on, and
+        // the frame that carries it is one this parser refuses.
+        let eaten = br#"{"type":"ADDED","object":{"metadata":{"labels":{"ferrum.io/zone":"prod"},"resourceVersion":"4"}}}"#;
+        assert!(
+            parse_labels_watch_event(eaten).is_err(),
+            "the frame is unreadable"
+        );
+        assert_eq!(
+            apply_labels_line(&mut cache, "namespaces", eaten)
+                .expect("a skipped frame is not a stream error"),
+            WatchOutcome::Ignored
+        );
+        // A well-formed frame right after it, and the stream is still running.
+        assert_eq!(
+            apply_labels_line(
+                &mut cache,
+                "namespaces",
+                br#"{"type":"ADDED","object":{"metadata":{"name":"dev","resourceVersion":"5"}}}"#
+            )
+            .expect("applied"),
+            WatchOutcome::Applied
+        );
+        assert_eq!(cache.resource_version(), "5");
+        // The hole is real: prod answers as unlabelled.
+        assert!(cache.labels_or_empty("", "prod").is_empty());
+        // So the cache must not be warm, which is the gate every consumer of
+        // these labels fails closed on.
+        assert!(cache.relist_pending());
+        assert!(!cache.is_warm(), "a cache that missed a frame is not warm");
+        cache.try_replace_all(Vec::new()).expect("relist fits");
+        assert!(cache.is_warm(), "a completed relist clears the debt");
     }
 
     #[test]
@@ -498,17 +959,14 @@ pub use client::{ApiserverConfig, ApiserverWatcher, LabelWatcher, SERVICE_ACCOUN
 
 #[cfg(feature = "apiserver")]
 mod client {
-    use super::{
-        apply_watch_event, event_resource_version, parse_labels_list, parse_labels_watch_event,
-        parse_pod_list, parse_watch_event,
-    };
-    use crate::labels::{label_event_resource_version, try_apply_labels_event, LabelCache};
-    use crate::source::PodCache;
+    use super::{apply_labels_line, apply_watch_line, parse_labels_list, parse_pod_list};
+    use crate::labels::LabelCache;
+    use crate::source::{PodCache, POD_WATCH_BUDGET};
     use crate::watch::WatchOutcome;
     use ferrum_common::{FerrumError, Result};
     use std::io::{self, BufRead, BufReader, Read, Write};
-    use std::net::TcpStream;
-    use std::path::PathBuf;
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
 
@@ -530,6 +988,13 @@ mod client {
     /// A cycle that streamed at least this long was a healthy connection, so
     /// the next reconnect starts from the base delay again.
     const HEALTHY_STREAM: Duration = Duration::from_secs(60);
+    /// A blackholed connection blocks in `read()` forever, and a watch thread
+    /// parked there never reconnects while the cache silently ages out. Half
+    /// the freshness budget: the timeout fires, the cycle reconnects and
+    /// relists, all before `PodCache::snapshot` starts refusing. Long enough
+    /// that ordinary bookmark gaps on a quiet cluster do not trip it.
+    const IO_TIMEOUT: Duration = Duration::from_secs(POD_WATCH_BUDGET.as_secs() / 2);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[derive(Debug, Clone)]
     pub struct ApiserverConfig {
@@ -568,13 +1033,39 @@ mod client {
                 .unwrap_or_else(|_| "443".into())
                 .parse::<u16>()
                 .map_err(|e| FerrumError::Degraded(format!("KUBERNETES_SERVICE_PORT: {e}")))?;
-            let dir = PathBuf::from(SERVICE_ACCOUNT_DIR);
+            Self::from_sa_dir(node_name, host, port, Path::new(SERVICE_ACCOUNT_DIR))
+        }
+
+        /// The half of `in_cluster` that does not read the environment, so
+        /// the token check below is reachable from a test without a projected
+        /// volume and without touching process-global env vars.
+        fn from_sa_dir(node_name: String, host: String, port: u16, dir: &Path) -> Result<Self> {
+            let token_path = dir.join("token");
+            // Checked at construction, not left to the first connect.
+            // `automountServiceAccountToken: false` on the pod spec or the
+            // ServiceAccount projects no token at all, and that is the shipped
+            // install defect cycle 10 slice A fixed in the manifests: without
+            // this check the config is built, the watch thread spawns, every
+            // connect authenticates with nothing, and the only symptom is an
+            // endless backoff on a cache that never warms. A failure here
+            // names the file that is missing, at startup, where the operator
+            // is looking. The token is still re-read on every connect —
+            // projected tokens rotate — so this is an existence check and not
+            // a value the config holds.
+            if !token_path.exists() {
+                return Err(FerrumError::Degraded(format!(
+                    "{} does not exist: no ServiceAccount token is projected into this pod, so \
+                     every apiserver request would authenticate as nobody. Check \
+                     automountServiceAccountToken on the pod spec and on the ServiceAccount.",
+                    token_path.display()
+                )));
+            }
             Ok(Self {
                 host,
                 port,
                 server_name: DEFAULT_SERVER_NAME.to_string(),
                 node_name,
-                token_path: dir.join("token"),
+                token_path,
                 ca_path: dir.join("ca.crt"),
             })
         }
@@ -596,10 +1087,40 @@ mod client {
                 .map_err(|e| FerrumError::Degraded(format!("apiserver server name: {e}")))?;
             let conn = rustls::ClientConnection::new(cfg, name)
                 .map_err(|e| FerrumError::Degraded(format!("tls client: {e}")))?;
-            let tcp = TcpStream::connect((self.host.as_str(), self.port))
-                .map_err(|e| FerrumError::Degraded(format!("apiserver connect: {e}")))?;
-            let _ = tcp.set_nodelay(true);
+            let tcp = self.dial()?;
             Ok(rustls::StreamOwned::new(conn, tcp))
+        }
+
+        /// Connect with every deadline set before the socket is used once.
+        fn dial(&self) -> Result<TcpStream> {
+            let addrs = (self.host.as_str(), self.port)
+                .to_socket_addrs()
+                .map_err(|e| FerrumError::Degraded(format!("apiserver resolve: {e}")))?;
+            let mut last: Option<io::Error> = None;
+            for addr in addrs {
+                match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                    Ok(tcp) => {
+                        let _ = tcp.set_nodelay(true);
+                        // Not best-effort: a socket with no read deadline is
+                        // exactly the hang these timeouts exist to break, so
+                        // failing to set them fails the connect.
+                        tcp.set_read_timeout(Some(IO_TIMEOUT))
+                            .and_then(|_| tcp.set_write_timeout(Some(IO_TIMEOUT)))
+                            .map_err(|e| {
+                                FerrumError::Degraded(format!("apiserver socket timeout: {e}"))
+                            })?;
+                        return Ok(tcp);
+                    }
+                    Err(e) => last = Some(e),
+                }
+            }
+            Err(FerrumError::Degraded(match last {
+                Some(e) => format!("apiserver connect: {e}"),
+                None => format!(
+                    "apiserver {}:{} resolved to no address",
+                    self.host, self.port
+                ),
+            }))
         }
 
         fn request(&self, stream: &mut TlsStream, path: &str) -> Result<()> {
@@ -706,6 +1227,7 @@ mod client {
             self.with_cache(|c| {
                 c.replace_all(pods);
                 c.set_resource_version(rv.clone());
+                c.mark_applied_at(Instant::now());
             });
             Ok(rv)
         }
@@ -721,7 +1243,11 @@ mod client {
             let head = read_head(&mut reader)?;
             match head.status {
                 200 => {}
-                410 => return Ok(WatchOutcome::MustRelist),
+                // Same fact as an in-band 410, only delivered as a status.
+                410 => {
+                    self.with_cache(|c| c.raise_relist_pending());
+                    return Ok(WatchOutcome::MustRelist);
+                }
                 other => {
                     return Err(FerrumError::Degraded(format!(
                         "apiserver watch returned {other}"
@@ -739,18 +1265,7 @@ mod client {
                 if line.iter().all(|b| b.is_ascii_whitespace()) {
                     continue;
                 }
-                let event = match parse_watch_event(&line) {
-                    Ok(e) => e,
-                    // One malformed frame must not drop the whole cache.
-                    Err(err) => {
-                        eprintln!("ferrum-k8smeta: skipping watch frame: {err}");
-                        continue;
-                    }
-                };
-                if let Some(next_rv) = event_resource_version(&event) {
-                    self.with_cache(|c| c.set_resource_version(next_rv));
-                }
-                let outcome = self.with_cache(|c| apply_watch_event(c, event));
+                let outcome = self.with_cache(|c| apply_watch_line(c, &line));
                 if outcome == WatchOutcome::MustRelist {
                     return Ok(outcome);
                 }
@@ -899,7 +1414,11 @@ mod client {
             let head = read_head(&mut reader)?;
             match head.status {
                 200 => {}
-                410 => return Ok(WatchOutcome::MustRelist),
+                // Same fact as an in-band 410, only delivered as a status.
+                410 => {
+                    self.sink.with(&mut |cache| cache.raise_relist_pending());
+                    return Ok(WatchOutcome::MustRelist);
+                }
                 other => {
                     return Err(FerrumError::Degraded(format!(
                         "apiserver {} watch returned {other}",
@@ -918,27 +1437,9 @@ mod client {
                 if line.iter().all(|b| b.is_ascii_whitespace()) {
                     continue;
                 }
-                let event = match parse_labels_watch_event(&line) {
-                    Ok(e) => e,
-                    // One malformed frame must not drop the whole cache.
-                    Err(err) => {
-                        eprintln!(
-                            "ferrum-k8smeta: skipping {} watch frame: {err}",
-                            self.kind.resource
-                        );
-                        continue;
-                    }
-                };
-                let next_rv = label_event_resource_version(&event);
-                let mut event = Some(event);
                 let mut applied: Result<WatchOutcome> = Ok(WatchOutcome::Ignored);
                 self.sink.with(&mut |cache| {
-                    if let Some(next) = next_rv.clone() {
-                        cache.set_resource_version(next);
-                    }
-                    if let Some(event) = event.take() {
-                        applied = try_apply_labels_event(cache, event);
-                    }
+                    applied = apply_labels_line(cache, self.kind.resource, &line);
                 });
                 // An object the cache refuses to hold ends the stream: growing
                 // the map without a ceiling is how one apiserver OOMs us.
@@ -1301,6 +1802,39 @@ mod client {
             }
         }
 
+        /// A pod with `automountServiceAccountToken: false` projects no token,
+        /// and construction used to succeed anyway: the watcher spawned, every
+        /// connect authenticated as nobody, and the whole install failure
+        /// showed up only as an endless backoff on a cache that never warmed.
+        /// The error must name the file.
+        #[test]
+        fn a_config_without_a_projected_token_is_an_error_that_names_the_file() {
+            let dir = std::env::temp_dir().join(format!(
+                "ferrum-sa-missing-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let err = ApiserverConfig::from_sa_dir("node-a".into(), "10.0.0.1".into(), 443, &dir)
+                .expect_err("a directory with no token is not a usable config");
+            let msg = degraded_text(err);
+            assert!(
+                msg.contains(&dir.join("token").display().to_string()),
+                "{msg}"
+            );
+            assert!(msg.contains("automountServiceAccountToken"), "{msg}");
+
+            // And the same directory once the token is there: a config, with
+            // the path kept for the per-connect re-read.
+            std::fs::write(dir.join("token"), b"tok").expect("write token");
+            let config =
+                ApiserverConfig::from_sa_dir("node-a".into(), "10.0.0.1".into(), 443, &dir)
+                    .expect("a projected token is a usable config");
+            assert_eq!(config.token_path, dir.join("token"));
+            assert_eq!(config.node_name, "node-a");
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
         #[test]
         fn ordinary_head_still_parses() {
             let head = head_of(
@@ -1420,6 +1954,59 @@ mod client {
             );
             assert_eq!(*slept.last().expect("delays"), MAX_RECONNECT_BACKOFF);
             assert!(slept.iter().all(|d| *d <= MAX_RECONNECT_BACKOFF));
+        }
+
+        fn silent_config() -> (std::net::TcpListener, ApiserverConfig) {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+            let port = listener.local_addr().expect("addr").port();
+            let config = ApiserverConfig {
+                host: "127.0.0.1".into(),
+                port,
+                server_name: "kubernetes.default.svc".into(),
+                node_name: "node-a".into(),
+                token_path: PathBuf::from("/nonexistent/token"),
+                ca_path: PathBuf::from("/nonexistent/ca.crt"),
+            };
+            (listener, config)
+        }
+
+        #[test]
+        fn every_dialed_socket_carries_both_deadlines() {
+            let (_listener, config) = silent_config();
+            let tcp = config.dial().expect("dial");
+            assert_eq!(tcp.read_timeout().expect("read"), Some(IO_TIMEOUT));
+            assert_eq!(tcp.write_timeout().expect("write"), Some(IO_TIMEOUT));
+        }
+
+        #[test]
+        fn a_peer_that_never_answers_ends_in_an_error_not_a_hang() {
+            let (_listener, config) = silent_config();
+            let mut tcp = config.dial().expect("dial");
+            // Same mechanism as IO_TIMEOUT, shortened so the test is not the
+            // one waiting out the budget.
+            tcp.set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("timeout");
+            let mut buf = [0u8; 1];
+            let err = tcp.read(&mut buf).expect_err("read must not block forever");
+            assert!(
+                matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ),
+                "{err:?}"
+            );
+        }
+
+        #[test]
+        fn io_timeout_expires_well_inside_the_freshness_budget() {
+            // The reconnect and relist have to happen while the cache is still
+            // fresh; a timeout at or past the budget would let it go stale.
+            assert!(IO_TIMEOUT < POD_WATCH_BUDGET);
+            assert!(IO_TIMEOUT + CONNECT_TIMEOUT < POD_WATCH_BUDGET);
+            assert!(
+                IO_TIMEOUT > HEALTHY_STREAM,
+                "bookmark gaps on a quiet cluster must not trip it"
+            );
         }
 
         #[test]

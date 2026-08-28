@@ -15,15 +15,36 @@ rules:
       - ferrumclusters
       - compliancesnapshots
     verbs: ["get", "list", "watch"]
+  # Only the status subresources this controller actually PATCHes. Each of the
+  # three below has an `ApiResource` in `watch.rs`, a watch loop that reaches
+  # `patch_status_dynamic`, and a status type it sends. A granted status a
+  # controller never writes is not a quiet no-op — it reports the zero value of
+  # its own struct forever (`degraded: false` on a cluster that is down) and is
+  # indistinguishable from a healthy one, while the grant carrying it is a
+  # permission with no purpose, which this project's threat model calls a
+  # lateral-movement target.
+  #
+  # Four grants of that shape have now been deleted. `policylibraries/status`,
+  # `ferrumclusters/status` and `compliancesnapshots/status` went first: their
+  # status types are declared in `ferrum-api` and named by no source file here.
+  # `runtimeprofiles/status` survived that cull and should not have. What kept
+  # it was `pub fn runtime_profile_status(…) -> RuntimeProfileStatus` in
+  # `lib.rs`, whose only consumer is `ReconcileOutput.profile_status`, read by
+  # two unit tests and by nothing else: no `runtime_profile_resource()`, no
+  # `ApiResource` for `runtimeprofiles`, no watch, no PATCH. A function
+  # returning a status type is not a writer of it, and the gate that kept this
+  # grant could not tell the two apart; it can now
+  # (`boundary_gate.rs::writes_status`).
+  #
+  # The alternative repair is the same in all four cases and is not one
+  # function: a watch, an ApiResource and a PATCH against an API server this
+  # workspace has never spoken to for those kinds. Restore the grant in the
+  # change that adds them, not before.
   - apiGroups: ["ferrum.io"]
     resources:
       - clustersecuritypolicies/status
       - securitypolicies/status
       - policyexceptions/status
-      - policylibraries/status
-      - runtimeprofiles/status
-      - ferrumclusters/status
-      - compliancesnapshots/status
     verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

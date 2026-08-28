@@ -35,4 +35,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 ferrum-compiler.workspace = true
+# The `prod-restricted` fixture the RFC acceptance cases are written against.
+# The join test must decide against the shipped policy, not a copy of it: a
+# copy is what cycle 7 found quietly rotting in a round-trip test.
+ferrum-testkit = { path = "../ferrum-testkit" }
 serde_yaml.workspace = true
