@@ -46,12 +46,12 @@ pipeline {
             steps {
                 sh '''
                     set -eu
+                    # Один проход: --error роняет стадию, --output оставляет артефакт.
+                    # В semgrep.json попадают находки уровня ERROR — те, что и есть гейт.
                     docker run --rm -v "$WORKSPACE":/src -w /src semgrep/semgrep:latest \
                         semgrep scan --config p/rust --config p/secrets \
-                            --metrics=off --no-error --json --output semgrep.json
-                    docker run --rm -v "$WORKSPACE":/src -w /src semgrep/semgrep:latest \
-                        semgrep scan --config p/rust --config p/secrets \
-                            --metrics=off --severity ERROR --error
+                            --metrics=off --severity ERROR --error \
+                            --json --output semgrep.json
                 '''
             }
             post {
@@ -90,11 +90,12 @@ pipeline {
                 script {
                     rust '''
                         set -eu
+                        # Исключаем только целиком покрытые security-стадией crate.
+                        # Списком таргетов admission не резать: новый tests/*.rs тогда
+                        # не попадёт никуда и молча перестанет гоняться.
                         cargo test --workspace \
-                            --exclude ferrum-admission \
                             --exclude ferrum-policy \
                             --exclude ferrum-crypto
-                        cargo test -p ferrum-admission --lib --test webhook
                     '''
                 }
             }
@@ -144,10 +145,22 @@ pipeline {
                 script {
                     rust '''
                         set -eu
-                        for bad in exception-bad-no-ticket; do
+                        # Ненулевой код сам по себе ничего не доказывает: пропавший файл
+                        # или сломанный разбор аргументов дают его же. Гейт держится на
+                        # вердикте валидатора, поэтому ждём конкретное сообщение.
+                        set -- "exception-bad-no-ticket:PolicyException.ticket пуст"
+                        for spec in "$@"; do
+                            bad=${spec%%:*}
+                            want=${spec#*:}
+                            out="$WORKSPACE/negative-$bad.log"
                             if cargo run -p ferrum-cli --quiet -- validate \
-                                "policies/examples/$bad.yaml" >/dev/null 2>&1; then
+                                "policies/examples/$bad.yaml" >"$out" 2>&1; then
                                 echo "$bad.yaml must fail validation" >&2
+                                exit 1
+                            fi
+                            if ! grep -qF "$want" "$out"; then
+                                echo "$bad.yaml failed for the wrong reason:" >&2
+                                cat "$out" >&2
                                 exit 1
                             fi
                             echo "ok: $bad.yaml rejected"
