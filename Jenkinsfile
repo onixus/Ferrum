@@ -6,15 +6,16 @@
 // означает нарушенный инвариант из AGENTS.md, а не сломанную фичу.
 // SAST стоит первым: находка роняет билд за минуту, а не после полной сборки Rust.
 
-def RUST_IMAGE = 'rust:1.75-bookworm'
-def RUST_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
-                ' -v ferrum-cargo-target:/build-target' +
-                ' -v ferrum-cargo-tools:/cargo-tools'
-
 // cargo-deny/cargo-audit ставятся в отдельный том: /usr/local/cargo/bin трогать нельзя,
 // там лежит сам cargo и монтирование его затрёт.
+// Константы держим внутри метода: `def` на верхнем уровне — локальная переменная
+// скрипта, из метода она не видна (MissingPropertyException, билд #9).
 def rust(String script) {
-    docker.image(RUST_IMAGE).inside(RUST_ARGS) {
+    def image = 'rust:1.75-bookworm'
+    def args = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
+               ' -v ferrum-cargo-target:/build-target' +
+               ' -v ferrum-cargo-tools:/cargo-tools'
+    docker.image(image).inside(args) {
         withEnv([
             'CARGO_TARGET_DIR=/build-target',
             'CARGO_TERM_COLOR=never',
