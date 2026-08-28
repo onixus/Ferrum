@@ -12,7 +12,10 @@ pub mod resolver;
 pub mod source;
 pub mod watch;
 
-pub use cgroupfs::{scan, CgroupEntry, CgroupFs, StdCgroupFs, DEFAULT_CGROUP_ROOT};
+pub use cgroupfs::{
+    cgroup2_root_from_mountinfo, detect_cgroup2_root, scan, CgroupEntry, CgroupFs, StdCgroupFs,
+    DEFAULT_CGROUP_ROOT, SELF_MOUNTINFO,
+};
 pub use index::SharedCgroupIndex;
 pub use labels::{
     apply_labels_event, apply_labels_stream, label_key, try_apply_labels_event, LabelCache,

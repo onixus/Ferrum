@@ -120,6 +120,52 @@ pub const DECODE_FAILURE_RUN_MAX: u64 = 64;
 pub const SELF_TGID_UNPUBLISHED: &str =
     "agent self tgid not published: not in the host pid namespace, so notAgentSelf rules \
      cannot be honoured on this node";
+/// The stale-target guard could not be computed at all, so no reaction on this
+/// node can ever run. Latched by construction: the cgroup2 mount table is read
+/// once, and a node does not grow a unified hierarchy at runtime.
+///
+/// Respond-scoped, and named like `SELF_TGID_UNPUBLISHED` rather than `DEG_*`
+/// for the same reason: under observe the guard is never reached — the role
+/// refusal returns first — so on the shipped default install this reason would
+/// be true of every node and mean nothing on any of them. The `DEG_*` family is
+/// the set of reasons that hold whatever the role is.
+pub const TARGET_CHECK_UNPROVABLE: &str =
+    "stale-target guard cannot be computed: the cgroup2 hierarchy the datapath keys on was not \
+     identified on this node, so every reaction refuses without having proven anything about its \
+     target and nothing is ever killed";
+/// Respond is on, kill rules have matched, and not one reaction has ever found
+/// its target still in the cgroup that raised the record.
+///
+/// This is the shape that separates "some targets vanish" from "no target has
+/// ever been provable". A workload that exits between the decision and the
+/// signal is ordinary — a busy node refuses constantly and is perfectly
+/// healthy — so a rate, a run, or "any stale refusal" would fire on every such
+/// node and drown every other signal, which is cycle 6's identity-miss defect
+/// and cycle 7's `SELF_TGID_UNPUBLISHED` defect over again. What a healthy node
+/// always has is at least *one* confirmation: some target, once, was where the
+/// record said it was. A single one clears this for the life of the process
+/// and no rate of refusals afterwards can raise it. Only a node that has never
+/// managed a single confirmation while refusing repeatedly is claiming a
+/// guard it has never once been able to satisfy.
+///
+/// A wrong cgroup root is the way this is reached without a broken derivation:
+/// the root parsed fine and names another hierarchy, so the inodes disagree
+/// every time. `TARGET_CHECK_UNPROVABLE` cannot see that; this can.
+pub const TARGET_NEVER_PROVEN: &str =
+    "respond is on and no reaction has ever confirmed its target: every kill this node decided \
+     was refused because the target was not in the cgroup that raised its record, and not one \
+     was ever found there — the guard is answering about the wrong cgroup hierarchy rather than \
+     catching pid reuse";
+/// Refusals for want of a provable target that a node may accumulate before
+/// never having proven one becomes a reason.
+///
+/// Not a rate and not a window: the denominator is the whole life of the
+/// process. It exists only so the very first refusal on a node that simply has
+/// not killed anything yet is not a verdict on it. Small, because on a node
+/// where the guard is keyed on the wrong hierarchy every single reaction lands
+/// here, and an operator who asked for respond should not wait on a threshold
+/// to learn the node reacts to nothing.
+pub const RESPOND_TARGET_UNPROVEN_MIN: u64 = 8;
 /// The reasons `is_degraded` can give, in the words the operator reads in
 /// `status.json` and in the transition line. Constants rather than literals:
 /// the file and the log line are a surface, and a reason that changes wording
@@ -249,8 +295,9 @@ pub use respond::{
     host_pid_namespace, host_pid_namespace_at, NoopResponder, ProcCgroupCheck, Responder,
     SignalResponder, TargetCheck, HOST_PID_NS_INO, MAX_TGID, REFUSE_AGENT_SELF,
     REFUSE_DENY_NOT_ENFORCEABLE, REFUSE_ISOLATE, REFUSE_NOT_CONTAINER, REFUSE_NO_RESPONDER,
-    REFUSE_ROLE, REFUSE_STALE_TARGET, REFUSE_TARGET_GONE, REFUSE_TGID_INIT, REFUSE_TGID_RANGE,
-    REFUSE_TGID_SELF, REFUSE_TGID_ZERO, REFUSE_UNKNOWN_IDENTITY, RESPOND_NO_HOST_PIDNS,
+    REFUSE_ROLE, REFUSE_STALE_TARGET, REFUSE_TARGET_GONE, REFUSE_TARGET_UNPROVABLE,
+    REFUSE_TGID_INIT, REFUSE_TGID_RANGE, REFUSE_TGID_SELF, REFUSE_TGID_ZERO,
+    REFUSE_UNKNOWN_IDENTITY, RESPOND_NO_HOST_PIDNS,
 };
 pub use ring::{RingLoop, RingTick};
 pub use source::{
@@ -357,6 +404,14 @@ pub struct Agent {
     respond_role_skipped: AtomicU64,
     respond_failed: AtomicU64,
     respond_stale_target: AtomicU64,
+    /// Reactions that found the target exactly where the record said it was.
+    /// The denominator `respond_stale_target` is measured against: see
+    /// `TARGET_NEVER_PROVEN`.
+    respond_target_confirmed: AtomicU64,
+    /// Reactions refused because the guard itself could not be evaluated.
+    /// Never counted as stale: that would be the same conflation the guard was
+    /// fixed to stop making.
+    respond_target_unprovable: AtomicU64,
     /// Latched from the sink: export died, enforcement is no longer recorded.
     export_dead: AtomicBool,
     /// True once the carrier has pushed the cgroup index into `ferrum_cgroups`
@@ -480,6 +535,8 @@ impl Agent {
             respond_role_skipped: AtomicU64::new(0),
             respond_failed: AtomicU64::new(0),
             respond_stale_target: AtomicU64::new(0),
+            respond_target_confirmed: AtomicU64::new(0),
+            respond_target_unprovable: AtomicU64::new(0),
             export_dead: AtomicBool::new(false),
             container_map_synced: AtomicBool::new(false),
             container_map_entries: AtomicU64::new(0),
@@ -641,6 +698,26 @@ impl Agent {
         // see it.
         if self.role.respond_enabled() && self.self_tgid_unpublished() {
             out.push(SELF_TGID_UNPUBLISHED.to_string());
+        }
+        // Under respond only, for the same reason: under observe the guard is
+        // never reached, so neither of these says anything about the node.
+        //
+        // Two reasons and not one, because they are two different claims. The
+        // first is about the guard — it could not be built, and that is known
+        // the moment the check is constructed. The second is about the node's
+        // whole history of reactions — the guard was built and has never once
+        // been satisfied, which is what a root that parsed but names the wrong
+        // hierarchy looks like from in here. The first subsumes the second:
+        // a guard that cannot run cannot confirm anything, and saying both
+        // would be one fault reported twice.
+        if self.role.respond_enabled() {
+            if let Some(why) = self.target_check.unprovable() {
+                out.push(format!("{TARGET_CHECK_UNPROVABLE}: {why}"));
+            } else if self.respond_target_confirmed.load(Ordering::Relaxed) == 0
+                && self.respond_stale_target.load(Ordering::Relaxed) >= RESPOND_TARGET_UNPROVEN_MIN
+            {
+                out.push(TARGET_NEVER_PROVEN.to_string());
+            }
         }
         out
     }
@@ -1121,6 +1198,26 @@ impl Agent {
     /// that was NOT sent to a reused pid.
     pub fn respond_stale_target_total(&self) -> u64 {
         self.respond_stale_target.load(Ordering::Relaxed)
+    }
+
+    /// Reactions whose target was still in the cgroup that raised the record.
+    /// Zero here beside a climbing `respond_stale_target_total` is the node
+    /// that has never once been able to satisfy the guard; see
+    /// `TARGET_NEVER_PROVEN`.
+    pub fn respond_target_confirmed_total(&self) -> u64 {
+        self.respond_target_confirmed.load(Ordering::Relaxed)
+    }
+
+    /// Reactions refused because the guard could not be computed at all. Not
+    /// stale targets: nothing was learned about these targets either way.
+    pub fn respond_target_unprovable_total(&self) -> u64 {
+        self.respond_target_unprovable.load(Ordering::Relaxed)
+    }
+
+    /// Why the stale-target guard cannot be evaluated on this node, if it
+    /// cannot. Reports; wires no probe and changes nothing.
+    pub fn target_check_unprovable(&self) -> Option<String> {
+        self.target_check.unprovable()
     }
 
     /// True once the export writer thread has died: enforcement still runs,
@@ -1889,8 +1986,25 @@ impl Agent {
         // The decision was made on an event that has been through a queue and
         // a poll interval; the pid space wraps in far less. Confirm the target
         // is still the workload that raised it before signalling anything.
+        // Asked before the guard runs, because a guard that cannot be computed
+        // has no answer to give and `None` from it would read as "gone". The
+        // refusal is the same refusal either way — nothing is signalled — but
+        // an operator has to be able to tell a node whose workloads exit from
+        // a node that cannot check anything at all.
+        if let Some(why) = self.target_check.unprovable() {
+            self.respond_target_unprovable
+                .fetch_add(1, Ordering::Relaxed);
+            self.respond_refused.fetch_add(1, Ordering::Relaxed);
+            return (
+                false,
+                Some(format!("{}: {why}", respond::REFUSE_TARGET_UNPROVABLE)),
+            );
+        }
         match self.target_check.cgroup_id(meta.tgid) {
-            Some(current) if current == meta.cgroup_id => {}
+            Some(current) if current == meta.cgroup_id => {
+                self.respond_target_confirmed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             Some(_) => {
                 self.respond_stale_target.fetch_add(1, Ordering::Relaxed);
                 self.respond_refused.fetch_add(1, Ordering::Relaxed);
@@ -4253,6 +4367,169 @@ mod tests {
         );
         assert_eq!(fake.killed(), vec![4242]);
         assert_eq!(agent.respond_stale_target_total(), 0);
+    }
+
+    /// A check that cannot be evaluated for any target at all.
+    struct UnprovableCheck(&'static str);
+
+    impl TargetCheck for UnprovableCheck {
+        fn cgroup_id(&self, _tgid: u32) -> Option<u64> {
+            None
+        }
+        fn unprovable(&self) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    /// Finding 1's second half. A guard that cannot be computed refused every
+    /// reaction on this node and said nothing: `respond_stale_target` had no
+    /// degradation reason behind it, so `is_degraded()` stayed false while
+    /// nothing was ever killed.
+    ///
+    /// The refusal is still a refusal — not signalling blind is right — but it
+    /// is a distinct one, it does not count as a stale target, and it degrades
+    /// on the first occurrence because a node in this state can never react.
+    #[test]
+    fn a_guard_that_cannot_be_computed_is_a_refusal_of_its_own_and_degrades() {
+        let (mut agent, fake) = respond_agent_with_fake();
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+        agent.set_target_check(Box::new(UnprovableCheck("no cgroup2 mount in mountinfo")));
+
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Kill);
+        assert!(fake.killed().is_empty(), "nothing may be signalled blind");
+        assert!(!sink.events()[0].executed);
+        let events = sink.events();
+        let err = events[0]
+            .respond_error
+            .as_deref()
+            .expect("a refusal must say why");
+        assert!(err.starts_with(REFUSE_TARGET_UNPROVABLE), "{err}");
+        assert!(err.contains("no cgroup2 mount in mountinfo"), "{err}");
+
+        // Not a stale target: nothing was learned about this target at all.
+        assert_eq!(agent.respond_stale_target_total(), 0);
+        assert_eq!(agent.respond_target_unprovable_total(), 1);
+        assert_eq!(agent.respond_target_confirmed_total(), 0);
+
+        // And the node says so, on the first one.
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with(TARGET_CHECK_UNPROVABLE)
+                    && r.contains("no cgroup2 mount in mountinfo")),
+            "{reasons:?}"
+        );
+        assert!(agent.is_degraded());
+        // One fault, one reason: the never-proven reason is subsumed.
+        assert!(
+            !reasons.iter().any(|r| r == TARGET_NEVER_PROVEN),
+            "{reasons:?}"
+        );
+    }
+
+    /// Under observe the guard is never reached, so an unbuildable one says
+    /// nothing about the node. Degrading here would pin the whole shipped
+    /// fleet to Degraded from second one and drown every other reason, which
+    /// is what cycle 7 had to undo for `SELF_TGID_UNPUBLISHED`.
+    #[test]
+    fn an_observe_node_is_not_degraded_by_a_guard_it_never_reaches() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.set_target_check(Box::new(UnprovableCheck("no cgroup2 mount")));
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+    }
+
+    /// The separation the whole reason turns on: a busy node whose workloads
+    /// exit between the decision and the signal refuses without limit and is
+    /// healthy, and a node that has never once found a target where the record
+    /// put it is not.
+    ///
+    /// The discriminator is a confirmation ever having happened, not a rate:
+    /// a rate cannot tell these apart, because the broken node and the busy
+    /// node have the same one.
+    #[test]
+    fn refusals_degrade_only_when_no_target_was_ever_proven() {
+        // A node that has never confirmed anything. Below the floor it is not
+        // yet a verdict — a node that has simply not killed anything yet.
+        let (mut agent, _fake) = respond_agent_with_fake();
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.set_target_check(Box::new(StaticCheck(Some(9_999))));
+        for _ in 0..RESPOND_TARGET_UNPROVEN_MIN - 1 {
+            agent.handle_event(
+                container_meta(4242),
+                &ev("execve", "sh", "/bin/sh", true, false),
+                &MemorySink::new(),
+            );
+        }
+        assert_eq!(
+            agent.respond_stale_target_total(),
+            RESPOND_TARGET_UNPROVEN_MIN - 1
+        );
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &MemorySink::new(),
+        );
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == TARGET_NEVER_PROVEN),
+            "{reasons:?}"
+        );
+
+        // The same node once it proves a single target: healthy, and no
+        // number of later refusals brings the reason back. This is the busy
+        // node, and it must never be told it has stopped enforcing.
+        let (mut agent, fake) = respond_agent_with_fake();
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &MemorySink::new(),
+        );
+        assert_eq!(fake.killed(), vec![4242]);
+        assert_eq!(agent.respond_target_confirmed_total(), 1);
+        agent.set_target_check(Box::new(StaticCheck(None)));
+        for _ in 0..RESPOND_TARGET_UNPROVEN_MIN * 4 {
+            agent.handle_event(
+                container_meta(4242),
+                &ev("execve", "sh", "/bin/sh", true, false),
+                &MemorySink::new(),
+            );
+        }
+        assert!(agent.respond_stale_target_total() > RESPOND_TARGET_UNPROVEN_MIN);
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
     }
 
     /// An empty index is not "this node runs no pods": it means every lookup

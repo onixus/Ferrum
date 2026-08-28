@@ -11,6 +11,122 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
+/// Where the kernel publishes this process's mount table.
+pub const SELF_MOUNTINFO: &str = "/proc/self/mountinfo";
+
+/// The cgroup2 (unified) mount point of this node, read from the mount table
+/// rather than assumed.
+///
+/// `DEFAULT_CGROUP_ROOT` is only right on a node where cgroup2 is mounted at
+/// the top of `/sys/fs/cgroup`. On a hybrid node it is a tmpfs holding one
+/// directory per v1 controller and cgroup2 sits below it (`unified`), so every
+/// path built on the constant names a file that is not there. Both the index
+/// (`scan`) and the agent's pre-signal target check are keyed on inodes of
+/// this hierarchy, and they must be keyed on the *same* one: a derivation that
+/// lives in one caller and not the other is two roots that can disagree.
+///
+/// `Degraded` rather than a fallback to the constant: a wrong root does not
+/// fail loudly, it answers every question with the wrong number. The caller
+/// has to be able to tell "no cgroup2 here" from "cgroup2 is at X".
+pub fn detect_cgroup2_root() -> Result<PathBuf> {
+    let raw = std::fs::read_to_string(SELF_MOUNTINFO)
+        .map_err(|e| FerrumError::Degraded(format!("{SELF_MOUNTINFO} unreadable: {e}")))?;
+    cgroup2_root_from_mountinfo(&raw)
+}
+
+/// The derivation itself, over mountinfo text.
+///
+/// A mountinfo line is `id parent major:minor root mountpoint opts... - fstype
+/// source superopts`; the fields before the ` - ` separator are the ones this
+/// needs. Only a mount whose *root* field is `/` is considered: a bind of a
+/// subtree of the hierarchy is a real cgroup2 mount that is nonetheless the
+/// wrong answer, because a path from `/proc/<pid>/cgroup` is relative to the
+/// whole hierarchy and would resolve under it to something else or to nothing.
+///
+/// More than one such hierarchy on different superblocks is refused rather
+/// than picked between. Several mount points of the *same* superblock are
+/// views of one hierarchy — the inodes agree whichever is used — so the
+/// shortest is taken and the answer is deterministic.
+pub fn cgroup2_root_from_mountinfo(raw: &str) -> Result<PathBuf> {
+    let mut whole: Vec<(String, PathBuf)> = Vec::new();
+    let mut subtrees = 0usize;
+    for line in raw.lines() {
+        let Some((before, after)) = line.split_once(" - ") else {
+            continue;
+        };
+        if after.split_whitespace().next() != Some("cgroup2") {
+            continue;
+        }
+        let mut fields = before.split_whitespace().skip(2);
+        let (Some(dev), Some(root), Some(point)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if root != "/" {
+            subtrees += 1;
+            continue;
+        }
+        whole.push((dev.to_string(), PathBuf::from(unescape_mount_point(point))));
+    }
+
+    whole.sort();
+    whole.dedup();
+    let devices: Vec<&String> = {
+        let mut d: Vec<&String> = whole.iter().map(|(dev, _)| dev).collect();
+        d.dedup();
+        d
+    };
+    match devices.len() {
+        0 if subtrees > 0 => Err(FerrumError::Degraded(format!(
+            "no whole cgroup2 hierarchy in {SELF_MOUNTINFO}: {subtrees} cgroup2 mount(s) are \
+             binds of a subtree, and a path from /proc/<pid>/cgroup does not resolve under one"
+        ))),
+        0 => Err(FerrumError::Degraded(format!(
+            "no cgroup2 mount in {SELF_MOUNTINFO}: this node has no unified hierarchy, so no \
+             cgroup inode can be computed for it"
+        ))),
+        1 => Ok(whole
+            .iter()
+            .map(|(_, point)| point)
+            .min_by_key(|p| (p.as_os_str().len(), p.as_os_str().to_owned()))
+            .cloned()
+            .expect("one device means at least one mount point")),
+        n => Err(FerrumError::Degraded(format!(
+            "{n} distinct cgroup2 hierarchies in {SELF_MOUNTINFO} ({}): which one the datapath \
+             keys on cannot be told from here, and picking wrong is indistinguishable from a \
+             target that moved",
+            whole
+                .iter()
+                .map(|(dev, p)| format!("{dev} at {}", p.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// mountinfo escapes space, tab, newline and backslash as three octal digits.
+fn unescape_mount_point(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_string();
+    }
+    let bytes: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == '\\' && i + 3 < bytes.len() {
+            let digits: String = bytes[i + 1..i + 4].iter().collect();
+            if let Ok(code) = u8::from_str_radix(&digits, 8) {
+                out.push(code as char);
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Marker file present only at the root of a cgroup v2 (unified) hierarchy.
 const V2_MARKER: &str = "cgroup.controllers";
 
@@ -234,6 +350,102 @@ pub fn container_id_matches(cgroup_id: &str, runtime_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The layout this defect was found on: `/sys/fs/cgroup` is a tmpfs of v1
+    /// controller directories and cgroup2 is one level down. Every inode the
+    /// datapath reports comes from `unified`; anything built on
+    /// `DEFAULT_CGROUP_ROOT` here names a path that does not exist.
+    #[test]
+    fn hybrid_node_resolves_to_the_unified_mount_not_the_tmpfs() {
+        let raw = "\
+35 23 0:27 / /sys/fs/cgroup rw,relatime - tmpfs tmpfs rw
+36 35 0:28 / /sys/fs/cgroup/cpu rw,relatime - cgroup cgroup rw,cpu
+44 35 0:36 / /sys/fs/cgroup/systemd rw,relatime - cgroup cgroup rw,name=systemd
+45 35 0:37 / /sys/fs/cgroup/unified rw,relatime - cgroup2 cgroup2 rw
+";
+        assert_eq!(
+            cgroup2_root_from_mountinfo(raw).expect("hybrid node has one cgroup2 mount"),
+            PathBuf::from("/sys/fs/cgroup/unified")
+        );
+    }
+
+    #[test]
+    fn unified_node_resolves_to_the_default_root() {
+        let raw =
+            "29 23 0:25 / /sys/fs/cgroup rw,nosuid,nodev,noexec - cgroup2 cgroup2 rw,nsdelegate\n";
+        assert_eq!(
+            cgroup2_root_from_mountinfo(raw).expect("unified node"),
+            PathBuf::from(DEFAULT_CGROUP_ROOT)
+        );
+    }
+
+    /// The rule the whole fix rests on: an answer the derivation cannot give
+    /// must not come back as an answer. A silent fallback to
+    /// `DEFAULT_CGROUP_ROOT` here is what turns "we do not know where cgroup2
+    /// is" into "the target left its cgroup", which is a different claim
+    /// entirely and the one that stops a node enforcing without saying so.
+    #[test]
+    fn an_ambiguous_or_absent_hierarchy_is_degraded_never_the_default() {
+        // v1 only: no unified hierarchy at all.
+        let v1 = "35 23 0:27 / /sys/fs/cgroup rw - tmpfs tmpfs rw\n\
+36 35 0:28 / /sys/fs/cgroup/cpu rw - cgroup cgroup rw,cpu\n";
+        let err = cgroup2_root_from_mountinfo(v1).expect_err("no cgroup2");
+        assert!(err.to_string().contains("no cgroup2 mount"), "{err}");
+
+        // Two hierarchies on different superblocks: unknowable from here.
+        let two = "29 23 0:25 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+45 35 0:37 / /run/other rw - cgroup2 cgroup2 rw\n";
+        let err = cgroup2_root_from_mountinfo(two).expect_err("ambiguous");
+        assert!(err.to_string().contains("2 distinct"), "{err}");
+
+        // Only a bind of a subtree: a real cgroup2 mount and still the wrong
+        // root, because /proc/<pid>/cgroup paths are whole-hierarchy paths.
+        let sub = "45 35 0:37 /kubepods /run/kubepods rw - cgroup2 cgroup2 rw\n";
+        let err = cgroup2_root_from_mountinfo(sub).expect_err("subtree bind");
+        assert!(err.to_string().contains("binds of a subtree"), "{err}");
+
+        // Nothing at all to read.
+        assert!(cgroup2_root_from_mountinfo("").is_err());
+    }
+
+    /// Several mount points of one superblock are one hierarchy: the inodes
+    /// agree whichever is used, so this is not ambiguity and must not degrade.
+    #[test]
+    fn several_views_of_one_hierarchy_pick_one_deterministically() {
+        let raw = "29 23 0:25 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+88 23 0:25 / /run/host/sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+        assert_eq!(
+            cgroup2_root_from_mountinfo(raw).expect("one hierarchy"),
+            PathBuf::from("/sys/fs/cgroup")
+        );
+    }
+
+    #[test]
+    fn octal_escapes_in_the_mount_point_are_decoded() {
+        let raw = "29 23 0:25 / /mnt/cgroup\\0402 rw - cgroup2 cgroup2 rw\n";
+        assert_eq!(
+            cgroup2_root_from_mountinfo(raw).expect("escaped point"),
+            PathBuf::from("/mnt/cgroup 2")
+        );
+    }
+
+    /// The node this ran on. Not an assertion about its layout — that is the
+    /// host's business — but that the derivation answers the same question
+    /// `scan` and the agent's target check ask, on whatever this node is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_derivation_agrees_with_this_node_if_it_has_a_cgroup2_mount() {
+        let Ok(root) = detect_cgroup2_root() else {
+            // A node with no unified hierarchy is a legitimate answer here.
+            return;
+        };
+        assert!(
+            root.join(V2_MARKER).exists(),
+            "derived cgroup2 root {} has no {V2_MARKER}: the derivation named a directory that \
+             is not the root of a unified hierarchy",
+            root.display()
+        );
+    }
 
     #[test]
     fn systemd_pod_slice_unescapes_uid() {
