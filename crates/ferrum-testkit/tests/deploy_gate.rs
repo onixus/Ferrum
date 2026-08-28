@@ -880,3 +880,556 @@ mod deploy_tree {
         result.expect("the rendered tree must pass the lint");
     }
 }
+
+/// The same trick this file plays on the policy invariants, aimed at the build.
+///
+/// Everything above checks that two written-down copies of a rule agree. This
+/// checks something weaker-sounding and, for a cycle, less true: that what the
+/// repository ships is produced by something in the repository. Two of the
+/// three binaries named by `deploy/` had never been linked by any stage, in any
+/// mode, and neither had an image — `deploy/admission/deployment.yaml` and
+/// `deploy/controller/deployment.yaml` named tags that nothing here built.
+///
+/// A stage is easy to delete and a manifest is easy to add, so this is written
+/// as a closure over both directions rather than as three more stages that
+/// happen to exist today: every `image:` a manifest names must be produced by a
+/// `docker build -t` in the `Jenkinsfile`, and every crate carrying a binary
+/// must be named on a cargo invocation that emits object code. `cargo clippy`
+/// does not count, and that is the point — it stops at `.rmeta`, which is how
+/// the production build of `ferrum-admission` passed CI for a cycle without
+/// ever being linked.
+mod build_closure {
+    use serde::Deserialize;
+    use serde_yaml::Value;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// Comment lines, in either language this gate reads. Both the `Jenkinsfile`
+    /// and the Dockerfiles talk *about* `docker build` and `cargo build` in
+    /// prose, and a gate that counted those would report that the pipeline
+    /// builds an image because a comment mentions one.
+    fn strip_comments(text: &str) -> String {
+        text.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.starts_with('#')
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Shell and Dockerfile line continuations, folded away so a command that
+    /// spans six lines is one line to look at. Every build command in this
+    /// repository is written that way.
+    fn joined_lines(text: &str) -> Vec<String> {
+        strip_comments(text)
+            .replace("\\\n", " ")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The repository half of an image reference. The pipeline tags with a
+    /// build number and the manifests with `v0.1.0`, so the repository is the
+    /// only part the two can be compared on. A `:` inside the last path segment
+    /// opens the tag; one before the last `/` is a registry port.
+    fn image_repo(reference: &str) -> String {
+        let reference = reference.trim().trim_matches('"');
+        let last_segment = reference.rfind('/').map_or(0, |i| i + 1);
+        match reference[last_segment..].find(':') {
+            Some(colon) => reference[..last_segment + colon].to_string(),
+            None => reference.to_string(),
+        }
+    }
+
+    /// One container as a manifest declares it. Nothing here needs the rest of
+    /// a PodSpec.
+    struct Container {
+        file: String,
+        image: String,
+        args: Vec<String>,
+    }
+
+    fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
+        {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                yaml_files(&path, out);
+            } else if path.extension().map(|e| e == "yaml").unwrap_or(false) {
+                out.push(path);
+            }
+        }
+    }
+
+    fn collect_containers(node: &Value, file: &str, out: &mut Vec<Container>) {
+        match node {
+            Value::Mapping(map) => {
+                if let Some(Value::String(image)) = map.get(&Value::from("image")) {
+                    let args = map
+                        .get(&Value::from("args"))
+                        .and_then(Value::as_sequence)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    out.push(Container {
+                        file: file.to_string(),
+                        image: image.clone(),
+                        args,
+                    });
+                }
+                for (_, value) in map.iter() {
+                    collect_containers(value, file, out);
+                }
+            }
+            Value::Sequence(items) => {
+                for item in items {
+                    collect_containers(item, file, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every container in `deploy/`, from every document of every manifest.
+    fn deploy_containers(root: &Path) -> Vec<Container> {
+        let mut files = Vec::new();
+        yaml_files(&root.join("deploy"), &mut files);
+        files.sort();
+        let mut out = Vec::new();
+        for path in files {
+            let raw = read(&path);
+            let name = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for doc in serde_yaml::Deserializer::from_str(&raw) {
+                let Ok(value) = Value::deserialize(doc) else {
+                    continue;
+                };
+                collect_containers(&value, &name, &mut out);
+            }
+        }
+        out
+    }
+
+    /// One `docker build` invocation: which Dockerfile it reads and which image
+    /// repositories it produces.
+    struct DockerBuild {
+        dockerfile: String,
+        images: Vec<String>,
+    }
+
+    fn docker_builds(script: &str) -> Vec<DockerBuild> {
+        let mut out = Vec::new();
+        for line in joined_lines(script) {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let Some(start) = tokens.windows(2).position(|w| w == ["docker", "build"]) else {
+                continue;
+            };
+            let mut dockerfile = "Dockerfile".to_string();
+            let mut images = Vec::new();
+            let mut i = start + 2;
+            while i < tokens.len() {
+                match tokens[i] {
+                    "-f" | "--file" => {
+                        if let Some(value) = tokens.get(i + 1) {
+                            dockerfile = value.trim_matches('"').to_string();
+                            i += 1;
+                        }
+                    }
+                    "-t" | "--tag" => {
+                        if let Some(value) = tokens.get(i + 1) {
+                            images.push(image_repo(value));
+                            i += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            out.push(DockerBuild { dockerfile, images });
+        }
+        out
+    }
+
+    /// One cargo invocation that leaves object code behind, and the features it
+    /// leaves it under.
+    struct CargoLink {
+        package: String,
+        features: BTreeSet<String>,
+    }
+
+    /// `build` and `run` link; `clippy`, `check`, `tree` and `fmt` do not, and
+    /// `test` links a harness rather than the `[[bin]]` a manifest names. Only
+    /// the first two are evidence that a shipped binary exists.
+    fn cargo_links(script: &str) -> Vec<CargoLink> {
+        let mut out = Vec::new();
+        for line in joined_lines(script) {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let Some(start) = tokens.iter().position(|token| *token == "cargo") else {
+                continue;
+            };
+            // `cargo +nightly build`: the toolchain sits between the two.
+            let subcommand = tokens[start + 1..].iter().find(|t| !t.starts_with('+'));
+            if !matches!(subcommand, Some(&"build") | Some(&"run")) {
+                continue;
+            }
+            let mut packages = Vec::new();
+            let mut features = BTreeSet::new();
+            let mut i = start;
+            while i < tokens.len() {
+                let token = tokens[i];
+                if token == "-p" || token == "--package" {
+                    if let Some(value) = tokens.get(i + 1) {
+                        packages.push(value.trim_matches('"').to_string());
+                        i += 1;
+                    }
+                } else if token == "--features" {
+                    if let Some(value) = tokens.get(i + 1) {
+                        add_features(value, &mut features);
+                        i += 1;
+                    }
+                } else if let Some(value) = token.strip_prefix("--features=") {
+                    add_features(value, &mut features);
+                }
+                i += 1;
+            }
+            for package in packages {
+                out.push(CargoLink {
+                    package,
+                    features: features.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    fn add_features(value: &str, out: &mut BTreeSet<String>) {
+        for feature in value.trim_matches('"').split(',') {
+            let feature = feature.trim();
+            if !feature.is_empty() {
+                out.insert(feature.to_string());
+            }
+        }
+    }
+
+    fn linked_packages(script: &str) -> BTreeSet<String> {
+        cargo_links(script)
+            .into_iter()
+            .map(|link| link.package)
+            .collect()
+    }
+
+    /// A workspace member that produces a binary, and why this gate thinks so.
+    struct BinCrate {
+        name: String,
+        reason: &'static str,
+    }
+
+    fn package_name(manifest: &str) -> Option<String> {
+        let mut in_package = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_package = line == "[package]";
+                continue;
+            }
+            if in_package {
+                if let Some(rest) = line.strip_prefix("name") {
+                    let rest = rest.trim_start().strip_prefix('=')?.trim();
+                    return Some(rest.trim_matches('"').to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Both spellings of a binary target: the explicit `[[bin]]` section and
+    /// the `src/main.rs` cargo picks up on its own. The second is how three of
+    /// the five in this workspace are declared, so a gate that only read
+    /// `[[bin]]` would miss the agent, the webhook and the controller — which
+    /// is to say all three of the ones that ship in an image.
+    fn binary_crates(root: &Path) -> Vec<BinCrate> {
+        let mut dirs = Vec::new();
+        for entry in std::fs::read_dir(root.join("crates")).expect("crates/") {
+            dirs.push(entry.expect("directory entry").path());
+        }
+        dirs.sort();
+        let mut out = Vec::new();
+        for dir in dirs {
+            let manifest_path = dir.join("Cargo.toml");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            let manifest = read(&manifest_path);
+            let name = package_name(&manifest)
+                .unwrap_or_else(|| panic!("no [package] name in {}", manifest_path.display()));
+            if manifest.lines().any(|line| line.trim() == "[[bin]]") {
+                out.push(BinCrate {
+                    name,
+                    reason: "[[bin]]",
+                });
+            } else if dir.join("src").join("main.rs").is_file() {
+                out.push(BinCrate {
+                    name,
+                    reason: "src/main.rs",
+                });
+            }
+        }
+        out
+    }
+
+    fn jenkinsfile(root: &Path) -> String {
+        read(&root.join("Jenkinsfile"))
+    }
+
+    /// Every image a manifest names is produced by this pipeline.
+    ///
+    /// The failure this closes is not hypothetical: `ferrum-admission:v0.1.0`
+    /// and `ferrum-controller:v0.1.0` were named by Deployments in this tree
+    /// and built by nothing in it, so `kubectl apply -f deploy/` produced two
+    /// ImagePullBackOffs and an enforcement plane that admits everything.
+    #[test]
+    fn every_image_a_manifest_names_is_built_by_the_pipeline() {
+        let root = repo_root();
+        let containers = deploy_containers(&root);
+        let built: BTreeSet<String> = docker_builds(&jenkinsfile(&root))
+            .into_iter()
+            .flat_map(|build| build.images)
+            .collect();
+
+        // Both halves must be capable of finding something. A subset check
+        // against an empty set is true for the wrong reason, and an empty set
+        // is what a renamed directory, a changed manifest layout or a reworked
+        // `docker build` line all produce.
+        assert!(
+            !containers.is_empty(),
+            "no container with an image: was found under deploy/, so this gate \
+             cannot see what the cluster is asked to pull and proves nothing"
+        );
+        assert!(
+            !built.is_empty(),
+            "no `docker build -t` was found in the Jenkinsfile, so this gate \
+             cannot see what the pipeline produces and proves nothing"
+        );
+
+        let orphans: Vec<String> = containers
+            .iter()
+            .filter(|container| !built.contains(&image_repo(&container.image)))
+            .map(|container| format!("  {} (named by {})", container.image, container.file))
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "these images are named by a manifest and produced by no `docker build -t` \
+             in the Jenkinsfile:\n{}\nAn image nothing builds is a tag that never \
+             existed: the manifest applies, the Pod never starts, and the plane it \
+             belongs to enforces nothing.",
+            orphans.join("\n")
+        );
+    }
+
+    /// Every crate that produces a binary is linked by a stage that emits
+    /// object code.
+    ///
+    /// `cargo clippy` is deliberately not evidence. It stops at `.rmeta`, and
+    /// the whole finding this gate exists for is that a crate can pass a clippy
+    /// line naming its production features for a cycle without one object file
+    /// ever being produced from that combination.
+    #[test]
+    fn every_crate_with_a_binary_is_linked_by_a_stage_that_emits_object_code() {
+        let root = repo_root();
+        let crates = binary_crates(&root);
+        let linked = linked_packages(&jenkinsfile(&root));
+
+        assert!(
+            !crates.is_empty(),
+            "no binary crate was found under crates/, so this gate cannot see \
+             what the workspace ships and proves nothing"
+        );
+        assert!(
+            !linked.is_empty(),
+            "no `cargo build`/`cargo run -p` was found in the Jenkinsfile, so \
+             this gate cannot see what the pipeline links and proves nothing"
+        );
+
+        let missing: Vec<String> = crates
+            .iter()
+            .filter(|c| !linked.contains(&c.name))
+            .map(|c| format!("  {} (a binary by {})", c.name, c.reason))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these crates produce a binary and no Jenkinsfile stage links one:\n{}\n\
+             A `cargo clippy` line does not count — it stops at .rmeta. A binary \
+             that has never been linked is an empty crate with more steps.",
+            missing.join("\n")
+        );
+    }
+
+    /// The parser under both tests above, checked against inputs whose answer is
+    /// known. Without this, "no crate is missing" is equally what a `cargo_links`
+    /// that has stopped recognising anything reports — and the distinction
+    /// between a clippy run and a link is the entire point.
+    #[test]
+    fn the_scan_counts_a_link_and_refuses_to_count_a_clippy_run() {
+        assert!(
+            linked_packages("cargo clippy -p ferrum-probe --all-targets -- -D warnings").is_empty(),
+            "clippy emits .rmeta and no object code; counting it as a link is the \
+             fail-open this gate exists to refuse"
+        );
+        assert!(
+            linked_packages("cargo check -p ferrum-probe").is_empty(),
+            "`cargo check` does not link either"
+        );
+        assert!(
+            linked_packages("cargo build --release -p ferrum-probe").contains("ferrum-probe"),
+            "a plain `cargo build -p` must be recognised, or every check above is \
+             satisfied by a scan that finds nothing"
+        );
+        assert!(
+            linked_packages("cargo +nightly build -p ferrum-probe --target x")
+                .contains("ferrum-probe"),
+            "a toolchain override must not hide the package"
+        );
+        assert!(
+            linked_packages("cargo run -p ferrum-probe --quiet -- validate x")
+                .contains("ferrum-probe"),
+            "`cargo run` links before it runs"
+        );
+        // Prose about a build is not a build.
+        assert!(
+            linked_packages("# cargo build -p ferrum-probe").is_empty(),
+            "a comment mentioning a build must not be read as one"
+        );
+        assert!(
+            docker_builds("// docker build -t ghcr.io/ferrum/x:v1 .")
+                .into_iter()
+                .all(|b| b.images.is_empty()),
+            "a comment mentioning an image must not be read as building one"
+        );
+        assert_eq!(image_repo("ghcr.io/ferrum/x:v0.1.0"), "ghcr.io/ferrum/x");
+        assert_eq!(image_repo("\"r:5000/ferrum/x:${TAG}\""), "r:5000/ferrum/x");
+    }
+
+    /// The image an operator pulls is built from the Dockerfile that links the
+    /// crate the image is named after.
+    ///
+    /// One file per image, not one file taking a crate name. The three images
+    /// differ by what each has to prove — a bpf object welded to a userspace
+    /// that agrees with its map layout, a feature that must have reached the
+    /// binary, neither — and a check behind an `if` keyed on a build arg is a
+    /// check the wrong argument skips.
+    #[test]
+    fn each_image_is_built_from_a_dockerfile_that_links_its_own_crate() {
+        let root = repo_root();
+        let builds = docker_builds(&jenkinsfile(&root));
+        assert!(!builds.is_empty(), "no `docker build` in the Jenkinsfile");
+        let known: BTreeSet<String> = binary_crates(&root).into_iter().map(|c| c.name).collect();
+
+        for build in &builds {
+            let path = root.join(&build.dockerfile);
+            assert!(
+                path.is_file(),
+                "the Jenkinsfile builds -f {} and no such file is in the tree",
+                build.dockerfile
+            );
+            let linked = linked_packages(&read(&path));
+            for image in &build.images {
+                let crate_name = image.rsplit('/').next().unwrap_or(image);
+                assert!(
+                    known.contains(crate_name),
+                    "{image} is built by {}, and {crate_name} is not a binary crate \
+                     in this workspace: the image name no longer says what is in it",
+                    build.dockerfile
+                );
+                assert!(
+                    linked.contains(crate_name),
+                    "{} produces {image} and never links {crate_name}. An image named \
+                     after a crate it does not contain is worse than one nothing \
+                     builds: it starts.",
+                    build.dockerfile
+                );
+            }
+        }
+    }
+
+    /// A flag a manifest passes that only a cargo feature provides is built into
+    /// the image that is passed it.
+    ///
+    /// `deploy/admission/deployment.yaml` passes `--apiserver`, and
+    /// `ferrum-admission` has that feature off by default. Built without it the
+    /// flag reaches a `die()` and the Pod CrashLoops on a node — a build-time
+    /// defect arriving as a runtime one, on the crate carrying three of the
+    /// eight section D acceptance cases. Both sides are read out of the tree:
+    /// the requirement from the manifest's own argv, the answer from the
+    /// Dockerfile that builds the image the manifest names.
+    #[test]
+    fn a_flag_only_a_feature_provides_is_built_into_the_image_that_is_passed_it() {
+        const FEATURE_FLAGS: [(&str, &str); 1] = [("--apiserver", "apiserver")];
+
+        let root = repo_root();
+        let containers = deploy_containers(&root);
+        let builds = docker_builds(&jenkinsfile(&root));
+
+        let mut checked = 0;
+        for (flag, feature) in FEATURE_FLAGS {
+            for container in containers
+                .iter()
+                .filter(|c| c.args.iter().any(|a| a == flag))
+            {
+                let repo = image_repo(&container.image);
+                let crate_name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
+                let build = builds
+                    .iter()
+                    .find(|build| build.images.contains(&repo))
+                    .unwrap_or_else(|| {
+                        panic!("{} passes {flag} and nothing builds {repo}", container.file)
+                    });
+                let link = cargo_links(&read(&root.join(&build.dockerfile)))
+                    .into_iter()
+                    .find(|link| link.package == crate_name)
+                    .unwrap_or_else(|| panic!("{} never links {crate_name}", build.dockerfile));
+                assert!(
+                    link.features.contains(feature),
+                    "{} passes {flag}, and {} links {crate_name} without --features \
+                     {feature}. The flag is gated on that feature at compile time, so \
+                     the container would die() on start: a defect in this file \
+                     arriving as a CrashLoopBackOff on a node.",
+                    container.file,
+                    build.dockerfile
+                );
+                checked += 1;
+            }
+        }
+
+        // The control. Every assertion above is inside a filter, and a filter
+        // that matches nothing runs no assertion at all — which is exactly what
+        // a renamed flag, a manifest moved out of deploy/ or a broken argv scan
+        // would produce.
+        assert!(
+            checked > 0,
+            "no container in deploy/ passes any of the feature-gated flags this gate \
+             knows about, so it asserted nothing. Either the flags moved, or the \
+             manifest scan stopped seeing argv."
+        );
+    }
+}

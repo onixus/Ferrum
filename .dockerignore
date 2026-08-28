@@ -1,3 +1,7 @@
+# One file, three contexts: Dockerfile, Dockerfile.admission and
+# Dockerfile.controller all take the repository root as their context and all
+# `COPY . .`, and docker reads this file by name regardless of -f.
+#
 # The build context is copied into the builder stage wholesale. target/ is a
 # host-target build directory that the musl build must not inherit, and it is
 # larger than everything else in the tree put together.
