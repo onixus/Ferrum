@@ -3549,10 +3549,16 @@ mod tests {
     /// with a 255-byte path and the truncation flag set. The workload opened
     /// `/var/run/` + `./` * 130 + `docker.sock`; the kernel resolved it, the
     /// buffer kept only the head, and `ends_with("docker.sock")` is false on
-    /// what arrived. With the flag the kill rule still fires and the node is
-    /// Degraded; without it the same bytes are indistinguishable from an
-    /// honest short path and the rule silently does not fire. That second half
-    /// is the regression anchor — it is the bypass this slice closes.
+    /// what arrived. With the flag the kill rule fires and the node is
+    /// Degraded.
+    ///
+    /// Without the flag it must do the same, and that is the half that
+    /// changed. A record with a buffer-filling head and no flag is what an ELF
+    /// built before `emit()` flagged a short read writes, so a node running
+    /// one after a rolling upgrade would silently miss this rule. The decoder
+    /// derives truncation from the buffer instead of trusting the flag, so
+    /// both records decide alike, both move `pathTruncatedTotal`, and both
+    /// degrade — with decay, so the node recovers on its own.
     #[test]
     fn a_truncated_docker_sock_path_still_kills_and_degrades() {
         use ferrum_ebpf::{SyscallArch, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED};
@@ -3581,26 +3587,57 @@ mod tests {
         assert!(agent.datapath_degraded());
         assert!(agent.is_degraded());
 
-        // Same bytes, flag cleared: the head is then the whole path, no suffix
-        // matches, and the record is merely audited.
-        //
-        // Cycle 8 measured that a pre-fix datapath writes exactly this record
-        // for an over-long path — the head, and no flag — so "the head is the
-        // whole path" is an assumption about the *producer*, not a fact about
-        // the bytes. It holds for the datapath in this tree, which now flags a
-        // read that filled the buffer; it does not hold for an object built
-        // before that. See `event::a_buffer_filling_path_is_not_yet_read_as_truncated`.
-        let honest = ring_record(openat, "app", head, EVENT_FLAG_CONTAINER, 7);
+        // Same bytes, flag cleared: the record a pre-fix ELF writes for this
+        // path. It must decide identically — the buffer is the evidence, and
+        // it is unchanged.
+        let flagless = ring_record(openat, "app", head, EVENT_FLAG_CONTAINER, 7);
+        let mut pre_fix = Agent::new(cfg_respond());
+        load_signed(&mut pre_fix, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        pre_fix.insert_cgroup(7, identity("pod-a"));
+        pre_fix.set_container_map_synced(1);
+        let seen = MemorySink::new();
+        pump_records(&pre_fix, SyscallArch::X86_64, [flagless], &seen);
+        assert_eq!(seen.events()[0].action, "kill", "the pre-fix ELF's record");
+        assert!(seen.events()[0].path_unknown);
+        assert_eq!(pre_fix.path_truncated_total(), 1);
+        assert!(pre_fix.datapath_degraded());
+        assert!(pre_fix.is_degraded());
+        let now = Instant::now();
+        assert!(pre_fix
+            .degraded_reasons_at(now)
+            .iter()
+            .any(|r| r == DEG_PATH_TRUNCATED));
+
+        // Degraded with decay, not latched: the counter is a total, the signal
+        // is a window. Once no truncated path has been decided for
+        // DEGRADED_RECOVERY the node is clean again on this reason.
+        let later = now + DEGRADED_RECOVERY;
+        assert!(!pre_fix.path_truncated_recent_at(later));
+        assert!(!pre_fix
+            .degraded_reasons_at(later)
+            .iter()
+            .any(|r| r == DEG_PATH_TRUNCATED));
+        assert_eq!(
+            pre_fix.path_truncated_total(),
+            1,
+            "the total does not decay"
+        );
+
+        // A path that fits decides on its bytes and signals nothing: the two
+        // verdicts above came from the truncation, not from a match the bytes
+        // happened to make.
+        let short = ring_record(openat, "app", "/var/run/app.sock", EVENT_FLAG_CONTAINER, 7);
         let mut clean = Agent::new(cfg_respond());
         load_signed(&mut clean, &encode_mvp(AGENT_ABI, Mode::Enforce));
         clean.insert_cgroup(7, identity("pod-a"));
         clean.set_container_map_synced(1);
         let quiet = MemorySink::new();
-        pump_records(&clean, SyscallArch::X86_64, [honest], &quiet);
+        pump_records(&clean, SyscallArch::X86_64, [short], &quiet);
         assert_ne!(quiet.events()[0].action, "kill");
         assert!(!quiet.events()[0].path_unknown);
         assert_eq!(clean.path_truncated_total(), 0);
         assert!(!clean.path_truncated_recent());
+        assert!(!clean.datapath_degraded());
     }
 
     /// The other half of the same flag, end to end: the path pointer was in a

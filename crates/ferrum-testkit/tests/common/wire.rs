@@ -139,12 +139,22 @@ impl RecordBuilder {
     }
 }
 
-/// A value longer than the buffer is written the way the datapath writes it:
-/// the buffer's worth of bytes and no NUL terminator. Returns whether the
-/// value overflowed — a value the size of the buffer already has nowhere to
-/// put its terminator, so the datapath cannot prove it was whole either.
+/// A value longer than the buffer is written the way the kernel writes it.
+///
+/// `bpf_probe_read_user_str` always terminates: it copies at most `len() - 1`
+/// bytes and spends the last on the NUL, so an over-long value arrives as a
+/// `len() - 1` byte head *plus a terminator*, never as a full buffer of bytes.
+/// Writing the full buffer here made testkit's truncated records one byte
+/// longer than any the kernel can produce, which was harmless only while
+/// nothing read the buffer's shape — the decoder now derives truncation from
+/// exactly that shape, so the two must agree.
+///
+/// Returns whether the value overflowed. A value that fills `len() - 1` bytes
+/// already overflows: its terminator took the last byte, the helper then
+/// returns the buffer size, and neither the datapath nor the decoder can tell
+/// it from a value that was cut.
 fn fill(dst: &mut [u8], src: &[u8]) -> bool {
-    let n = src.len().min(dst.len());
+    let n = src.len().min(dst.len() - 1);
     dst[..n].copy_from_slice(&src[..n]);
-    src.len() >= dst.len()
+    src.len() >= dst.len() - 1
 }

@@ -269,10 +269,22 @@ fn replay_control_plane_down_lkg(arch: SyscallArch) {
 /// from the length alone, so the kill rule still fires and the node goes
 /// Degraded.
 ///
-/// The second half is the regression anchor: the same bytes with the flag
-/// cleared are a record the kernel cannot produce, and they are then
-/// indistinguishable from an honest short path — merely audited. That is the
-/// bypass the flag closes, so the pair must disagree.
+/// The second half is the regression anchor, and it now asserts the opposite
+/// of what it did. It used to build the same bytes with the flag cleared and
+/// require them to be merely audited, on the reading that such a record was
+/// one the kernel could not produce. Cycle 8 measured otherwise: that is
+/// exactly what an ELF built before `emit()` flagged a buffer-filling read
+/// writes, and a rolling upgrade leaves such an object under a new agent. So
+/// the old anchor asserted the fail-open it was written to close — a
+/// `docker.sock` rule silently missed, `is_degraded()` false. It now requires
+/// the flagless record to be killed and to degrade like the flagged one: the
+/// decoder derives truncation from the buffer, so the flag is the one
+/// difference that makes no difference.
+///
+/// The claim the old second half really carried — that the verdict comes from
+/// the truncation and not from the bytes happening to match — is kept by the
+/// third: a path that fits, and does not end in `docker.sock`, is audited,
+/// degrades nothing and moves no counter.
 #[test]
 fn a_truncated_docker_sock_path_still_kills_and_degrades() {
     let long = format!("/var/run/{}docker.sock", "./".repeat(130));
@@ -297,11 +309,36 @@ fn a_truncated_docker_sock_path_still_kills_and_degrades() {
         );
         assert!(agent.is_degraded());
 
+        // The pre-fix ELF's record: the same head, and no flag. The decoder
+        // derives the truncation from the buffer, so the node behaves as if
+        // the flag were there.
+        let (pre_fix, killed_pre_fix) = replay_agent(None);
+        let seen = MemorySink::new();
+        let flagless = open_path("openat", &long).path_truncated(false).build(arch);
+        let stats = pump_records(&pre_fix, arch, vec![flagless], &seen);
+        assert_eq!(stats.handled, 1, "{}", arch.as_str());
+        assert_eq!(
+            seen.events()[0].action,
+            "kill",
+            "a pre-fix ELF's unflagged record must not slip the rule, {}",
+            arch.as_str()
+        );
+        assert_eq!(seen.events()[0].rule.as_str(), "no-runtime-sock");
+        assert!(seen.events()[0].path_unknown, "and it must say why");
+        assert_eq!(killed_tgids(&killed_pre_fix), vec![TGID_WORKLOAD]);
+        assert_eq!(pre_fix.path_truncated_total(), 1, "the counter still moves");
+        assert!(pre_fix.path_truncated_recent());
+        assert!(pre_fix.datapath_degraded());
+        assert!(pre_fix.is_degraded());
+
+        // And a path that fits is untouched by any of it: the verdict above
+        // comes from the truncation, not from bytes that happened to match.
         let (clean, unharmed) = replay_agent(None);
         let quiet = MemorySink::new();
-        let honest = open_path("openat", &long).path_truncated(false).build(arch);
-        pump_records(&clean, arch, vec![honest], &quiet);
+        let short = open_path("openat", "/var/run/app.sock").build(arch);
+        pump_records(&clean, arch, vec![short], &quiet);
         assert_ne!(quiet.events()[0].action, "kill", "{}", arch.as_str());
+        assert!(!quiet.events()[0].path_unknown);
         assert!(killed_tgids(&unharmed).is_empty());
         assert_eq!(clean.path_truncated_total(), 0);
         assert!(!clean.path_truncated_recent());

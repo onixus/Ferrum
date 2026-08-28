@@ -50,13 +50,14 @@ pub const EVENT_FLAG_AGENT_SELF: u8 = 1 << 1;
 /// unset. The datapath therefore sets it on a read that filled the buffer,
 /// not only on one that failed.
 ///
-/// An object built before that fix sets nothing, and userspace cannot tell
-/// its record from an honest 255-byte path without deriving truncation from
-/// the buffer shape — the helper spends the last byte on a terminator, so a
-/// string with nowhere to put one did not fit. That derivation is not made
-/// (see `ferrum_ebpf::syscall_event`), so a node still running such an object
-/// after a rolling upgrade stays fail-open on a path over `PATH_LEN` until
-/// its image is replaced.
+/// An object built before that fix sets nothing, so userspace does not trust
+/// the flag alone: `ferrum_ebpf::path_truncated` also reads the buffer shape
+/// — the helper spends the last byte on a terminator, so a string with
+/// nowhere to put one did not fit. A node still running a pre-fix object
+/// after a rolling upgrade is therefore covered without waiting for its image
+/// to be replaced. Keep the two in step: this flag and that derivation state
+/// the same comparison, one against the length the helper returned and one
+/// against the bytes that arrived.
 pub const EVENT_FLAG_PATH_TRUNCATED: u8 = 1 << 2;
 
 /// Layout stamp carried by every ring record in `Event::_pad`.
