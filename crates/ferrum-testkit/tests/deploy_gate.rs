@@ -1252,48 +1252,62 @@ mod build_closure {
         let mut out = Vec::new();
         for line in joined_lines(script, lang) {
             let tokens: Vec<&str> = line.split_whitespace().collect();
-            let Some(start) = tokens
-                .iter()
-                .position(|token| *token == "cargo")
-                .filter(|i| is_command_position(&tokens, *i))
-            else {
-                continue;
-            };
-            // `cargo +nightly build`: the toolchain sits between the two.
-            let Some(subcommand) = tokens[start + 1..].iter().find(|t| !t.starts_with('+')) else {
-                continue;
-            };
-            let subcommand = (*subcommand).to_string();
-            let mut packages = Vec::new();
-            let mut features = BTreeSet::new();
-            let mut all_targets = false;
-            let mut i = start;
-            while i < tokens.len() {
-                let token = tokens[i];
-                if token == "-p" || token == "--package" {
-                    if let Some(value) = tokens.get(i + 1) {
-                        packages.push(value.trim_matches('"').to_string());
-                        i += 1;
-                    }
-                } else if token == "--features" {
-                    if let Some(value) = tokens.get(i + 1) {
+            // Every `cargo` in command position, not the first `cargo` on the
+            // line. Taking only the first and dropping the line when that one
+            // was prose is the mirror of the bug `is_command_position` was
+            // added for: `echo "... cargo test ..." && cargo test -p X` is the
+            // house style these gates' own failure messages ask the reader to
+            // write, and it hid the real invocation behind the echo of it.
+            let starts: Vec<usize> = (0..tokens.len())
+                .filter(|i| tokens[*i] == "cargo" && is_command_position(&tokens, *i))
+                .collect();
+            for (nth, &start) in starts.iter().enumerate() {
+                // Each invocation owns its own arguments: the scan stops at the
+                // separator that ends this command, so a later `--features` is
+                // not read as belonging to this one.
+                let end = tokens[start + 1..]
+                    .iter()
+                    .position(|t| COMMAND_STARTS.contains(t))
+                    .map(|offset| start + 1 + offset)
+                    .unwrap_or(tokens.len())
+                    .min(starts.get(nth + 1).copied().unwrap_or(usize::MAX));
+                // `cargo +nightly build`: the toolchain sits between the two.
+                let Some(subcommand) = tokens[start + 1..end].iter().find(|t| !t.starts_with('+'))
+                else {
+                    continue;
+                };
+                let subcommand = (*subcommand).to_string();
+                let mut packages = Vec::new();
+                let mut features = BTreeSet::new();
+                let mut all_targets = false;
+                let mut i = start;
+                while i < end {
+                    let token = tokens[i];
+                    if token == "-p" || token == "--package" {
+                        if let Some(value) = tokens[..end].get(i + 1) {
+                            packages.push(value.trim_matches('"').to_string());
+                            i += 1;
+                        }
+                    } else if token == "--features" {
+                        if let Some(value) = tokens[..end].get(i + 1) {
+                            add_features(value, &mut features);
+                            i += 1;
+                        }
+                    } else if let Some(value) = token.strip_prefix("--features=") {
                         add_features(value, &mut features);
-                        i += 1;
+                    } else if token == "--all-targets" {
+                        all_targets = true;
                     }
-                } else if let Some(value) = token.strip_prefix("--features=") {
-                    add_features(value, &mut features);
-                } else if token == "--all-targets" {
-                    all_targets = true;
+                    i += 1;
                 }
-                i += 1;
-            }
-            for package in packages {
-                out.push(CargoRun {
-                    subcommand: subcommand.clone(),
-                    package,
-                    features: features.clone(),
-                    all_targets,
-                });
+                for package in packages {
+                    out.push(CargoRun {
+                        subcommand: subcommand.clone(),
+                        package,
+                        features: features.clone(),
+                        all_targets,
+                    });
+                }
             }
         }
         out
@@ -2185,6 +2199,38 @@ mod build_closure {
         assert!(env_prefixed.features.contains("attach"));
         let after_separator = one("mkdir -p dist && cargo build -p ferrum-agent --features attach");
         assert_eq!(after_separator.subcommand, "build");
+
+        // The other direction of the same rule, and the one the fix for prose
+        // introduced: the echo must not hide the command it echoes. Taking the
+        // *first* `cargo` on the line and dropping the line when that one was
+        // prose meant a real invocation announced in this pipeline's house
+        // style was never recorded by the feature or link gates at all.
+        let announced = one(
+            "echo \"run cargo test -p ferrum-admission --features apiserver\" && cargo test -p \
+             ferrum-admission --features apiserver",
+        );
+        assert_eq!(
+            announced.subcommand, "test",
+            "an echo of the command being run must not hide the run of it"
+        );
+        assert!(announced.features.contains("apiserver"));
+
+        // Two real invocations on one line are two runs, each with its own
+        // arguments: a scan that ran to end of line would give the first one
+        // the second's features and report a coverage that does not exist.
+        let both = cargo_runs(
+            "cargo build -p ferrum-agent --features attach && cargo test -p ferrum-agent \
+             --features attach,apiserver",
+            Lang::Groovy,
+        );
+        assert_eq!(both.len(), 2, "two commands on one line are two runs");
+        assert_eq!(both[0].subcommand, "build");
+        assert!(
+            !both[0].features.contains("apiserver"),
+            "the second command's --features must not be read as the first's"
+        );
+        assert_eq!(both[1].subcommand, "test");
+        assert!(both[1].features.contains("apiserver"));
     }
 
     /// A flag a manifest passes that only a cargo feature provides is built into
@@ -2297,6 +2343,76 @@ mod build_closure {
         assert!(one("image: x\n").is_empty());
     }
 
+    /// Every `--flag` a source file reads inside a column-zero
+    /// `#[cfg(feature = …)]` item, and the feature that gates it.
+    ///
+    /// The item's extent is the point. A braced item ends at its column-zero
+    /// `}`; a braceless one — `use`, `const`, `mod x;` — ends at its own `;`,
+    /// and running that one to the next column-zero `}` sweeps every unrelated
+    /// read between here and the end of some later item in under this feature,
+    /// which is a gate failing on flags nothing gates. Every `#[cfg]` in the
+    /// tree today sits on a braced item, so this is a false positive waiting
+    /// rather than a bypass — but a rule that decides an item's extent by
+    /// looking for the next `}` is not deciding what it claims to.
+    fn cfg_feature_flags(krate: &str, body: &str) -> BTreeSet<(String, String, String)> {
+        let mut derived: BTreeSet<(String, String, String)> = BTreeSet::new();
+        let lines: Vec<&str> = body.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            // Item-level attributes only.
+            let Some(feature) = lines[i]
+                .strip_prefix("#[cfg(feature = \"")
+                .and_then(|rest| rest.split('"').next())
+            else {
+                i += 1;
+                continue;
+            };
+            let feature = feature.to_string();
+            // The item head is the first line after this attribute and any
+            // others stacked on the same item.
+            let mut head = i + 1;
+            while head < lines.len() && lines[head].starts_with("#[") {
+                head += 1;
+            }
+            // Where the item head ends decides which of the two it is. A `fn`
+            // signature runs over several lines before its `{`; a `use` that
+            // imports a group carries `{` and its `;` on one line, so the `;`
+            // is asked about first.
+            let mut k = head;
+            while k < lines.len() && !lines[k].trim_end().ends_with(';') && !lines[k].contains('{')
+            {
+                k += 1;
+            }
+            let end = if lines
+                .get(k)
+                .is_some_and(|line| !line.trim_end().ends_with(';'))
+            {
+                let mut j = k;
+                while j < lines.len() && lines[j] != "}" {
+                    j += 1;
+                }
+                j
+            } else {
+                (k + 1).min(lines.len())
+            };
+            for line in &lines[i + 1..end] {
+                for call in ["map.get(\"", "map.contains_key(\""] {
+                    for hit in line.split(call).skip(1) {
+                        if let Some(flag) = hit.split('"').next() {
+                            derived.insert((
+                                krate.to_string(),
+                                format!("--{flag}"),
+                                feature.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+            i = end;
+        }
+        derived
+    }
+
     /// Every flag a shipped binary reads inside a `#[cfg(feature = …)]` item is
     /// named in `FEATURE_FLAGS`.
     ///
@@ -2317,38 +2433,37 @@ mod build_closure {
         let mut derived: BTreeSet<(String, String, String)> = BTreeSet::new();
         for krate in ["ferrum-admission", "ferrum-agent"] {
             let path = root.join("crates").join(krate).join("src/main.rs");
-            let body = read(&path);
-            let lines: Vec<&str> = body.lines().collect();
-            let mut i = 0;
-            while i < lines.len() {
-                // Item-level attributes only: the scan below runs to the first
-                // column-zero `}`, which is the end of the item it opened.
-                let Some(feature) = lines[i]
-                    .strip_prefix("#[cfg(feature = \"")
-                    .and_then(|rest| rest.split('"').next())
-                else {
-                    i += 1;
-                    continue;
-                };
-                let feature = feature.to_string();
-                let mut j = i + 1;
-                while j < lines.len() && lines[j] != "}" {
-                    for call in ["map.get(\"", "map.contains_key(\""] {
-                        for hit in lines[j].split(call).skip(1) {
-                            if let Some(flag) = hit.split('"').next() {
-                                derived.insert((
-                                    krate.to_string(),
-                                    format!("--{flag}"),
-                                    feature.clone(),
-                                ));
-                            }
-                        }
-                    }
-                    j += 1;
-                }
-                i = j;
-            }
+            derived.extend(cfg_feature_flags(krate, &read(&path)));
         }
+
+        // A braceless column-zero `#[cfg]` ends at its own `;`. Scanned to the
+        // next column-zero `}` instead, the `use` below would put every read
+        // in the function after it under `apiserver` and fail this gate on
+        // flags nothing gates.
+        let braceless = cfg_feature_flags(
+            "synthetic",
+            "#[cfg(feature = \"apiserver\")]\nuse std::io::Write;\n\nfn unrelated() {\n    \
+             map.get(\"swept\");\n}\n",
+        );
+        assert!(
+            braceless.is_empty(),
+            "a cfg on a braceless item swept unrelated reads in under its feature: {braceless:?}"
+        );
+        // And the braced form it must keep reading.
+        let braced = cfg_feature_flags(
+            "synthetic",
+            "#[cfg(feature = \"apiserver\")]\nfn gated() {\n    map.get(\"real\");\n}\n",
+        );
+        assert_eq!(
+            braced,
+            [(
+                "synthetic".to_string(),
+                "--real".to_string(),
+                "apiserver".to_string()
+            )]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        );
 
         // The calibration. An empty or shrunken derivation is what a moved
         // `main.rs`, a reformatted attribute or a renamed `Flags` field also

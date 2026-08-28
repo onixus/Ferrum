@@ -722,9 +722,14 @@ fn check_tracefs(
         let Some(path) = m.get("mountPath").and_then(Value::as_str) else {
             return false;
         };
+        // Both sides normalised, for the reason on `normalised_path`: a
+        // trailing slash on either the mountPath or the hostPath names the
+        // same tracefs directory, and comparing raw strings made this rule
+        // report a missing mount about a manifest that has one.
+        let path = normalised_path(path);
         TRACEFS_ROOTS.contains(&path)
             && mounted_host_path(spec, container, path).is_some_and(|(host, kind)| {
-                host == path && kind.as_deref() == Some(HOST_PATH_DIRECTORY)
+                normalised_path(&host) == path && kind.as_deref() == Some(HOST_PATH_DIRECTORY)
             })
     });
     if mounted {
@@ -2412,6 +2417,37 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    /// The mount written the other legal way, on the rule cycle 11 left
+    /// un-normalised.
+    ///
+    /// `mountPath: /sys/kernel/tracing/` names the directory the agent opens,
+    /// and so does `hostPath.path` with the same slash. FD026 compared both
+    /// against `TRACEFS_ROOTS` and against each other as raw strings, so a
+    /// manifest that mounts tracefs correctly reported an agent that mounts
+    /// none, and `lint-deploy` exited 1 on a tree with nothing wrong with it.
+    /// The direction that matters: this is a finding fired at a correct
+    /// manifest, not one missed on a broken one.
+    #[test]
+    fn a_trailing_slash_on_the_tracefs_mount_is_not_a_missing_mount() {
+        let mount = "              mountPath: /sys/kernel/tracing\n";
+        let host = "            path: /sys/kernel/tracing\n";
+        let dir = agent_tree_with("tracefs-slash", |raw| {
+            assert!(
+                raw.contains(mount) && raw.contains(host),
+                "the tracefs mount moved"
+            );
+            raw.replace(mount, "              mountPath: /sys/kernel/tracing/\n")
+                .replace(host, "            path: /sys/kernel/tracing/\n")
+        });
+        assert_eq!(
+            codes_in(&dir),
+            code_set(&[]),
+            "a trailing slash names the same tracefs directory; FD026 must not report a \
+             missing mount about a manifest that has one"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The committed negative tree the Jenkins 'Validate policies' stage runs,

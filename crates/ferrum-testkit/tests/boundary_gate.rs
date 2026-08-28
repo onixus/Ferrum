@@ -621,6 +621,10 @@ const STATUS_TYPES: [(&str, &str, &str); 7] = [
     ),
 ];
 
+/// The API group every kind in `STATUS_TYPES` belongs to. A wildcard resource
+/// grant is only a grant on those when the rule names this group, or every one.
+const FERRUM_GROUP: &str = "ferrum.io";
+
 /// RBAC verbs that write. `get`, `list` and `watch` on a status subresource are
 /// a read grant and not the finding here.
 const WRITE_VERBS: [&str; 5] = ["create", "update", "patch", "delete", "*"];
@@ -833,9 +837,40 @@ fn granted_status_writes(
             if !writes {
                 continue;
             }
+            // A wildcard is the strongest form of the grant this census
+            // exists to refuse, and the literal `/status` match was blind to
+            // it: `resources: ["*"]` with a write verb grants every status
+            // subresource in the groups the rule names and reads as granting
+            // none. Expanded against STATUS_TYPES, which is entirely
+            // `ferrum.io`, so a wildcard is only expanded when the rule names
+            // that group (or every group). A core-group wildcard grants
+            // `pods/status` too; that is a different finding, and FD002 in
+            // `lint-deploy` is what refuses wildcards outright.
+            let ferrum_group = sequence(rule, "apiGroups")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|group| group == "*" || group == FERRUM_GROUP);
             for resource in sequence(rule, "resources").iter().filter_map(Value::as_str) {
-                if resource.contains("/status") {
-                    granted.insert(resource.to_string());
+                let wildcard = match resource {
+                    "*" => Some(None),
+                    other => other.strip_suffix("/*").map(Some),
+                };
+                match wildcard {
+                    Some(prefix) if ferrum_group => {
+                        for (status, _, _) in STATUS_TYPES {
+                            let names = prefix
+                                .map_or(true, |kind| status.strip_suffix("/status") == Some(kind));
+                            if names {
+                                granted.insert(status.to_string());
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if resource.contains("/status") {
+                            granted.insert(resource.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -1107,6 +1142,93 @@ fn every_shipped_subject_has_one_reachable_channel_that_carries_a_cause() {
          deploy/controller/rbac.yaml in the same change and delete this control; if it does \
          not, this scan has stopped telling a handle from a mention and the negative half of \
          it proves nothing"
+    );
+}
+
+/// The reader under assertion 3, on the grant shape that assertion was blind
+/// to.
+///
+/// `resources: ["*"]` with write verbs grants every status subresource in the
+/// group, and the census matched the literal `/status`, so the strongest
+/// possible version of the grant it exists to refuse was the one form it could
+/// not see. A rule that decides by substring where it claims to decide by
+/// meaning: the same defect the two rules above were fixed for.
+///
+/// Not a gate over the tree — `deploy/` carries no wildcard and FD002 refuses
+/// one — so this is the reader on inputs whose answer is known, which is what
+/// keeps assertion 3 honest when a wildcard does arrive.
+#[test]
+fn a_wildcard_resource_grant_is_a_status_grant() {
+    let rules = |groups: &str,
+                 resources: &str,
+                 verbs: &str|
+     -> BTreeMap<(String, String), Vec<Value>> {
+        let body = format!(
+            "rules:\n  - apiGroups: [{groups}]\n    resources: [{resources}]\n    verbs: [{verbs}]\n"
+        );
+        let doc: Value = serde_yaml::from_str(&body).expect("role");
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            ("ClusterRole".to_string(), "test".to_string()),
+            sequence(&doc, "rules").to_vec(),
+        );
+        roles
+    };
+    let bindings = vec![Binding {
+        role_kind: "ClusterRole".to_string(),
+        role_name: "test".to_string(),
+        accounts: vec!["ferrum-test".to_string()],
+    }];
+    let accounts: BTreeSet<String> = ["ferrum-test".to_string()].into_iter().collect();
+
+    let (granted, reached) = granted_status_writes(
+        &accounts,
+        &rules("\"ferrum.io\"", "\"*\"", "\"get\", \"patch\""),
+        &bindings,
+    );
+    assert_eq!(reached, 1, "the synthetic binding resolved to no rule");
+    assert!(
+        granted.contains("policyexceptions/status"),
+        "a wildcard resource with a write verb grants every status subresource in the group \
+         and must be read as granting them: {granted:?}"
+    );
+    assert_eq!(
+        granted.len(),
+        STATUS_TYPES.len(),
+        "a wildcard grants every kind this census knows, not some of them: {granted:?}"
+    );
+
+    // The halves that keep the expansion from becoming "a wildcard anywhere is
+    // every grant": a read-only wildcard is not a write grant, and a wildcard
+    // in another group does not reach ferrum.io kinds.
+    let (read_only, _) = granted_status_writes(
+        &accounts,
+        &rules("\"ferrum.io\"", "\"*\"", "\"get\", \"list\", \"watch\""),
+        &bindings,
+    );
+    assert!(
+        read_only.is_empty(),
+        "a read grant on a status subresource is not the finding here: {read_only:?}"
+    );
+    let (other_group, _) =
+        granted_status_writes(&accounts, &rules("\"\"", "\"*\"", "\"patch\""), &bindings);
+    assert!(
+        other_group.is_empty(),
+        "a core-group wildcard grants no ferrum.io status: {other_group:?}"
+    );
+
+    // The subresource wildcard is the same grant written one level in.
+    let (subresource, _) = granted_status_writes(
+        &accounts,
+        &rules("\"ferrum.io\"", "\"policyexceptions/*\"", "\"patch\""),
+        &bindings,
+    );
+    assert_eq!(
+        subresource,
+        ["policyexceptions/status".to_string()]
+            .into_iter()
+            .collect(),
+        "`<resource>/*` grants that resource's status and only that one"
     );
 }
 
