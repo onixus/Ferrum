@@ -2648,7 +2648,7 @@ mod tests {
     fn a_policy_name_with_no_resolvable_bundle_secret_is_a_finding() {
         let dir = agent_tree_with("no-bundle-secret", |raw| {
             raw.replace(
-                "          secret:\n            secretName: ferrum-bundle-cluster-prod-restricted\n            optional: true",
+                "          secret:\n            secretName: ferrum-bundle-cluster-prod-restricted",
                 "          emptyDir: {}",
             )
         });

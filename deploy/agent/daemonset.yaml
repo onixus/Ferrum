@@ -138,7 +138,13 @@ spec:
           hostPath:
             path: /var/lib/ferrum/lkg
             type: DirectoryOrCreate
+        # Not optional. The binary exits 2 when the bundle is absent and no
+        # last-known-good is on the node, so a tolerant mount here promises a
+        # patience the process does not have: every Pod on a fresh cluster
+        # starts, finds nothing, exits and CrashLoopBackOffs until a human
+        # creates the Secret. Requiring it keeps the Pod Pending with the
+        # missing Secret named on it, which is the same failure said once and
+        # in the place an operator looks.
         - name: bundle
           secret:
             secretName: ferrum-bundle-cluster-prod-restricted
-            optional: true

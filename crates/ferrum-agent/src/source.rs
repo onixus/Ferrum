@@ -437,27 +437,16 @@ impl<'a> RawReader<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FileStamp {
     mtime: SystemTime,
     len: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SourceStamp {
     fsig: FileStamp,
     digest: Option<FileStamp>,
-}
-
-fn stamp_one(path: &Path) -> Option<FileStamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.is_dir() {
-        return None;
-    }
-    Some(FileStamp {
-        mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        len: meta.len(),
-    })
 }
 
 /// What a stat of `exceptions.fsig` established.
@@ -495,19 +484,71 @@ pub(crate) fn exceptions_stamp(path: &Path) -> ExceptionsStamp {
     }
 }
 
-/// Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
-/// Vanished files return `None` so a poll loop keeps last-known-good.
-pub(crate) fn source_stamp(path: &Path) -> Option<SourceStamp> {
-    if let Some(snap) = source_snapshot_dir(path) {
-        Some(SourceStamp {
-            fsig: stamp_one(&snap.join(BUNDLE_FSIG_KEY))?,
-            digest: Some(stamp_one(&snap.join(BUNDLE_DIGEST_KEY))?),
-        })
-    } else {
-        Some(SourceStamp {
-            fsig: stamp_one(path)?,
-            digest: None,
-        })
+/// What a stat of the bundle mount established.
+///
+/// Three answers, for the reason `ExceptionsStamp` above is three-valued: an
+/// `Option<SourceStamp>` collapses ENOENT, EACCES after a remount, EIO, ELOOP
+/// and a dangling `..data` symlink into the same `None`, and the poll loop
+/// reads that `None` as "unchanged". A mount that will not stat then looks
+/// exactly like a bundle nobody has republished — the node stops taking policy
+/// for the rest of the process lifetime and every counter it publishes reads
+/// healthy, because `DEG_LOADER` is raised on a bundle that was offered and
+/// refused, never on one that was never offered at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BundleStamp {
+    /// ENOENT: no bundle at this path. The poll loop keeps last-known-good and
+    /// says nothing, which is what a node before its first policy looks like.
+    #[default]
+    Absent,
+    Present(SourceStamp),
+    /// The stat failed for a reason that is not ENOENT, or succeeded on
+    /// something that cannot be a bundle. Never equal to `Absent`.
+    Unreadable,
+}
+
+/// Stat the path as given so kubelet `..data` rotates are visible; do not
+/// canonicalize.
+pub(crate) fn bundle_stamp(path: &Path) -> BundleStamp {
+    let (fsig, digest) = match source_snapshot_dir(path) {
+        Some(snap) => (
+            snap.join(BUNDLE_FSIG_KEY),
+            Some(snap.join(BUNDLE_DIGEST_KEY)),
+        ),
+        None => (path.to_path_buf(), None),
+    };
+    let fsig = match stamp_kind(&fsig) {
+        FileStampKind::Present(stamp) => stamp,
+        FileStampKind::Absent => return BundleStamp::Absent,
+        FileStampKind::Unreadable => return BundleStamp::Unreadable,
+    };
+    let digest = match digest {
+        None => None,
+        // A snapshot carrying an fsig and no digest is half a rotate in
+        // progress, not a bundle: the pair is stamped or nothing is.
+        Some(path) => match stamp_kind(&path) {
+            FileStampKind::Present(stamp) => Some(stamp),
+            FileStampKind::Absent => return BundleStamp::Absent,
+            FileStampKind::Unreadable => return BundleStamp::Unreadable,
+        },
+    };
+    BundleStamp::Present(SourceStamp { fsig, digest })
+}
+
+enum FileStampKind {
+    Present(FileStamp),
+    Absent,
+    Unreadable,
+}
+
+fn stamp_kind(path: &Path) -> FileStampKind {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => FileStampKind::Unreadable,
+        Ok(meta) => FileStampKind::Present(FileStamp {
+            mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            len: meta.len(),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => FileStampKind::Absent,
+        Err(_) => FileStampKind::Unreadable,
     }
 }
 
@@ -658,15 +699,29 @@ mod tests {
         std::os::unix::fs::symlink("..snap2", &tmp).expect("tmp link");
         std::fs::rename(&tmp, dir.join(KUBELET_DATA_DIR)).expect("rotate ..data");
         assert_integrity(load_path(&dir, &pk));
-        assert!(source_stamp(&dir).is_some());
+        assert!(matches!(bundle_stamp(&dir), BundleStamp::Present(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn vanished_mount_has_no_stamp() {
+    fn vanished_mount_is_absent_and_an_unreadable_one_is_not() {
         let dir = temp_dir("vanished");
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(source_stamp(&dir).is_none());
+        assert_eq!(bundle_stamp(&dir), BundleStamp::Absent);
+
+        // A mount whose bundle the loader can never read is not the same
+        // answer as no bundle: collapsing the two is what let a node stop
+        // taking policy in silence.
+        std::fs::create_dir_all(dir.join(BUNDLE_FSIG_KEY)).expect("dir where the file goes");
+        assert_eq!(bundle_stamp(&dir), BundleStamp::Unreadable);
+        std::fs::remove_dir_all(dir.join(BUNDLE_FSIG_KEY)).expect("rm");
+
+        // And a symlink loop caught mid-rotation: ELOOP, not ENOENT.
+        std::os::unix::fs::symlink("loop-b", dir.join("loop-a")).expect("loop-a");
+        std::os::unix::fs::symlink("loop-a", dir.join("loop-b")).expect("loop-b");
+        std::os::unix::fs::symlink("loop-a", dir.join(BUNDLE_FSIG_KEY)).expect("fsig link");
+        assert_eq!(bundle_stamp(&dir), BundleStamp::Unreadable);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

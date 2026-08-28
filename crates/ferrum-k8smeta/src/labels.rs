@@ -119,14 +119,15 @@ impl LabelCache {
             && self.age_at(now).is_some_and(|age| age <= self.max_age)
     }
 
-    /// The watch demanded a relist (`410 Gone`) that has not completed. Until
-    /// it does, the cache is not warm however recently the stream spoke.
+    /// The watch owes a relist that has not completed — `410 Gone`, or a frame
+    /// the parser could not read. Until it does, the cache is not warm however
+    /// recently the stream spoke.
     pub fn relist_pending(&self) -> bool {
         self.relist_pending
     }
 
-    /// Raise the obligation on `410`. There is deliberately no public way to
-    /// lower it: only a completed [`LabelCache::try_replace_all`] discharges it.
+    /// Raise the obligation. There is deliberately no public way to lower it:
+    /// only a completed [`LabelCache::try_replace_all`] discharges it.
     pub fn raise_relist_pending(&mut self) {
         self.relist_pending = true;
     }

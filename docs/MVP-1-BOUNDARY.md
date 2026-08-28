@@ -228,6 +228,9 @@
 | `DATAPATH_UNDECODABLE` — подряд идущие записи не декодируются: терминальная, не затухающая | U | U `ferrum-agent/src/lib.rs::a_run_of_records_that_all_fail_to_decode_is_degraded_without_more_traffic` |
 | `DATAPATH_ABI_MISMATCH` — прицепленный ELF штампует записи ABI, который этот декодер не читает | U | U `ferrum-agent/src/lib.rs::a_datapath_whose_every_record_is_refused_is_degraded_without_more_traffic` · U `ferrum-agent/src/lib.rs::a_degraded_node_that_changes_why_says_so` |
 | `RECORD_CHANNEL_GONE` — записи вычерпываются из ring и выбрасываются, не дойдя ни до одного правила | U | U `ferrum-agent/src/lib.rs::a_disconnected_record_channel_latches` |
+| `DEG_BUNDLE_UNREADABLE` — bundle-mount на месте и не stat-ится: политика не может доехать, и при этом ни один bundle не был отвергнут | U | U `ferrum-agent/src/lib.rs::a_bundle_mount_that_cannot_be_stat_ed_is_not_a_bundle_that_has_not_changed` |
+| `DEG_CLOCK_ROLLBACK` — часы узла ушли назад под монотонный пол: срок каждого waiver считается по источнику времени, которому нельзя верить | U | U `ferrum-agent/src/lib.rs::clock_rollback_keeps_an_expired_waiver_expired` |
+| `DEG_CLOCK_FLOOR_UNPERSISTED` — монотонный пол не пишется на диск: защита от отката часов живёт только до рестарта | U | U `ferrum-agent/src/lib.rs::a_clock_floor_that_cannot_be_written_is_a_reason` |
 
 `DEG_STATUS_UNWRITABLE` по устройству отстаёт на один тик: запись, которая
 не удалась, не может нести запись о собственном провале. Первый провалившийся

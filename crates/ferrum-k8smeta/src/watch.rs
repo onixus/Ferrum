@@ -147,6 +147,83 @@ pub fn apply_watch_stream(cache: &mut PodCache, body: &[u8]) -> Result<WatchOutc
     Ok(outcome)
 }
 
+/// The relist obligation, raised the same way on either cache.
+///
+/// Both watch streams meet the same two facts — `410 Gone`, and a frame this
+/// build cannot read — and both must answer them identically. One trait so the
+/// answer is written once.
+pub trait RelistDebt {
+    fn raise_relist_pending(&mut self);
+}
+
+impl RelistDebt for PodCache {
+    fn raise_relist_pending(&mut self) {
+        PodCache::raise_relist_pending(self)
+    }
+}
+
+impl RelistDebt for crate::labels::LabelCache {
+    fn raise_relist_pending(&mut self) {
+        crate::labels::LabelCache::raise_relist_pending(self)
+    }
+}
+
+/// A frame the parser cannot read is a change that happened and was not
+/// applied: exactly the fact `410 Gone` carries, and it reaches the cache the
+/// same way. Skipping it and reading on leaves the cache `listed`, fresh and
+/// owing nothing while a namespace it never saw answers a selector as
+/// unlabelled — an unobserved label reported as an absent one, which is the
+/// fail-open this project refused in cycle 6.
+///
+/// Deliberately not an `Err` that ends the stream. A frame this build rejects
+/// may be one a newer apiserver invented — a `type:` added in an upgrade — and
+/// reconnecting on each of them turns a rolling control-plane upgrade into a
+/// reconnect storm against the apiserver, authored by the component that is
+/// supposed to protect it. The stream keeps running, the consumer fails closed
+/// on the cold cache immediately, and the next relist discharges the debt.
+fn note_unreadable_frame<C: RelistDebt + ?Sized>(cache: &mut C, resource: &str, err: &FerrumError) {
+    eprintln!("ferrum-k8smeta: unreadable {resource} watch frame, relist pending: {err}");
+    cache.raise_relist_pending();
+}
+
+/// One line of a pod `watch=1` stream, folded in. The single place a pod frame
+/// is turned into cache state, so the network loop cannot answer an unreadable
+/// frame differently from a replayed one.
+pub fn apply_watch_line(cache: &mut PodCache, line: &[u8]) -> WatchOutcome {
+    let event = match parse_watch_event(line) {
+        Ok(event) => event,
+        Err(err) => {
+            note_unreadable_frame(cache, "pods", &err);
+            return WatchOutcome::Ignored;
+        }
+    };
+    if let Some(rv) = event_resource_version(&event) {
+        cache.set_resource_version(rv);
+    }
+    apply_watch_event(cache, event)
+}
+
+/// Same for one line of a namespaces/serviceaccounts stream. `Err` is reserved
+/// for an object the cache refuses to hold, which does end the stream: an
+/// unbounded map is how one apiserver OOMs the node.
+pub fn apply_labels_line(
+    cache: &mut crate::labels::LabelCache,
+    resource: &str,
+    line: &[u8],
+) -> Result<WatchOutcome> {
+    let event = match parse_labels_watch_event(line) {
+        Ok(event) => event,
+        Err(err) => {
+            note_unreadable_frame(cache, resource, &err);
+            return Ok(WatchOutcome::Ignored);
+        }
+    };
+    if let Some(rv) = crate::labels::label_event_resource_version(&event) {
+        cache.set_resource_version(rv);
+    }
+    crate::labels::try_apply_labels_event(cache, event)
+}
+
 fn event_resource_version(event: &PodWatchEvent) -> Option<String> {
     match event {
         PodWatchEvent::Bookmark(rv) => Some(rv.clone()),
@@ -438,6 +515,51 @@ mod freshness_tests {
         assert_eq!(cache.len(), 1);
     }
 
+    /// A watch frame this build cannot parse is a change that happened and was
+    /// not applied. Skipping it and reading on left the cache listed, fresh and
+    /// owing nothing — warm, with a hole in it — so every consumer that gates on
+    /// warmth proceeded off pods it had never been told about.
+    #[test]
+    fn a_frame_this_build_cannot_read_leaves_the_cache_owing_a_relist() {
+        let mut cache = PodCache::new("node-a");
+        cache.replace_all(vec![PodRecord {
+            uid: "u1".into(),
+            namespace: "prod".into(),
+            name: "web-0".into(),
+            node_name: "node-a".into(),
+            ..Default::default()
+        }]);
+        cache.mark_applied_at(Instant::now());
+        cache.snapshot().expect("a listed cache resolves");
+
+        // A `type:` a newer apiserver invented, mid rolling upgrade.
+        assert_eq!(
+            apply_watch_line(
+                &mut cache,
+                br#"{"type":"PATCHED","object":{"metadata":{}}}"#
+            ),
+            WatchOutcome::Ignored
+        );
+        // The stream keeps running: the very next frame still applies.
+        assert_eq!(
+            apply_watch_line(
+                &mut cache,
+                br#"{"type":"ADDED","object":{"metadata":{"uid":"u2","name":"web-1","namespace":"prod","resourceVersion":"9"},"spec":{"nodeName":"node-a"}}}"#
+            ),
+            WatchOutcome::Applied
+        );
+        assert_eq!(cache.len(), 2, "the frames we can read are still applied");
+        assert!(cache.is_fresh_at(Instant::now()), "the watch is alive");
+        // And the cache says what it is: behind, not complete.
+        assert!(cache.relist_pending());
+        assert!(
+            cache.snapshot().is_err(),
+            "a cache with a hole in it does not name cgroups"
+        );
+        cache.replace_all(Vec::new());
+        assert!(!cache.relist_pending(), "a relist discharges the debt");
+    }
+
     #[test]
     fn only_a_completed_relist_clears_the_debt() {
         let Some(mut cache) = stale_cache() else {
@@ -636,6 +758,50 @@ mod label_parse_tests {
         assert!(cache.is_warm(), "a completed relist clears the debt");
     }
 
+    /// The same fact on the label caches, where it is a fail-open: the
+    /// namespace whose ADDED frame was eaten has labels, the cache does not
+    /// have them, and `labels_or_empty` cannot tell that apart from a namespace
+    /// that carries none. An unobserved label is not a non-match, so the cache
+    /// must stop calling itself warm the moment it misses a frame.
+    #[test]
+    fn an_eaten_namespace_frame_is_not_a_namespace_without_labels() {
+        let mut cache = LabelCache::new();
+        cache.try_replace_all(Vec::new()).expect("empty list fits");
+        assert!(cache.is_warm(), "a completed list of zero objects is warm");
+
+        // prod is created with the label a namespaceSelector matches on, and
+        // the frame that carries it is one this parser refuses.
+        let eaten = br#"{"type":"ADDED","object":{"metadata":{"labels":{"ferrum.io/zone":"prod"},"resourceVersion":"4"}}}"#;
+        assert!(
+            parse_labels_watch_event(eaten).is_err(),
+            "the frame is unreadable"
+        );
+        assert_eq!(
+            apply_labels_line(&mut cache, "namespaces", eaten)
+                .expect("a skipped frame is not a stream error"),
+            WatchOutcome::Ignored
+        );
+        // A well-formed frame right after it, and the stream is still running.
+        assert_eq!(
+            apply_labels_line(
+                &mut cache,
+                "namespaces",
+                br#"{"type":"ADDED","object":{"metadata":{"name":"dev","resourceVersion":"5"}}}"#
+            )
+            .expect("applied"),
+            WatchOutcome::Applied
+        );
+        assert_eq!(cache.resource_version(), "5");
+        // The hole is real: prod answers as unlabelled.
+        assert!(cache.labels_or_empty("", "prod").is_empty());
+        // So the cache must not be warm, which is the gate every consumer of
+        // these labels fails closed on.
+        assert!(cache.relist_pending());
+        assert!(!cache.is_warm(), "a cache that missed a frame is not warm");
+        cache.try_replace_all(Vec::new()).expect("relist fits");
+        assert!(cache.is_warm(), "a completed relist clears the debt");
+    }
+
     #[test]
     fn non_410_watch_error_is_not_a_relist() {
         let line = br#"{"type":"ERROR","object":{"kind":"Status","message":"boom","code":500}}"#;
@@ -651,11 +817,8 @@ pub use client::{ApiserverConfig, ApiserverWatcher, LabelWatcher, SERVICE_ACCOUN
 
 #[cfg(feature = "apiserver")]
 mod client {
-    use super::{
-        apply_watch_event, event_resource_version, parse_labels_list, parse_labels_watch_event,
-        parse_pod_list, parse_watch_event,
-    };
-    use crate::labels::{label_event_resource_version, try_apply_labels_event, LabelCache};
+    use super::{apply_labels_line, apply_watch_line, parse_labels_list, parse_pod_list};
+    use crate::labels::LabelCache;
     use crate::source::{PodCache, POD_WATCH_BUDGET};
     use crate::watch::WatchOutcome;
     use ferrum_common::{FerrumError, Result};
@@ -960,18 +1123,7 @@ mod client {
                 if line.iter().all(|b| b.is_ascii_whitespace()) {
                     continue;
                 }
-                let event = match parse_watch_event(&line) {
-                    Ok(e) => e,
-                    // One malformed frame must not drop the whole cache.
-                    Err(err) => {
-                        eprintln!("ferrum-k8smeta: skipping watch frame: {err}");
-                        continue;
-                    }
-                };
-                if let Some(next_rv) = event_resource_version(&event) {
-                    self.with_cache(|c| c.set_resource_version(next_rv));
-                }
-                let outcome = self.with_cache(|c| apply_watch_event(c, event));
+                let outcome = self.with_cache(|c| apply_watch_line(c, &line));
                 if outcome == WatchOutcome::MustRelist {
                     return Ok(outcome);
                 }
@@ -1143,27 +1295,9 @@ mod client {
                 if line.iter().all(|b| b.is_ascii_whitespace()) {
                     continue;
                 }
-                let event = match parse_labels_watch_event(&line) {
-                    Ok(e) => e,
-                    // One malformed frame must not drop the whole cache.
-                    Err(err) => {
-                        eprintln!(
-                            "ferrum-k8smeta: skipping {} watch frame: {err}",
-                            self.kind.resource
-                        );
-                        continue;
-                    }
-                };
-                let next_rv = label_event_resource_version(&event);
-                let mut event = Some(event);
                 let mut applied: Result<WatchOutcome> = Ok(WatchOutcome::Ignored);
                 self.sink.with(&mut |cache| {
-                    if let Some(next) = next_rv.clone() {
-                        cache.set_resource_version(next);
-                    }
-                    if let Some(event) = event.take() {
-                        applied = try_apply_labels_event(cache, event);
-                    }
+                    applied = apply_labels_line(cache, self.kind.resource, &line);
                 });
                 // An object the cache refuses to hold ends the stream: growing
                 // the map without a ceiling is how one apiserver OOMs us.
