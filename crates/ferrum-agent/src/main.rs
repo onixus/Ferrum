@@ -354,6 +354,16 @@ fn run(
         }
         Err(err) => {
             eprintln!("ferrum-agent: kernel attach failed, datapath is Degraded: {err}");
+            // The stderr line is on one node's console; status.json is what is
+            // read from off the node, and until now it said only "no kernel
+            // attach" with no cause anywhere in it. The container map is not
+            // ready for exactly one reason here — there is no handle to sync
+            // it through — so that reason is the attach failure itself,
+            // RLIMIT_MEMLOCK state and all.
+            agent
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .mark_container_map_error(format!("kernel attach failed: {err}"));
             ctx.set_degraded(true);
             park_degraded(&agent, &out, bundle_path, reload_ms);
         }

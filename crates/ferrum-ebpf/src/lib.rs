@@ -26,11 +26,11 @@ pub use ferrum_ebpf_progs::{
 };
 pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
 pub use kernel::{
-    elf_map_def, plan_cgroup_sync, verify_map_defs, CgroupSyncPlan, MapDef, SyncStats, MAP_DEF_LEN,
-    REQUIRED_MAPS,
+    elf_map_def, plan_cgroup_sync, verify_map_defs, CgroupSyncPlan, MapDef, Memlock, SyncStats,
+    MAP_DEF_LEN, REQUIRED_MAPS,
 };
 #[cfg(feature = "attach")]
-pub use kernel::{KernelHandle, RingReader};
+pub use kernel::{raise_memlock, KernelHandle, RingReader};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
 pub use prefilter::{prefilter_image, PrefilterImage, PATH_BEARING_SYSCALLS};
 pub use spec::{

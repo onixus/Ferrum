@@ -16,7 +16,29 @@ node for nothing.
 The datapath ELF lives at /usr/share/ferrum/ferrum-ebpf-progs.bpf.o inside the
 agent image and is passed as --bpf-elf in both DaemonSets. An agent built with
 the attach feature exits rather than run without it; an agent built without
-attach ignores the flag and reports Degraded.
+attach ignores the flag and reports Degraded. The image is built by the
+Dockerfile at the root of this repository: ferrum-agent linked for musl with
+--features attach,apiserver, which is the only combination that compiles the
+cgroup sync into ferrum_cgroups, plus that ELF at that path.
+
+Both DaemonSets mount /sys/kernel/tracing read-only. Attaching a tracepoint
+means reading events/<category>/<name>/id out of tracefs, and so does the probe
+that decides which hooks this kernel has. tracefs is a filesystem of its own
+and no container runtime propagates it, so without the mount the probe can
+establish nothing, every attach is tried, every one fails, and the agent parks
+with "kernel attach failed, datapath is Degraded" on every node — the ELF, the
+capabilities and the RBAC all correct. `ferrumctl lint-deploy` FD026 is a
+finding on an attach build without it. hostPath type is Directory: a node whose
+tracefs is somewhere else leaves the pod unschedulable and visible rather than
+running an agent that can hook nothing.
+
+CAP_BPF and CAP_PERFMON, and no CAP_SYS_RESOURCE. Kernels before 5.11 charge
+the event ring and the cgroup hash against RLIMIT_MEMLOCK; the agent raises its
+soft limit to the hard one before every load, which needs no capability, and
+cannot raise the hard one, which would. Where that is not enough the load fails
+and says so: the attach error names the limit it ran under, on stderr and in
+status.json (containerMapError, and the container-map reason in
+degradedReasons). It is never a silent degrade.
 
 The respond ClusterRole grants pods delete only. pods/eviction and
 networkpolicies were there for Isolate, which the agent does not implement and

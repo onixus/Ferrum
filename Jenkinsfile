@@ -2,6 +2,14 @@
 // Сборка в docker.image().inside(): CARGO_TARGET_DIR обязан быть named volume.
 // Bind-mount macOS/VirtioFS ломает cargo недетерминированно (E0463 can't find crate).
 // clippy — check-only (.rmeta); cargo test после него пересоберёт .rlib — это ожидаемо.
+//
+// 'Agent binary' is the stage that links. Everything above it — clippy on
+// attach,apiserver included — stops at .rmeta or runs the default features,
+// so until that stage the one production combination had never produced an
+// object file, let alone an executable. 'Agent image' is the only stage that
+// leaves the container: it needs the docker CLI on the node, not inside the
+// rust image, and a socket mounted into this container would be the escape
+// route the runtime rules exist to kill.
 
 def RUST_IMAGE = 'rust:1.75-bookworm'
 def RUST_DOCKER_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry -v ferrum-cargo-target:/build-target'
@@ -68,6 +76,42 @@ pipeline {
             }
         }
 
+        // The production combination, linked. AGENTS.md requires musl of
+        // userspace; ring compiles C, so the target needs a musl cc as well as
+        // the Rust std. --locked because this is the artefact the image ships:
+        // a release build that may resolve a different dependency set than the
+        // one CI tested is not one.
+        stage('Agent binary') {
+            steps {
+                sh '''
+                    set -eu
+                    target=x86_64-unknown-linux-musl
+                    rustup target add "$target"
+                    if ! command -v musl-gcc >/dev/null 2>&1; then
+                        apt-get update
+                        apt-get install -y --no-install-recommends musl-tools
+                    fi
+                    CC_x86_64_unknown_linux_musl=musl-gcc \
+                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                        cargo build --release --locked --target "$target" \
+                            -p ferrum-agent --features attach,apiserver
+                    bin="$CARGO_TARGET_DIR/$target/release/ferrum-agent"
+                    test -x "$bin"
+                    # A dynamically linked "musl" build is a binary that will
+                    # not start on the node it was built for. `file` is not in
+                    # this image; the interpreter entry is, and its absence is
+                    # the whole claim.
+                    if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
+                        echo "agent binary is dynamically linked, musl target notwithstanding" >&2
+                        exit 1
+                    fi
+                    mkdir -p dist
+                    cp "$bin" dist/ferrum-agent
+                '''
+                archiveArtifacts artifacts: 'dist/ferrum-agent', fingerprint: true
+            }
+        }
+
         stage('BPF ELF') {
             steps {
                 sh '''
@@ -111,6 +155,12 @@ pipeline {
                     cp "$elf" dist/ferrum-ebpf-progs.bpf.o
                 '''
                 archiveArtifacts artifacts: 'dist/ferrum-ebpf-progs.bpf.o', fingerprint: true
+                // What 'Agent image' builds from. Stashed rather than trusted
+                // to still be in this workspace: that stage runs on the node
+                // with its own workspace, and an image built from whatever
+                // happened to be lying there is not the tree this pipeline
+                // tested.
+                stash includes: 'Dockerfile,Cargo.toml,Cargo.lock,rust-toolchain.toml,crates/**,dist/ferrum-ebpf-progs.bpf.o', name: 'image-context'
             }
         }
 
@@ -162,6 +212,34 @@ pipeline {
                         exit 1
                     fi
                     echo "ok: $passed attach_live tests executed against this kernel"
+                    # The lib tests behind the same feature. `cargo test
+                    # --workspace` runs default features, so until this line
+                    # nothing ever executed the RLIMIT_MEMLOCK raise that every
+                    # production attach now goes through — and it is the raise
+                    # living outside the code under test that this cycle was
+                    # about.
+                    cargo test -p ferrum-ebpf --features attach --lib
+                '''
+            }
+        }
+
+        // The image deploy/agent/daemonset.yaml names. Runs on the node and
+        // not in the rust container: `docker build` needs the daemon, and the
+        // way to reach it from inside this container would be to mount
+        // /var/run/docker.sock — the hostPath FD006 is a finding on and the
+        // runtime rules kill. The Dockerfile re-runs elf_inspect against the
+        // two files it is about to put in the same image, so a binary and an
+        // ELF that disagree cannot be welded together here.
+        stage('Agent image') {
+            agent any
+            steps {
+                unstash 'image-context'
+                sh '''
+                    set -eu
+                    test -f dist/ferrum-ebpf-progs.bpf.o
+                    docker build \
+                        --build-arg BPF_ELF=dist/ferrum-ebpf-progs.bpf.o \
+                        -t "ghcr.io/ferrum/ferrum-agent:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
                 '''
             }
         }
@@ -220,6 +298,27 @@ pipeline {
                     done
                     echo "ok: rcgen and x509-parser stay off the admission and agent graphs"
                     echo "ok: and are still detectable on ferrum-cli, which must carry them"
+                    # ferrum-ebpf gained libc as a normal dependency, gated on
+                    # `attach`, for the getrlimit/setrlimit pair every load now
+                    # runs through. That is a boundary change and it is checked
+                    # here rather than argued in a review: under `attach` aya
+                    # already resolves libc, so the crate borrowed it in that
+                    # configuration and gains nothing by naming it; the default
+                    # build must still carry neither. Both halves, because an
+                    # absence with no positive control proves nothing.
+                    if cargo tree -p ferrum-ebpf -e normal | grep -qE "(^| )libc v"; then
+                        echo "crate boundary: ferrum-ebpf links libc with default features;" >&2
+                        echo "the stable offline build must stay free of it" >&2
+                        exit 1
+                    fi
+                    if ! cargo tree -p ferrum-ebpf -e normal --features attach \
+                        | grep -qE "(^| )libc v"; then
+                        echo "crate boundary: libc is absent from ferrum-ebpf --features attach," >&2
+                        echo "so the check above cannot detect anything and the memlock raise" >&2
+                        echo "has no libc to call" >&2
+                        exit 1
+                    fi
+                    echo "ok: libc is on ferrum-ebpf's graph only under attach, where aya already put it"
                 '''
             }
         }
@@ -345,6 +444,26 @@ pipeline {
                         exit 1
                     fi
                     echo "ok: fixtures/deploy-bad rejected"
+                    # FD026. An agent with the ELF, the capabilities and the
+                    # RBAC all correct and no tracefs mounted reads no
+                    # tracepoint id, fails every attach and parks Degraded on
+                    # every node — which is the state the shipped DaemonSets
+                    # were in. The rule asserts an absence, so it needs a tree
+                    # that has it: grep the code, not just the exit status, or
+                    # a fixture failing for another reason passes this stage.
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- lint-deploy crates/ferrum-testkit/fixtures/deploy-bad-tracefs >/tmp/ferrum-bad-tracefs.out 2>/tmp/ferrum-bad-tracefs.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "fixtures/deploy-bad-tracefs must fail lint-deploy" >&2
+                        exit 1
+                    fi
+                    if ! grep -q FD026 /tmp/ferrum-bad-tracefs.err /tmp/ferrum-bad-tracefs.out; then
+                        echo "deploy-bad-tracefs failed on something other than FD026" >&2
+                        exit 1
+                    fi
+                    echo "ok: an attach build with no tracefs mount rejected"
                 '''
             }
         }

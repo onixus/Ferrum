@@ -2,9 +2,16 @@
 //!
 //! Built only for `target_arch = "bpf"` (bpfel-unknown-none, nightly +
 //! build-std); the host build compiles to an empty stub so the stable-1.75
-//! workspace gates stay green. There is no kernel CI here: these programs are
-//! not verifier-tested in this repository, and userspace attach stays behind
-//! the opt-in `attach` feature of `ferrum-ebpf`.
+//! workspace gates stay green. Userspace attach stays behind the opt-in
+//! `attach` feature of `ferrum-ebpf`.
+//!
+//! The object this crate produces is not a build artefact of the workspace:
+//! the `Dockerfile` copies it in from the build context, at the path
+//! `--bpf-elf` names in both shipped DaemonSets, and re-runs the map-ABI
+//! inspection against the binary it is being put in the image beside. The
+//! Jenkins 'BPF attach' stage is where these programs meet a verifier — that
+//! stage, and nothing else in this repository, executes one of their
+//! instructions.
 
 #![cfg_attr(target_arch = "bpf", no_std, no_main)]
 
