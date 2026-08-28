@@ -139,6 +139,44 @@ impl FailureClass {
     }
 }
 
+/// The classes in which a call actually issued a request to the API server and
+/// got an answer.
+///
+/// The only thing that can mark a class as having worked, and the reason
+/// `note_success` does not take a bare `FailureClass`. A call site cannot know
+/// what the call it just awaited decided to skip: `attach_exceptions` on a plan
+/// that carries no Secret, `persist_exceptions` on an installation whose bundle
+/// Secrets do not exist yet, a reconcile of an object that is already converged
+/// — each of those returns `Ok(())` having asked the API server for nothing,
+/// and each of them used to be counted as a success of its class. That is not a
+/// counter being one out: `ever_ok` is what the terminal rule turns on, it can
+/// never be turned back off, and one no-op success makes a deployment fault in
+/// that class unreportable for the life of the process.
+///
+/// So the receipt travels out of the code that makes the request. A function
+/// that issues nothing has nothing to return but `Requested::NONE`, and
+/// `watch.rs` cannot invent one for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Requested(u8);
+
+impl Requested {
+    /// Nothing was asked of the API server.
+    pub const NONE: Requested = Requested(0);
+
+    /// One request of `class` was issued and answered.
+    pub fn of(class: FailureClass) -> Self {
+        Requested(1 << class.index())
+    }
+
+    pub fn contains(self, class: FailureClass) -> bool {
+        self.0 & Requested::of(class).0 != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 #[derive(Debug, Default)]
 struct ClassState {
     total: AtomicU64,
@@ -158,6 +196,8 @@ pub struct ControllerHealth {
     status_write_failures: AtomicU64,
     /// Complain about an unwritable directory once, not once per tick.
     status_error_logged: AtomicBool,
+    /// Same, for the case of no directory at all.
+    no_status_dir_logged: AtomicBool,
     /// A counter moved since the last publish. What keeps a `Restarted` burst
     /// of a thousand objects from becoming a thousand fsyncs on the path the
     /// reconcile loops run on.
@@ -173,10 +213,21 @@ impl ControllerHealth {
         &self.classes[class.index()]
     }
 
-    /// A request of `class` went through: the run resets and the class is
-    /// marked as having worked at least once, which is what can never be
-    /// undone and what the terminal rule turns on.
-    pub fn note_success(&self, class: FailureClass) {
+    /// Every class in `requested` had a request go through: its run resets and
+    /// the class is marked as having worked at least once, which is what can
+    /// never be undone and what the terminal rule turns on.
+    ///
+    /// `Requested::NONE` records nothing, which is the point: a call that
+    /// asked the API server for nothing did not succeed at anything.
+    pub fn note_success(&self, requested: Requested) {
+        for class in FailureClass::ALL {
+            if requested.contains(class) {
+                self.note_class_success(class);
+            }
+        }
+    }
+
+    fn note_class_success(&self, class: FailureClass) {
         let state = self.class(class);
         let first = !state.ever_ok.swap(true, Ordering::Relaxed);
         let recovered = state.run.swap(0, Ordering::Relaxed) != 0;
@@ -311,25 +362,46 @@ impl ControllerHealth {
         out
     }
 
+    /// Write `status.json` into `dir` if a counter has moved since the last
+    /// publish, whole or not at all.
+    ///
+    /// Called on the reconcile path, where the alternative is an `fsync` per
+    /// watch event. The periodic publish is what keeps the timestamp moving
+    /// when nothing changes.
+    ///
+    /// Returns nothing on purpose. A failed publish is already a counter, a
+    /// reason and a line — see `publish` — and the loops that call this have
+    /// no decision to make about it: a reporting surface that could divert the
+    /// reconcile path would be the probe this module refuses to be. Its three
+    /// callers dropped the `bool` it used to return, which is a value nobody
+    /// reads and a question nobody may answer.
+    pub fn publish_if_changed(&self, dir: Option<&Path>) {
+        if !self.changed.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        self.publish(dir);
+    }
+
     /// Write `status.json` into `dir`, whole or not at all.
     ///
     /// Returns whether the state is published. A failure is counted, raises
     /// `REASON_STATUS_UNWRITABLE` and removes the file that is now lying, and
     /// it never propagates: the caller has policy to reconcile.
-    /// Publish only if a counter has moved since the last publish.
-    ///
-    /// Called on the reconcile path, where the alternative is an `fsync` per
-    /// watch event. The periodic publish is what keeps the timestamp moving
-    /// when nothing changes.
-    pub fn publish_if_changed(&self, dir: Option<&Path>) -> bool {
-        if !self.changed.swap(false, Ordering::Relaxed) {
-            return true;
-        }
-        self.publish(dir)
-    }
-
     pub fn publish(&self, dir: Option<&Path>) -> bool {
         let Some(dir) = dir else {
+            // Not a failure — an operator who asked for no status file did not
+            // fail to get one — but not a silence either: without this line
+            // «no file» is indistinguishable from a controller whose writes
+            // are failing, and a `--status-dir` dropped between the manifest
+            // and the process would look exactly like a controller that was
+            // never given one. `ferrum-agent` says the same thing in the same
+            // case.
+            if !self.no_status_dir_logged.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "ferrum-controller: no --status-dir, so {STATUS_NAME} is not written: this \
+                     controller's counters have no reader but the lines it prints on each failure"
+                );
+            }
             return true;
         };
         self.changed.store(false, Ordering::Relaxed);
@@ -480,7 +552,7 @@ mod tests {
 
         // And a success takes the class back out of the list without erasing
         // the count: the counter is the history, the run is the state.
-        health.note_success(FailureClass::Reconcile);
+        health.note_success(Requested::of(FailureClass::Reconcile));
         assert_eq!(health.reconcile_failures(), 1);
         assert_eq!(health.failure_run(FailureClass::Reconcile), 0);
         assert!(health.ever_succeeded(FailureClass::Reconcile));
@@ -549,17 +621,55 @@ mod tests {
     }
 
     /// A class that has ever worked cannot end the process, however long the
-    /// burst.
+    /// burst — and «worked» means a request of that class was issued and
+    /// answered, not that a function returned `Ok`.
     ///
     /// «Never once succeeded» is the whole of the protection: it is what tells
     /// a deployment that is wrong from a cluster that is busy. An API server
     /// rolling, a conflict storm on one object or a webhook in front of the
     /// PATCH all produce runs far longer than `TERMINAL_RUN`, and none of them
     /// is a reason to stop reconciling.
+    ///
+    /// The half added after the audit is the second one. This test used to
+    /// take «a success» as given and ask only what a later burst did with it,
+    /// which is exactly the assumption that made the defect invisible: three
+    /// call sites in `watch.rs` marked a class as having worked after a call
+    /// that had issued no request at all, and this test asserted the
+    /// protection they thereby granted forever. `Requested::NONE` is what such
+    /// a call returns now, and the assertions below are that it protects
+    /// nothing.
     #[test]
     fn a_class_that_succeeded_once_does_not_go_terminal_on_a_later_burst() {
+        // Nothing requested, nothing succeeded — and the class stays killable.
+        let vacuous = ControllerHealth::new();
+        vacuous.note_success(Requested::NONE);
+        assert!(!vacuous.ever_succeeded(FailureClass::ExceptionPublish));
+        let mut vacuous_err = None;
+        for _ in 0..TERMINAL_RUN {
+            vacuous_err = vacuous
+                .note_failure(FailureClass::ExceptionPublish, "secret patch: 403")
+                .err();
+        }
+        assert!(
+            vacuous_err.is_some(),
+            "a success that made no request disarmed the terminal rule for the class, which \
+             nothing can re-arm for the life of the process"
+        );
+
+        // A receipt names its class and only its class: the same call that
+        // issues a status PATCH and nothing else must not credit `reconcile`.
+        let one = Requested::of(FailureClass::StatusPatch);
+        assert!(one.contains(FailureClass::StatusPatch));
+        for class in FailureClass::ALL {
+            if class != FailureClass::StatusPatch {
+                assert!(!one.contains(class), "{}", class.name());
+            }
+        }
+        assert!(Requested::NONE.is_empty());
+        assert!(!one.is_empty());
+
         let health = ControllerHealth::new();
-        health.note_success(FailureClass::StatusPatch);
+        health.note_success(Requested::of(FailureClass::StatusPatch));
         for i in 0..TERMINAL_RUN * 10 {
             health
                 .note_failure(FailureClass::StatusPatch, "status patch p: 409 Conflict")
@@ -584,7 +694,7 @@ mod tests {
         // burst in a class that has never worked is terminal, which is the
         // control on the sentence above.
         let other = ControllerHealth::new();
-        other.note_success(FailureClass::StatusPatch);
+        other.note_success(Requested::of(FailureClass::StatusPatch));
         let mut err = None;
         for _ in 0..TERMINAL_RUN {
             err = other
@@ -604,7 +714,7 @@ mod tests {
     fn the_status_file_is_written_whole_and_a_failed_write_is_its_own_reason() {
         let dir = temp_dir("publish");
         let health = ControllerHealth::new();
-        health.note_success(FailureClass::Watch);
+        health.note_success(Requested::of(FailureClass::Watch));
         health
             .note_failure(FailureClass::Reconcile, "compile: rule 3 has no match")
             .expect("one failure is not terminal");

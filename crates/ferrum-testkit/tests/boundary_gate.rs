@@ -1138,18 +1138,7 @@ fn every_shipped_subject_has_one_reachable_channel_that_carries_a_cause() {
             "no pod spec under deploy/ that runs {subject} names a serviceAccountName, so no \
              binding can be followed to it and this census asked nothing about it"
         );
-        let sources_dir = root.join("crates").join(subject).join("src");
-        assert!(
-            sources_dir.is_dir(),
-            "{} does not exist, so what {subject} writes cannot be read",
-            sources_dir.display()
-        );
-        let mut files = Vec::new();
-        rs_files(&sources_dir, &mut files);
-        let sources: String = files
-            .iter()
-            .map(|path| strip_rust_comments(&fs::read_to_string(path).expect("source file")))
-            .collect();
+        let sources = crate_sources(&root, subject);
         for resource in &granted {
             let Some((_, kind, status_type)) = STATUS_TYPES.iter().find(|(r, _, _)| r == resource)
             else {
@@ -1203,15 +1192,7 @@ fn every_shipped_subject_has_one_reachable_channel_that_carries_a_cause() {
          follow a ServiceAccount through a binding to a rule, so every subject above came \
          back with nothing granted and the loop proved nothing. Found: {granted:?}"
     );
-    let mut controller_sources = Vec::new();
-    rs_files(
-        &root.join("crates/ferrum-controller/src"),
-        &mut controller_sources,
-    );
-    let controller_body: String = controller_sources
-        .iter()
-        .map(|path| strip_rust_comments(&fs::read_to_string(path).expect("source file")))
-        .collect();
+    let controller_body = crate_sources(&root, "ferrum-controller");
     assert!(
         writes_status(&controller_body, "PolicyException"),
         "the writer this census is calibrated on is gone: it can no longer tell a granted \
@@ -1314,7 +1295,35 @@ fn a_wildcard_resource_grant_is_a_status_grant() {
     );
 }
 
-/// Every source file of one shipped crate, comments stripped, as one string.
+/// `text` up to its first test module.
+///
+/// Every reachability question in this file is about the binary that ships,
+/// and a `#[cfg(test)]` module is not in it. Without this cut a single unit
+/// test building `GroupVersionKind::gvk("ferrum.io", "v1", "PolicyLibrary")`
+/// makes `reaches_kind` say the controller can address PolicyLibrary, and the
+/// read grant deleted in cycle 12 can be restored with a gate that stays
+/// green — a handle that exists only in a test binary resurrecting a
+/// permission in the shipped ClusterRole.
+///
+/// The cut is the first line that is exactly `#[cfg(test)]`, and everything
+/// after it goes. That is the convention in every crate here: the test module
+/// is last in the file and nothing shipped follows it. It fails toward
+/// reporting a grant dead — cutting too much can only remove handles — which
+/// is the direction that produces a finding to look at rather than a silence.
+fn strip_test_modules(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if line.trim() == "#[cfg(test)]" {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Every source file of one shipped crate, comments and test modules stripped,
+/// as one string.
 fn crate_sources(root: &Path, subject: &str) -> String {
     let dir = root.join("crates").join(subject).join("src");
     assert!(
@@ -1327,7 +1336,11 @@ fn crate_sources(root: &Path, subject: &str) -> String {
     files.sort();
     files
         .iter()
-        .map(|path| strip_rust_comments(&fs::read_to_string(path).expect("source file")))
+        .map(|path| {
+            strip_test_modules(&strip_rust_comments(
+                &fs::read_to_string(path).expect("source file"),
+            ))
+        })
         .collect()
 }
 
@@ -1464,6 +1477,71 @@ fn a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose() {
          the same change and delete this control; if it does not, this scan has stopped \
          telling a handle from a mention and the finding above can never be made"
     );
+
+    // A handle that exists only in a test binary is not a handle. Read on
+    // inputs whose answer is known, because with the tree clean a cut that
+    // removed nothing would look exactly like this one.
+    let shipped_and_tested = "fn watch() {\n    GroupVersionKind::gvk(GROUP, VERSION, \"SecurityPolicy\");\n}\n\
+                              #[cfg(test)]\nmod tests {\n    fn t() {\n        \
+                              GroupVersionKind::gvk(GROUP, VERSION, \"PolicyLibrary\");\n    }\n}\n";
+    let shipped = strip_test_modules(shipped_and_tested);
+    assert!(
+        reaches_kind(&shipped, "SecurityPolicy"),
+        "the cut took the shipped half of the file with it"
+    );
+    assert!(
+        reaches_kind(shipped_and_tested, "PolicyLibrary"),
+        "this control asserts nothing unless the uncut text does reach the Kind"
+    );
+    assert!(
+        !reaches_kind(&shipped, "PolicyLibrary"),
+        "a gvk literal inside #[cfg(test)] still reads as reachability, so a unit test can \
+         restore any read grant in the shipped RBAC and this census will not see it"
+    );
+
+    // ------------------------------------------------------------------
+    // Every subject a binding points at is a subject something runs.
+    //
+    // The walk above starts at `image:` and reaches rules through the
+    // ServiceAccounts of the pod specs that carry it, so a binding whose only
+    // subject is an account no pod spec names resolves to no crate, is asked
+    // no question, and is refused by nothing. A ClusterRole carrying the four
+    // resources this cycle deleted, with every writing verb, bound to
+    // `ServiceAccount/ferrum-controller-ops`, passed every set in this crate
+    // and `lint-deploy` too: the entire subject of the finding, restored and
+    // invisible. Whatever such an account is for, it is a grant this tree
+    // ships and nothing in this tree exercises — the definition of the
+    // permission with no purpose the two censuses above exist to refuse.
+    let mut running: BTreeSet<String> = BTreeSet::new();
+    for accounts in subjects.values() {
+        running.extend(accounts.iter().cloned());
+    }
+    let mut unreachable: Vec<String> = Vec::new();
+    for binding in &bindings {
+        for account in &binding.accounts {
+            if !running.contains(account) {
+                unreachable.push(format!(
+                    "  ServiceAccount/{account} <- {}/{}",
+                    binding.role_kind, binding.role_name
+                ));
+            }
+        }
+    }
+    unreachable.sort();
+    unreachable.dedup();
+    assert!(
+        unreachable.is_empty(),
+        "these bindings grant a role to a ServiceAccount no pod spec under deploy/ runs:\n{}\n\
+         No image is bound to that subject, so no crate answers for it and every census in \
+         this file walks past the grant entirely. Delete the binding, or run something as \
+         that account.",
+        unreachable.join("\n")
+    );
+    assert!(
+        !running.is_empty(),
+        "no pod spec under deploy/ names a serviceAccountName, so the check above compared \
+         every binding against an empty set and passed nothing"
+    );
 }
 
 /// Whether any mapping anywhere under `node` carries `key`.
@@ -1504,6 +1582,74 @@ fn controller_container(root: &Path) -> (Value, Value) {
     panic!("no Deployment in deploy/controller/deployment.yaml");
 }
 
+/// The variants of `pub enum FailureClass` in `health.rs`, in source order.
+///
+/// Read out of the enum rather than listed here, which is the difference
+/// between this gate and the one it replaces. That one held its own copy of
+/// the four classes and a docstring claiming they were «taken from the code»;
+/// a fifth variant with no accessor, no key and no mention anywhere in
+/// `watch.rs` passed it green, because the list it checked against was the
+/// list it shipped with. A gate that decides against its own hardcoded answer
+/// asks the tree nothing.
+fn failure_class_variants(health: &str) -> Vec<String> {
+    let at = health.find("pub enum FailureClass {").expect(
+        "health.rs no longer declares `pub enum FailureClass`, so this gate has no \
+                 list of classes to check and would pass over any number of them",
+    );
+    let body = &health[at..];
+    let end = body.find("\n}").expect("the enum is closed");
+    let mut out = Vec::new();
+    for line in body[..end].lines().skip(1) {
+        let line = line.trim();
+        let Some(name) = line.strip_suffix(',') else {
+            continue;
+        };
+        if !name.is_empty()
+            && name.chars().next().is_some_and(char::is_uppercase)
+            && name.chars().all(|c| c.is_alphanumeric())
+        {
+            out.push(name.to_string());
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "no variant was read out of `pub enum FailureClass`, so every assertion below runs \
+         over an empty list and proves nothing"
+    );
+    out
+}
+
+/// `<variant>` -> the counter name its `counter()` arm returns.
+fn failure_class_counters(health: &str, variants: &[String]) -> BTreeMap<String, String> {
+    let at = health
+        .find("pub fn counter(self) -> &'static str {")
+        .expect("health.rs no longer maps a class to its counter name");
+    let body = &health[at..];
+    let end = body.find("\n    }").expect("the fn is closed");
+    let mut out = BTreeMap::new();
+    for variant in variants {
+        let arm = format!("FailureClass::{variant} => \"");
+        let Some(from) = body[..end].find(&arm) else {
+            continue;
+        };
+        let rest = &body[from + arm.len()..];
+        let quote = rest.find('"').expect("the counter name is closed");
+        out.insert(variant.clone(), rest[..quote].to_string());
+    }
+    out
+}
+
+/// How `watch.rs` and `apply.rs` route a failure or a receipt to a class. A
+/// class named in none of these forms is a class nothing in the reconcile path
+/// can ever record.
+const CLASS_ROUTES: [&str; 3] = ["note_failure(", "as_class(", "Requested::of("];
+
+fn routes_class(sources: &str, variant: &str) -> bool {
+    CLASS_ROUTES
+        .iter()
+        .any(|route| sources.contains(&format!("{route}FailureClass::{variant}")))
+}
+
 /// Every class of failure that can happen after `run_watch` is entered reaches
 /// a counter and a file, and a class in which nothing has ever worked reaches
 /// the exit code.
@@ -1538,14 +1684,27 @@ fn controller_container(root: &Path) -> (Value, Value) {
 fn the_controllers_channel_names_every_post_start_failure_class() {
     let root = repo_root();
     let src = root.join("crates/ferrum-controller/src");
+    // The shipped half of each file: `#[cfg(test)]` and everything after it
+    // is not in the binary an operator runs. Without the cut the unit tests in
+    // `watch.rs` answered for it — `watch.contains("FailureClass::Watch")` was
+    // satisfied by a test, and a `note_failure` written inside one counted as
+    // the reconcile path noting a failure.
     let read = |name: &str| {
-        strip_rust_comments(&fs::read_to_string(src.join(name)).unwrap_or_else(|e| {
-            panic!("crates/ferrum-controller/src/{name}: {e}");
-        }))
+        strip_test_modules(&strip_rust_comments(
+            &fs::read_to_string(src.join(name)).unwrap_or_else(|e| {
+                panic!("crates/ferrum-controller/src/{name}: {e}");
+            }),
+        ))
     };
     let main = read("main.rs");
     let watch = read("watch.rs");
     let health = read("health.rs");
+    let apply = read("apply.rs");
+    // The class of a failure is decided at the call site, and one of those
+    // sites moved into `apply.rs` when the receipt did: `persist_class` is
+    // read by both files and is what keeps the class a failure is charged to
+    // and the class a success credits from being two answers.
+    let routed = format!("{watch}{apply}");
 
     // The startup half, unchanged: a returned error is printed with the
     // `error:` prefix and the process leaves with 1. It is now also the half
@@ -1566,43 +1725,95 @@ fn the_controllers_channel_names_every_post_start_failure_class() {
         );
     }
 
-    // Every class this controller can fail in, taken from the code rather than
-    // from a list in this file: a class added and never counted is exactly the
-    // defect this gate exists for.
-    let classes: Vec<&str> = [
-        "reconcile_failures",
-        "status_patch_failures",
-        "watch_errors",
-        "exception_publish_failures",
-    ]
-    .into_iter()
-    .collect();
-    let variants: Vec<&str> = ["Reconcile", "StatusPatch", "Watch", "ExceptionPublish"]
-        .into_iter()
-        .collect();
-    for counter in &classes {
+    // Every class this controller can fail in, read out of the enum that
+    // declares them. The list this replaces was written out in this file under
+    // a docstring that said it was not: five classes passed it with the fifth
+    // having no accessor, no key and no call site anywhere.
+    let variants = failure_class_variants(&health);
+    let counters = failure_class_counters(&health, &variants);
+    for variant in &variants {
+        let counter = counters.get(variant).unwrap_or_else(|| {
+            panic!(
+                "FailureClass::{variant} has no arm in `counter()`, so it has no name in \
+                 status.json and a reader of the file cannot find it"
+            )
+        });
         assert!(
             health.contains(&format!("pub fn {counter}(")),
-            "health.rs has no `{counter}` accessor: the document names this counter and a \
-             reader of the file would find no such key"
+            "health.rs has no `{counter}` accessor for FailureClass::{variant}: nothing in \
+             or out of this process can read that counter by name"
         );
         assert!(
-            health.contains(&format!("\"{counter}\"")),
-            "health.rs never writes {counter:?} as a key, so the counter exists in the \
-             process and not in anything an operator can poll"
+            routes_class(&routed, variant),
+            "no call site in watch.rs or apply.rs names FailureClass::{variant} in any of \
+             {CLASS_ROUTES:?}, so that class of failure happens and nothing counts it — the \
+             defect this gate replaces, one class in. A class the reconcile path never \
+             records is a counter that is zero forever and a terminal rule that can never \
+             fire."
         );
     }
+
+    // The list `ALL` is what `status_json` and `degraded_reasons` iterate, so
+    // a variant missing from it is a class with a counter nothing publishes.
+    let all_at = health
+        .find("pub const ALL:")
+        .expect("health.rs no longer lists the classes it iterates");
+    let all_end = health[all_at..].find("];").expect("the list is closed") + all_at;
+    let all = &health[all_at..all_end];
     for variant in &variants {
         assert!(
-            health.contains(&format!("FailureClass::{variant}")),
-            "health.rs does not know the class FailureClass::{variant}"
-        );
-        assert!(
-            watch.contains(&format!("FailureClass::{variant}")),
-            "watch.rs never notes FailureClass::{variant}, so that class of failure happens \
-             and nothing counts it — the defect this gate replaces, one class in"
+            all.contains(&format!("FailureClass::{variant}")),
+            "FailureClass::{variant} is not in `ALL`, so degraded_reasons() and status_json() \
+             walk past it: it can fail, be counted, end the process, and appear in nothing an \
+             operator reads"
         );
     }
+    assert!(
+        all.contains(&format!("[FailureClass; {}]", variants.len())),
+        "`ALL` is not declared over all {} variants of FailureClass: {all}",
+        variants.len()
+    );
+
+    // And every counter is a key of the published object by construction,
+    // rather than by a literal this file could be told to look for.
+    let status_at = health
+        .find("pub fn status_json(")
+        .expect("health.rs no longer publishes an object");
+    let status_body = &health[status_at..];
+    let status_end = status_body.find("\n    }").expect("the fn is closed");
+    let status_body = &status_body[..status_end];
+    assert!(
+        status_body.contains("for class in FailureClass::ALL") && status_body.contains("counter"),
+        "status_json no longer derives its keys from FailureClass::ALL and counter(), so the \
+         set of classes and the set of keys in the file can drift: {status_body}"
+    );
+
+    // A success may not be named at a call site: it travels back from the code
+    // that made the request. Three sites in watch.rs used to credit a class
+    // for a call that had issued nothing — a plan with no Secret, a publish
+    // pass over no Secret — and `ever_ok` is permanent, so each of them
+    // disarmed the terminal rule for that class for the life of the process.
+    assert!(
+        !routed.contains("note_success(FailureClass::"),
+        "a call site names the class it succeeded in. A success is a `Requested` returned by \
+         the function that issued the request; a class named at the call site is a success \
+         claimed by code that cannot know whether a request was made"
+    );
+    let invented: Vec<&str> = watch
+        .match_indices("Requested::of(")
+        .map(|(at, _)| {
+            let rest = &watch[at..];
+            &rest[..rest.find(')').map(|i| i + 1).unwrap_or(rest.len())]
+        })
+        .filter(|call| !call.contains("FailureClass::Watch"))
+        .collect();
+    assert!(
+        invented.is_empty(),
+        "watch.rs builds a receipt for a class whose request it did not make: {invented:?}. \
+         `Watch` is the one class whose request is the watch itself, so an event delivered is \
+         its answer; every other receipt must come back from apply.rs, which is where the \
+         request is issued"
+    );
 
     // Each loop still reports, and now also counts. Three loops, two kinds of
     // failure each: the event's own and the watch's.
