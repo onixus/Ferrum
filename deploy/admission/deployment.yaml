@@ -19,7 +19,13 @@ spec:
         app.kubernetes.io/part-of: ferrum
     spec:
       serviceAccountName: ferrum-admission
-      automountServiceAccountToken: false
+      # --apiserver below opens the namespace/ServiceAccount label watch, and
+      # the projected token is the only credential it has: with automount off
+      # there is no token file, every connect fails behind a backoff, the
+      # cache never lists and every policy carrying a selector denies each Pod
+      # it selects. This is also what makes the ClusterRole in rbac.yaml
+      # reachable at all.
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532

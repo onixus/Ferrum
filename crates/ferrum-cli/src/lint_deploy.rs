@@ -42,6 +42,7 @@ const PRIVATE_KEY_IN_TREE: &str = "FD023";
 const POLICY_NAME_UNJOINED: &str = "FD024";
 const DUPLICATE_JOINED_FLAG: &str = "FD025";
 const BPF_ELF_WITHOUT_TRACEFS: &str = "FD026";
+const LABEL_SOURCE_UNJOINED: &str = "FD027";
 
 /// Bundle Secrets the controller writes: `ferrum-bundle-cluster-<policy>` for a
 /// cluster-scoped policy, `ferrum-bundle-ns-<namespace>-<policy>` for a
@@ -93,6 +94,22 @@ const TRACEFS_ROOTS: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/trac
 /// byte for byte the state the `emptyDir` fixture exists to catch.
 const HOST_PATH_DIRECTORY: &str = "Directory";
 
+/// The two flag spellings that mean "this container reads labels from the
+/// apiserver", and the only two watches in this product.
+///
+/// `--apiserver` opens the cluster-wide namespace/ServiceAccount label watch
+/// (`ApiserverConfig::cluster_wide`). `--node` scopes the pod watch
+/// (`ApiserverConfig::from_service_account`), whose pod records carry the
+/// namespace labels the runtime plane resolves a selector against — and which
+/// refuses an empty node name outright, so a `--node` with no value names no
+/// watch. Both authenticate with the projected ServiceAccount token and
+/// nothing else.
+const APISERVER_FLAG: &str = "--apiserver";
+const NODE_FLAG: &str = "--node";
+
+/// Policy kinds whose `spec.selector` is what a label watch has to answer.
+const POLICY_KINDS: [&str; 2] = ["ClusterSecurityPolicy", "SecurityPolicy"];
+
 const OBSERVE_FORBIDDEN_VERBS: [&str; 3] = ["delete", "deletecollection", "*"];
 const OBSERVE_FORBIDDEN_RESOURCES: [&str; 5] =
     ["secrets", "pods/exec", "pods/attach", "pods/eviction", "*"];
@@ -136,6 +153,7 @@ fn collect_findings(dir: &Path) -> Result<(Vec<Finding>, usize)> {
     check_bindings(&docs, &roles, &mut findings);
     check_wildcard_rules(&docs, &mut findings);
     check_pod_templates(&docs, &mut findings);
+    check_label_source(&docs, dir, &mut findings);
     check_webhooks(&docs, &mut findings);
     check_webhook_tls(&docs, &mut findings);
     check_webhook_pki(&docs, &mut findings);
@@ -592,6 +610,257 @@ fn mounted_host_path(
                 Some((path, kind))
             })
     })
+}
+
+/// The label source the process will actually have, against the selectors the
+/// policy it names will actually carry.
+///
+/// A namespace or ServiceAccount selector is answered from labels no manifest
+/// holds: they are read from the apiserver, over a watch that authenticates
+/// with the projected ServiceAccount token and nothing else. Two lines of one
+/// manifest decide whether that watch can ever list, and they are written far
+/// apart — the flag is in the container's argv, the token is a pod-spec field
+/// and a ServiceAccount field — so a tree can contradict itself here and look
+/// complete from either end.
+///
+/// Both halves are that same join, and neither is repairable at runtime:
+///
+/// - A container that names a watch (`--apiserver`, or `--node` with a node
+///   name) while automount is off. `ApiserverConfig::in_cluster` reads only
+///   `KUBERNETES_SERVICE_HOST`, which is always set, so construction succeeds
+///   and the watcher spawns; `token()` then fails on every connect, forever,
+///   behind a backoff. For admission that leaves `WatchedLabels::is_warm()`
+///   false permanently and `review` denies every Pod a selector-bearing policy
+///   selects — deny-everything, not fail-open, which is why it survives an
+///   audit that looks for the other direction. For the agent the same missing
+///   token leaves `spawn_cgroup_refresh` with no pod metadata, the cgroup
+///   index empty and no event ever flagged as a container. The RBAC granted to
+///   the account is never exercised either way.
+///
+/// - The mirror: a container naming a `--policy-name` whose policy in this
+///   tree carries a `namespaceSelector` or a `serviceAccountSelector`, with no
+///   watch named at all. The token may well be projected; nothing reads it,
+///   the labels are never fetched, and the selector can never be answered.
+///   An unresolved predicate is not a non-match, so that policy denies
+///   (admission) or misses (runtime) for as long as the install stands.
+///
+/// A finding, never a warning, for the reason FD005 and FD022 were each added:
+/// a lint that passes on a join it cannot verify is what put this defect in
+/// the shipped tree. Deliberately not scoped to one workload — the coupling is
+/// identical in the DaemonSet and the Deployment, and a rule that knows which
+/// is which is a rule that is right once.
+///
+/// Read through `container_flag`, not by looking for the flag string in the
+/// args array: both binaries key argv into a map, so a repeated flag keeps the
+/// last occurrence. A lint reading any other one proves its join against a
+/// string the process never sees, which is the FD024/FD018 defect exactly.
+fn check_label_source(docs: &[Doc], dir: &Path, findings: &mut Vec<Finding>) {
+    let policies = selector_bearing_policies(dir);
+    if policies.is_none() {
+        eprintln!(
+            "note: policies/ not found above {}; the selector half of {LABEL_SOURCE_UNJOINED} \
+             is skipped",
+            dir.display()
+        );
+    }
+    for doc in docs {
+        let Some(spec) = pod_spec(doc) else {
+            continue;
+        };
+        let owner = format!("{}/{}", kind(doc), name(doc));
+        for key in ["initContainers", "containers"] {
+            for container in seq(spec, key) {
+                let cname = container
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unnamed>");
+                let argv = argv_of(container);
+                let mut finding = |msg: String| {
+                    findings.push(Finding {
+                        code: LABEL_SOURCE_UNJOINED,
+                        file: doc.file.clone(),
+                        msg,
+                    })
+                };
+                match label_source(&argv) {
+                    Some(flag) => {
+                        if let Err(why) = token_projected(doc, spec, docs) {
+                            finding(format!(
+                                "{owner} container '{cname}' passes {flag}, which opens an \
+                                 apiserver watch, but {why}. The projected token is the only \
+                                 credential that watch has, so every connect fails behind a \
+                                 backoff and the cache never lists: a selector is never \
+                                 answered, and nothing at runtime repairs it"
+                            ));
+                        }
+                    }
+                    None => {
+                        let Some(policies) = policies.as_ref() else {
+                            continue;
+                        };
+                        let Some(policy) = container_flag(&argv, "--policy-name")
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty())
+                        else {
+                            continue;
+                        };
+                        if policies.get(&policy) == Some(&true) {
+                            finding(format!(
+                                "{owner} container '{cname}' names --policy-name '{policy}', \
+                                 whose policy in this tree carries a namespaceSelector or a \
+                                 serviceAccountSelector, and names no apiserver label source \
+                                 ({APISERVER_FLAG}, or {NODE_FLAG} with a node name). Those \
+                                 labels are read from the apiserver and from nowhere else, so \
+                                 the selector can never be answered — and an unresolved \
+                                 predicate is not a non-match"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The apiserver watch this container's argv names, if any. Empty `--node`
+/// names none: `from_service_account` refuses an empty node name, and the
+/// fallback behind it indexes a node that does not exist.
+fn label_source(argv: &[String]) -> Option<&'static str> {
+    if container_flag(argv, APISERVER_FLAG).is_some() {
+        return Some(APISERVER_FLAG);
+    }
+    container_flag(argv, NODE_FLAG)
+        .filter(|v| !v.trim().is_empty())
+        .map(|_| NODE_FLAG)
+}
+
+/// Whether a ServiceAccount token is projected into this pod, or why it is
+/// not.
+///
+/// Three-state, and the precedence is Kubernetes': the pod field wins when it
+/// is set, the ServiceAccount's value applies when it is not, and unset on
+/// both is a mounted token. A ServiceAccount this tree does not define answers
+/// neither way, and an unresolved predicate is not a non-match — the same
+/// stance FD016 takes on a roleRef it cannot resolve.
+fn token_projected(doc: &Doc, spec: &Value, docs: &[Doc]) -> Result<(), String> {
+    match spec
+        .get("automountServiceAccountToken")
+        .and_then(Value::as_bool)
+    {
+        Some(false) => {
+            return Err(
+                "the pod spec sets automountServiceAccountToken: false, so no token \
+                        file exists in the container"
+                    .to_string(),
+            )
+        }
+        // A pod-level `true` overrides whatever the account says.
+        Some(true) => return Ok(()),
+        None => {}
+    }
+    let sa = spec
+        .get("serviceAccountName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if sa.is_empty() {
+        // Running as the namespace default is FD014's finding, and the default
+        // account does project a token.
+        return Ok(());
+    }
+    let namespace = doc_namespace(doc);
+    let account = docs.iter().find(|d| {
+        kind(d) == "ServiceAccount"
+            && name(d) == sa
+            && match (namespace, doc_namespace(d)) {
+                (Some(want), Some(have)) => want == have,
+                _ => true,
+            }
+    });
+    match account {
+        None => Err(format!(
+            "ServiceAccount '{sa}' is not defined in this tree and the pod spec does not set \
+             automountServiceAccountToken, so nothing here shows a token is projected"
+        )),
+        Some(account) => match account
+            .value
+            .get("automountServiceAccountToken")
+            .and_then(Value::as_bool)
+        {
+            Some(false) => Err(format!(
+                "ServiceAccount '{sa}' sets automountServiceAccountToken: false and the pod \
+                 spec does not override it"
+            )),
+            _ => Ok(()),
+        },
+    }
+}
+
+/// Every policy in this tree, by name, and whether its selector needs labels
+/// only an apiserver watch can supply.
+///
+/// `None` when there is no `policies/` directory above the linted one: the
+/// claim this makes is about the policies the tree carries, and a tree that
+/// carries none is not a tree that contradicts itself. The caller says so on
+/// stderr rather than passing quietly, the same way the CRD catalog check
+/// does.
+fn selector_bearing_policies(dir: &Path) -> Option<BTreeMap<String, bool>> {
+    let policy_dir = find_policies_dir(dir)?;
+    let mut files = Vec::new();
+    collect_files(&policy_dir, &mut files).ok()?;
+    files.sort();
+    let mut out = BTreeMap::new();
+    for path in files {
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for doc in serde_yaml::Deserializer::from_str(&raw) {
+            let Ok(value) = Value::deserialize(doc) else {
+                continue;
+            };
+            let kind = value.get("kind").and_then(Value::as_str).unwrap_or("");
+            if !POLICY_KINDS.contains(&kind) {
+                continue;
+            }
+            let Some(policy) = value
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let selector = value.get("spec").and_then(|s| s.get("selector"));
+            let watched = ["namespaceSelector", "serviceAccountSelector"]
+                .iter()
+                .any(|key| {
+                    selector
+                        .and_then(|s| s.get(key))
+                        .is_some_and(selector_is_nonempty)
+                });
+            out.insert(policy.to_string(), watched);
+        }
+    }
+    Some(out)
+}
+
+/// A selector with neither a matchLabels entry nor a matchExpression selects
+/// everything and needs no labels to do it.
+fn selector_is_nonempty(selector: &Value) -> bool {
+    !seq(selector, "matchExpressions").is_empty()
+        || selector
+            .get("matchLabels")
+            .and_then(Value::as_mapping)
+            .is_some_and(|m| !m.is_empty())
+}
+
+fn find_policies_dir(start: &Path) -> Option<PathBuf> {
+    let mut cur = fs::canonicalize(start).ok()?;
+    loop {
+        let candidate = cur.join("policies");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        cur = cur.parent()?.to_path_buf();
+    }
 }
 
 /// `--policy-name` is an unjoined string.
@@ -1509,15 +1778,7 @@ mod tests {
     /// else. Written to a temp dir rather than a committed fixture because
     /// the fixture tree belongs to another crate.
     fn agent_tree_with(tag: &str, edit: impl Fn(String) -> String) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ferrum-lint-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("tmpdir");
+        let dir = tmp_tree(tag);
         let raw = fs::read_to_string(repo_path("deploy/agent/daemonset.yaml"))
             .expect("deploy/agent/daemonset.yaml");
         fs::write(dir.join("daemonset.yaml"), edit(raw)).expect("write manifest");
@@ -1763,6 +2024,222 @@ mod tests {
                 .map(|c| c.to_string())
                 .collect::<BTreeSet<_>>()
         );
+    }
+
+    /// The shipped admission install, both files that decide whether the watch
+    /// it names has a token, with one line under test edited. Written to a temp
+    /// dir for the same reason `agent_tree_with` is.
+    fn admission_tree_with(tag: &str, edit: impl Fn(String) -> String) -> PathBuf {
+        let dir = tmp_tree(tag);
+        for file in ["deployment.yaml", "serviceaccount.yaml"] {
+            let raw = fs::read_to_string(repo_path(&format!("deploy/admission/{file}")))
+                .unwrap_or_else(|e| panic!("deploy/admission/{file}: {e}"));
+            fs::write(dir.join(file), edit(raw)).expect("write manifest");
+        }
+        dir
+    }
+
+    fn tmp_tree(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrum-lint-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("tmpdir");
+        dir
+    }
+
+    /// A manifest tree with a `policies/` directory beside it, which is what
+    /// the selector half of FD027 resolves `--policy-name` against. Returns
+    /// the directory to lint.
+    fn tree_beside_policies(
+        tag: &str,
+        policy: &str,
+        manifest_name: &str,
+        manifest: &str,
+    ) -> PathBuf {
+        let root = tmp_tree(tag);
+        let policies = root.join("policies");
+        let deploy = root.join("deploy");
+        fs::create_dir_all(&policies).expect("policies dir");
+        fs::create_dir_all(&deploy).expect("deploy dir");
+        fs::write(policies.join("policy.yaml"), policy).expect("write policy");
+        fs::write(deploy.join(manifest_name), manifest).expect("write manifest");
+        deploy
+    }
+
+    fn code_set(codes: &[&str]) -> BTreeSet<String> {
+        codes.iter().map(|c| c.to_string()).collect()
+    }
+
+    fn shipped(rel: &str) -> String {
+        fs::read_to_string(repo_path(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+    }
+
+    /// The committed negative tree for FD027, checked for the exact code: a
+    /// positive control, because an assertion of absence proves nothing on its
+    /// own and a fixture that fails on an unrelated finding is that absence
+    /// again.
+    ///
+    /// The ServiceAccount half. The pod spec says nothing about automount, so
+    /// the account's `false` applies, and the container passes `--apiserver`
+    /// anyway.
+    #[test]
+    fn the_token_fixture_fails_on_that_rule_and_no_other() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-token");
+        assert_eq!(codes, code_set([LABEL_SOURCE_UNJOINED].as_slice()));
+    }
+
+    /// The pod-spec half, against the shipped admission Deployment with that
+    /// one line flipped — which is byte for byte the tree this repository
+    /// shipped until the manifest beside this rule was fixed. `cluster_wide()`
+    /// succeeds regardless (it reads `KUBERNETES_SERVICE_HOST` and nothing
+    /// else), the watcher spawns, and `token()` fails on every connect behind
+    /// a backoff: `is_warm()` never becomes true and every Pod a
+    /// selector-bearing policy selects is denied, forever.
+    #[test]
+    fn an_apiserver_watch_without_a_projected_token_is_a_finding() {
+        let dir = admission_tree_with("no-token", |raw| {
+            raw.replace(
+                "automountServiceAccountToken: true",
+                "automountServiceAccountToken: false",
+            )
+        });
+        assert_eq!(codes_in(&dir), code_set([LABEL_SOURCE_UNJOINED].as_slice()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Kubernetes' precedence, not this lint's: a pod-level `true` overrides
+    /// the account, so the same `false` that is a finding in the fixture is
+    /// not one here. Reading the two fields as an `||` would report a defect
+    /// the cluster does not have.
+    #[test]
+    fn a_pod_level_automount_overrides_the_account() {
+        let dir = admission_tree_with("pod-overrides-account", |raw| {
+            if raw.contains("kind: ServiceAccount") {
+                raw.replace(
+                    "automountServiceAccountToken: true",
+                    "automountServiceAccountToken: false",
+                )
+            } else {
+                raw
+            }
+        });
+        assert!(codes_in(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The mirror. The token is projected and nothing reads it: the container
+    /// names a policy carrying a `namespaceSelector` and no watch at all, so
+    /// the labels that selector is resolved against are never fetched. Either
+    /// half alone is a manifest whose two lines contradict.
+    #[test]
+    fn a_selector_bearing_policy_with_no_label_source_is_a_finding() {
+        let dir = tree_beside_policies(
+            "no-label-source",
+            &shipped("policies/examples/prod-restricted.yaml"),
+            "deployment.yaml",
+            &shipped("deploy/admission/deployment.yaml").replace("            - --apiserver\n", ""),
+        );
+        assert_eq!(codes_in(&dir), code_set([LABEL_SOURCE_UNJOINED].as_slice()));
+        let _ = fs::remove_dir_all(dir.parent().expect("root"));
+    }
+
+    /// A policy whose selector needs no labels puts nobody in scope: the same
+    /// manifest, against a policy with the `namespaceSelector` taken out, is
+    /// clean. Without this the mirror would be a rule that fires on every
+    /// `--policy-name`.
+    #[test]
+    fn a_policy_without_a_selector_needs_no_label_source() {
+        let policy = shipped("policies/examples/prod-restricted.yaml").replace(
+            "    namespaceSelector:\n      matchExpressions:\n        - key: ferrum.io/zone\n          operator: In\n          values: [pci, secrets]\n",
+            "",
+        );
+        assert!(!policy.contains("namespaceSelector"), "policy edit missed");
+        let dir = tree_beside_policies(
+            "selectorless-policy",
+            &policy,
+            "deployment.yaml",
+            &shipped("deploy/admission/deployment.yaml").replace("            - --apiserver\n", ""),
+        );
+        assert!(codes_in(&dir).is_empty());
+        let _ = fs::remove_dir_all(dir.parent().expect("root"));
+    }
+
+    /// The bypass this rule must not have. `--node` is what scopes the agent's
+    /// pod watch, and `parse_flags` keeps the last one: an argv naming a node
+    /// and then naming none runs with none, so the watch this manifest appears
+    /// to open does not exist. A lint that looked for the string `--node` in
+    /// the args array — rather than reading the value through `container_flag`
+    /// — would see it present and print ok, which is the FD024/FD018 defect
+    /// exactly.
+    #[test]
+    fn the_last_node_is_the_one_watched() {
+        let dir = tree_beside_policies(
+            "dup-node",
+            &shipped("policies/examples/prod-restricted.yaml"),
+            "daemonset.yaml",
+            &shipped("deploy/agent/daemonset.yaml").replace(
+                "            - --node\n            - $(NODE_NAME)\n",
+                "            - --node\n            - $(NODE_NAME)\n            - --node\n",
+            ),
+        );
+        assert_eq!(
+            codes_in(&dir),
+            code_set([LABEL_SOURCE_UNJOINED, DUPLICATE_JOINED_FLAG].as_slice())
+        );
+        let _ = fs::remove_dir_all(dir.parent().expect("root"));
+    }
+
+    /// The agent reaches the apiserver by `--node`, not `--apiserver`, and it
+    /// needs the token for the same reason: without it `spawn_cgroup_refresh`
+    /// gets no pod metadata, the cgroup index stays empty and no event is ever
+    /// flagged as a container. A rule that knew only about the webhook would
+    /// be right once.
+    #[test]
+    fn the_agents_pod_watch_needs_the_same_token() {
+        let dir = agent_tree_with("agent-no-token", |raw| {
+            raw.replace(
+                "automountServiceAccountToken: true",
+                "automountServiceAccountToken: false",
+            )
+        });
+        assert_eq!(codes_in(&dir), code_set([LABEL_SOURCE_UNJOINED].as_slice()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--node` with no value names no node: `from_service_account` refuses an
+    /// empty one, and the HOSTNAME fallback behind it scopes the watch to a
+    /// node that does not exist. So it is not a label source, and it does not
+    /// pull the container into the token half either.
+    #[test]
+    fn an_empty_node_flag_is_not_a_label_source() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(label_source(&argv(&["--node", "node-1"])), Some(NODE_FLAG));
+        assert_eq!(label_source(&argv(&["--node"])), None);
+        assert_eq!(label_source(&argv(&["--node", "--bundle", "/b"])), None);
+        // An `--apiserver` with no value is the documented in-cluster default,
+        // not an absent flag: `label_source` in ferrum-admission only
+        // overrides host/port when the value is non-empty.
+        assert_eq!(label_source(&argv(&["--apiserver"])), Some(APISERVER_FLAG));
+        assert_eq!(label_source(&argv(&["--bundle", "/b"])), None);
+    }
+
+    /// Only a selector that actually needs labels counts.
+    #[test]
+    fn an_empty_selector_needs_no_labels() {
+        let selector = |yaml: &str| serde_yaml::from_str::<Value>(yaml).unwrap();
+        assert!(selector_is_nonempty(&selector(
+            "matchExpressions:\n  - key: ferrum.io/zone\n    operator: Exists\n"
+        )));
+        assert!(selector_is_nonempty(&selector(
+            "matchLabels:\n  tier: prod\n"
+        )));
+        assert!(!selector_is_nonempty(&selector("matchLabels: {}\n")));
+        assert!(!selector_is_nonempty(&selector("matchExpressions: []\n")));
     }
 
     /// The lint's argv reader must agree with `parse_flags` in
