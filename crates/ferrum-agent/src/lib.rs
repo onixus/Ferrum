@@ -46,6 +46,24 @@ pub const CONTAINER_MAP_SYNC_BUDGET: Duration = Duration::from_secs(30);
 /// count it, and only call it a datapath fault once a sync that had the cgroup
 /// available has since been accepted and it is still unflagged.
 pub const CONTAINER_FLAG_GRACE: Duration = Duration::from_secs(6);
+/// How long "a scan has been through and this cgroup is still not a pod" is
+/// good for before it must be re-earned.
+///
+/// The proof is about a cgroup *id*, and the kernel recycles ids. Once an id
+/// that settled as a host process is reused for a container, the entry keeps
+/// answering `container_unproven` false from a timestamp hours old, and the
+/// record leaves under the default action with no `container_unknown` and no
+/// `REFUSE_NOT_CONTAINER` — silence, which is worse than a refused kill.
+/// Without a TTL nothing ages a proven entry out below
+/// `CONTAINER_FLAG_TRACKED_MAX`, so on a node with a handful of host cgroups
+/// the entry is immortal.
+///
+/// Re-earning costs one refresh round: the entry reopens at `now` and the
+/// next accepted sync settles it again. Long enough that kubelet, containerd
+/// and sshd are unproven for a couple of seconds every five minutes rather
+/// than every couple of seconds; short enough that a recycled id cannot lie
+/// for a shift.
+pub const UNPROVEN_PROOF_TTL: Duration = Duration::from_secs(300);
 /// Degradation signals raised by observation (unresolved labels, a datapath
 /// that keeps disagreeing) decay when the condition stops recurring. A latch
 /// that only a restart clears stops carrying information.
@@ -131,7 +149,14 @@ pub const DEG_LKG_PARTIAL: &str =
 pub const DEG_CONTAINER_FLAG: &str =
     "container flag disagreement outlived its publish window: the datapath is not flagging \
      containers the index knows";
-/// Every waiver on this node names a policy this node is not running.
+/// `status.json` could not be written. The node still enforces and still
+/// stamps every envelope, but the file a collector reads is gone: this reason
+/// is the only thing left that says the surface itself is down, and it rides
+/// the envelopes and the transition line rather than the file it is about.
+pub const DEG_STATUS_UNWRITABLE: &str =
+    "status file unwritable: this node's state cannot be published, so status.json is absent \
+     rather than stale";
+/// Waivers on this node that can never demote anything here.
 pub const WAIVERS_UNJOINED: &str =
     "waivers do not join this agent's policy: they are signed, verified, in scope and apply to \
      nothing here";
@@ -169,9 +194,16 @@ struct UnprovenWindow {
 /// Not the same policy as `container_flag_window` (`note_container_flag_
 /// disagreement`), where an entry past grace has already been converted into
 /// a fault and removed, so the old entries there are the disposable ones.
-fn evict_unproven(windows: &mut HashMap<u64, UnprovenWindow>, synced_at: Option<Instant>) {
+fn evict_unproven(
+    windows: &mut HashMap<u64, UnprovenWindow>,
+    synced_at: Option<Instant>,
+    now: Instant,
+) {
     let before = windows.len();
-    let proven = |w: &UnprovenWindow| synced_at.is_some_and(|at| at > w.opened);
+    let proven = |w: &UnprovenWindow| {
+        synced_at.is_some_and(|at| at > w.opened)
+            && now.saturating_duration_since(w.opened) < UNPROVEN_PROOF_TTL
+    };
     windows.retain(|_, w| proven(w));
     if windows.len() < before {
         return;
@@ -197,7 +229,8 @@ fn within(slot: &Mutex<Option<Instant>>, now: Instant, window: Duration) -> bool
 
 pub use clock::{MonotonicFloor, MAX_EXCEPTION_DAYS};
 pub use status::{
-    status_json, write_status, StatusOutput, StatusPublisher, STATUS_NAME, STATUS_TMP_NAME,
+    status_json, write_status, StatusOutput, StatusPublisher, StatusTick, STATUS_NAME,
+    STATUS_TMP_NAME,
 };
 
 /// The degraded state at one instant: whether, why, and — once per change —
@@ -358,6 +391,14 @@ pub struct Agent {
     /// `containerOnly` rules that would have decided a record and were skipped
     /// on a caller the agent could not prove was not a container.
     container_unproven: AtomicU64,
+    /// The last attempt to publish `status.json` failed, so this node's state
+    /// is not readable from the node. Not latched: it clears on the first
+    /// write that succeeds.
+    status_write_failed: AtomicBool,
+    /// How many publishes of `status.json` have failed. Readable in the next
+    /// file that does get written, which is the only place a reader can learn
+    /// that the surface has been down and is back.
+    status_write_failed_count: AtomicU64,
     /// Decisions taken against a selector that could not be resolved because
     /// the label caches had nothing for that namespace / SA / cluster.
     labels_unknown: AtomicU64,
@@ -394,7 +435,12 @@ pub struct Agent {
     /// Last degraded state handed to a caller that logs transitions. None
     /// until the first report, so the first tick always says which state the
     /// node started in.
-    degraded_reported: Mutex<Option<bool>>,
+    ///
+    /// The reasons, not just the bool: a node that goes from ring drops to a
+    /// terminal wrong-ELF fault never flips the bool, and used to change that
+    /// state in complete silence on the log surface — the one surface an
+    /// operator has when the export directory is gone.
+    degraded_reported: Mutex<Option<Vec<String>>>,
 }
 
 impl Agent {
@@ -446,6 +492,8 @@ impl Agent {
             container_flag_fault_at: Mutex::new(None),
             container_unproven_window: Mutex::new(HashMap::new()),
             container_unproven: AtomicU64::new(0),
+            status_write_failed: AtomicBool::new(false),
+            status_write_failed_count: AtomicU64::new(0),
             labels_unknown: AtomicU64::new(0),
             labels_unknown_at: Mutex::new(None),
             ring_drop_at: Mutex::new(None),
@@ -563,6 +611,15 @@ impl Agent {
         if self.container_flag_degraded_at(now) {
             out.push(DEG_CONTAINER_FLAG.to_string());
         }
+        // The reporting surface is itself down. Says nothing about
+        // enforcement, which carries on: it says that everything else here
+        // is being written nowhere, and the usual cause (ENOSPC on the
+        // export directory) is the same one that makes every event write
+        // fail. This reason cannot reach the file it is about — that is the
+        // point of it — so it travels on the envelopes and on stderr.
+        if self.status_write_failed() {
+            out.push(DEG_STATUS_UNWRITABLE.to_string());
+        }
         if let Some(reason) = self.respond_disabled_reason() {
             out.push(reason);
         }
@@ -600,8 +657,12 @@ impl Agent {
             .degraded_reported
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let changed = *last != Some(degraded);
-        *last = Some(degraded);
+        // On the reasons, not on the bool. Degraded is not one state: the
+        // node that adds a terminal fault to a recoverable one, or recovers
+        // from one of two, has changed what an operator must do about it,
+        // and a line only on the boolean edge never says so.
+        let changed = last.as_deref() != Some(reasons.as_slice());
+        *last = Some(reasons.clone());
         drop(last);
         let transition = changed.then(|| {
             serde_json::json!({
@@ -628,7 +689,41 @@ impl Agent {
             .count() as u64
     }
 
-    /// "I hold waivers and none of them names my policy."
+    /// Can this waiver demote anything at all on this node?
+    ///
+    /// The record-independent half of `exception_applies`, asked through
+    /// `exception_applies` itself rather than re-derived: the probe is the
+    /// most favourable record this waiver could ever meet — its own target
+    /// namespace, its own first named rule. If that record would not satisfy
+    /// it, no record can, and the waiver is dead weight on this node.
+    ///
+    /// A bare `policies.contains(policy_name)` is not this check. It counts
+    /// an expired waiver, a self-approved one and one with an empty rules
+    /// axis as joined, and every one of those demotes exactly nothing while
+    /// reading as a live exemption.
+    fn waiver_can_apply(&self, spec: &PolicyExceptionSpec, now: DateTime<Utc>) -> bool {
+        if self.policy_name.is_empty() {
+            return false;
+        }
+        let Some(rule) = spec.target.rules.first() else {
+            return false;
+        };
+        ferrum_policy::exception_applies(spec, &spec.target.namespace, &self.policy_name, rule, now)
+    }
+
+    /// Loaded exceptions that can demote nothing on this node whatever
+    /// arrives. A superset of `waivers_unjoined_total`, which only counts the
+    /// policy-name mismatch: this one also has the expired waiver and the
+    /// malformed one, both of which name this policy and waive nothing.
+    pub fn waivers_inert_total(&self) -> u64 {
+        let now = self.now();
+        self.exceptions
+            .iter()
+            .filter(|spec| !self.waiver_can_apply(spec, now))
+            .count() as u64
+    }
+
+    /// "I hold waivers that can waive nothing here."
     ///
     /// The FRMB carries no policy name, so nothing joins `--policy-name` to
     /// the bundle in the mounted Secret: rename the policy, or run a second
@@ -637,39 +732,80 @@ impl Agent {
     /// be proven here without a bundle format change, so it is *stated*
     /// instead — and `lint-deploy` FD024 checks the other end of it, against
     /// objects already deployed.
+    ///
+    /// Per waiver, not all-or-nothing. One live waiver used to suppress this
+    /// for every other waiver on the node, so 49 dead ones out of 50 moved a
+    /// counter nobody alerts on and said nothing: the 49 kills they were
+    /// meant to demote still fired, and the node read healthy throughout.
     pub fn waivers_unjoined(&self) -> Option<String> {
         let held = self.exceptions.len();
         if held == 0 {
             return None;
         }
-        if self
+        let now = self.now();
+        let inert: Vec<&PolicyExceptionSpec> = self
             .exceptions
             .iter()
-            .any(|spec| spec.target.policies.iter().any(|p| *p == self.policy_name))
-        {
+            .filter(|spec| !self.waiver_can_apply(spec, now))
+            .collect();
+        if inert.is_empty() {
             return None;
         }
-        let named: BTreeSet<&str> = self
-            .exceptions
-            .iter()
-            .flat_map(|spec| spec.target.policies.iter().map(String::as_str))
-            .collect();
-        let named = if named.is_empty() {
-            "none".to_string()
-        } else {
-            named.into_iter().collect::<Vec<_>>().join(", ")
+        let names = |specs: &[&PolicyExceptionSpec]| -> String {
+            let named: BTreeSet<&str> = specs
+                .iter()
+                .flat_map(|spec| spec.target.policies.iter().map(String::as_str))
+                .collect();
+            if named.is_empty() {
+                "none".to_string()
+            } else {
+                named.into_iter().collect::<Vec<_>>().join(", ")
+            }
         };
-        Some(if self.policy_name.is_empty() {
-            format!(
+        if self.policy_name.is_empty() {
+            return Some(format!(
                 "{WAIVERS_UNJOINED}: {held} loaded, and this agent was started without \
-                 --policy-name, so no waiver can ever apply (they name: {named})"
-            )
-        } else {
-            format!(
-                "{WAIVERS_UNJOINED}: {held} loaded, none names policy '{}' (they name: {named})",
-                self.policy_name
-            )
-        })
+                 --policy-name, so no waiver can ever apply (they name: {})",
+                names(&inert)
+            ));
+        }
+        // One category each, most specific first: a waiver naming another
+        // policy is reported as that even if it has also expired.
+        let mut unjoined: Vec<&PolicyExceptionSpec> = Vec::new();
+        let mut expired = 0usize;
+        let mut rest = 0usize;
+        for spec in &inert {
+            if !spec.target.policies.iter().any(|p| *p == self.policy_name) {
+                unjoined.push(spec);
+            } else if now >= spec.expires_at {
+                expired += 1;
+            } else {
+                rest += 1;
+            }
+        }
+        let mut parts = Vec::new();
+        if !unjoined.is_empty() {
+            parts.push(format!(
+                "{} name another policy (they name: {})",
+                unjoined.len(),
+                names(&unjoined)
+            ));
+        }
+        if expired > 0 {
+            parts.push(format!("{expired} expired"));
+        }
+        if rest > 0 {
+            parts.push(format!(
+                "{rest} cannot match any record (no rule named, or the four-eyes and TTL checks \
+                 refuse them)"
+            ));
+        }
+        Some(format!(
+            "{WAIVERS_UNJOINED}: {} of {held} loaded waivers can demote nothing on policy '{}': {}",
+            inert.len(),
+            self.policy_name,
+            parts.join("; ")
+        ))
     }
 
     /// The kernel container map is usable: last sync succeeded and it holds
@@ -817,13 +953,20 @@ impl Agent {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if windows.len() >= CONTAINER_FLAG_TRACKED_MAX && !windows.contains_key(&cgroup_id) {
-            evict_unproven(&mut windows, synced_at);
+            evict_unproven(&mut windows, synced_at, now);
         }
         let entry = windows.entry(cgroup_id).or_insert(UnprovenWindow {
             opened: now,
             seen: now,
         });
         entry.seen = now;
+        // The proof has a shelf life: cgroup ids are recycled, and an entry
+        // that settled hours ago is a statement about whatever held the id
+        // then. Reopening re-asks the question; the next accepted sync
+        // answers it again within one refresh round.
+        if now.saturating_duration_since(entry.opened) >= UNPROVEN_PROOF_TTL {
+            entry.opened = now;
+        }
         let opened = entry.opened;
         // A scan that resolved after the question was first asked had every
         // container running at that moment in it, this one included.
@@ -986,6 +1129,32 @@ impl Agent {
         self.export_dead.load(Ordering::Relaxed)
     }
 
+    /// Record the outcome of one `status.json` publish. Called by the poll
+    /// loop after the write, with every guard on the shared agent dropped,
+    /// so this must stay lock-free.
+    ///
+    /// A failed publish is Degraded on purpose. The previous file said
+    /// `"degraded": false` and `commit` removes it rather than leave that
+    /// standing, so without this the node's state would be readable nowhere:
+    /// the reason travels on the exported envelopes and the transition line
+    /// instead, and the count survives into the next file that is written.
+    pub fn note_status_write(&self, ok: bool) {
+        if !ok {
+            self.status_write_failed_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.status_write_failed.store(!ok, Ordering::Relaxed);
+    }
+
+    /// The last publish of `status.json` failed.
+    pub fn status_write_failed(&self) -> bool {
+        self.status_write_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn status_write_failed_total(&self) -> u64 {
+        self.status_write_failed_count.load(Ordering::Relaxed)
+    }
+
     /// Events the export path lost: dropped by a full queue, or accepted and
     /// never written. Both mean an enforcement that happened left no record.
     pub fn export_lost_total(&self) -> u64 {
@@ -1022,7 +1191,16 @@ impl Agent {
             .export_queue_dropped_total()
             .saturating_add(sink.export_write_failed_total())
             .saturating_add(sink.export_writer_lost_total());
-        let seen = self.export_lost_seen.swap(lost, Ordering::Relaxed);
+        // `fetch_max`, not `swap`: this has two callers — the event path and
+        // the poll tick — and under `poll_status` they hold only read guards,
+        // so they run concurrently. A `swap` lets the loser write back the
+        // value it read before the winner's update, and `export_lost_total`
+        // then DECREASES between two ticks: a consumer computing a rate over
+        // a monotonic counter sees a negative delta, and the next read of the
+        // real value re-marks `export_lost_at` for a loss that already
+        // decayed. The sink's counters only ever grow, so the agent's mirror
+        // of them must only ever grow too.
+        let seen = self.export_lost_seen.fetch_max(lost, Ordering::Relaxed);
         if lost > seen {
             mark_now(&self.export_lost_at, now);
         }
@@ -1916,13 +2094,22 @@ pub fn poll_bundle(
     let mut stamps = PollStamps::default();
     loop {
         std::thread::sleep(interval);
-        poll_once(agent, path, &mut stamps, out);
+        let tick = poll_once(agent, path, &mut stamps, out);
+        let ok = stamps.publisher.commit(&tick, out);
+        agent.note_status_write(ok);
     }
 }
 
 /// `poll_bundle` for a datapath that is pumping events concurrently: the write
 /// lock is taken per tick, not held across the sleep, so reload never blocks
 /// the decision path for longer than one reload.
+///
+/// The guard is also dropped before `status.json` is written. `RwLock` is
+/// write-preferring, so a pending writer here blocks the ring-drain and pump
+/// threads from taking a read guard: an `fsync` on a hostPath under IO
+/// pressure inside that window stalls the drain, `ferrum_events` fills, and
+/// the kernel drops records no rule ever sees. The reporting surface is not
+/// allowed to cost enforcement, so the write happens with nothing held.
 pub fn poll_bundle_shared(
     agent: &std::sync::RwLock<Agent>,
     path: &Path,
@@ -1932,8 +2119,15 @@ pub fn poll_bundle_shared(
     let mut stamps = PollStamps::default();
     loop {
         std::thread::sleep(interval);
-        let mut guard = agent.write().unwrap_or_else(|e| e.into_inner());
-        poll_once(&mut guard, path, &mut stamps, out);
+        let tick = {
+            let mut guard = agent.write().unwrap_or_else(|e| e.into_inner());
+            poll_once(&mut guard, path, &mut stamps, out)
+        };
+        let ok = stamps.publisher.commit(&tick, out);
+        agent
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_status_write(ok);
     }
 }
 
@@ -1948,7 +2142,14 @@ pub fn poll_status(
     let mut publisher = StatusPublisher::default();
     loop {
         std::thread::sleep(interval);
-        publisher.publish(&agent.read().unwrap_or_else(|e| e.into_inner()), out);
+        // Same split as `poll_bundle_shared`: nothing on the shared agent is
+        // held across the file write.
+        let tick = publisher.tick(&agent.read().unwrap_or_else(|e| e.into_inner()), out);
+        let ok = publisher.commit(&tick, out);
+        agent
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_status_write(ok);
     }
 }
 
@@ -1959,7 +2160,14 @@ struct PollStamps {
     publisher: StatusPublisher,
 }
 
-fn poll_once(agent: &mut Agent, path: &Path, stamps: &mut PollStamps, out: &StatusOutput<'_>) {
+/// Returns the tick to `commit` rather than committing it: the filesystem
+/// half runs at the caller, after every guard on the agent is dropped.
+fn poll_once(
+    agent: &mut Agent,
+    path: &Path,
+    stamps: &mut PollStamps,
+    out: &StatusOutput<'_>,
+) -> StatusTick {
     if let Some(next) = source::source_stamp(path) {
         if Some(next) != stamps.bundle {
             stamps.bundle = Some(next);
@@ -1984,7 +2192,7 @@ fn poll_once(agent: &mut Agent, path: &Path, stamps: &mut PollStamps, out: &Stat
         }
     }
     agent.clock().persist();
-    stamps.publisher.publish(agent, out);
+    stamps.publisher.tick(agent, out)
 }
 
 fn lkg_present(dir: &Path) -> bool {
@@ -3459,8 +3667,13 @@ mod tests {
         assert_eq!(sink.events()[0].action, "kill");
     }
 
+    /// The wall clock a record arrives at. Not a literal date: waiver checks
+    /// reject an `expiresAt` more than `MAX_EXCEPTION_DAYS` past the record,
+    /// and `waivers_unjoined` asks `Agent::now()`, so a fixed date here would
+    /// make these tests pass until it drifts out of that window and then fail
+    /// for a reason that has nothing to do with the code.
     fn fixed_now() -> chrono::DateTime<chrono::Utc> {
-        chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 8, 27, 12, 0, 0).unwrap()
+        chrono::Utc::now()
     }
 
     fn waiver(ns: &str, policy: &str, rules: &[&str]) -> ferrum_api::PolicyExceptionSpec {
@@ -5253,7 +5466,10 @@ mod tests {
     }
 
     /// A directory that cannot be written is said once, not once a tick, and
-    /// never stops the agent: the surface reports, it does not act.
+    /// never stops the agent: the surface reports, it does not act. But it is
+    /// not silent either — the failure is a degraded reason from the tick
+    /// after it, because the file that would have carried it is the file that
+    /// could not be written.
     #[test]
     fn an_unwritable_status_dir_does_not_stop_the_tick() {
         let agent = healthy_agent();
@@ -5263,7 +5479,294 @@ mod tests {
             status_dir: Some(Path::new("/proc/ferrum-does-not-exist")),
         };
         let mut publisher = StatusPublisher::default();
+        // The first tick's state was computed before its own write failed.
         assert!(!publisher.publish(&agent, &out).degraded);
+        let second = publisher.publish(&agent, &out);
+        assert!(second.degraded, "a state surface that is down is Degraded");
+        assert!(second.reasons.iter().any(|r| r == DEG_STATUS_UNWRITABLE));
+        // And the tick keeps running: a status file that stalls the poll loop
+        // would be worse than one that lies.
+        assert!(publisher.publish(&agent, &out).degraded);
+        assert_eq!(agent.status_write_failed_total(), 3);
+    }
+
+    /// B3. The previous tick's file is byte-identical and says
+    /// `"degraded": false`. The commonest reason a write into --export-dir
+    /// fails is the export directory filling up, which is the same condition
+    /// that fails every event write — so the moment this reader matters most
+    /// is the moment it would freeze on its last healthy answer. It is
+    /// removed instead: absence is unambiguous, a frozen `ts` is not.
+    #[test]
+    fn a_failed_status_write_removes_the_file_rather_than_leave_it_lying() {
+        let dir = temp_dir("status-stale");
+        let agent = healthy_agent();
+        let out = StatusOutput {
+            ctx: None,
+            sink: None,
+            status_dir: Some(&dir),
+        };
+        let mut publisher = StatusPublisher::default();
         assert!(!publisher.publish(&agent, &out).degraded);
+        let healthy = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+        assert!(healthy.contains("\"degraded\":false"));
+
+        // Whatever the cause on the node — ENOSPC, a read-only remount, a
+        // vanished mount — the tick cannot lay down its temp file.
+        fs::create_dir(dir.join(STATUS_TMP_NAME)).expect("block the temp name");
+        let blocked = publisher.publish(&agent, &out);
+        assert!(
+            !dir.join(STATUS_NAME).exists(),
+            "a file that cannot be refreshed must not stay behind claiming {blocked:?}",
+        );
+        assert!(agent.status_write_failed());
+
+        // Recovered: the file comes back, and it carries the count of the
+        // publishes that failed, which is how a reader learns the surface was
+        // down at all once it is up again.
+        fs::remove_dir(dir.join(STATUS_TMP_NAME)).expect("unblock");
+        let back = publisher.publish(&agent, &out);
+        assert!(back.reasons.iter().any(|r| r == DEG_STATUS_UNWRITABLE));
+        let raw = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json is back");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("whole JSON object");
+        assert_eq!(value["statusWriteFailed"], true);
+        assert_eq!(value["statusWriteFailedTotal"], 1);
+        assert!(!publisher.publish(&agent, &out).degraded);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// B2. The write is off the lock. `poll_bundle_shared` takes the agent's
+    /// write lock every reload tick, `RwLock` is write-preferring, and the
+    /// ring-drain and pump threads need a read guard to make progress: an
+    /// `fsync` on a hostPath under IO pressure inside that window stalls the
+    /// drain, `ferrum_events` fills, and the kernel drops records no rule ever
+    /// sees. The reporting surface may not cost enforcement.
+    ///
+    /// What this proves: `commit` completes while another thread holds the
+    /// write lock on the shared agent — so it takes no guard on it, and no
+    /// caller can hold one through it, since `commit` cannot reach an `Agent`
+    /// at all. What it does not prove: anything about how long an `fsync`
+    /// takes, which is the property that makes the discipline matter.
+    #[test]
+    fn the_status_write_holds_no_lock_on_the_shared_agent() {
+        let dir = temp_dir("status-lock");
+        let agent = std::sync::Arc::new(std::sync::RwLock::new(healthy_agent()));
+        let mut publisher = StatusPublisher::default();
+        let tick = {
+            let guard = agent.read().unwrap_or_else(|e| e.into_inner());
+            let out = StatusOutput {
+                ctx: None,
+                sink: None,
+                status_dir: Some(&dir),
+            };
+            publisher.tick(&guard, &out)
+        };
+
+        // Exactly what the poll loop used to hold across the write.
+        let held = agent.write().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_dir = dir.clone();
+        std::thread::spawn(move || {
+            let out = StatusOutput {
+                ctx: None,
+                sink: None,
+                status_dir: Some(&writer_dir),
+            };
+            let ok = StatusPublisher::default().commit(&tick, &out);
+            let _ = tx.send(ok);
+        });
+        let published = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the status write must not wait on the agent lock");
+        assert!(published);
+        drop(held);
+
+        let raw = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+        serde_json::from_str::<serde_json::Value>(&raw).expect("whole JSON object");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// F8. Without --export-dir there is no file, and before this the
+    /// counters had no reader at all in that configuration. The whole object
+    /// goes to stderr on each state change instead — bounded by the changes,
+    /// not by the tick rate.
+    #[test]
+    fn an_agent_with_no_export_dir_still_has_a_reader() {
+        let agent = healthy_agent();
+        let out = StatusOutput {
+            ctx: None,
+            sink: None,
+            status_dir: None,
+        };
+        let mut publisher = StatusPublisher::default();
+        let first = publisher.tick(&agent, &out);
+        assert!(first.state.transition.is_some());
+        let json = first
+            .json()
+            .expect("with no file, the state change carries the whole object");
+        assert_eq!(json["degraded"], false);
+        assert!(json["eventsDroppedTotal"].is_u64());
+        assert!(
+            publisher.commit(&first, &out),
+            "nothing was asked for, so nothing failed"
+        );
+        // A steady state is not re-logged once a second.
+        assert!(publisher.tick(&agent, &out).json().is_none());
+    }
+
+    /// F5. Degraded is not one state. A node that goes from ring drops to a
+    /// terminal wrong-ELF fault never flips the boolean, and used to change
+    /// what an operator must do about it without a single line on the log
+    /// surface — the only surface left when the export directory is gone.
+    #[test]
+    fn a_degraded_node_that_changes_why_says_so() {
+        let agent = healthy_agent();
+        let t0 = Instant::now();
+        assert!(agent.degraded_state_at(t0).transition.is_some());
+        agent.record_drop_at(1, t0);
+        let entered = agent.degraded_state_at(t0);
+        assert!(entered.degraded);
+        assert!(entered
+            .transition
+            .expect("entering")
+            .contains(DEG_RING_DROPS));
+        assert!(
+            agent.degraded_state_at(t0).transition.is_none(),
+            "the same reasons twice is not a transition"
+        );
+
+        agent.mark_terminal_fault(DATAPATH_ABI_MISMATCH);
+        let worse = agent.degraded_state_at(t0);
+        assert!(worse.degraded, "it was degraded before and still is");
+        let line = worse
+            .transition
+            .expect("a new reason on an already-degraded node is a transition");
+        assert!(line.contains(DATAPATH_ABI_MISMATCH), "{line}");
+        assert!(line.contains(DEG_RING_DROPS), "{line}");
+        assert!(agent.degraded_state_at(t0).transition.is_none());
+    }
+
+    /// F4. `note_export_state_at` has two callers — the event path and the
+    /// poll tick — and under `poll_status` both hold only read guards, so
+    /// they run concurrently. A `swap` let the loser write back the reading it
+    /// took before the winner's, and a monotonic counter an operator computes
+    /// a rate over went backwards.
+    #[test]
+    fn the_export_loss_mirror_never_moves_backwards() {
+        struct Counted(AtomicU64);
+        impl EventSink for Counted {
+            fn emit(&self, _event: &EnforcementEvent) {}
+            fn export_queue_dropped_total(&self) -> u64 {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+
+        let agent = healthy_agent();
+        let t0 = Instant::now();
+        let sink = Counted(AtomicU64::new(12));
+        agent.note_export_state_at(&sink, t0);
+        assert_eq!(agent.export_lost_total(), 12);
+
+        // The other caller read 10 before that update and lands after it.
+        sink.0.store(10, Ordering::Relaxed);
+        let stale = t0 + DEGRADED_RECOVERY;
+        agent.note_export_state_at(&sink, stale);
+        assert_eq!(
+            agent.export_lost_total(),
+            12,
+            "the sink's counters only grow, so this mirror of them must too"
+        );
+
+        // And the next real reading is not a fresh loss just because the
+        // mirror had been knocked down below it.
+        sink.0.store(12, Ordering::Relaxed);
+        let after = stale + Duration::from_secs(1);
+        agent.note_export_state_at(&sink, after);
+        assert_eq!(agent.export_lost_total(), 12);
+        assert!(
+            !agent.export_lossy_recent_at(after),
+            "a loss that already decayed must not be re-marked by a stale reading"
+        );
+    }
+
+    /// F6. The proof is about a cgroup *id*, and the kernel recycles ids.
+    /// Nothing aged a proven entry out below `CONTAINER_FLAG_TRACKED_MAX`, so
+    /// on a node with a handful of host cgroups it was immortal: an id that
+    /// settled as a host process hours ago kept answering "not a container"
+    /// for whatever holds it now, and a record from a real container left
+    /// under the default action with no `container_unknown` and no
+    /// `REFUSE_NOT_CONTAINER` — silence, which is worse than a refused kill.
+    #[test]
+    fn a_proof_that_a_cgroup_is_not_a_container_has_a_shelf_life() {
+        const HOST: u64 = 42;
+        let agent = healthy_agent();
+        let base = Instant::now();
+        agent.set_container_map_synced_at(1, base);
+
+        assert!(agent.container_unproven(HOST, base));
+        agent.set_container_map_synced_at(1, base + Duration::from_secs(1));
+        assert!(!agent.container_unproven(HOST, base + Duration::from_secs(2)));
+
+        // Long after: the map is still being synced (so the node is healthy
+        // and this answer is the one that decides), but the proof is older
+        // than an id is guaranteed to be.
+        let later = base + UNPROVEN_PROOF_TTL + Duration::from_secs(1);
+        agent.set_container_map_synced_at(1, later - Duration::from_secs(1));
+        assert!(
+            agent.container_unproven(HOST, later),
+            "a proof this old is about whatever held the id then"
+        );
+
+        // One refresh round re-earns it, so the host processes are unproven
+        // for a couple of seconds every TTL, not every couple of seconds.
+        agent.set_container_map_synced_at(1, later + Duration::from_secs(1));
+        assert!(!agent.container_unproven(HOST, later + Duration::from_secs(2)));
+        assert!(agent.unproven_window_len() <= CONTAINER_FLAG_TRACKED_MAX);
+    }
+
+    /// F7. One live waiver used to suppress the reason for every other waiver
+    /// on the node: 49 dead ones out of 50 moved a counter nobody alerts on
+    /// and said nothing, while the 49 kills they were meant to demote fired.
+    /// And the check was a bare name comparison, so an expired waiver counted
+    /// as joined.
+    #[test]
+    fn one_live_waiver_does_not_excuse_the_dead_ones() {
+        let mut agent = Agent::new(cfg_respond_named("prod-restricted"));
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+
+        let mut expired = waiver("ns", "prod-restricted", &["no-runtime-sock"]);
+        expired.expires_at = fixed_now() - chrono::Days::new(1);
+        agent.set_exceptions(vec![
+            waiver("ns", "prod-restricted", &["no-runtime-sock"]),
+            waiver("ns", "prod-strict", &["no-runtime-sock"]),
+            expired,
+        ]);
+
+        assert_eq!(agent.waivers_inert_total(), 2);
+        assert_eq!(
+            agent.waivers_unjoined_total(),
+            1,
+            "the policy-name counter keeps the meaning it had"
+        );
+        let reason = agent
+            .waivers_unjoined()
+            .expect("two of these three waive nothing");
+        assert!(reason.contains(WAIVERS_UNJOINED), "{reason}");
+        assert!(reason.contains("2 of 3"), "{reason}");
+        assert!(reason.contains("prod-strict"), "{reason}");
+        assert!(reason.contains("expired"), "{reason}");
+        assert!(agent.is_degraded());
+
+        // The live one still demotes: this is a report, not a refusal.
+        let sink = MemorySink::new();
+        let d = agent.handle_event_at(
+            7,
+            &ev("openat", "app", "/var/run/docker.sock", true, false),
+            &sink,
+            fixed_now(),
+        );
+        assert_eq!(d.action, Action::Audit);
     }
 }
