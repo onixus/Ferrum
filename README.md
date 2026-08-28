@@ -69,12 +69,21 @@ cargo run -p ferrum-cli -- lint-deploy deploy
 ```
 
 Скрипт вердикта — `Jenkinsfile` в корне, джоба `ferrum` на локальном Jenkins
-`:8081`. Стадии: `SAST (semgrep)`, `Format`, `Clippy`, `Test`,
-`Agent binary`, `Admission binary`, `Controller binary`, `BPF ELF`,
-`BPF attach`, `BPF join`, `BPF join mutations`, `Agent image`,
-`Admission image`, `Controller image`, `Crate boundary`, `Validate policies`,
-`Security: policy invariants`, `Security: MVP acceptance`,
-`Security: supply chain`.
+`:8081`. Девятнадцать стадий, разложенных по четырём исполнителям:
+
+- на ноде — `SAST (semgrep)` и три стадии образов (`Agent image`,
+  `Admission image`, `Controller image`): им нужен docker CLI, а сокет,
+  проброшенный в контейнер, был бы тем самым hostPath, который правила рантайма
+  убивают;
+- в rust-контейнере родной архитектуры — группа `Build` (`Format`, `Clippy`,
+  `Test`, `BPF ELF`, `BPF attach`, `BPF join`, `BPF join mutations`) и группа
+  `Checks` (`Crate boundary`, `Validate policies`, `Security: policy invariants`,
+  `Security: MVP acceptance`, `Security: supply chain`);
+- в x86_64-контейнере под эмуляцией — группа `Link` (`Agent binary`,
+  `Admission binary`, `Controller binary`). Цель `x86_64-unknown-linux-musl` не
+  выводится из архитектуры ноды намеренно: стенд ядра — x86_64, и бинарь,
+  слинкованный под arm64, оставил бы стадию зелёной, а утверждение про
+  продуктовую комбинацию — про то, чего на стенде не будет.
 
 **Ни одна стадия этого `Jenkinsfile` в Jenkins ещё не проходила.** Билд №17
 (28.08, ревизия `4abce25`) — первый прогон этого скрипта, и он упал на самой

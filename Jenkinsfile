@@ -34,6 +34,23 @@ def RUST_DOCKER_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
                        ' -v ferrum-cargo-target:/build-target' +
                        ' -v ferrum-cargo-tools:/cargo-tools'
 
+// Стадии линковки идут в x86_64-контейнере под эмуляцией. Нода здесь arm64,
+// а цель — x86_64-unknown-linux-musl: `apt-get install musl-tools` ставит
+// arm64-сборку musl-gcc, и она не понимает `-m64`, которым `ring` компилирует
+// свой C. Это уронило билд #19 на 'Agent binary'.
+//
+// Цель не выводится из архитектуры ноды намеренно. Стенд ядра, на котором
+// измерено всё с меткой K в MVP-1-BOUNDARY.md, — Linux 6.18.44 x86_64;
+// подставить сюда arm64 значит оставить стадию зелёной, а строку «продуктовая
+// комбинация линкуется под musl» — про бинарь, которого на стенде не будет.
+//
+// Отдельный том под target обязателен: host-артефакты и build-скрипты двух
+// архитектур в одном каталоге — это чужие объектные файлы под теми же именами.
+// Реестр общий: там исходники, они от архитектуры не зависят.
+def RUST_DOCKER_ARGS_AMD64 = '--platform=linux/amd64' +
+                             ' -v ferrum-cargo-home:/usr/local/cargo/registry' +
+                             ' -v ferrum-cargo-target-amd64:/build-target'
+
 pipeline {
     agent none
 
@@ -41,8 +58,9 @@ pipeline {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
-        // BPF ELF stage adds nightly install + build-std + bpf-linker on a cold cache.
-        timeout(time: 45, unit: 'MINUTES')
+        // BPF ELF stage adds nightly install + build-std + bpf-linker on a cold cache,
+        // and 'Link' compiles the whole graph under QEMU the first time.
+        timeout(time: 90, unit: 'MINUTES')
     }
 
     environment {
@@ -158,140 +176,6 @@ pipeline {
                         # requires this line and the clippy line above for each one.
                         cargo test -p ferrum-admission --features apiserver
                     '''
-                }
-            }
-
-            // The production combination, linked. AGENTS.md requires musl of
-            // userspace; ring compiles C, so the target needs a musl cc as well as
-            // the Rust std. --locked because this is the artefact the image ships:
-            // a release build that may resolve a different dependency set than the
-            // one CI tested is not one.
-            stage('Agent binary') {
-                steps {
-                    sh '''
-                        set -eu
-                        target=x86_64-unknown-linux-musl
-                        rustup target add "$target"
-                        if ! command -v musl-gcc >/dev/null 2>&1; then
-                            apt-get update
-                            apt-get install -y --no-install-recommends musl-tools
-                        fi
-                        CC_x86_64_unknown_linux_musl=musl-gcc \
-                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-                            cargo build --release --locked --target "$target" \
-                                -p ferrum-agent --features attach,apiserver
-                        bin="$CARGO_TARGET_DIR/$target/release/ferrum-agent"
-                        test -x "$bin"
-                        # A dynamically linked "musl" build is a binary that will
-                        # not start on the node it was built for. `file` is not in
-                        # this image; the interpreter entry is, and its absence is
-                        # the whole claim.
-                        if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
-                            echo "agent binary is dynamically linked, musl target notwithstanding" >&2
-                            exit 1
-                        fi
-                        mkdir -p dist
-                        cp "$bin" dist/ferrum-agent
-                    '''
-                    archiveArtifacts artifacts: 'dist/ferrum-agent', fingerprint: true
-                }
-            }
-
-            // The webhook, in the one combination deploy/admission/deployment.yaml
-            // runs. `apiserver` is off by default, `cargo test --workspace` runs
-            // default features and clippy stops at .rmeta, so before this stage the
-            // production build of the crate that carries unsigned-deny,
-            // privileged-deny and cluster-admin-bind-deny existed in no artefact of
-            // any kind.
-            stage('Admission binary') {
-                steps {
-                    sh '''
-                        set -eu
-                        target=x86_64-unknown-linux-musl
-                        rustup target add "$target"
-                        if ! command -v musl-gcc >/dev/null 2>&1; then
-                            apt-get update
-                            apt-get install -y --no-install-recommends musl-tools
-                        fi
-                        CC_x86_64_unknown_linux_musl=musl-gcc \
-                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-                            cargo build --release --locked --target "$target" \
-                                -p ferrum-admission --features apiserver
-                        bin="$CARGO_TARGET_DIR/$target/release/ferrum-admission"
-                        test -x "$bin"
-                        # A dynamically linked "musl" build is a binary that will
-                        # not start on the scratch base its image uses. `file` is
-                        # not in this image; the interpreter entry is, and its
-                        # absence is the whole claim.
-                        if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
-                            echo "admission binary is dynamically linked, musl target notwithstanding" >&2
-                            exit 1
-                        fi
-                        # The feature is checked on the binary, not trusted to the
-                        # cargo line above surviving an edit. Two-sided, and the two
-                        # sides are each other's positive control: exactly one of
-                        # these strings is compiled in — the die() message only
-                        # without the feature, the apiserver error prefix only with
-                        # it. A default build fails the first; a grep that has
-                        # stopped matching anything fails the second.
-                        if grep -aq 'requires the `apiserver` feature at build time' "$bin"; then
-                            echo "the webhook linked without --features apiserver: the --apiserver" >&2
-                            echo "flag deploy/admission/deployment.yaml passes would die() on a node," >&2
-                            echo "which is a build defect arriving as a CrashLoopBackOff" >&2
-                            exit 1
-                        fi
-                        if ! grep -aq 'error: apiserver: ' "$bin"; then
-                            echo "the apiserver code path is absent from this binary, so the check" >&2
-                            echo "above cannot detect anything and proved nothing" >&2
-                            exit 1
-                        fi
-                        echo "ok: ferrum-admission linked for $target with the apiserver feature in it"
-                        mkdir -p dist
-                        cp "$bin" dist/ferrum-admission
-                    '''
-                    archiveArtifacts artifacts: 'dist/ferrum-admission', fingerprint: true
-                }
-            }
-
-            // The controller declares no features, so `cargo build -p
-            // ferrum-controller` is its production combination — but it had never
-            // been linked for the target it ships on either, and it is the one
-            // component that mounts the bundle signing key.
-            stage('Controller binary') {
-                steps {
-                    sh '''
-                        set -eu
-                        target=x86_64-unknown-linux-musl
-                        rustup target add "$target"
-                        if ! command -v musl-gcc >/dev/null 2>&1; then
-                            apt-get update
-                            apt-get install -y --no-install-recommends musl-tools
-                        fi
-                        CC_x86_64_unknown_linux_musl=musl-gcc \
-                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-                            cargo build --release --locked --target "$target" \
-                                -p ferrum-controller
-                        bin="$CARGO_TARGET_DIR/$target/release/ferrum-controller"
-                        test -x "$bin"
-                        if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
-                            echo "controller binary is dynamically linked, musl target notwithstanding" >&2
-                            exit 1
-                        fi
-                        # Identity, not spelling: this binary is the one handed the
-                        # signing seed, and the flags its Deployment passes are the
-                        # cheapest thing in it that no other component has.
-                        for flag in --seed-file --namespace; do
-                            if ! grep -aq -- "$flag" "$bin"; then
-                                echo "the controller binary does not know $flag, which" >&2
-                                echo "deploy/controller/deployment.yaml passes it" >&2
-                                exit 1
-                            fi
-                        done
-                        echo "ok: ferrum-controller linked for $target"
-                        mkdir -p dist
-                        cp "$bin" dist/ferrum-controller
-                    '''
-                    archiveArtifacts artifacts: 'dist/ferrum-controller', fingerprint: true
                 }
             }
 
@@ -628,6 +512,159 @@ pipeline {
                         FERRUM_BPF_ELF="$PWD/dist/ferrum-ebpf-progs.bpf.o" \
                             crates/ferrum-agent/tests/mutations/run.sh
                     '''
+                }
+            }
+            }
+        }
+
+
+        // Три стадии, которые линкуют, — в x86_64-контейнере под эмуляцией.
+        // Отдельная группа, а не общий с 'Build' контейнер: под QEMU идёт только
+        // то, что обязано быть x86_64, а fmt, clippy и 884 теста остаются на
+        // родной архитектуре ноды. Ниже 'BPF join mutations', а не выше, потому
+        // что ни одна стадия датапейса эти бинари не читает — они архивируются
+        // и на этом их путь заканчивается; образы линкуют свои заново из
+        // застэшенных исходников.
+        stage('Link') {
+            agent {
+                docker {
+                    image RUST_IMAGE
+                    args RUST_DOCKER_ARGS_AMD64
+                    reuseNode true
+                }
+            }
+            stages {
+            // The production combination, linked. AGENTS.md requires musl of
+            // userspace; ring compiles C, so the target needs a musl cc as well as
+            // the Rust std. --locked because this is the artefact the image ships:
+            // a release build that may resolve a different dependency set than the
+            // one CI tested is not one.
+            stage('Agent binary') {
+                steps {
+                    sh '''
+                        set -eu
+                        target=x86_64-unknown-linux-musl
+                        rustup target add "$target"
+                        if ! command -v musl-gcc >/dev/null 2>&1; then
+                            apt-get update
+                            apt-get install -y --no-install-recommends musl-tools
+                        fi
+                        CC_x86_64_unknown_linux_musl=musl-gcc \
+                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                            cargo build --release --locked --target "$target" \
+                                -p ferrum-agent --features attach,apiserver
+                        bin="$CARGO_TARGET_DIR/$target/release/ferrum-agent"
+                        test -x "$bin"
+                        # A dynamically linked "musl" build is a binary that will
+                        # not start on the node it was built for. `file` is not in
+                        # this image; the interpreter entry is, and its absence is
+                        # the whole claim.
+                        if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
+                            echo "agent binary is dynamically linked, musl target notwithstanding" >&2
+                            exit 1
+                        fi
+                        mkdir -p dist
+                        cp "$bin" dist/ferrum-agent
+                    '''
+                    archiveArtifacts artifacts: 'dist/ferrum-agent', fingerprint: true
+                }
+            }
+
+            // The webhook, in the one combination deploy/admission/deployment.yaml
+            // runs. `apiserver` is off by default, `cargo test --workspace` runs
+            // default features and clippy stops at .rmeta, so before this stage the
+            // production build of the crate that carries unsigned-deny,
+            // privileged-deny and cluster-admin-bind-deny existed in no artefact of
+            // any kind.
+            stage('Admission binary') {
+                steps {
+                    sh '''
+                        set -eu
+                        target=x86_64-unknown-linux-musl
+                        rustup target add "$target"
+                        if ! command -v musl-gcc >/dev/null 2>&1; then
+                            apt-get update
+                            apt-get install -y --no-install-recommends musl-tools
+                        fi
+                        CC_x86_64_unknown_linux_musl=musl-gcc \
+                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                            cargo build --release --locked --target "$target" \
+                                -p ferrum-admission --features apiserver
+                        bin="$CARGO_TARGET_DIR/$target/release/ferrum-admission"
+                        test -x "$bin"
+                        # A dynamically linked "musl" build is a binary that will
+                        # not start on the scratch base its image uses. `file` is
+                        # not in this image; the interpreter entry is, and its
+                        # absence is the whole claim.
+                        if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
+                            echo "admission binary is dynamically linked, musl target notwithstanding" >&2
+                            exit 1
+                        fi
+                        # The feature is checked on the binary, not trusted to the
+                        # cargo line above surviving an edit. Two-sided, and the two
+                        # sides are each other's positive control: exactly one of
+                        # these strings is compiled in — the die() message only
+                        # without the feature, the apiserver error prefix only with
+                        # it. A default build fails the first; a grep that has
+                        # stopped matching anything fails the second.
+                        if grep -aq 'requires the `apiserver` feature at build time' "$bin"; then
+                            echo "the webhook linked without --features apiserver: the --apiserver" >&2
+                            echo "flag deploy/admission/deployment.yaml passes would die() on a node," >&2
+                            echo "which is a build defect arriving as a CrashLoopBackOff" >&2
+                            exit 1
+                        fi
+                        if ! grep -aq 'error: apiserver: ' "$bin"; then
+                            echo "the apiserver code path is absent from this binary, so the check" >&2
+                            echo "above cannot detect anything and proved nothing" >&2
+                            exit 1
+                        fi
+                        echo "ok: ferrum-admission linked for $target with the apiserver feature in it"
+                        mkdir -p dist
+                        cp "$bin" dist/ferrum-admission
+                    '''
+                    archiveArtifacts artifacts: 'dist/ferrum-admission', fingerprint: true
+                }
+            }
+
+            // The controller declares no features, so `cargo build -p
+            // ferrum-controller` is its production combination — but it had never
+            // been linked for the target it ships on either, and it is the one
+            // component that mounts the bundle signing key.
+            stage('Controller binary') {
+                steps {
+                    sh '''
+                        set -eu
+                        target=x86_64-unknown-linux-musl
+                        rustup target add "$target"
+                        if ! command -v musl-gcc >/dev/null 2>&1; then
+                            apt-get update
+                            apt-get install -y --no-install-recommends musl-tools
+                        fi
+                        CC_x86_64_unknown_linux_musl=musl-gcc \
+                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                            cargo build --release --locked --target "$target" \
+                                -p ferrum-controller
+                        bin="$CARGO_TARGET_DIR/$target/release/ferrum-controller"
+                        test -x "$bin"
+                        if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
+                            echo "controller binary is dynamically linked, musl target notwithstanding" >&2
+                            exit 1
+                        fi
+                        # Identity, not spelling: this binary is the one handed the
+                        # signing seed, and the flags its Deployment passes are the
+                        # cheapest thing in it that no other component has.
+                        for flag in --seed-file --namespace; do
+                            if ! grep -aq -- "$flag" "$bin"; then
+                                echo "the controller binary does not know $flag, which" >&2
+                                echo "deploy/controller/deployment.yaml passes it" >&2
+                                exit 1
+                            fi
+                        done
+                        echo "ok: ferrum-controller linked for $target"
+                        mkdir -p dist
+                        cp "$bin" dist/ferrum-controller
+                    '''
+                    archiveArtifacts artifacts: 'dist/ferrum-controller', fingerprint: true
                 }
             }
             }
