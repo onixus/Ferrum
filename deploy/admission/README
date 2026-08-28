@@ -34,8 +34,20 @@ offline command.
                      -f deploy/admission/service.yaml \
                      -f deploy/admission/deployment.yaml
 
+   deployment.yaml mounts ferrum-bundle-cluster-prod-restricted, which the
+   controller writes once a ClusterSecurityPolicy of that name exists and
+   compiles. The mount is deliberately not optional: the binary refuses to
+   start without a verified bundle, so until that Secret exists the Pods sit in
+   ContainerCreating and `kubectl describe pod` names the Secret they are
+   waiting for. Create the policy, or apply this file after it. The
+   alternative — a webhook that starts without a bundle — is two Ready
+   replicas denying every Pod in the cluster with nothing on the Deployment to
+   say why (readiness here is a TCP connect, and the process answers it long
+   before it has a policy to answer with).
+
 3. Apply the webhook configuration last: with failurePolicy=Fail it starts
-   rejecting requests the moment it exists.
+   rejecting requests the moment it exists. Nothing before this point can deny
+   a Pod, which is why the wait in step 2 costs nothing.
 
        kubectl apply -f deploy/admission/validatingwebhookconfiguration.yaml
 

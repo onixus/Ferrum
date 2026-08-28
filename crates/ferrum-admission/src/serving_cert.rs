@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use crate::server::{stamp_one, FileStamp};
+use crate::server::{stat_one, FileStamp, MountStat};
 
 /// Days before notAfter at which the loaded certificate becomes loud. Defined
 /// in `ferrum-common` so the deploy lint and this binary cannot drift: the
@@ -108,6 +108,7 @@ pub struct TlsSource {
     reload_failures: AtomicU64,
     expiry_warnings: AtomicU64,
     rollbacks: AtomicU64,
+    mount_unreadable: AtomicU64,
 }
 
 impl TlsSource {
@@ -130,6 +131,7 @@ impl TlsSource {
             reload_failures: AtomicU64::new(0),
             expiry_warnings: AtomicU64::new(0),
             rollbacks: AtomicU64::new(0),
+            mount_unreadable: AtomicU64::new(0),
         });
         source.check_expiry();
         Ok(source)
@@ -161,6 +163,14 @@ impl TlsSource {
     /// How many swaps were undone by [`Self::roll_back`].
     pub fn rollbacks(&self) -> u64 {
         self.rollbacks.load(Ordering::Relaxed)
+    }
+
+    /// How many times the serving mount answered a stat with something that is
+    /// neither a readable file nor ENOENT. Each one is a rotation this process
+    /// can no longer see coming, on the material whose expiry stops Pod
+    /// creation cluster-wide.
+    pub fn mount_unreadable(&self) -> u64 {
+        self.mount_unreadable.load(Ordering::Relaxed)
     }
 
     /// Re-read both files and swap on success. Errors leave the old material
@@ -253,21 +263,43 @@ pub fn poll_serving_cert(source: Arc<TlsSource>, interval: Duration) {
     thread::spawn(move || poll_loop(source, interval));
 }
 
+/// Both halves as one answer. Unreadable outranks absent: one file refusing a
+/// stat is not a Secret key that was removed.
+fn material_stat(source: &TlsSource) -> MountStat<(FileStamp, FileStamp)> {
+    match (stat_one(&source.cert_path), stat_one(&source.key_path)) {
+        (MountStat::Unreadable, _) | (_, MountStat::Unreadable) => MountStat::Unreadable,
+        (MountStat::Present(cert), MountStat::Present(key)) => MountStat::Present((cert, key)),
+        _ => MountStat::Absent,
+    }
+}
+
 fn poll_loop(source: Arc<TlsSource>, interval: Duration) {
     // No initial stamp: a rotation between the first load and this thread must
     // not be skipped.
-    let mut stamp: Option<(FileStamp, FileStamp)> = None;
+    let mut stat: Option<MountStat<(FileStamp, FileStamp)>> = None;
     loop {
         thread::sleep(interval);
         source.check_expiry();
-        let (Some(cert), Some(key)) = (stamp_one(&source.cert_path), stamp_one(&source.key_path))
-        else {
-            continue;
-        };
-        if Some((cert, key)) == stamp {
+        let next = material_stat(&source);
+        if Some(next) == stat {
             continue;
         }
-        stamp = Some((cert, key));
+        stat = Some(next);
+        match next {
+            MountStat::Present(_) => {}
+            // A key missing from the mount keeps the material already loaded:
+            // the certificate is in memory, and the Secret is mid-rewrite.
+            MountStat::Absent => continue,
+            MountStat::Unreadable => {
+                let total = source.mount_unreadable.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "ferrum-admission: serving certificate mount is present but cannot be \
+                     stat'd; the current material keeps serving and no rotation will be seen \
+                     until that stops (serving_cert_unreadable_total={total})"
+                );
+                continue;
+            }
+        }
         let before = source.facts();
         if let Err(err) = source.reload() {
             eprintln!(

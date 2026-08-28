@@ -34,7 +34,7 @@ pub use eval::{
 pub use ferrum_ids::Digest;
 #[cfg(feature = "apiserver")]
 pub use labels::WatchedLabels;
-pub use labels::{ColdLabels, LabelSource, StaticLabels};
+pub use labels::{ColdLabels, LabelSource, LabelWarmth, StaticLabels};
 pub use program::{parse_program, AdmissionProgram, ADMISSION_ABI, ADMISSION_MAGIC};
 pub use review::{handle_review_bytes, ReviewConfig, ReviewReply};
 pub use server::{poll_bundle_file, poll_exceptions_file, serve, serve_listener, WebhookState};

@@ -282,3 +282,64 @@ fn unusable_material_keeps_the_current_certificate() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// B2, third copy: the poller's `(Some, Some) else continue` answered "gone"
+/// and "cannot be stat'd" the same way, on the material whose expiry stops Pod
+/// creation cluster-wide. Both keep serving what is loaded; only one of them
+/// means no rotation will ever be seen again, and it now says so.
+#[test]
+fn an_unreadable_serving_mount_is_counted_and_a_deleted_one_is_not() {
+    let dir = temp_dir("stat");
+    install(&dir, "serving");
+    let source = source(&dir);
+    let mounted = source.config();
+    poll_serving_cert(Arc::clone(&source), Duration::from_millis(10));
+
+    // Deleted: kubelet is between writes. Quiet, and nothing to count.
+    std::fs::remove_file(dir.join("tls.crt")).expect("remove cert");
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        source.mount_unreadable(),
+        0,
+        "a key missing from the mount is a Secret being rewritten"
+    );
+    assert!(
+        Arc::ptr_eq(&mounted, &source.config()),
+        "and the loaded material keeps serving"
+    );
+    assert_eq!(source.reload_failures(), 0);
+
+    // Unreadable: tls.crt is there and does not stat as a file.
+    std::fs::create_dir(dir.join("tls.crt")).expect("directory in its place");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while source.mount_unreadable() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "an unreadable serving mount must be counted, not silently skipped"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        Arc::ptr_eq(&mounted, &source.config()),
+        "an unreadable mount must not disturb what is serving"
+    );
+    assert_eq!(
+        source.reload_failures(),
+        0,
+        "nothing was read, so nothing failed to parse"
+    );
+
+    // And it does not latch: the rotation that follows is still picked up.
+    std::fs::remove_dir(dir.join("tls.crt")).expect("remove placeholder dir");
+    install(&dir, "rotated");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Arc::ptr_eq(&mounted, &source.config()) {
+        assert!(
+            Instant::now() < deadline,
+            "the poller must resume once the mount is readable again"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(source.mount_unreadable(), 1, "counted once per transition");
+    std::fs::remove_dir_all(&dir).ok();
+}

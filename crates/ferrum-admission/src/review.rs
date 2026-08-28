@@ -124,11 +124,15 @@ fn handle_with(
     subject.policy_namespace = cfg.policy_namespace.clone();
 
     // A cold cache denies only what it would actually decide: a policy with no
-    // namespace/ServiceAccount selector never needed those labels.
-    if !cfg.labels.is_warm() && watched_labels_selected(program) {
+    // namespace/ServiceAccount selector never needed those labels. Sample the
+    // warmth once and carry its cause into the reply: this message is the only
+    // channel admission has, and it reaches the human running kubectl at the
+    // moment of the deny.
+    let warmth = cfg.labels.warmth();
+    if !warmth.is_warm() && watched_labels_selected(program) {
         return ok_deny(
             &uid,
-            "namespace labels unavailable: label cache has not listed yet",
+            &format!("namespace labels unavailable: {}", warmth.reason()),
         );
     }
     subject.namespace_labels = cfg.labels.namespace_labels(&subject.namespace);
