@@ -207,7 +207,7 @@ mod tests {
     fn a_predicate_one_byte_over_the_bound_is_unobservable() {
         assert_eq!(unobservable_comm(&["", "sh"]), None);
         let exact = "x".repeat(COMM_MATCH_MAX);
-        assert_eq!(unobservable_comm(&[exact.clone()]), None);
+        assert_eq!(unobservable_comm(std::slice::from_ref(&exact)), None);
         let over = "x".repeat(COMM_MATCH_MAX + 1);
         assert_eq!(
             unobservable_comm(&[exact.clone(), over.clone()]),
@@ -220,10 +220,13 @@ mod tests {
 
         assert_eq!(unobservable_path_pattern::<&str>(&[]), None);
         let exact = "p".repeat(PATH_MATCH_MAX);
-        assert_eq!(unobservable_path_pattern(&[exact.clone()]), None);
+        assert_eq!(
+            unobservable_path_pattern(std::slice::from_ref(&exact)),
+            None
+        );
         let over = "p".repeat(PATH_MATCH_MAX + 1);
         assert_eq!(
-            unobservable_path_pattern(&[over.clone()]),
+            unobservable_path_pattern(std::slice::from_ref(&over)),
             Some((over.as_str(), PATH_MATCH_MAX + 1))
         );
     }
@@ -236,7 +239,7 @@ mod tests {
         assert_eq!(multibyte.chars().count(), 8);
         assert_eq!(multibyte.len(), 16);
         assert_eq!(
-            unobservable_comm(&[multibyte.clone()]),
+            unobservable_comm(std::slice::from_ref(&multibyte)),
             Some((multibyte.as_str(), 16))
         );
     }

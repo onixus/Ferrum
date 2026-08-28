@@ -6,17 +6,40 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 Источник истины по архитектуре: `docs/rfc/FERRUM-RFC-02-architecture.md`.
 Каталог CRD: `docs/crd/README.md`.
 
-Репозиторий сейчас — каркас workspace и API-типов, не готовый агент.
-Пустой crate не называть MVP.
+Control plane собран: controller → compile → Secret → admission/agent, LKG на диске.
+Датаплейна нет: aya-ebpf требует nightly, kernel attach отдаёт `Degraded`.
+Отсутствующий datapath не называть работающим runtime enforcement.
 
 ## Toolchain
 
-- Workspace: Rust 1.75, edition 2021, GPL-3.0-only (`rust-toolchain.toml`).
-- `kube-derive` не подключать на 1.75: транзитивные crate требуют edition2024.
+- Workspace: Rust 1.97.1, edition 2021, GPL-3.0-only (`rust-toolchain.toml`).
+- kube 1.x + k8s-openapi 0.25 (`v1_33`). Тулчейн поднят с 1.75 ради advisories: старый
+  стек тянул rustls 0.21 с тремя CVE и пять unmaintained crate.
 - Nightly только у `ferrum-ebpf-progs`. Userspace — stable + musl.
 - Перед сдачей: `cargo fmt`, `cargo clippy -p <crate> -- -D warnings` на затронутых crate.
 - Тесты точечно: `cargo test -p <crate>`. Не гонять весь workspace без нужды.
 - Политики без кластера: `cargo run -p ferrum-cli -- validate policies/examples/<file>.yaml`.
+
+## Тесты гоняются в локальном Jenkins
+
+Полный прогон — только на локальном Jenkins `http://localhost:8081`, джоба `ferrum`
+(собирает `main` из `/Users/onixus/Git/Ferrum`, скрипт — `Jenkinsfile` в репозитории).
+Локально у себя гоняйте максимум `cargo test -p <crate>` по затронутому crate;
+вердикт по изменению даёт Jenkins, а не ваша машина.
+
+- Запуск без коммита: `curl -s --get --data-urlencode "url=/Users/onixus/Git/Ferrum" http://localhost:8081/git/notifyCommit`.
+  После коммита в `main` джоба стартует сама (post-commit hook + поллинг раз в 2 минуты).
+- API-токена нет, UI недоступен: лог билда читать из
+  `/Users/onixus/jenkins_home/jobs/ferrum/builds/<N>/log`, артефакты — в `.../archive/`.
+- Функциональные стадии: `Test`, `Validate policies` (в ней же негативные кейсы),
+  плюс стадии сборки бинарей, образов и BPF. Имена стадий цитирует
+  `docs/MVP-1-BOUNDARY.md`, и `crates/ferrum-testkit/tests/boundary_gate.rs` роняет
+  сборку на переименовании — стадию не переименовывать в одиночку.
+- Стадии security: `SAST (semgrep)`, `Security: policy invariants`,
+  `Security: MVP acceptance` (приёмка из раздела MVP-1),
+  `Security: supply chain` (cargo-deny + cargo-audit).
+- Новый инвариант или новый пункт приёмки — добавлять тест в security-стадию,
+  а не в общий `cargo test`. Красная security-стадия не «флейк»: это нарушенный инвариант.
 
 ## Границы crate
 
@@ -31,7 +54,7 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 | `ferrum-agent` | eBPF + last-known-good | compiler, cluster-admin SA |
 | `ferrum-ebpf-progs` | aya-ebpf datapath | tokio, kube, `String` на syscall path |
 | `ferrum-controller` | reconcile + compile + rollout | datapath, CAP_BPF |
-| `ferrum-crypto` | подпись/проверка bundle, mTLS material | фейковый `Ok` |
+| `ferrum-crypto` | подпись/проверка bundle, mTLS material (ring, rustls-webpki) | openssl-sys, выпуск CA, сеть, фейковый `Ok` |
 | `ferrum-cli` | `ferrumctl` offline | живой кластер в MVP-1 |
 
 Версии в проде сшиваются `PolicyBundle.digest`. Несовместимый агент bundle не грузит и остаётся на last-known-good.
@@ -47,7 +70,9 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 - trust roots едут в bundle; admission не ходит в Rekor на каждый Pod;
 - `disabled=true` вместе с `mode=enforce` — ошибка валидации;
 - Kill/Isolate без match (syscall/comm/path) — ошибка валидации, это kill-all;
-- `verify_bundle_signature` и аналоги не возвращают фейковый `Ok`.
+- `verify_bundle_signature` и аналоги не возвращают фейковый `Ok`;
+- `BUNDLE_SIGNATURE_CONTEXT` и `KEY_BIND_MSG` — разные домены: Ed25519-seed
+  bundle не является TLS-ключом и не должен проходить проверку как он.
 
 Секции политики: `supply` + `admit` + `runtime`.
 

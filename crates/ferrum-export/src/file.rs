@@ -508,7 +508,7 @@ mod tests {
                 Some(n) => {
                     let n = n.min(data.len());
                     self.buf.extend_from_slice(&data[..n]);
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, "flaky"))
+                    Err(std::io::Error::other("flaky"))
                 }
                 None => {
                     self.buf.extend_from_slice(data);

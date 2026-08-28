@@ -12,8 +12,8 @@
 
 use ferrum_common::{FerrumError, Result};
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, DnValue,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, DnValue,
+    ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber,
     PKCS_ECDSA_P256_SHA256,
 };
 use sha2::{Digest as _, Sha256};
@@ -65,6 +65,14 @@ pub fn service_dns_names(service: &str, namespace: &str) -> Vec<String> {
     ]
 }
 
+/// rcgen 0.13 хочет IA5, а не String: имена Service всегда ASCII, но проверить
+/// это должен код, а не комментарий.
+fn dns_san_entry(name: &str) -> Result<SanType> {
+    let ia5 = Ia5String::try_from(name.to_string())
+        .map_err(|e| FerrumError::Validation(format!("SAN {name} is not IA5: {e}")))?;
+    Ok(SanType::DnsName(ia5))
+}
+
 /// Issue a self-signed CA valid until `not_after`.
 pub fn issue_ca(common_name: &str, not_after: SystemTime) -> Result<CaMaterial> {
     if common_name.trim().is_empty() {
@@ -73,7 +81,6 @@ pub fn issue_ca(common_name: &str, not_after: SystemTime) -> Result<CaMaterial> 
     check_lifetime(not_after)?;
 
     let mut params = CertificateParams::default();
-    params.alg = &PKCS_ECDSA_P256_SHA256;
     params.not_before = not_before().into();
     params.not_after = not_after.into();
     params.serial_number = Some(serial_for(common_name.as_bytes()));
@@ -85,13 +92,14 @@ pub fn issue_ca(common_name: &str, not_after: SystemTime) -> Result<CaMaterial> 
         KeyUsagePurpose::DigitalSignature,
     ];
 
-    let cert = Certificate::from_params(params)
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| FerrumError::Integrity(format!("CA key generation failed: {e}")))?;
+    let cert = params
+        .self_signed(&key)
         .map_err(|e| FerrumError::Integrity(format!("CA generation failed: {e}")))?;
     let material = CaMaterial {
-        cert_pem: cert
-            .serialize_pem()
-            .map_err(|e| FerrumError::Integrity(format!("CA encoding failed: {e}")))?,
-        key_pem: cert.serialize_private_key_pem(),
+        cert_pem: cert.pem(),
+        key_pem: key.serialize_pem(),
     };
     let der = single(pem_certificates(&material.cert_pem)?, "CA")?;
     let (_, parsed) = X509Certificate::from_der(&der)
@@ -124,10 +132,9 @@ pub fn issue_serving_cert(
     }
     check_lifetime(not_after)?;
 
-    let issuer = load_ca(ca)?;
+    let (issuer_cert, issuer_key) = load_ca(ca)?;
 
     let mut params = CertificateParams::default();
-    params.alg = &PKCS_ECDSA_P256_SHA256;
     params.not_before = not_before().into();
     params.not_after = not_after.into();
     params.serial_number = Some(serial_for(dns_names.join(",").as_bytes()));
@@ -135,23 +142,23 @@ pub fn issue_serving_cert(
     params.is_ca = IsCa::ExplicitNoCa;
     params.subject_alt_names = dns_names
         .iter()
-        .map(|n| SanType::DnsName(n.clone()))
-        .collect();
+        .map(|n| dns_san_entry(n))
+        .collect::<Result<Vec<_>>>()?;
     params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::KeyEncipherment,
     ];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
 
-    let cert = Certificate::from_params(params)
-        .map_err(|e| FerrumError::Integrity(format!("serving cert generation failed: {e}")))?;
-    let cert_pem = cert
-        .serialize_pem_with_signer(&issuer)
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| FerrumError::Integrity(format!("serving key generation failed: {e}")))?;
+    let cert = params
+        .signed_by(&key, &issuer_cert, &issuer_key)
         .map_err(|e| FerrumError::Integrity(format!("serving cert signing failed: {e}")))?;
 
     let material = ServingMaterial {
-        cert_pem,
-        key_pem: cert.serialize_private_key_pem(),
+        cert_pem: cert.pem(),
+        key_pem: key.serialize_pem(),
         dns_names,
     };
     // Material that cannot be verified is not issued material.
@@ -342,11 +349,11 @@ fn check_lifetime(not_after: SystemTime) -> Result<()> {
     Ok(())
 }
 
-/// rcgen 0.12 signs a child from the issuer's *params*, not from its DER, so
-/// the issuer has to be rebuilt: its subject DN and its key are the only parts
+/// rcgen signs a child from the issuer's *params*, not from its DER, so the
+/// issuer has to be rebuilt: its subject DN and its key are the only parts
 /// that reach the child. Any mismatch is caught by the `verify_chain` call at
 /// the end of issuance, which compares the emitted issuer against the CA.
-fn load_ca(ca: &CaMaterial) -> Result<Certificate> {
+fn load_ca(ca: &CaMaterial) -> Result<(rcgen::Certificate, KeyPair)> {
     let key = KeyPair::from_pem(&ca.key_pem)
         .map_err(|e| FerrumError::Integrity(format!("CA key is unreadable: {e}")))?;
     let der = single(pem_certificates(&ca.cert_pem)?, "CA")?;
@@ -359,12 +366,12 @@ fn load_ca(ca: &CaMaterial) -> Result<Certificate> {
     }
 
     let mut params = CertificateParams::default();
-    params.alg = &PKCS_ECDSA_P256_SHA256;
-    params.key_pair = Some(key);
     params.distinguished_name = rebuild_dn(parsed.subject())?;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-    Certificate::from_params(params)
-        .map_err(|e| FerrumError::Integrity(format!("CA is unusable as an issuer: {e}")))
+    let cert = params
+        .self_signed(&key)
+        .map_err(|e| FerrumError::Integrity(format!("CA is unusable as an issuer: {e}")))?;
+    Ok((cert, key))
 }
 
 fn rebuild_dn(name: &X509Name<'_>) -> Result<DistinguishedName> {
@@ -477,7 +484,7 @@ fn single(mut der: Vec<Vec<u8>>, what: &str) -> Result<Vec<u8>> {
 /// Standard base64 with padding — the encoding `caBundle` and Secret data use.
 pub fn base64_encode(data: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b1 = *chunk.first().unwrap_or(&0) as u32;
         let b2 = *chunk.get(1).unwrap_or(&0) as u32;
@@ -544,7 +551,7 @@ pub fn base64_decode(data: &str) -> Result<Vec<u8>> {
             out.push((acc >> bits) as u8);
         }
     }
-    if chars % 4 != 0 {
+    if !chars.is_multiple_of(4) {
         return Err(FerrumError::Integrity(
             "base64 length is not a multiple of 4".into(),
         ));
@@ -588,21 +595,24 @@ mod tests {
     ) -> ServingMaterial {
         let dns_names = service_dns_names("ferrum-admission", "ferrum");
         let mut params = CertificateParams::default();
-        params.alg = &PKCS_ECDSA_P256_SHA256;
         params.not_before = not_before().into();
         params.not_after = not_after.into();
         params.distinguished_name = ferrum_dn(&dns_names[2]);
         params.is_ca = IsCa::ExplicitNoCa;
         params.subject_alt_names = dns_names
             .iter()
-            .map(|n| SanType::DnsName(n.clone()))
-            .collect();
+            .map(|n| dns_san_entry(n))
+            .collect::<Result<Vec<_>>>()
+            .expect("san");
         params.extended_key_usages = eku;
-        let cert = Certificate::from_params(params).expect("leaf");
-        let issuer = load_ca(ca).expect("issuer");
+        let (issuer_cert, issuer_key) = load_ca(ca).expect("issuer");
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let cert = params
+            .signed_by(&key, &issuer_cert, &issuer_key)
+            .expect("leaf");
         ServingMaterial {
-            cert_pem: cert.serialize_pem_with_signer(&issuer).expect("leaf pem"),
-            key_pem: cert.serialize_private_key_pem(),
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
             dns_names,
         }
     }

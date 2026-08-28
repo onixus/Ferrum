@@ -18,6 +18,8 @@
 | ferrum-admission | исполнение bundle | compiler, CAP_BPF |
 | ferrum-agent | eBPF + LKG | compiler |
 | ferrum-ebpf-progs | aya-ebpf | tokio, kube, String на syscall |
+| ferrum-controller | reconcile + compile + rollout | datapath, CAP_BPF |
+| ferrum-crypto | подпись bundle, mTLS material | openssl-sys, выпуск CA, сеть |
 
 Userspace: stable + musl. Nightly только у eBPF-progs.
 
@@ -53,6 +55,13 @@ Root на ноде enforcement не побеждает.
 | EoP | SA агента с delete pods | два SA: observe и respond; respond выключен |
 
 CP down ≤ 2ч → last-known-good, `Degraded=true`, не fail-open.
+
+Состояние контрмер: подпись bundle и mTLS material — `ferrum-crypto`, trust
+roots caller-supplied, домены `BUNDLE_SIGNATURE_CONTEXT` и `KEY_BIND_MSG`
+разделены. LKG у агента и fail-closed admission — есть. LSM на pin path и
+in-kernel drop не реализованы: aya-ebpf требует nightly, attach отдаёт
+`Degraded`. Spoofing закрыт только на уровне подписи и TLS-идентичности,
+не на уровне ядра.
 
 ## D. Покрытие MVP
 

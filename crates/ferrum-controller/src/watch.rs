@@ -246,12 +246,19 @@ async fn run_exception_watch(
     exceptions: &ExceptionSet,
 ) -> Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &policy_exception_resource());
-    // Raw watcher events: Deleted must revoke, applied_objects would hide it.
+    // Raw watcher events: Delete must revoke, applied_objects would hide it.
     let mut stream = std::pin::pin!(watcher(api, watcher::Config::default()));
+    // kube 1.x отдаёт релист потоком Init/InitApply/InitDone вместо одного
+    // Restarted(objs). Собираем его в сторонний набор и подменяем живой одним
+    // шагом на InitDone: иначе в середине релиста опубликуется пустой набор,
+    // то есть массовая отмена действующих exception.
+    let staging: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => {
-                if let Err(err) = handle_exception_event(client, cfg, exceptions, ev).await {
+                if let Err(err) =
+                    handle_exception_event(client, cfg, exceptions, &staging, ev).await
+                {
                     eprintln!("ferrum-controller: {err}");
                 }
             }
@@ -265,6 +272,7 @@ async fn handle_exception_event(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    staging: &ExceptionSet,
     event: watcher::Event<DynamicObject>,
 ) -> Result<()> {
     // Status patches must never block publication: the in-memory set is
@@ -272,12 +280,12 @@ async fn handle_exception_event(
     // revoked/narrowed exception live in the Secrets (that is fail-open).
     let mut status_errors: Vec<String> = Vec::new();
     match event {
-        watcher::Event::Applied(obj) => {
+        watcher::Event::Apply(obj) => {
             if let Err(err) = apply_exception_object(client, exceptions, &obj).await {
                 status_errors.push(err.to_string());
             }
         }
-        watcher::Event::Deleted(obj) => {
+        watcher::Event::Delete(obj) => {
             if let (Some(ns), Some(name)) = (
                 obj.metadata.namespace.as_deref(),
                 obj.metadata.name.as_deref(),
@@ -288,13 +296,17 @@ async fn handle_exception_event(
                     .remove(&format!("{ns}/{name}"));
             }
         }
-        watcher::Event::Restarted(objs) => {
-            exceptions.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            for obj in &objs {
-                if let Err(err) = apply_exception_object(client, exceptions, obj).await {
-                    status_errors.push(err.to_string());
-                }
+        watcher::Event::Init => {
+            staging.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        watcher::Event::InitApply(obj) => {
+            if let Err(err) = apply_exception_object(client, staging, &obj).await {
+                status_errors.push(err.to_string());
             }
+        }
+        watcher::Event::InitDone => {
+            let relisted = staging.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            *exceptions.lock().unwrap_or_else(|e| e.into_inner()) = relisted;
         }
     }
     persist_exceptions(
@@ -1053,7 +1065,7 @@ mod tests {
         let (status, live) = exception_disposition(&obj);
         assert!(status.active, "{}", status.message);
         let spec = live.expect("live spec");
-        let json = crate::exceptions_json(&[spec.clone()]).expect("json");
+        let json = crate::exceptions_json(std::slice::from_ref(&spec)).expect("json");
         let decoded: Vec<ferrum_api::PolicyExceptionSpec> =
             serde_json::from_slice(&json).expect("admission-side decode");
         assert_eq!(decoded, vec![spec]);

@@ -11,9 +11,8 @@ description = "cgroup inode -> pod identity. Forbidden: kube client, tokio, aya.
 ferrum-common.workspace = true
 serde_json.workspace = true
 # Network watch only: the default build of a crate on the decision path links no TLS.
-rustls = { version = "=0.21.11", optional = true }
-rustls-pemfile = { version = "=1.0.4", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 
 [features]
 default = []
-apiserver = ["dep:rustls", "dep:rustls-pemfile"]
+apiserver = ["dep:rustls"]

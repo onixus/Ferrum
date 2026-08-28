@@ -1,13 +1,20 @@
-//! Policy-bundle integrity: Ed25519 over raw bytes, SHA-256 digest.
+//! Policy-bundle integrity (Ed25519) and mTLS PEM material (X.509).
 //!
-//! Trust roots are caller-supplied key bytes. This crate does not fetch Rekor,
-//! CT logs, or any other network source.
+//! Bundle signatures and TLS identity are separate domains. Do not reuse
+//! [`BUNDLE_SIGNATURE_CONTEXT`] Ed25519 seeds as TLS keys.
+//!
+//! Trust roots are caller-supplied. This crate does not fetch Rekor, CT logs,
+//! or any other network source, and it does not issue CAs at runtime.
 //!
 //! Signatures are Ed25519 over `BUNDLE_SIGNATURE_CONTEXT || raw`, not raw
 //! Ed25519 over `raw`. Admission, agent, and controller must call these
 //! functions; they must not verify with a generic Ed25519 verifier.
 
 #![deny(unsafe_code)]
+
+mod mtls;
+
+pub use mtls::{load_mtls_pem, verify_mtls_material, verify_mtls_peer, MtlsMaterial, PeerRole};
 
 #[cfg(feature = "x509")]
 pub mod x509;
@@ -84,7 +91,7 @@ fn signed_message(raw: &[u8]) -> Vec<u8> {
     msg
 }
 
-fn is_all_zero(bytes: &[u8]) -> bool {
+pub(crate) fn is_all_zero(bytes: &[u8]) -> bool {
     bytes.iter().fold(0u8, |acc, b| acc | b) == 0
 }
 

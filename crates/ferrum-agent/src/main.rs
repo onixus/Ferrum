@@ -294,8 +294,14 @@ fn install_signal_handlers() {
     // Async-signal-safe by construction: the handler only sets a flag.
     #[allow(unsafe_code)]
     unsafe {
-        libc::signal(libc::SIGTERM, on_terminate as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_terminate as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            on_terminate as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            on_terminate as *const () as libc::sighandler_t,
+        );
     }
 }
 

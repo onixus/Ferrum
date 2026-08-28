@@ -27,8 +27,12 @@
 // directions: an `image:` in deploy/ that no `docker build -t` here produces,
 // or a crate with a `[[bin]]` that no stage links, fails by name.
 
-def RUST_IMAGE = 'rust:1.75-bookworm'
-def RUST_DOCKER_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry -v ferrum-cargo-target:/build-target'
+def RUST_IMAGE = 'rust:1-bookworm'
+// Третий том — под cargo-deny/cargo-audit: /usr/local/cargo/bin трогать нельзя,
+// там лежит сам cargo и монтирование его затрёт.
+def RUST_DOCKER_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
+                       ' -v ferrum-cargo-target:/build-target' +
+                       ' -v ferrum-cargo-tools:/cargo-tools'
 
 pipeline {
     agent {
@@ -50,9 +54,33 @@ pipeline {
     environment {
         CARGO_TARGET_DIR = '/build-target'
         CARGO_TERM_COLOR = 'never'
+        CARGO_INSTALL_ROOT = '/cargo-tools'
     }
 
     stages {
+        // Первым: находка роняет билд за минуту, а не после полной сборки Rust.
+        // agent any по той же причине, что у стадий образов: docker CLI живёт на
+        // ноде, а не внутри rust-образа.
+        stage('SAST (semgrep)') {
+            agent any
+            steps {
+                sh '''
+                    set -eu
+                    # Один проход: --error роняет стадию, --output оставляет артефакт.
+                    # В semgrep.json попадают находки уровня ERROR — те, что и есть гейт.
+                    docker run --rm -v "$WORKSPACE":/src -w /src semgrep/semgrep:latest \
+                        semgrep scan --config p/rust --config p/secrets \
+                            --metrics=off --severity ERROR --error \
+                            --json --output semgrep.json
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
+                }
+            }
+        }
+
         stage('Format') {
             steps {
                 sh '''
@@ -738,6 +766,12 @@ pipeline {
                         echo "exception-bad-no-ticket.yaml must fail validation" >&2
                         exit 1
                     fi
+                    if ! grep -qF "PolicyException.ticket пуст" \
+                        /tmp/ferrum-bad-exception.err /tmp/ferrum-bad-exception.out; then
+                        echo "exception-bad-no-ticket.yaml failed for the wrong reason" >&2
+                        cat /tmp/ferrum-bad-exception.err /tmp/ferrum-bad-exception.out >&2
+                        exit 1
+                    fi
                     echo "ok: exception-bad-no-ticket.yaml rejected"
                     # A rule naming a syscall the datapath does not hook is a
                     # signed policy that can never fire. The validator has to
@@ -911,6 +945,54 @@ pipeline {
                     fi
                     echo "ok: an --apiserver webhook with no projected token rejected"
                 '''
+            }
+        }
+
+        stage('Security: policy invariants') {
+            steps {
+                sh '''
+                    set -eu
+                    cargo test -p ferrum-policy
+                    cargo test -p ferrum-crypto
+                    cargo test -p ferrum-crypto --features x509
+                '''
+            }
+        }
+
+        // Приёмка из AGENTS.md: unsigned/privileged/cluster-admin → deny,
+        // exception без TTL → reject, CP down → LKG, не fail-open.
+        stage('Security: MVP acceptance') {
+            steps {
+                sh '''
+                    set -eu
+                    cargo test -p ferrum-admission --test mvp
+                '''
+            }
+        }
+
+        stage('Security: supply chain') {
+            steps {
+                sh '''
+                    set -eu
+                    export PATH=/cargo-tools/bin:$PATH
+                    # Сборка инструментов не должна пачкать общий /build-target:
+                    # иначе рабочие артефакты вытесняются впустую.
+                    CARGO_TARGET_DIR=/tmp/ferrum-tools-target
+                    export CARGO_TARGET_DIR
+                    command -v cargo-deny  >/dev/null || cargo install --locked cargo-deny
+                    command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
+                    unset CARGO_TARGET_DIR
+                    cargo deny check licenses bans sources advisories
+                    cargo audit --json > "$WORKSPACE/cargo-audit.json" || {
+                        cat "$WORKSPACE/cargo-audit.json" >&2
+                        exit 1
+                    }
+                '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'cargo-audit.json', allowEmptyArchive: true
+                }
             }
         }
     }

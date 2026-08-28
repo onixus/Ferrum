@@ -964,6 +964,7 @@ mod client {
     use crate::source::{PodCache, POD_WATCH_BUDGET};
     use crate::watch::WatchOutcome;
     use ferrum_common::{FerrumError, Result};
+    use rustls::pki_types::pem::PemObject;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::path::{Path, PathBuf};
@@ -1083,7 +1084,7 @@ mod client {
 
         fn connect(&self) -> Result<TlsStream> {
             let cfg = self.tls_config()?;
-            let name = rustls::ServerName::try_from(self.server_name.as_str())
+            let name = rustls::pki_types::ServerName::try_from(self.server_name.clone())
                 .map_err(|e| FerrumError::Degraded(format!("apiserver server name: {e}")))?;
             let conn = rustls::ClientConnection::new(cfg, name)
                 .map_err(|e| FerrumError::Degraded(format!("tls client: {e}")))?;
@@ -1143,7 +1144,8 @@ mod client {
                 FerrumError::Degraded(format!("cluster CA {}: {e}", self.ca_path.display()))
             })?;
             let mut reader = io::Cursor::new(pem);
-            let certs = rustls_pemfile::certs(&mut reader)
+            let certs = rustls::pki_types::CertificateDer::pem_reader_iter(&mut reader)
+                .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| FerrumError::Degraded(format!("cluster CA parse: {e}")))?;
             if certs.is_empty() {
                 return Err(FerrumError::Degraded(
@@ -1153,15 +1155,18 @@ mod client {
             let mut roots = rustls::RootCertStore::empty();
             for cert in certs {
                 roots
-                    .add(&rustls::Certificate(cert))
+                    .add(cert)
                     .map_err(|e| FerrumError::Degraded(format!("cluster CA rejected: {e}")))?;
             }
             // Cluster CA only: no system roots, no fallback to webpki defaults.
             Ok(Arc::new(
-                rustls::ClientConfig::builder()
-                    .with_safe_defaults()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
+                rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| FerrumError::Degraded(format!("tls protocol versions: {e}")))?
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
             ))
         }
     }
@@ -1849,7 +1854,7 @@ mod client {
         #[test]
         fn giant_header_line_is_degraded_not_buffered() {
             let mut raw = b"HTTP/1.1 200 OK\r\nX-Flood: ".to_vec();
-            raw.extend(std::iter::repeat(b'A').take(MAX_HEADER_LINE_BYTES * 4));
+            raw.extend(std::iter::repeat_n(b'A', MAX_HEADER_LINE_BYTES * 4));
             raw.extend_from_slice(b"\r\n\r\n");
             let msg = degraded_text(head_of(&raw).expect_err("must refuse"));
             assert!(msg.contains("header line exceeds"), "{msg}");
@@ -1858,7 +1863,7 @@ mod client {
         #[test]
         fn giant_status_line_is_degraded() {
             let mut raw = b"HTTP/1.1 200 ".to_vec();
-            raw.extend(std::iter::repeat(b'X').take(MAX_HEADER_LINE_BYTES + 1));
+            raw.extend(std::iter::repeat_n(b'X', MAX_HEADER_LINE_BYTES + 1));
             raw.extend_from_slice(b"\r\n\r\n");
             let msg = degraded_text(head_of(&raw).expect_err("must refuse"));
             assert!(msg.contains("header line exceeds"), "{msg}");
