@@ -1074,10 +1074,20 @@ mod build_closure {
 
     /// One container as a manifest declares it. Nothing here needs the rest of
     /// a PodSpec.
+    ///
+    /// `argv` is `command` followed by `args`, which is what the process
+    /// receives and what `argv_of` in `crates/ferrum-cli/src/lint_deploy.rs`
+    /// reads. Reading `args:` alone — which this did for one cycle — is a
+    /// bypass rather than an approximation: `command: ["/ferrum-admission",
+    /// "serve", …, "--apiserver"]` with no `args:` key is the other legal
+    /// Kubernetes spelling of the same process, and under it every gate below
+    /// stops seeing `--apiserver`, both feature requirements evaporate, the
+    /// `wanted` tripwire still fires green on the two agent flags, and the
+    /// image may then ship a binary whose `--apiserver` reaches `die()`.
     struct Container {
         file: String,
         image: String,
-        args: Vec<String>,
+        argv: Vec<String>,
     }
 
     fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -1096,21 +1106,18 @@ mod build_closure {
         match node {
             Value::Mapping(map) => {
                 if let Some(Value::String(image)) = map.get(&Value::from("image")) {
-                    let args = map
-                        .get(&Value::from("args"))
-                        .and_then(Value::as_sequence)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let mut argv = Vec::new();
+                    for key in ["command", "args"] {
+                        let Some(items) = map.get(&Value::from(key)).and_then(Value::as_sequence)
+                        else {
+                            continue;
+                        };
+                        argv.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+                    }
                     out.push(Container {
                         file: file.to_string(),
                         image: image.clone(),
-                        args,
+                        argv,
                     });
                 }
                 for (_, value) in map.iter() {
@@ -1205,13 +1212,51 @@ mod build_closure {
         all_targets: bool,
     }
 
+    /// Tokens after which the next word starts a command rather than continuing
+    /// one. `sh` is dash here, so this is the whole list it needs.
+    /// `RUN` is here because a Dockerfile is the other script this reader
+    /// parses and `RUN` is where its shell line begins.
+    const COMMAND_STARTS: [&str; 16] = [
+        "&&", "||", "|", ";", "&", "(", "{", "!", "if", "elif", "while", "until", "then", "do",
+        "else", "RUN",
+    ];
+
+    /// Whether the token at `i` is a command being run, rather than a word
+    /// inside one.
+    ///
+    /// `position(|t| *t == "cargo")` — anywhere on the line — was what this
+    /// used, and this pipeline's house style is a self-describing `echo` of the
+    /// exact command, printed by the gates' own failure messages for the reader
+    /// to paste. So `echo "run cargo test -p ferrum-admission --features
+    /// apiserver"` satisfied the test half of the feature gate above without
+    /// running anything, and a shell `#` comment carrying a cargo line did the
+    /// same. A command is the first word of the line or the first word after a
+    /// separator; nothing else is.
+    fn is_command_position(tokens: &[&str], i: usize) -> bool {
+        let mut before = tokens[..i].iter().rev();
+        loop {
+            match before.next() {
+                None => return true,
+                Some(prev) if COMMAND_STARTS.contains(prev) => return true,
+                // `FOO=bar cargo …` and `sudo cargo …`: still a command.
+                Some(prev) if prev.contains('=') && !prev.starts_with('-') => continue,
+                Some(&"sudo") | Some(&"env") | Some(&"exec") | Some(&"time") => continue,
+                Some(_) => return false,
+            }
+        }
+    }
+
     /// Every `cargo <subcommand> ... -p <package>` in a script, one entry per
     /// package named.
     fn cargo_runs(script: &str, lang: Lang) -> Vec<CargoRun> {
         let mut out = Vec::new();
         for line in joined_lines(script, lang) {
             let tokens: Vec<&str> = line.split_whitespace().collect();
-            let Some(start) = tokens.iter().position(|token| *token == "cargo") else {
+            let Some(start) = tokens
+                .iter()
+                .position(|token| *token == "cargo")
+                .filter(|i| is_command_position(&tokens, *i))
+            else {
                 continue;
             };
             // `cargo +nightly build`: the toolchain sits between the two.
@@ -1908,6 +1953,15 @@ mod build_closure {
     /// - `--node` (`ferrum-agent`) opens the pod watch that fills the cgroup
     ///   index. Without `apiserver` the index stays empty, nothing is flagged
     ///   as a container and no kill can pass its guards.
+    ///
+    /// Hand-written, and held to the sources by
+    /// `every_flag_read_under_a_cfg_feature_is_in_the_table` below: a flag a
+    /// binary reads inside a `#[cfg(feature = …)]` item and this table does
+    /// not name is a fourth entry that would otherwise be invisible to both
+    /// gates. The reverse direction stays a judgement and is not derivable:
+    /// `--node` is read outside any `cfg`, and what makes it a feature flag is
+    /// that the only consumer of its value — `spawn_cgroup_refresh` — is the
+    /// `apiserver` build. Nothing in the argv site says so.
     const FEATURE_FLAGS: [(&str, &str); 3] = [
         ("--apiserver", "apiserver"),
         ("--bpf-elf", "attach"),
@@ -1973,18 +2027,33 @@ mod build_closure {
         // What the install asks for: (crate, feature), from the manifests' own
         // argv and the image each container names.
         let mut wanted: BTreeSet<(String, String)> = BTreeSet::new();
-        for container in &containers {
-            for (flag, feature) in FEATURE_FLAGS {
-                if container.args.iter().any(|a| a == flag) {
+        let mut unselected = Vec::new();
+        for (flag, feature) in FEATURE_FLAGS {
+            let mut seen = false;
+            for container in &containers {
+                if container.argv.iter().any(|a| a == flag) {
                     wanted.insert((crate_of(&container.image), feature.to_string()));
+                    seen = true;
                 }
             }
+            if !seen {
+                unselected.push(format!("  {flag} (would select {feature})"));
+            }
         }
+        // The tripwire, per entry rather than over the whole table. `wanted`
+        // being non-empty is satisfied by any one surviving flag, which is
+        // exactly how a single flag can be made invisible — rewritten into
+        // `command:`, renamed, or moved out of `deploy/` — while the other two
+        // keep this gate green and the requirement it carried disappears with
+        // no build turning red.
         assert!(
-            !wanted.is_empty(),
-            "no container in deploy/ passes any of the feature-gated flags in FEATURE_FLAGS, \
-             so this gate asserted nothing. Either the flags moved, or the manifest scan \
-             stopped seeing argv."
+            unselected.is_empty(),
+            "no container under deploy/ passes these feature-gated flags:\n{}\nEvery entry in \
+             FEATURE_FLAGS is a requirement some manifest makes; an entry no manifest selects \
+             asserts nothing here. Either the install genuinely stopped asking for it — then \
+             delete the row, deliberately, in a diff — or the manifest scan stopped seeing \
+             argv.",
+            unselected.join("\n")
         );
 
         let satisfies = |run: &CargoRun, krate: &str, feature: &str| {
@@ -2088,6 +2157,34 @@ mod build_closure {
         // today and which must not silently stop being read if it starts to.
         let joined = one("cargo test -p ferrum-agent --features=attach,apiserver");
         assert!(joined.features.contains("attach") && joined.features.contains("apiserver"));
+
+        // A word inside another command is not that command. This pipeline's
+        // house style is a self-describing echo of the exact line to run, and
+        // the failure messages above tell the reader to write one — so an echo
+        // naming a cargo invocation is the cheapest possible way to satisfy
+        // this gate without running anything.
+        for prose in [
+            "echo \"run cargo test -p ferrum-admission --features apiserver\" >&2",
+            "# cargo test -p ferrum-admission --features apiserver",
+            "grep -q cargo test -p ferrum-admission --features apiserver \"$out\"",
+        ] {
+            assert!(
+                cargo_runs(prose, Lang::Groovy).is_empty(),
+                "{prose:?} names cargo without running it, and counting it would make this \
+                 gate satisfiable by a sentence"
+            );
+        }
+
+        // And the spellings the Jenkinsfile actually uses, which must keep
+        // parsing: leading environment assignments, `if !`, and a separator.
+        let env_prefixed = one(
+            "if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF=\"$elf\" cargo test -p ferrum-agent \
+             --features attach,apiserver --lib",
+        );
+        assert_eq!(env_prefixed.subcommand, "test");
+        assert!(env_prefixed.features.contains("attach"));
+        let after_separator = one("mkdir -p dist && cargo build -p ferrum-agent --features attach");
+        assert_eq!(after_separator.subcommand, "build");
     }
 
     /// A flag a manifest passes that only a cargo feature provides is built into
@@ -2106,12 +2203,16 @@ mod build_closure {
         let containers = deploy_containers(&root);
         let builds = docker_builds(&jenkinsfile(&root), Lang::Groovy);
 
-        let mut checked = 0;
+        let mut unselected = Vec::new();
         for (flag, feature) in FEATURE_FLAGS {
-            for container in containers
+            let passed: Vec<&Container> = containers
                 .iter()
-                .filter(|c| c.args.iter().any(|a| a == flag))
-            {
+                .filter(|c| c.argv.iter().any(|a| a == flag))
+                .collect();
+            if passed.is_empty() {
+                unselected.push(format!("  {flag} (would require --features {feature})"));
+            }
+            for container in passed {
                 let repo = image_repo(&container.image);
                 let crate_name = repo.rsplit('/').next().unwrap_or(&repo).to_string();
                 let build = builds
@@ -2133,19 +2234,163 @@ mod build_closure {
                     container.file,
                     build.dockerfile
                 );
-                checked += 1;
             }
         }
 
-        // The control. Every assertion above is inside a filter, and a filter
-        // that matches nothing runs no assertion at all — which is exactly what
-        // a renamed flag, a manifest moved out of deploy/ or a broken argv scan
-        // would produce.
+        // The control, per flag. Every assertion above is inside a filter, and
+        // a filter that matches nothing runs no assertion at all — which is
+        // exactly what a renamed flag, a manifest moved out of `deploy/`, an
+        // argv rewritten from `args:` into `command:` past a scan that only
+        // read one of them, or a broken argv scan would produce. Counting the
+        // whole table lets any two survivors carry the third.
         assert!(
-            checked > 0,
-            "no container in deploy/ passes any of the feature-gated flags this gate \
-             knows about, so it asserted nothing. Either the flags moved, or the \
-             manifest scan stopped seeing argv."
+            unselected.is_empty(),
+            "no container under deploy/ passes these feature-gated flags:\n{}\nSo for each of \
+             them this gate ran no assertion at all. Either the flags moved, or the manifest \
+             scan stopped seeing argv.",
+            unselected.join("\n")
+        );
+    }
+
+    /// The manifest reader under both gates above, on the two spellings
+    /// Kubernetes accepts for the same argv.
+    ///
+    /// A PodSpec may put the whole command line in `command:`, or split it
+    /// across `command:` and `args:`, or leave `command:` out and let the
+    /// image's ENTRYPOINT supply argv[0]. The process sees one argv either
+    /// way, `argv_of` in `crates/ferrum-cli/src/lint_deploy.rs` reads both
+    /// keys, and a scan here that read only `args:` would let the webhook be
+    /// rewritten into the first spelling — legal, equivalent, reviewable — and
+    /// take `--apiserver` out of both gates' sight in the same edit. The
+    /// clippy line, the test line and `--features apiserver` in
+    /// `Dockerfile.admission` could then all be deleted with CI green, and the
+    /// image would ship a binary whose `--apiserver` reaches `die()`: two
+    /// replicas in CrashLoopBackOff behind `failurePolicy: Fail`.
+    #[test]
+    fn a_containers_argv_is_command_then_args_and_either_alone() {
+        let one = |yaml: &str| {
+            let value: Value = serde_yaml::from_str(yaml).expect("fixture");
+            let mut out = Vec::new();
+            collect_containers(&value, "fixture.yaml", &mut out);
+            assert_eq!(out.len(), 1, "{yaml:?} parsed as {} containers", out.len());
+            out.into_iter().next().expect("one container").argv
+        };
+
+        assert_eq!(
+            one("image: x\nargs: [serve, --apiserver]\n"),
+            vec!["serve", "--apiserver"]
+        );
+        assert_eq!(
+            one("image: x\ncommand: [/ferrum-admission, serve, --apiserver]\n"),
+            vec!["/ferrum-admission", "serve", "--apiserver"],
+            "a manifest that puts the whole command line in `command:` passes the same \
+             argv to the same process, and a scan that cannot see it hands every gate \
+             built on argv a silent way out"
+        );
+        assert_eq!(
+            one("image: x\ncommand: [/ferrum-admission]\nargs: [serve, --apiserver]\n"),
+            vec!["/ferrum-admission", "serve", "--apiserver"],
+            "command comes first and args follows it; concatenating them in the other \
+             order would still find the flag here and misreport the value of any flag \
+             read positionally"
+        );
+        assert!(one("image: x\n").is_empty());
+    }
+
+    /// Every flag a shipped binary reads inside a `#[cfg(feature = …)]` item is
+    /// named in `FEATURE_FLAGS`.
+    ///
+    /// The table is what both gates above enumerate, and a hand-written table
+    /// has one failure mode: the fourth entry nobody adds. A flag whose reader
+    /// only exists under a feature is exactly the shape of the two entries
+    /// already there — `--apiserver` on the webhook and `--bpf-elf` on the
+    /// agent — so a fifth `#[cfg(feature = …)] fn` that reads `flags.map` is a
+    /// requirement `deploy/` can make that neither gate would ever check.
+    ///
+    /// This is one direction only, and deliberately: the table may hold more
+    /// than the sources derive. `--node` is read outside any `cfg` and is in
+    /// the table because its only consumer is the `apiserver` build, which is
+    /// a judgement about the program and not a fact about the argv site.
+    #[test]
+    fn every_flag_read_under_a_cfg_feature_is_in_the_table() {
+        let root = repo_root();
+        let mut derived: BTreeSet<(String, String, String)> = BTreeSet::new();
+        for krate in ["ferrum-admission", "ferrum-agent"] {
+            let path = root.join("crates").join(krate).join("src/main.rs");
+            let body = read(&path);
+            let lines: Vec<&str> = body.lines().collect();
+            let mut i = 0;
+            while i < lines.len() {
+                // Item-level attributes only: the scan below runs to the first
+                // column-zero `}`, which is the end of the item it opened.
+                let Some(feature) = lines[i]
+                    .strip_prefix("#[cfg(feature = \"")
+                    .and_then(|rest| rest.split('"').next())
+                else {
+                    i += 1;
+                    continue;
+                };
+                let feature = feature.to_string();
+                let mut j = i + 1;
+                while j < lines.len() && lines[j] != "}" {
+                    for call in ["map.get(\"", "map.contains_key(\""] {
+                        for hit in lines[j].split(call).skip(1) {
+                            if let Some(flag) = hit.split('"').next() {
+                                derived.insert((
+                                    krate.to_string(),
+                                    format!("--{flag}"),
+                                    feature.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+        }
+
+        // The calibration. An empty or shrunken derivation is what a moved
+        // `main.rs`, a reformatted attribute or a renamed `Flags` field also
+        // produces, and it would make every assertion below vacuous.
+        for known in [
+            ("ferrum-admission", "--apiserver", "apiserver"),
+            ("ferrum-agent", "--bpf-elf", "attach"),
+        ] {
+            let want = (
+                known.0.to_string(),
+                known.1.to_string(),
+                known.2.to_string(),
+            );
+            assert!(
+                derived.contains(&want),
+                "the scan no longer finds {} reading {} under #[cfg(feature = \"{}\")], so it \
+                 can no longer find a fourth one either and this gate proves nothing. Found: \
+                 {derived:?}",
+                known.0,
+                known.1,
+                known.2
+            );
+        }
+
+        let missing: Vec<String> = derived
+            .iter()
+            .filter(|(_, flag, feature)| {
+                !FEATURE_FLAGS
+                    .iter()
+                    .any(|(f, feat)| f == flag && feat == feature)
+            })
+            .map(|(krate, flag, feature)| {
+                format!("  {krate} reads {flag} only under --features {feature}")
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these flags are read inside a #[cfg(feature = …)] item and FEATURE_FLAGS does not \
+             name them:\n{}\nA manifest may pass any of them, and neither the lint-and-test \
+             gate nor the image gate would notice: the flag would reach a build that does not \
+             compile its reader.",
+            missing.join("\n")
         );
     }
 }

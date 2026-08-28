@@ -598,22 +598,42 @@ fn check_optional_required_mount(
     }
 }
 
+/// A path with its trailing slashes removed, so `/etc/ferrum/bundle/` and
+/// `/etc/ferrum/bundle` are one directory. Root stays `/`.
+///
+/// Both sides need it. `mountPath: /etc/ferrum/bundle/` is legal Kubernetes and
+/// names the same mount, while `--bundle /etc/ferrum/bundle` is the argv this
+/// tree ships. Unnormalised, `path == at` is false and so is
+/// `starts_with("{at}/")`, so the mount resolves to nothing and FD028 misses a
+/// manifest that declares the bundle Secret optional — the finding that rule
+/// exists for, silenced by one character.
+fn normalised_path(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
 /// The volume that serves `path` in this container, and the mount path it
 /// arrives on.
 ///
 /// Longest matching mount wins, which is Kubernetes' own resolution: a
 /// container may mount `/etc/ferrum` and `/etc/ferrum/tls`, and a file under
-/// the second is served by the second.
+/// the second is served by the second. Length is compared on the normalised
+/// form, so a trailing slash cannot make one mount win over a longer one.
 fn volume_serving<'a>(
     spec: &'a Value,
     container: &'a Value,
     path: &str,
 ) -> Option<(String, &'a Value)> {
+    let path = normalised_path(path);
     let mount = seq(container, "volumeMounts")
         .iter()
         .filter_map(|m| {
-            let at = m.get("mountPath").and_then(Value::as_str)?;
-            let serves = path == at || path.starts_with(&format!("{}/", at.trim_end_matches('/')));
+            let at = normalised_path(m.get("mountPath").and_then(Value::as_str)?);
+            let serves = at == "/" || path == at || path.starts_with(&format!("{at}/"));
             serves.then_some((at, m.get("name").and_then(Value::as_str)?))
         })
         .max_by_key(|(at, _)| at.len())?;
@@ -733,9 +753,10 @@ fn mounted_host_path(
     mount_path: &str,
 ) -> Option<(String, Option<String>)> {
     let volume_name = seq(container, "volumeMounts").iter().find_map(|m| {
-        (m.get("mountPath").and_then(Value::as_str)? == mount_path)
-            .then(|| m.get("name").and_then(Value::as_str))
-            .flatten()
+        (normalised_path(m.get("mountPath").and_then(Value::as_str)?)
+            == normalised_path(mount_path))
+        .then(|| m.get("name").and_then(Value::as_str))
+        .flatten()
     })?;
     seq(spec, "volumes").iter().find_map(|v| {
         (v.get("name").and_then(Value::as_str)? == volume_name)
@@ -1298,9 +1319,10 @@ fn secret_names_policy(secret: &str, policy: &str) -> bool {
 /// The `secretName` of the volume mounted at `mount_path` in this container.
 fn mounted_secret(spec: &Value, container: &Value, mount_path: &str) -> Option<String> {
     let volume_name = seq(container, "volumeMounts").iter().find_map(|m| {
-        (m.get("mountPath").and_then(Value::as_str)? == mount_path)
-            .then(|| m.get("name").and_then(Value::as_str))
-            .flatten()
+        (normalised_path(m.get("mountPath").and_then(Value::as_str)?)
+            == normalised_path(mount_path))
+        .then(|| m.get("name").and_then(Value::as_str))
+        .flatten()
     })?;
     seq(spec, "volumes").iter().find_map(|v| {
         (v.get("name").and_then(Value::as_str)? == volume_name)
@@ -2491,6 +2513,39 @@ mod tests {
     /// has no last-known-good at all, readiness is a TCP connect so two
     /// CrashLoopBackOff replicas still report Ready, and `failurePolicy: Fail`
     /// denies every Pod outside `ferrum` and `kube-system` while they do.
+    /// The same finding, with the mount path written the other legal way.
+    ///
+    /// Not a second test of the rule: a test of the join between the argv and
+    /// the volume, which is where a whole finding used to disappear without a
+    /// diff to the rule itself. The exact code set is what makes it two
+    /// findings at once — `mounted_secret` compared the same two strings the
+    /// same unnormalised way, so the slash also made FD024 report that the
+    /// bundle «is not a mounted Secret volume» about a manifest that mounts
+    /// one.
+    #[test]
+    fn a_trailing_slash_on_the_mount_path_does_not_hide_the_finding() {
+        let (plain, tolerant) = OPTIONAL_BUNDLE_SECRET;
+        let dir = agent_tree_with("optional-bundle-slash", |raw| {
+            assert!(raw.contains(plain), "the bundle volume moved");
+            let raw = raw.replace(plain, tolerant);
+            assert!(
+                raw.contains("              mountPath: /etc/ferrum/bundle\n"),
+                "the bundle mountPath moved"
+            );
+            raw.replace(
+                "              mountPath: /etc/ferrum/bundle\n",
+                "              mountPath: /etc/ferrum/bundle/\n",
+            )
+        });
+        assert_eq!(
+            codes_in(&dir),
+            code_set([OPTIONAL_REQUIRED_MOUNT].as_slice()),
+            "a trailing slash on mountPath names the same directory the agent opens, and \
+             the rule must not stop seeing the volume because of it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_webhooks_bundle_mount_is_the_same_finding() {
         let (plain, tolerant) = OPTIONAL_BUNDLE_SECRET;
@@ -2593,6 +2648,44 @@ mod tests {
         assert_eq!(at, "/etc/ferrum");
         assert_eq!(declared_optional(volume), None);
         assert!(volume_serving(&spec, container, "/etc/ferrumx/tls.crt").is_none());
+    }
+
+    /// The trailing slash, on both sides of the same comparison.
+    ///
+    /// `mountPath: /etc/ferrum/bundle/` is legal Kubernetes and names the
+    /// directory the agent opens as `--bundle /etc/ferrum/bundle`. The resolver
+    /// matched `path == at` or `path.starts_with("{at}/")` on unnormalised
+    /// strings, and a slash on either side made both false: the mount resolved
+    /// to nothing, `check_optional_required_mount` returned before it reached
+    /// `declared_optional`, and FD028 missed a bundle Secret declared optional.
+    /// One character, and the finding this rule exists for is gone — the same
+    /// shape as the manifest line that started this cycle.
+    #[test]
+    fn a_trailing_slash_names_the_same_directory_on_either_side() {
+        let spec: Value = serde_yaml::from_str(
+            "containers:\n  - name: c\n    volumeMounts:\n      - name: bundle\n        mountPath: /etc/ferrum/bundle/\n      - name: outer\n        mountPath: /etc/ferrum\nvolumes:\n  - name: bundle\n    secret:\n      secretName: b\n      optional: true\n  - name: outer\n    secret:\n      secretName: a\n",
+        )
+        .expect("fixture spec");
+        let container = &seq(&spec, "containers")[0];
+        for path in [
+            "/etc/ferrum/bundle",
+            "/etc/ferrum/bundle/",
+            "/etc/ferrum/bundle/exceptions.fsig",
+        ] {
+            let (at, volume) = volume_serving(&spec, container, path)
+                .unwrap_or_else(|| panic!("{path} is served by the bundle mount"));
+            assert_eq!(at, "/etc/ferrum/bundle", "{path}");
+            assert_eq!(
+                declared_optional(volume),
+                Some("Secret"),
+                "{path} resolved to the wrong volume, so FD028 would read the tolerance of a \
+                 mount the process never opens"
+            );
+        }
+        // Normalising must not make a longer mount lose to a shorter one that
+        // only looked longer for its slash.
+        let (at, _) = volume_serving(&spec, container, "/etc/ferrum/other").expect("outer mount");
+        assert_eq!(at, "/etc/ferrum");
     }
 
     /// The committed negative tree for FD027, checked for the exact code: a
