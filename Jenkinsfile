@@ -34,23 +34,6 @@ def RUST_DOCKER_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
                        ' -v ferrum-cargo-target:/build-target' +
                        ' -v ferrum-cargo-tools:/cargo-tools'
 
-// Стадии линковки идут в x86_64-контейнере под эмуляцией. Нода здесь arm64,
-// а цель — x86_64-unknown-linux-musl: `apt-get install musl-tools` ставит
-// arm64-сборку musl-gcc, и она не понимает `-m64`, которым `ring` компилирует
-// свой C. Это уронило билд #19 на 'Agent binary'.
-//
-// Цель не выводится из архитектуры ноды намеренно. Стенд ядра, на котором
-// измерено всё с меткой K в MVP-1-BOUNDARY.md, — Linux 6.18.44 x86_64;
-// подставить сюда arm64 значит оставить стадию зелёной, а строку «продуктовая
-// комбинация линкуется под musl» — про бинарь, которого на стенде не будет.
-//
-// Отдельный том под target обязателен: host-артефакты и build-скрипты двух
-// архитектур в одном каталоге — это чужие объектные файлы под теми же именами.
-// Реестр общий: там исходники, они от архитектуры не зависят.
-def RUST_DOCKER_ARGS_AMD64 = '--platform=linux/amd64' +
-                             ' -v ferrum-cargo-home:/usr/local/cargo/registry' +
-                             ' -v ferrum-cargo-target-amd64:/build-target'
-
 pipeline {
     agent none
 
@@ -298,18 +281,21 @@ pipeline {
         }
 
 
-        // Три стадии, которые линкуют, — в x86_64-контейнере под эмуляцией.
-        // Отдельная группа, а не общий с 'Build' контейнер: под QEMU идёт только
-        // то, что обязано быть x86_64, а fmt, clippy и 884 теста остаются на
-        // родной архитектуре ноды. Стоит выше 'Datapath', потому что ядра ей не
-        // нужно: ни одна стадия датапейса эти бинари не читает — они архивируются,
-        // и на этом их путь заканчивается; образы линкуют свои заново из
-        // застэшенных исходников.
+        // Три стадии, которые линкуют. Контейнер родной архитектуры: цель
+        // x86_64 берётся кросс-компиляцией, а не эмуляцией — под QEMU падал сам
+        // rustc, а не наш скрипт. Цель из архитектуры ноды не выводится: стенд
+        // ядра, на котором измерено всё с меткой K в MVP-1-BOUNDARY.md, — x86_64,
+        // и бинарь под arm64 оставил бы стадию зелёной, а утверждение про
+        // продуктовую комбинацию — про то, чего на стенде не будет.
+        //
+        // Стоит выше 'Datapath', потому что ядра ей не нужно: ни одна стадия
+        // датапейса эти бинари не читает — они архивируются, и на этом их путь
+        // заканчивается; образы линкуют свои заново из застэшенных исходников.
         stage('Link') {
             agent {
                 docker {
                     image RUST_IMAGE
-                    args RUST_DOCKER_ARGS_AMD64
+                    args RUST_DOCKER_ARGS
                     reuseNode true
                 }
             }
@@ -325,12 +311,22 @@ pipeline {
                         set -eu
                         target=x86_64-unknown-linux-musl
                         rustup target add "$target"
-                        if ! command -v musl-gcc >/dev/null 2>&1; then
+                        # Кросс, а не эмуляция. Нода arm64, цель x86_64, и
+                        # amd64-контейнер это чинил ровно до `rustc -vV`: под QEMU
+                        # он падал с SIGSEGV, не начав компиляции (билд #23).
+                        # Здесь rustc идёт нативно, std под цель даёт rustup, C
+                        # половину ring компилирует кросс-gcc из штатного Debian,
+                        # а линкует rust-lld тем musl, который rustup везёт с
+                        # собой: musl-tools ставит musl-gcc родной архитектуры,
+                        # и он не понимает -m64 (билд #19).
+                        if ! command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
                             apt-get update
-                            apt-get install -y --no-install-recommends musl-tools
+                            apt-get install -y --no-install-recommends \
+                                gcc-x86-64-linux-gnu libc6-dev-amd64-cross
                         fi
-                        CC_x86_64_unknown_linux_musl=musl-gcc \
-                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                        CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc \
+                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+                        RUSTFLAGS="-C link-self-contained=yes" \
                             cargo build --release --locked --target "$target" \
                                 -p ferrum-agent --features attach,apiserver
                         bin="$CARGO_TARGET_DIR/$target/release/ferrum-agent"
@@ -362,12 +358,22 @@ pipeline {
                         set -eu
                         target=x86_64-unknown-linux-musl
                         rustup target add "$target"
-                        if ! command -v musl-gcc >/dev/null 2>&1; then
+                        # Кросс, а не эмуляция. Нода arm64, цель x86_64, и
+                        # amd64-контейнер это чинил ровно до `rustc -vV`: под QEMU
+                        # он падал с SIGSEGV, не начав компиляции (билд #23).
+                        # Здесь rustc идёт нативно, std под цель даёт rustup, C
+                        # половину ring компилирует кросс-gcc из штатного Debian,
+                        # а линкует rust-lld тем musl, который rustup везёт с
+                        # собой: musl-tools ставит musl-gcc родной архитектуры,
+                        # и он не понимает -m64 (билд #19).
+                        if ! command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
                             apt-get update
-                            apt-get install -y --no-install-recommends musl-tools
+                            apt-get install -y --no-install-recommends \
+                                gcc-x86-64-linux-gnu libc6-dev-amd64-cross
                         fi
-                        CC_x86_64_unknown_linux_musl=musl-gcc \
-                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                        CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc \
+                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+                        RUSTFLAGS="-C link-self-contained=yes" \
                             cargo build --release --locked --target "$target" \
                                 -p ferrum-admission --features apiserver
                         bin="$CARGO_TARGET_DIR/$target/release/ferrum-admission"
@@ -416,12 +422,22 @@ pipeline {
                         set -eu
                         target=x86_64-unknown-linux-musl
                         rustup target add "$target"
-                        if ! command -v musl-gcc >/dev/null 2>&1; then
+                        # Кросс, а не эмуляция. Нода arm64, цель x86_64, и
+                        # amd64-контейнер это чинил ровно до `rustc -vV`: под QEMU
+                        # он падал с SIGSEGV, не начав компиляции (билд #23).
+                        # Здесь rustc идёт нативно, std под цель даёт rustup, C
+                        # половину ring компилирует кросс-gcc из штатного Debian,
+                        # а линкует rust-lld тем musl, который rustup везёт с
+                        # собой: musl-tools ставит musl-gcc родной архитектуры,
+                        # и он не понимает -m64 (билд #19).
+                        if ! command -v x86_64-linux-gnu-gcc >/dev/null 2>&1; then
                             apt-get update
-                            apt-get install -y --no-install-recommends musl-tools
+                            apt-get install -y --no-install-recommends \
+                                gcc-x86-64-linux-gnu libc6-dev-amd64-cross
                         fi
-                        CC_x86_64_unknown_linux_musl=musl-gcc \
-                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                        CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc \
+                        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+                        RUSTFLAGS="-C link-self-contained=yes" \
                             cargo build --release --locked --target "$target" \
                                 -p ferrum-controller
                         bin="$CARGO_TARGET_DIR/$target/release/ferrum-controller"
