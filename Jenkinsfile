@@ -166,6 +166,11 @@ pipeline {
                         # Не пачкать общий /build-target чужим rustc: иначе следующая
                         # сборка на 1.75 переедет по фингерпринтам и пересоберётся с нуля.
                         export CARGO_TARGET_DIR=/tmp/ferrum-tools-target
+                        # rust-toolchain.toml в воркспейсе перебивает образ, и rustup
+                        # уводит обратно на 1.75 (билд #11). Берём тулчейн образа.
+                        RUSTUP_TOOLCHAIN=$(rustup toolchain list | head -1 | cut -d' ' -f1)
+                        export RUSTUP_TOOLCHAIN
+                        rustc --version
                         command -v cargo-deny  >/dev/null || cargo install --locked cargo-deny
                         command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
                         cargo deny check licenses bans sources advisories
