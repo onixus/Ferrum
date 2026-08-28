@@ -308,7 +308,7 @@
 |---|---|---|---|
 | `ferrum-agent` | `status.json` и флаг `degraded` в конверте экспорта | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::a_degraded_node_that_changes_why_says_so` |
 | `ferrum-admission` | текст `message` в отказе — то, что видит человек, запустивший `kubectl` | U | U `webhook.rs::a_warm_watch_decides_and_a_cold_one_denies_with_the_cold_reason` · U `webhook.rs::unsigned_image_deny` |
-| `ferrum-controller` | `status.json` в `--status-dir` плюс код выхода: до входа в watch — `error: <причина>` и выход 1; после — счётчик и причина на класс отказа в файле, а прогон отказов одного класса без единого успеха завершает процесс | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` · U `health.rs::a_single_failed_event_is_counted_and_the_process_keeps_running` · U `health.rs::a_run_of_status_patch_failures_with_no_success_is_terminal_and_names_the_class` · U `health.rs::a_class_that_succeeded_once_does_not_go_terminal_on_a_later_burst` · U `health.rs::the_status_file_is_written_whole_and_a_failed_write_is_its_own_reason` · U `ferrum-controller/src/watch.rs::a_reconcile_that_published_nothing_marks_no_class_as_having_worked` · U `apply.rs::a_publish_pass_over_no_secret_requests_nothing` · U `ferrum-controller/src/main.rs::the_status_dir_the_manifest_passes_is_the_one_the_watch_config_carries` · U `boundary_gate.rs::the_controllers_channel_names_every_post_start_failure_class` |
+| `ferrum-controller` | `status.json` в `--status-dir` плюс код выхода: до входа в watch — `error: <причина>` и выход 1; после — счётчик и причина на класс отказа в файле, а всплеск отказов одного класса без единого успеха завершает процесс | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` · U `health.rs::a_failure_run_is_a_burst_and_not_a_lifetime` · U `health.rs::the_file_written_after_a_failed_publish_says_the_publish_failed` · U `health.rs::a_single_failed_event_is_counted_and_the_process_keeps_running` · U `health.rs::a_run_of_status_patch_failures_with_no_success_is_terminal_and_names_the_class` · U `health.rs::a_class_that_succeeded_once_does_not_go_terminal_on_a_later_burst` · U `health.rs::the_status_file_is_written_whole_and_a_failed_write_is_its_own_reason` · U `ferrum-controller/src/watch.rs::a_reconcile_that_published_nothing_marks_no_class_as_having_worked` · U `apply.rs::a_publish_pass_over_no_secret_requests_nothing` · U `ferrum-controller/src/main.rs::the_status_dir_the_manifest_passes_is_the_one_the_watch_config_carries` · U `boundary_gate.rs::the_controllers_channel_names_every_post_start_failure_class` |
 
 Строка контроллера — единственная, которая до этого цикла не проходила третье
 утверждение, и не тем каналом, который в ней стоял: `deploy/controller/rbac.yaml`
@@ -396,8 +396,8 @@ watch, отказ публикации подписанных exception, — б�
 сказать почему.
 
 Терминальное правило одно и узкое: прогон в `TERMINAL_RUN` отказов **одного
-класса**, в котором ни один запрос этого класса **ни разу** не прошёл,
-возвращает `Err` из `run_watch` — дальше это обычный путь `main`: `error:
+класса**, пришедших не реже чем раз в `TERMINAL_WINDOW`, в котором ни один
+запрос этого класса **ни разу** не прошёл, возвращает `Err` из `run_watch` — дальше это обычный путь `main`: `error:
 <причина>` и выход 1. Оба условия обязательны. Один 403 на одном объекте —
 плохой объект, и процесс, который на нём уходит, и есть тот crash-loop, от
 которого отказался статус агента; класс, в котором не работало **ничего**, —
@@ -452,6 +452,48 @@ Secret обновлён, а статус нет, то есть частично 
 между запусками, не сообщает ничего. И `Jenkinsfile` этот файл ни в одной
 стадии не читает: всё, что здесь стоит `U`, прогнано на этом дереве руками,
 как и всюду в этом документе.
+
+**У той же расписки есть обратная сторона, и она стреляла по здоровому
+процессу.** Требование «успех — только там, где был запрос» верно, а места, где
+запрос *был*, оказались не размечены, и терминальное правило стало вероятнее
+убить работающий контроллер, чем поймать сломанный RBAC. Три штуки, все
+измерены против stub-apiserver, а не рассуждением:
+
+- `persist_exceptions` выходила из цикла патчей первым же `?`, выбрасывая
+  расписку по Secret'ам, которые уже пропатчила. Один Secret, отказывающий
+  постоянно (413 на разросшемся списке, повторяющийся конфликт), — и класс, в
+  котором публикация работает на всех остальных Secret, выглядит классом, где
+  не работало ничего. Теперь пасс идёт до конца, отказ каждого Secret
+  считается отдельно, а исключения доезжают до всех Secret, кроме сломанного.
+- Сошедшийся объект возвращал `Ok(())`, не засчитав GET, которым он и решил,
+  что сошёлся. На кластере в установившемся режиме — где сошлись все объекты —
+  `reconcile.ever_ok` был ложен всю жизнь процесса. Расписку теперь отдаёт
+  `load_bundle_secret`, то есть тот код, который запрос и сделал. Цена названа:
+  этот GET — полноценный запрос класса `reconcile` (его отказ туда же и
+  считается), поэтому установка, где `get secrets` разрешён, а PATCH статуса
+  политики — нет, до терминального правила по `reconcile` больше не доходит.
+  Симметрия здесь обязательна: класс, в котором отказ считают, а успех нет, —
+  это ровно тот перекос, из-за которого правило и стреляло не туда.
+- Secret с меткой владельца и без метки политики считался отказом
+  `exception_publish` на **каждом** событии, а пасс, который его нашёл, ничего
+  не патчил и расписки не давал. Прогон такого рода неограничен по построению:
+  объект неисправен, пока его не починит человек, и десятое событие завершало
+  процесс. Это причина (`note_unactionable`: список в `status.json`, строка в
+  `degraded_reasons()`, самозатухающая на первом пассе, который его больше не
+  видит) и никогда не прогон.
+
+И сам прогон получил окно. «Десять подряд, и между ними ничего не прошло» без
+часов означает «десятый из них, когда бы он ни пришёл»: у класса, которому
+нечем поставить `ever_ok` — `exception_publish` на установке без единого
+bundle-Secret ровно таков, — десять транзиентных ошибок за день завершали
+процесс. `TERMINAL_WINDOW` = 580 с и выбран не за круглость: watch этого
+бинаря уходит с `timeoutSeconds=290` (`kube-core`, `WatchParams`), после чего
+watcher релистит и передаёт **каждый** объект заново, — значит деплойный (а не
+объектный) отказ перезаваливается не реже чем раз в 290 с даже на кластере,
+где ничего не редактируют и политика одна. Удвоение — запас на сам релист:
+список идёт не мгновенно и может быть повторён, а один медленный релист не
+должен рвать прогон. Десять отказов по-прежнему обязаны уложиться примерно в
+десять минут, а не в сутки.
 
 **Молчаливых веток в этом цикле стало на одну меньше.** `Event::Deleted`
 объекта без `namespace`/`name` не удалял исключение из набора — ни класса, ни
@@ -515,6 +557,14 @@ Secret обновлён, а статус нет, то есть частично 
 | Каждый non-default feature, который выбирает argv поставляемого манифеста, компилируется и как lint-таргет (`clippy --all-targets`), и как test-таргет: `cargo build` этого не засчитывает, потому что не компилирует ни одного тестового таргета, а `cargo tree` не компилирует вообще ничего | U | U `deploy_gate.rs::every_feature_a_manifest_selects_is_a_lint_and_test_target` · U `deploy_gate.rs::a_build_is_not_a_test_and_a_tree_is_not_a_compile` · U `Jenkinsfile::Clippy` · U `Jenkinsfile::Test` |
 | То же утверждение, исполненное, а не прочитанное: гейт сам запускает `cargo clippy --features … --all-targets -- -D warnings` и `cargo test --features …` для каждой пары (crate, feature), которую выбирает поставляемый манифест, и требует успеха. Строка в Jenkinsfile присутствовала и была верна ровно в тот цикл, когда её таргеты не собирались | U | U `deploy_gate.rs::every_feature_a_manifest_selects_actually_compiles_and_passes` |
 | Манифест не может объявить `optional: true` на томе, обслуживающем путь, без которого бинарь не стартует, — FD028, находка, а не предупреждение; том, который бинарь действительно терпит, находкой не является | U | U `lint_deploy.rs::a_required_mount_declared_optional_is_a_finding` · U `lint_deploy.rs::the_webhooks_bundle_mount_is_the_same_finding` · U `lint_deploy.rs::an_optional_serving_certificate_is_a_finding_too` · U `lint_deploy.rs::a_mount_the_binary_tolerates_may_be_optional` · U `lint_deploy.rs::a_file_is_served_by_the_longest_mount_that_covers_it` |
+| Том, чей `defaultMode` недоступен `runAsUser` этого пода, — FD029, находка, а не предупреждение: kubelet пишет Secret-том root:root и меняет группу только под `fsGroup`, поэтому «аккуратный» 0400 под non-root — это ключ, который процесс не откроет; правило читает оба смысла литерала, потому что `0400` — это 256 для YAML 1.1, применяющего манифест, и вообще не число для 1.2, читающего его здесь | U | U `lint_deploy.rs::a_volume_mode_the_run_as_user_cannot_read_is_a_finding` · U `lint_deploy.rs::a_mode_is_readable_only_through_bits_the_uid_actually_gets` · U `lint_deploy.rs::deploy_tree_is_clean` |
+| Первый `kube::Client` контроллера строится, а не паникует: провайдер rustls ставится до него, потому что `kube` ставит свой только под фичей `aws-lc-rs`, которой в этом дереве нет | U | U `ferrum-controller/src/watch.rs::the_process_has_a_crypto_provider_before_its_first_client` · U `ferrum-controller/src/watch.rs::a_converged_object_credits_the_get_it_made` |
+| Прогон отказов, завершающий процесс, — всплеск, а не итог жизни процесса: отказ, пришедший позже `TERMINAL_WINDOW` после предыдущего, начинает прогон заново, а сломанный деплой, который перезаваливается раз в relist (290 с, `timeoutSeconds` каждого watch), правило по-прежнему завершает | U | U `health.rs::a_failure_run_is_a_burst_and_not_a_lifetime` |
+| Объект, который нечем починить ни одним запросом, — причина в `status.json` и в `is_degraded()`, но никогда не прогон: Secret без метки политики виден на каждом событии, поэтому его прогон неограничен по построению | U | U `health.rs::an_unactionable_object_degrades_without_ending_the_process` · U `ferrum-controller/src/watch.rs::a_secret_that_cannot_be_scoped_is_a_reason_and_never_a_terminal_run` |
+| Расписка переживает отказ соседнего Secret, а сошедшийся объект засчитывает GET, которым он и сошёлся: и то и другое измерено против stub-apiserver, а не смоделировано | U | U `ferrum-controller/src/watch.rs::one_secret_that_refuses_every_patch_does_not_end_a_controller_that_publishes` · U `ferrum-controller/src/watch.rs::a_converged_object_credits_the_get_it_made` |
+| Неотскоупленный список исключений не публикуется ни одним из двух путей: `attach_exceptions` отказывает Secret без метки политики так же, как `exception_targets` его пропускает | U | U `ferrum-controller/src/watch.rs::attaching_to_an_unlabelled_secret_publishes_nothing` |
+| Файл, записанный после неудавшейся публикации, несёт `statusWriteFailed: true` и `REASON_STATUS_UNWRITABLE`, а следующий за ним — уже нет | U | U `health.rs::the_file_written_after_a_failed_publish_says_the_publish_failed` |
+| Неразрешённый селектор решает запись и не посылает сигнала: правило применено, совпадение экспортировано с `labels_unknown`, отказ назван `REFUSE_LABELS_UNKNOWN` и посчитан, `SIGKILL` не отправлен — а та же запись против наблюдённых меток убивает | U | U `ferrum-agent/src/lib.rs::an_unresolved_selector_decides_the_record_and_signals_nothing` |
 | Каждая цитата «Делает» разрешается в определение `fn` или в стадию, а список §D здесь — ровно `AcceptanceCase::ALL` | U | U `boundary_gate.rs::every_claim_in_the_does_section_cites_something_that_exists` · U `boundary_gate.rs::the_document_lists_exactly_the_rfc_d_cases` |
 | Каждая причина деградации, которую агент может объявить, названа здесь — по префиксу `DEG_`, по телу `degraded_reasons_at` и по аргументам `mark_terminal_fault` | U | U `boundary_gate.rs::every_degraded_reason_the_agent_can_raise_is_named_in_the_document` |
 | Классы отказа контроллера перечисляются из тела `pub enum FailureClass`, а не из списка в самом гейте: у каждого варианта обязан быть аксессор счётчика, место в `ALL`, ключ в `status_json`, выведенный из `counter()`, и хотя бы одно место маршрутизации в `watch.rs`/`apply.rs`; успех класса нельзя назвать на месте вызова | U | U `boundary_gate.rs::the_controllers_channel_names_every_post_start_failure_class` |
@@ -665,6 +715,26 @@ Secret обновлён, а статус нет, то есть частично 
   relist. Отдельного таймаута «долг просрочен, кадров нет» этот слайс не
   добавлял: он был бы вторым дедлайном на том же сокете. Значит окно отказов
   на молчащем потоке — до 150 секунд, а не до 5.
+
+  **Но на рантайме это окно больше не окно убийств.** Радиус тут другой, чем в
+  admission, и это не деталь: тепло кеша — свойство узла и группы, а не пода,
+  поэтому один 410 на watch namespace помечает ненаблюдённым **каждый** pod
+  узла разом. `decide_with` программу применяет — пропуск правил был бы
+  молчаливым fail-open, и обе плоскости обязаны отвечать на это состояние
+  одинаково, — но *применить* и *исполнить* здесь не одно и то же.
+  Fail-closed в admission отказывает Pod, и следующая попытка это отменяет;
+  fail-closed на рантайме — это `SIGKILL`, которого не отменяет ничто, и
+  выдавался бы он workload'ам, про которых никто не установил, что политика их
+  выбирает. Поэтому `react` отказывается сигналить, пока scope не разрешён:
+  `REFUSE_LABELS_UNKNOWN`, `executed=false`, запись с `labels_unknown` и
+  сработавшим правилом, `respond_refused_total`, `DEG_LABELS_UNKNOWN`. Ровно
+  та же форма, что и у отказа по неизвестной identity, шагом раньше: «какой
+  это workload» и «покрывает ли его эта политика» — два вопроса, и сигналу
+  нужны оба ответа. Цена названа и принята: на время холодного кеша (до 5 с
+  hold-down на живом потоке, до 150 с на молчащем) `Kill`/`Isolate` под
+  `namespaceSelector` не исполняются — совпадение экспортируется, узел
+  Degraded, а `Deny` и `Audit` не затронуты, потому что ни один из них процесс
+  не завершает.
 
 - **Меток кластера у узла нет и не заведено.** `PodRecord::identity` зашивает
   `cluster_labels_observed: false`, и это честно: объекта «кластер» Kubernetes

@@ -41,7 +41,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Published into `--status-dir`.
 pub const STATUS_NAME: &str = "status.json";
@@ -74,7 +74,36 @@ pub const REASON_STATUS_UNWRITABLE: &str =
 /// The run is what keeps a single bad object from tripping it before anything
 /// else has had a chance to succeed: ten in a row, with none of them ever
 /// having worked, is a deployment fault and not an object.
+///
+/// The third half is `TERMINAL_WINDOW`: ten in a row *and nothing in between*
+/// is a statement about a burst, and without a clock it was a statement about
+/// the whole life of the process.
 pub const TERMINAL_RUN: u64 = 10;
+
+/// The longest gap between two failures of one class that still counts as the
+/// same run.
+///
+/// Without it the run has no clock at all, and «ten in a row with nothing
+/// succeeding in between» silently means «the tenth of them, whenever it
+/// arrives». A class that has never had a success to reset it — `exception_
+/// publish` on an installation with no bundle Secret yet is the shipped
+/// example, since a pass over no Secret issues no request and receipts nothing
+/// — then accumulates ten transient errors over an afternoon and ends a
+/// controller that was working. That is the crash loop this module was written
+/// to avoid, reached from the other side.
+///
+/// The value is the cadence a genuinely broken deployment cannot fall below,
+/// not a round number. `kube::runtime::watcher` is driven by a watch whose
+/// `timeoutSeconds` is 290 (`kube-core`'s `WatchParams`, sent on every watch
+/// call this binary makes and capped at 295 by the API server): when the watch
+/// ends, the watcher re-lists and every object is delivered again, so a fault
+/// that is in the deployment rather than in one object re-fails at most 290
+/// seconds after the last time it did — even on a cluster where nothing is
+/// edited and one policy exists. Doubling that is the margin for the relist
+/// itself: the list call takes time, can be retried, and a run must not be
+/// broken by one slow one. Ten failures then still have to arrive inside about
+/// ten minutes, rather than over a day.
+pub const TERMINAL_WINDOW: Duration = Duration::from_secs(2 * 290);
 
 /// A class of failure that can happen after `run_watch` has been entered.
 ///
@@ -183,6 +212,13 @@ struct ClassState {
     run: AtomicU64,
     ever_ok: AtomicBool,
     last: Mutex<Option<String>>,
+    /// When the failure that ends the current run happened, so the next one
+    /// can be told whether it belongs to the same burst. See
+    /// `TERMINAL_WINDOW`.
+    last_failure_at: Mutex<Option<Instant>>,
+    /// Subjects of this class that are wrong in a way no API call can fix, as
+    /// the last pass over them saw it. See `note_unactionable`.
+    unactionable: Mutex<Vec<String>>,
 }
 
 /// Every counter the controller keeps, and the reasons they add up to.
@@ -232,9 +268,50 @@ impl ControllerHealth {
         let first = !state.ever_ok.swap(true, Ordering::Relaxed);
         let recovered = state.run.swap(0, Ordering::Relaxed) != 0;
         *state.last.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *state
+            .last_failure_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         if first || recovered {
             self.changed.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Everything of `class` that is wrong in a way no API call can mend, as
+    /// this pass over it sees it. Replaces the previous list whole, and
+    /// returns whether it changed.
+    ///
+    /// These are not failures and must never reach the terminal rule. A Secret
+    /// carrying this controller's owner label and no policy label is one
+    /// object being wrong: the controller can see it without asking the API
+    /// server anything, no retry will change the answer, and so the run of it
+    /// is unbounded by construction — every event forever. Charged to
+    /// `note_failure` it was a guaranteed exit on the tenth event of a
+    /// controller that was otherwise publishing correctly, dressed up as «this
+    /// class has never worked».
+    ///
+    /// It is still a reason: `degraded_reasons` names every subject, so
+    /// `is_degraded()` is true for exactly as long as the object is wrong, and
+    /// false again on the first pass that no longer sees it. That last part is
+    /// why the list is replaced rather than added to — a reason that outlives
+    /// its cause teaches an operator to ignore reasons.
+    pub fn note_unactionable(&self, class: FailureClass, subjects: Vec<String>) -> bool {
+        let state = self.class(class);
+        let mut held = state.unactionable.lock().unwrap_or_else(|e| e.into_inner());
+        if *held == subjects {
+            return false;
+        }
+        *held = subjects;
+        self.changed.store(true, Ordering::Relaxed);
+        true
+    }
+
+    pub fn unactionable(&self, class: FailureClass) -> Vec<String> {
+        self.class(class)
+            .unactionable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// A request of `class` failed: count it, lengthen the run, keep the cause
@@ -244,10 +321,39 @@ impl ControllerHealth {
     /// out of `run_watch`, `main` prints `error: <cause>` and exits 1. `Ok` is
     /// «counted, keep going», which is what every ordinary failure gets.
     pub fn note_failure(&self, class: FailureClass, cause: impl Display) -> Result<()> {
+        self.note_failure_at(class, cause, Instant::now())
+    }
+
+    /// `note_failure`, at an explicit instant, so the window the run is
+    /// measured in can be asserted without waiting it out.
+    pub fn note_failure_at(
+        &self,
+        class: FailureClass,
+        cause: impl Display,
+        now: Instant,
+    ) -> Result<()> {
         let state = self.class(class);
         let cause = cause.to_string();
         state.total.fetch_add(1, Ordering::Relaxed);
-        let run = state.run.fetch_add(1, Ordering::Relaxed) + 1;
+        // The run is a burst, not a lifetime total: a failure that arrives
+        // more than `TERMINAL_WINDOW` after the last one of its class starts a
+        // new run rather than lengthening one that has been standing since the
+        // process began.
+        let run = {
+            let mut at = state
+                .last_failure_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let continues =
+                at.is_none_or(|prev| now.saturating_duration_since(prev) <= TERMINAL_WINDOW);
+            *at = Some(now);
+            if continues {
+                state.run.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                state.run.store(1, Ordering::Relaxed);
+                1
+            }
+        };
         self.changed.store(true, Ordering::Relaxed);
         *state.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(cause.clone());
         if run >= TERMINAL_RUN && !state.ever_ok.load(Ordering::Relaxed) {
@@ -292,9 +398,9 @@ impl ControllerHealth {
         self.failures(FailureClass::ExceptionPublish)
     }
 
-    /// The publish that failed most recently did fail. False in any file that
-    /// got written — the flag is cleared before the write it describes — so
-    /// this reads as «the previous publish failed».
+    /// The last publish attempt failed, and stays true until one gets through.
+    /// True in the first file written after a failure — that file is the
+    /// carrier of the reason — and cleared once that write has landed.
     pub fn status_write_failed(&self) -> bool {
         self.status_write_failed.load(Ordering::Relaxed)
     }
@@ -325,6 +431,18 @@ impl ControllerHealth {
             out.push(format!(
                 "{}: {run} in a row{ever}; last: {cause}",
                 class.name()
+            ));
+        }
+        for class in FailureClass::ALL {
+            let stuck = self.unactionable(class);
+            if stuck.is_empty() {
+                continue;
+            }
+            out.push(format!(
+                "{}: {} object(s) this controller cannot act on and no retry will mend: {}",
+                class.name(),
+                stuck.len(),
+                stuck.join(", ")
             ));
         }
         if self.status_write_failed() {
@@ -358,6 +476,10 @@ impl ControllerHealth {
                 json!(self.ever_succeeded(class)),
             );
             map.insert(format!("{counter}_last"), json!(self.last_cause(class)));
+            map.insert(
+                format!("{counter}_unactionable"),
+                json!(self.unactionable(class)),
+            );
         }
         out
     }
@@ -405,10 +527,23 @@ impl ControllerHealth {
             return true;
         };
         self.changed.store(false, Ordering::Relaxed);
-        self.status_write_failed.store(false, Ordering::Relaxed);
+        // Built before the flag is cleared, not after. Clearing it first made
+        // `REASON_STATUS_UNWRITABLE` and `statusWriteFailed: true` unreachable
+        // in every file that was ever published — the one state the module
+        // promises to report is the one it deleted on its way to reporting it,
+        // and the unit test behind it read the reasons in memory, where the
+        // flag was still set. So the first file that gets through after a
+        // failed publish is the one that says a publish failed, which is what
+        // «raises it for the next reader that gets through» has to mean.
         let value = self.status_json();
         match write_status(dir, &value) {
             Ok(()) => {
+                if self.status_write_failed.swap(false, Ordering::Relaxed) {
+                    // The file just written says the surface was unwritable,
+                    // and it no longer is. Republish so the reason does not
+                    // stand on disk after it stopped being true.
+                    self.changed.store(true, Ordering::Relaxed);
+                }
                 self.status_error_logged.store(false, Ordering::Relaxed);
                 true
             }
@@ -444,10 +579,11 @@ impl ControllerHealth {
 /// module existed.
 fn terminal_reason(class: FailureClass, run: u64, cause: &str) -> String {
     format!(
-        "{} failed {run} times in a row and no {} request has ever succeeded since this \
-         process started: that is the deployment, not the object — check the RBAC and the \
+        "{} failed {run} times in a row within {}s and no {} request has ever succeeded since \
+         this process started: that is the deployment, not the object — check the RBAC and the \
          CRDs. Last cause: {cause}",
         class.name(),
+        TERMINAL_WINDOW.as_secs(),
         class.name(),
     )
 }
@@ -789,5 +925,170 @@ mod tests {
         assert!(!quiet.is_degraded());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The reason a publish failed reaches the first file that gets written.
+    ///
+    /// The test above asserts `REASON_STATUS_UNWRITABLE` in the reasons *in
+    /// memory*, and that is where it stayed: `publish` cleared the flag before
+    /// building the object it was about to write, so `statusWriteFailed` was
+    /// false and the reason absent in every file this controller ever
+    /// published. A signal that runs the whole length of the module and
+    /// arrives nowhere is the defect this tree keeps finding, one surface in.
+    #[test]
+    fn the_file_written_after_a_failed_publish_says_the_publish_failed() {
+        let dir = temp_dir("unwritable");
+        let health = ControllerHealth::new();
+
+        // One publish that cannot happen: the directory is gone.
+        let gone = dir.join("gone");
+        fs::create_dir_all(&gone).expect("dir");
+        assert!(health.publish(Some(&gone)));
+        fs::remove_dir_all(&gone).expect("remove");
+        assert!(!health.publish(Some(&gone)), "a vanished directory fails");
+        assert!(health.status_write_failed());
+
+        // And the next publish, into a directory that works. This is the file
+        // «raises it for the next reader that gets through» is about.
+        assert!(health.publish(Some(&dir)));
+        let body = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+        let value: Value = serde_json::from_str(&body).expect("whole JSON");
+        assert_eq!(
+            value["statusWriteFailed"],
+            json!(true),
+            "the published file does not carry the failed publish it is the report of: {body}"
+        );
+        assert_eq!(value["statusWriteFailuresTotal"], json!(1));
+        assert_eq!(value["degraded"], json!(true));
+        assert!(
+            value["degradedReasons"]
+                .as_array()
+                .expect("reasons")
+                .iter()
+                .any(|r| r.as_str() == Some(REASON_STATUS_UNWRITABLE)),
+            "the reason is in memory and not in the file: {body}"
+        );
+
+        // The flag is cleared by the write that carried it, and the next
+        // publish reports a surface that works — a reason that outlived its
+        // cause is the other half of the same defect.
+        assert!(!health.status_write_failed());
+        assert!(health.publish(Some(&dir)));
+        let body = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+        let value: Value = serde_json::from_str(&body).expect("whole JSON");
+        assert_eq!(value["statusWriteFailed"], json!(false), "{body}");
+        assert_eq!(value["degraded"], json!(false), "{body}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Ten failures spread over an afternoon are not a run.
+    ///
+    /// `TERMINAL_RUN` counted consecutive failures with no clock at all, so
+    /// «ten in a row and nothing has ever succeeded» meant «the tenth of them,
+    /// whenever it arrives». `exception_publish` on an installation whose
+    /// bundle Secrets do not exist yet has no success to reset it — the pass
+    /// issues no request and receipts nothing — so ten transient list errors,
+    /// hours apart, ended a controller that was working. The run is a burst
+    /// now, and the control below is that a burst still ends the process.
+    #[test]
+    fn a_failure_run_is_a_burst_and_not_a_lifetime() {
+        let start = Instant::now();
+
+        let slow = ControllerHealth::new();
+        for i in 0..TERMINAL_RUN * 3 {
+            // One gap longer than the window, repeatedly: no two of these
+            // failures belong to the same run.
+            let at = start + (TERMINAL_WINDOW + Duration::from_secs(1)) * (i as u32);
+            slow.note_failure_at(FailureClass::ExceptionPublish, "secret list: timeout", at)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failure {i}, {}s after the one before it, ended the process: {e}",
+                        (TERMINAL_WINDOW + Duration::from_secs(1)).as_secs()
+                    )
+                });
+        }
+        assert_eq!(slow.exception_publish_failures(), TERMINAL_RUN * 3);
+        assert_eq!(
+            slow.failure_run(FailureClass::ExceptionPublish),
+            1,
+            "a failure that arrives after the window starts a run, it does not lengthen one"
+        );
+        assert!(
+            slow.is_degraded(),
+            "not terminal is not silent: the last failure is still a reason"
+        );
+
+        // The control: the same ten failures at the cadence a deployment fault
+        // actually produces them. `kube` re-lists when its watch times out, so
+        // every object is delivered again and the fault re-fails — 290s apart
+        // at the very slowest, which is inside the window by construction.
+        let relist = Duration::from_secs(290);
+        assert!(
+            relist <= TERMINAL_WINDOW,
+            "a window shorter than one relist cannot see a broken deployment at all"
+        );
+        let broken = ControllerHealth::new();
+        let mut last = Ok(());
+        for i in 0..TERMINAL_RUN {
+            last = broken.note_failure_at(
+                FailureClass::StatusPatch,
+                "status patch: 403 Forbidden",
+                start + relist * (i as u32),
+            );
+        }
+        let err = last.expect_err("a deployment that never worked must still end the process");
+        assert!(err.to_string().contains("status_patch"), "{err}");
+
+        // And a success inside the window is what a healthy controller has:
+        // it clears the run and the clock behind it.
+        let ok = ControllerHealth::new();
+        for i in 0..TERMINAL_RUN * 2 {
+            ok.note_failure_at(
+                FailureClass::Reconcile,
+                "secret get: 500",
+                start + relist * (i as u32),
+            )
+            .expect("a class that keeps working is never terminal");
+            ok.note_success(Requested::of(FailureClass::Reconcile));
+        }
+    }
+
+    /// An object nothing can mend is a reason, never a run.
+    #[test]
+    fn an_unactionable_object_degrades_without_ending_the_process() {
+        let health = ControllerHealth::new();
+        assert!(health.note_unactionable(
+            FailureClass::ExceptionPublish,
+            vec!["hand-made".to_string()]
+        ));
+        assert!(
+            !health.note_unactionable(
+                FailureClass::ExceptionPublish,
+                vec!["hand-made".to_string()]
+            ),
+            "the same list twice is not a change, and a change is what publishes a file"
+        );
+        assert!(health.is_degraded());
+        let reasons = health.degraded_reasons();
+        assert!(
+            reasons.iter().any(|r| r.contains("hand-made")),
+            "{reasons:?}"
+        );
+        assert_eq!(
+            health.failure_run(FailureClass::ExceptionPublish),
+            0,
+            "an object nothing can mend must not be able to reach the terminal rule: its run \
+             is unbounded by construction"
+        );
+        assert_eq!(
+            health.status_json()["exception_publish_failures_unactionable"],
+            json!(["hand-made"])
+        );
+
+        // Self-healing: the pass that no longer sees it takes the reason with
+        // it.
+        assert!(health.note_unactionable(FailureClass::ExceptionPublish, Vec::new()));
+        assert!(!health.is_degraded());
     }
 }

@@ -2229,6 +2229,7 @@ impl Agent {
             agent_self,
             in_container,
             identity.is_unknown(),
+            decision.labels_unknown,
         ) {
             // The role skip is the configuration, not a refused reaction: on
             // an observe node — the shipped default — every match of a kill
@@ -5931,6 +5932,111 @@ mod tests {
         assert!(!hit.labels_unknown);
         assert_eq!(observed.labels_unknown_total(), 0);
         assert!(!observed.labels_unknown_recent());
+    }
+
+    /// The same unresolved selector decides the record and sends no signal.
+    ///
+    /// Applying the program on `LabelsUnknown` is right and stays: skipping
+    /// the rules would be a silent fail-open, and admission refuses the same
+    /// state. Executing on it is not the same act. The cache whose warmth is
+    /// in question is per node and per group, so `LabelsUnknown` is never one
+    /// workload's problem: one 410 on the namespace watch marks every pod on
+    /// the node unobserved at once, and a `Kill` rule under a
+    /// `namespaceSelector` then reaches every workload the node runs — for a
+    /// scope no answer has established. Admission's fail-closed refuses a Pod
+    /// and the next attempt undoes it; a SIGKILL is undone by nothing.
+    ///
+    /// So the match is recorded and exported, `respond_refused_total` counts
+    /// it, `DEG_LABELS_UNKNOWN` stands, and the signal waits for the caches.
+    #[test]
+    fn an_unresolved_selector_decides_the_record_and_signals_nothing() {
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_ns_scoped_kill_ebpf(AGENT_ABI));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.set_target_check(Box::new(StaticCheck(Some(1))));
+        let fake = std::sync::Arc::new(FakeResponder::default());
+        agent.set_responder(Box::new(std::sync::Arc::clone(&fake)));
+
+        let mut cold = pci_identity();
+        cold.namespace_labels.clear();
+        cold.namespace_labels_observed = false;
+        agent.insert_cgroup(1, cold);
+
+        let sink = MemorySink::new();
+        let meta = EventMeta {
+            cgroup_id: 1,
+            pid: 4242,
+            tgid: 4242,
+            in_container: true,
+            agent_self: false,
+            path_truncated: false,
+        };
+        let decision = agent.handle_event(meta, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+
+        // Unchanged: the program applies, the rule matches, the record says so.
+        assert_eq!(decision.action, Action::Kill);
+        assert_eq!(decision.rule_id.as_deref(), Some("no-shell"));
+        assert!(decision.labels_unknown);
+        assert!(agent.is_degraded());
+
+        // New: nothing was signalled, and the reason is on the record.
+        assert!(
+            fake.killed().is_empty(),
+            "a workload was killed on a selector nobody could resolve"
+        );
+        assert_eq!(agent.respond_kill_total(), 0);
+        assert!(agent.respond_refused_total() > 0);
+        let event = &sink.events()[0];
+        assert!(!event.executed);
+        assert_eq!(
+            event.respond_error.as_deref(),
+            Some(respond::REFUSE_LABELS_UNKNOWN)
+        );
+        assert!(event.labels_unknown);
+
+        // The control: the same agent, the same rule, an identity whose
+        // labels were observed. The refusal is about the unresolved scope and
+        // nothing else.
+        let (warm, warm_fake) = {
+            let mut a = Agent::new(cfg_respond());
+            load_signed(&mut a, &encode_ns_scoped_kill_ebpf(AGENT_ABI));
+            a.set_attached(true);
+            a.set_container_map_synced(1);
+            a.set_target_check(Box::new(StaticCheck(Some(1))));
+            let f = std::sync::Arc::new(FakeResponder::default());
+            a.set_responder(Box::new(std::sync::Arc::clone(&f)));
+            a.insert_cgroup(1, pci_identity());
+            (a, f)
+        };
+        let hit = warm.handle_event(meta, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+        assert_eq!(hit.action, Action::Kill);
+        assert!(!hit.labels_unknown);
+        assert_eq!(warm_fake.killed(), vec![4242]);
+    }
+
+    /// `encode_prod_restricted_ebpf` in enforce: the same `namespaceSelector`
+    /// over a `Kill` rule that is not capped to audit by the mode.
+    fn encode_ns_scoped_kill_ebpf(abi: u32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.put_magic(&EBPF_MAGIC);
+        w.put_u32(abi);
+        w.put_u8(Mode::Enforce.as_u8());
+        w.put_bool(false);
+        w.put_i32(100);
+        w.put_u8(Action::Audit.as_u8());
+        put_empty_label_selector(&mut w);
+        w.put_u16(0);
+        w.put_u16(1);
+        w.put_str("ferrum.io/zone");
+        w.put_str("In");
+        w.put_str_list(&["pci", "secrets"]);
+        put_empty_label_selector(&mut w);
+        put_empty_label_selector(&mut w);
+        w.put_str_list(&["registry.internal.example"]);
+        w.put_bool(true);
+        put_prod_restricted_rules(&mut w);
+        w.finish()
     }
 
     /// A sync that succeeded once is not a sync that is still happening. A
