@@ -522,6 +522,20 @@ fn controller_signed_exceptions_are_accepted_by_agent_and_admission() {
         serde_json::from_slice(&payload).expect("payload is the spec array");
     assert_eq!(decoded, specs);
 
+    // The fourth copy. `ferrumctl` is the offline half of the same channel —
+    // it is what an operator runs to look at bytes a cluster is serving — and
+    // until this line the row in docs/MVP-1-BOUNDARY.md said "four copies"
+    // while the test under it exercised three. A codec copy that nothing
+    // compares is the drift this test exists to catch, one crate over.
+    let (cli_key, cli_sig, cli_raw) =
+        ferrum_cli::fsig::decode_fsig(&sealed).expect("ferrumctl decodes controller bytes");
+    assert_eq!(cli_raw, payload, "the CLI reads a different payload");
+    assert_eq!(
+        cli_key, trust_root,
+        "the CLI reads a different embedded key"
+    );
+    assert_eq!(cli_sig.len(), 64, "an Ed25519 signature is 64 bytes");
+
     // The agent takes it from the mount and the waiver demotes the kill.
     let dir = temp_lkg();
     std::fs::create_dir_all(&dir).expect("tmpdir");

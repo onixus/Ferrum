@@ -107,6 +107,17 @@ const HOST_PATH_DIRECTORY: &str = "Directory";
 const APISERVER_FLAG: &str = "--apiserver";
 const NODE_FLAG: &str = "--node";
 
+/// The one directory every client in this workspace reads a ServiceAccount
+/// token from. Mirrors `SERVICE_ACCOUNT_DIR` in
+/// `crates/ferrum-k8smeta/src/watch.rs`, where `ApiserverConfig` joins `token`
+/// onto it and opens nothing else; change both together.
+///
+/// The path is load-bearing and not decoration: a pod may project a token into
+/// any directory it likes, and one projected at `/var/run/secrets/tokens` is a
+/// file no binary in this product ever opens. So it is the mount path, not the
+/// existence of a projection, that says whether the watch has a credential.
+const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
+
 /// Policy kinds whose `spec.selector` is what a label watch has to answer.
 const POLICY_KINDS: [&str; 2] = ["ClusterSecurityPolicy", "SecurityPolicy"];
 
@@ -153,7 +164,7 @@ fn collect_findings(dir: &Path) -> Result<(Vec<Finding>, usize)> {
     check_bindings(&docs, &roles, &mut findings);
     check_wildcard_rules(&docs, &mut findings);
     check_pod_templates(&docs, &mut findings);
-    check_label_source(&docs, dir, &mut findings);
+    check_label_source(&docs, &roles, dir, &mut findings);
     check_webhooks(&docs, &mut findings);
     check_webhook_tls(&docs, &mut findings);
     check_webhook_pki(&docs, &mut findings);
@@ -647,6 +658,19 @@ fn mounted_host_path(
 ///   An unresolved predicate is not a non-match, so that policy denies
 ///   (admission) or misses (runtime) for as long as the install stands.
 ///
+/// - The third case, which the two flags cannot reach: a pod whose
+///   ServiceAccount this tree *grants RBAC to* and into which no token is
+///   projected at all. `--apiserver` and `--node` are the two workloads this
+///   rule knew about, and "a rule that knows about one workload is a rule that
+///   will be right once" applies to the flag names as much as to the workload
+///   names — `deploy/controller/deployment.yaml` passes neither, and its whole
+///   job is reconcile-compile-rollout against the API server while it mounts
+///   the bundle signing key. A workload with no token authenticates as
+///   `system:anonymous`: every request the grant covers is refused, and the
+///   grant itself becomes a claim about an identity nothing uses. The trigger
+///   is therefore read out of the tree's own RBAC rather than out of a list of
+///   flags this file would have to keep up to date.
+///
 /// A finding, never a warning, for the reason FD005 and FD022 were each added:
 /// a lint that passes on a join it cannot verify is what put this defect in
 /// the shipped tree. Deliberately not scoped to one workload — the coupling is
@@ -657,7 +681,13 @@ fn mounted_host_path(
 /// args array: both binaries key argv into a map, so a repeated flag keeps the
 /// last occurrence. A lint reading any other one proves its join against a
 /// string the process never sees, which is the FD024/FD018 defect exactly.
-fn check_label_source(docs: &[Doc], dir: &Path, findings: &mut Vec<Finding>) {
+fn check_label_source(
+    docs: &[Doc],
+    roles: &BTreeMap<String, &Value>,
+    dir: &Path,
+    findings: &mut Vec<Finding>,
+) {
+    let granted = granted_service_accounts(docs, roles);
     let policies = selector_bearing_policies(dir);
     if policies.is_none() {
         eprintln!(
@@ -671,6 +701,10 @@ fn check_label_source(docs: &[Doc], dir: &Path, findings: &mut Vec<Finding>) {
             continue;
         };
         let owner = format!("{}/{}", kind(doc), name(doc));
+        // Whether the flag half already reported this pod. The RBAC half below
+        // is a strictly weaker claim about the same missing file, so reporting
+        // both would print one defect twice.
+        let mut flagged = false;
         for key in ["initContainers", "containers"] {
             for container in seq(spec, key) {
                 let cname = container
@@ -687,7 +721,8 @@ fn check_label_source(docs: &[Doc], dir: &Path, findings: &mut Vec<Finding>) {
                 };
                 match label_source(&argv) {
                     Some(flag) => {
-                        if let Err(why) = token_projected(doc, spec, docs) {
+                        if let Err(why) = token_projected(doc, spec, Some(container), docs) {
+                            flagged = true;
                             finding(format!(
                                 "{owner} container '{cname}' passes {flag}, which opens an \
                                  apiserver watch, but {why}. The projected token is the only \
@@ -722,7 +757,80 @@ fn check_label_source(docs: &[Doc], dir: &Path, findings: &mut Vec<Finding>) {
                 }
             }
         }
+
+        if flagged {
+            continue;
+        }
+        let sa = spec
+            .get("serviceAccountName")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        // An empty one is FD014's finding, and the namespace default projects
+        // a token anyway; naming an account this tree grants nothing is not a
+        // claim about the apiserver at all.
+        let Some(binding) = granted.get(sa) else {
+            continue;
+        };
+        if let Err(why) = token_projected(doc, spec, None, docs) {
+            findings.push(Finding {
+                code: LABEL_SOURCE_UNJOINED,
+                file: doc.file.clone(),
+                msg: format!(
+                    "{owner} runs as ServiceAccount '{sa}', which {binding} grants RBAC in this \
+                     tree, but {why}. Without a token the pod authenticates as system:anonymous \
+                     and every request that grant covers is refused: the grant describes an \
+                     identity no container in this pod can present"
+                ),
+            });
+        }
     }
+}
+
+/// Every ServiceAccount this tree grants RBAC to, and the binding that does it.
+///
+/// A grant counts when the roleRef resolves here to a Role or ClusterRole that
+/// carries at least one rule, or names one of the built-ins `ALLOWED_EXTERNAL_
+/// ROLE_REFS` accepts — those are real grants the API server defines. A roleRef
+/// that resolves to nothing is left alone: FD016 is the finding for that, and
+/// stacking a second code on it would say the same thing twice. A Role with no
+/// rules grants nothing, so a pod with no token contradicts nothing.
+fn granted_service_accounts(
+    docs: &[Doc],
+    roles: &BTreeMap<String, &Value>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for doc in docs {
+        let k = kind(doc);
+        if k != "RoleBinding" && k != "ClusterRoleBinding" {
+            continue;
+        }
+        let Some(role_ref) = doc.value.get("roleRef") else {
+            continue;
+        };
+        let key = format!(
+            "{}/{}",
+            role_ref.get("kind").and_then(Value::as_str).unwrap_or(""),
+            role_ref.get("name").and_then(Value::as_str).unwrap_or("")
+        );
+        let grants = match roles.get(&key) {
+            Some(role) => !seq(role, "rules").is_empty(),
+            None => ALLOWED_EXTERNAL_ROLE_REFS.contains(&key.as_str()),
+        };
+        if !grants {
+            continue;
+        }
+        for subject in seq(&doc.value, "subjects") {
+            if subject.get("kind").and_then(Value::as_str) != Some("ServiceAccount") {
+                continue;
+            }
+            let Some(sname) = subject.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            out.entry(sname.to_string())
+                .or_insert_with(|| format!("{k}/{} -> {key}", name(doc)));
+        }
+    }
+    out
 }
 
 /// The apiserver watch this container's argv names, if any. Empty `--node`
@@ -737,15 +845,113 @@ fn label_source(argv: &[String]) -> Option<&'static str> {
         .map(|_| NODE_FLAG)
 }
 
+/// The volumes of this pod that project a ServiceAccount token, by name.
+///
+/// `automountServiceAccountToken: false` beside an explicit
+/// `volumes: - projected: { sources: [ { serviceAccountToken: … } ] }` is the
+/// hardened *spelling* of a mounted token, not the absence of one: it is how a
+/// pod keeps the ambient token out of every container and hands one scoped,
+/// short-lived token to the container that needs it. Reading only the automount
+/// field would make that tree a finding on an install that works, and — since
+/// this code is never a warning — the only way to satisfy the rule would be to
+/// turn automount back on, which widens the token's exposure to every container
+/// in the pod. A rule that pushes a tree towards the less hardened shape is
+/// worse than no rule.
+fn projected_token_volumes(spec: &Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for volume in seq(spec, "volumes") {
+        let Some(vname) = volume.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let projects_token = volume
+            .get("projected")
+            .map(|projected| {
+                seq(projected, "sources")
+                    .iter()
+                    .any(|source| source.get("serviceAccountToken").is_some())
+            })
+            .unwrap_or(false);
+        if projects_token {
+            out.insert(vname.to_string());
+        }
+    }
+    out
+}
+
+/// Whether this container mounts one of those volumes where the code looks.
+///
+/// Both halves are required. A projection no container mounts is a token in the
+/// kubelet's head and nowhere in the filesystem; a projection mounted somewhere
+/// other than `SERVICE_ACCOUNT_DIR` is a file this product does not open.
+fn mounts_token_at_service_account_dir(container: &Value, volumes: &BTreeSet<String>) -> bool {
+    seq(container, "volumeMounts").iter().any(|mount| {
+        let named = mount
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|n| volumes.contains(n))
+            .unwrap_or(false);
+        let at_dir = mount
+            .get("mountPath")
+            .and_then(Value::as_str)
+            .map(|p| p.trim_end_matches('/') == SERVICE_ACCOUNT_DIR)
+            .unwrap_or(false);
+        named && at_dir
+    })
+}
+
 /// Whether a ServiceAccount token is projected into this pod, or why it is
 /// not.
 ///
-/// Three-state, and the precedence is Kubernetes': the pod field wins when it
-/// is set, the ServiceAccount's value applies when it is not, and unset on
-/// both is a mounted token. A ServiceAccount this tree does not define answers
-/// neither way, and an unresolved predicate is not a non-match — the same
-/// stance FD016 takes on a roleRef it cannot resolve.
-fn token_projected(doc: &Doc, spec: &Value, docs: &[Doc]) -> Result<(), String> {
+/// An explicit projection mounted at `SERVICE_ACCOUNT_DIR` wins over every
+/// automount answer below it, because it is a token file the container can
+/// actually open whatever the automount field says. `container` is the one
+/// asking: a projection is mounted per container, so the flag half of FD027
+/// passes the container whose argv names the watch, and the pod-level half
+/// passes `None` and accepts a mount by any container.
+///
+/// Failing that the precedence is Kubernetes': the pod field wins when it is
+/// set, the ServiceAccount's value applies when it is not, and unset on both is
+/// a mounted token. A ServiceAccount this tree does not define answers neither
+/// way, and an unresolved predicate is not a non-match — the same stance FD016
+/// takes on a roleRef it cannot resolve.
+fn token_projected(
+    doc: &Doc,
+    spec: &Value,
+    container: Option<&Value>,
+    docs: &[Doc],
+) -> Result<(), String> {
+    let projected = projected_token_volumes(spec);
+    if !projected.is_empty() {
+        let mounted = match container {
+            Some(container) => mounts_token_at_service_account_dir(container, &projected),
+            None => ["initContainers", "containers"].iter().any(|key| {
+                seq(spec, key)
+                    .iter()
+                    .any(|c| mounts_token_at_service_account_dir(c, &projected))
+            }),
+        };
+        if mounted {
+            return Ok(());
+        }
+    }
+    // Said once and appended to every answer below: without it a pod that
+    // projects a token and mounts it in the wrong place is told only that
+    // automount is off, which is the one thing about it that is deliberate.
+    let unmounted = if projected.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (the pod projects a ServiceAccount token in volume(s) {}, and no volumeMount here \
+             puts one at {SERVICE_ACCOUNT_DIR}, which is the only directory this product opens a \
+             token from)",
+            projected.iter().cloned().collect::<Vec<_>>().join(", ")
+        )
+    };
+    token_from_automount(doc, spec, docs).map_err(|why| format!("{why}{unmounted}"))
+}
+
+/// The automount half of the answer above, unchanged: pod field, then account.
+fn token_from_automount(doc: &Doc, spec: &Value, docs: &[Doc]) -> Result<(), String> {
     match spec
         .get("automountServiceAccountToken")
         .and_then(Value::as_bool)
@@ -2210,6 +2416,166 @@ mod tests {
                 "automountServiceAccountToken: false",
             )
         });
+        assert_eq!(codes_in(&dir), code_set([LABEL_SOURCE_UNJOINED].as_slice()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The shipped controller Deployment, its ServiceAccount and its RBAC,
+    /// with one edit applied to all three.
+    fn controller_tree_with(tag: &str, edit: impl Fn(String) -> String) -> PathBuf {
+        let dir = tmp_tree(tag);
+        for file in ["deployment.yaml", "serviceaccount.yaml", "rbac.yaml"] {
+            let raw = fs::read_to_string(repo_path(&format!("deploy/controller/{file}")))
+                .unwrap_or_else(|e| panic!("deploy/controller/{file}: {e}"));
+            fs::write(dir.join(file), edit(raw)).expect("write manifest");
+        }
+        dir
+    }
+
+    /// The workload the two flags cannot see. `ferrum-controller` passes
+    /// neither `--apiserver` nor `--node`; its whole job is reconcile-compile-
+    /// rollout against the API server, and it mounts the bundle signing key.
+    /// Flip its automount to `false` and every earlier spelling of this rule
+    /// printed ok on a Deployment that authenticates as nobody — the rule knew
+    /// two flag names, and a rule that knows about one workload is right once.
+    #[test]
+    fn a_granted_service_account_with_no_projected_token_is_a_finding() {
+        let dir = controller_tree_with("controller-no-token", |raw| {
+            raw.replace(
+                "automountServiceAccountToken: true",
+                "automountServiceAccountToken: false",
+            )
+        });
+        assert_eq!(codes_in(&dir), code_set([LABEL_SOURCE_UNJOINED].as_slice()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The control, and the reason the trigger is the tree's RBAC rather than a
+    /// list of workload names: the same Deployment with the same flip, with no
+    /// binding beside it, grants nothing to that account and so contradicts
+    /// nothing. A rule that fired here would fire on every pod in every tree.
+    #[test]
+    fn a_service_account_this_tree_grants_nothing_needs_no_token() {
+        let dir = tmp_tree("controller-ungranted");
+        for file in ["deployment.yaml", "serviceaccount.yaml"] {
+            let raw = shipped(&format!("deploy/controller/{file}")).replace(
+                "automountServiceAccountToken: true",
+                "automountServiceAccountToken: false",
+            );
+            fs::write(dir.join(file), raw).expect("write manifest");
+        }
+        assert!(codes_in(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A Role that grants no verb is not a grant. Without this the rule above
+    /// would be satisfied by the existence of a binding rather than by anything
+    /// the identity can do.
+    #[test]
+    fn a_binding_to_a_ruleless_role_is_not_a_grant() {
+        let dir = tmp_tree("controller-ruleless");
+        for file in ["deployment.yaml", "serviceaccount.yaml"] {
+            let raw = shipped(&format!("deploy/controller/{file}")).replace(
+                "automountServiceAccountToken: true",
+                "automountServiceAccountToken: false",
+            );
+            fs::write(dir.join(file), raw).expect("write manifest");
+        }
+        fs::write(
+            dir.join("rbac.yaml"),
+            "apiVersion: rbac.authorization.k8s.io/v1\n\
+             kind: ClusterRole\n\
+             metadata:\n  name: ferrum-controller\n\
+             rules: []\n\
+             ---\n\
+             apiVersion: rbac.authorization.k8s.io/v1\n\
+             kind: ClusterRoleBinding\n\
+             metadata:\n  name: ferrum-controller\n\
+             roleRef:\n\
+             \x20 apiGroup: rbac.authorization.k8s.io\n\
+             \x20 kind: ClusterRole\n\
+             \x20 name: ferrum-controller\n\
+             subjects:\n\
+             \x20 - kind: ServiceAccount\n\
+             \x20   name: ferrum-controller\n\
+             \x20   namespace: ferrum\n",
+        )
+        .expect("write rbac");
+        assert!(codes_in(&dir).is_empty(), "{:?}", codes_in(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The shipped admission Deployment in the shape F5 is about: automount
+    /// off, one explicit `projected` ServiceAccount token, mounted by the
+    /// container that opens the watch. `mount_path` is the only thing the three
+    /// cases below differ by; `None` mounts the projection nowhere.
+    fn hardened_admission_tree(tag: &str, mount_path: Option<&str>) -> PathBuf {
+        admission_tree_with(tag, |raw| {
+            if !raw.contains("kind: Deployment") {
+                return raw;
+            }
+            let mut out = raw.replace(
+                "      automountServiceAccountToken: true",
+                "      automountServiceAccountToken: false",
+            );
+            assert!(
+                out.contains("automountServiceAccountToken: false"),
+                "the automount edit missed"
+            );
+            if let Some(path) = mount_path {
+                out = out.replace(
+                    "          volumeMounts:\n",
+                    &format!(
+                        "          volumeMounts:\n\
+                         \x20           - name: sa-token\n\
+                         \x20             mountPath: {path}\n\
+                         \x20             readOnly: true\n"
+                    ),
+                );
+                assert!(out.contains("name: sa-token"), "the mount edit missed");
+            }
+            let volumes = "      volumes:\n\
+                 \x20       - name: sa-token\n\
+                 \x20         projected:\n\
+                 \x20           sources:\n\
+                 \x20             - serviceAccountToken:\n\
+                 \x20                 path: token\n\
+                 \x20                 expirationSeconds: 3600\n";
+            let out = out.replace("      volumes:\n", volumes);
+            assert!(out.contains("projected:"), "the volume edit missed");
+            out
+        })
+    }
+
+    /// The hardened shape is not a finding. Keeping the ambient token out of
+    /// every container and handing one scoped, expiring token to the container
+    /// that authenticates is the *more* defensive manifest; a rule reading only
+    /// `automountServiceAccountToken` called it a hard finding, and since
+    /// FD027 is never a warning the only repair on offer was to widen the
+    /// token's exposure to the whole pod.
+    #[test]
+    fn a_projected_token_where_the_code_reads_it_is_not_a_finding() {
+        let dir = hardened_admission_tree("projected-ok", Some(SERVICE_ACCOUNT_DIR));
+        assert!(codes_in(&dir).is_empty(), "{:?}", codes_in(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And the path is the check, not the projection. `ApiserverConfig` joins
+    /// `token` onto `SERVICE_ACCOUNT_DIR` and opens nothing else, so a token
+    /// projected at `/var/run/secrets/tokens` is a file this product never
+    /// reads — the same cold cache, arriving by a different route.
+    #[test]
+    fn a_projected_token_mounted_somewhere_else_is_still_a_finding() {
+        let dir = hardened_admission_tree("projected-elsewhere", Some("/var/run/secrets/tokens"));
+        assert_eq!(codes_in(&dir), code_set([LABEL_SOURCE_UNJOINED].as_slice()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A projection no container mounts is a token in the kubelet's head and
+    /// nowhere in the filesystem.
+    #[test]
+    fn a_projected_token_no_container_mounts_is_still_a_finding() {
+        let dir = hardened_admission_tree("projected-unmounted", None);
         assert_eq!(codes_in(&dir), code_set([LABEL_SOURCE_UNJOINED].as_slice()));
         let _ = fs::remove_dir_all(&dir);
     }

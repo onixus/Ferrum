@@ -471,25 +471,36 @@ pipeline {
                         exit 1
                     fi
                     # Per-test evidence, named. Each test that reaches a
-                    # confirmed SIGKILL prints one line through one helper, so
-                    # the set of lines this run must contain can be read out of
-                    # the source instead of written down here — a test that
-                    # gains or loses its kill is required, or stopped being
-                    # required, by this stage on the same commit. The line is
-                    # printed after waitpid has confirmed the signal, so it is
-                    # reachable only from the far end of record -> verdict ->
-                    # signal and no skip can emit it.
+                    # confirmed SIGKILL prints one line through one helper. The
+                    # line is printed after waitpid has confirmed the signal, so
+                    # it is reachable only from the far end of record -> verdict
+                    # -> signal, and no skip can emit it.
+                    #
+                    # The set is read out of join_evidence.rs and NOT out of
+                    # $src, which is where it came from until cycle 11.
+                    # Deriving it from the file under test is self-lowering one
+                    # level finer than the count, and cheaper to hit: gut the
+                    # kill half of one test — keep its record and decode
+                    # assertions, drop the responder call and its
+                    # signalled(...) — and the test passes, passed still equals
+                    # expected, the required set silently shrinks from four
+                    # labels to three, this stage goes green, and the section D
+                    # row that test covers keeps a K witness that no longer
+                    # carries a record to a signal. join_evidence.rs holds the
+                    # set to the rows the boundary document names and asserts
+                    # against $src in both directions under a plain cargo test.
                     #
                     # The one join test with no line here is the stale-target
                     # refusal, which deliberately kills nothing; the count check
                     # above is what covers it.
                     names=/tmp/ferrum-join-evidence.txt
-                    grep -o 'signalled("[^"]*"' "$src" \
-                        | sed 's/^signalled("//; s/"$//' | sort -u > "$names"
+                    anchor=crates/ferrum-agent/tests/join_evidence.rs
+                    sed -n 's/^ *evidence: "\\(.*\\)",$/\\1/p' "$anchor" \
+                        | sort -u > "$names"
                     if [ ! -s "$names" ]; then
-                        echo "no signalled(...) call sites found in $src: this stage can no" >&2
-                        echo "longer name the evidence it requires, so requiring it proves" >&2
-                        echo "nothing" >&2
+                        echo "no evidence labels found in $anchor: this stage can no longer" >&2
+                        echo "name the evidence it requires, so requiring it proves nothing." >&2
+                        echo "Check the shape of REQUIRED_KILLS." >&2
                         exit 1
                     fi
                     while read -r what; do
@@ -516,10 +527,22 @@ pipeline {
         // measurement survived only as prose in a merge body.
         //
         // No patch here survives. This comment said one did until the harness
-        // was run: on Linux 6.18.44 all four are killed, each naming the gate::
-        // test that caught it. A `cargo test` exit status is not on its own a
-        // kill — it is also what a compile error returns — so run.sh requires
-        // per patch that the join built, ran, and named a failing test.
+        // was run: on Linux 6.18.44 all six are killed, each naming the gate::
+        // test that caught it. It then said four for a cycle after two more
+        // were added — the patch headers and the boundary document were
+        // refreshed and this line was not, which is why the count it names is
+        // now derived and not written down. A `cargo test` exit status is not
+        // on its own a kill — it is also what a compile error returns — so
+        // run.sh requires per patch that the join built, ran, and named a
+        // failing test.
+        //
+        // And how many patches: run.sh iterated whatever *.patch it found and
+        // asserted nothing about the number, so deleting five of six left one
+        // measured mutation, no survivors, and this stage green. The set is
+        // named in crates/ferrum-agent/tests/mutation_manifest.rs, which
+        // run.sh checks this directory against before it applies anything and
+        // which `cargo test --workspace` holds to the directory on every
+        // commit, kernel or no kernel.
         stage('BPF join mutations') {
             steps {
                 sh '''

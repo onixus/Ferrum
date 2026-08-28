@@ -107,8 +107,42 @@ revert() {
     fi
 }
 
+# The floor, derived from the tree rather than from this directory.
+#
+# Everything below iterates whatever *.patch it finds and asserts nothing about
+# how many. Delete 02..06 and keep 01: one mutation is measured, survivors=0,
+# unmeasured=0, and the success line at the end still says every mutation makes
+# the join fail — of a set a fifth of the size, with the boundary rows for the
+# truncated path, the flag-stripped record and RESPOND_SIGNAL_FAILING then
+# measured by nothing that ran. That is the "green having run almost nothing"
+# shape the two stages above this one closed by deriving their counts from the
+# source, and a harness cannot derive its own floor from the directory it is
+# supposed to be checking. `mutation_manifest.rs` names the set; a `cargo test`
+# holds that list to this directory, and this holds this run to that list.
+manifest="$root/crates/ferrum-agent/tests/mutation_manifest.rs"
+test -f "$manifest"
+floor="$(sed -n 's/^ *"\(.*\.patch\)",$/\1/p' "$manifest" | wc -l)"
+if [ "$floor" -lt 1 ]; then
+    echo "read no patch names out of $manifest. This script's own idea of how many" >&2
+    echo "mutations it must measure is broken, so it can no longer tell a full run" >&2
+    echo "from one patch." >&2
+    exit 1
+fi
+found=0
+for patch in "$here"/*.patch; do
+    test -f "$patch" && found=$((found + 1))
+done
+if [ "$found" -ne "$floor" ]; then
+    echo "$here holds $found patch(es) and $manifest names $floor. A mutation that is" >&2
+    echo "not on disk is a property this gate is no longer measured against, and this" >&2
+    echo "script would otherwise report ok for whatever is left. Re-anchor the missing" >&2
+    echo "patch, or register a new one in mutation_manifest.rs." >&2
+    exit 1
+fi
+
 survivors=0
 unmeasured=0
+measured=0
 for patch in "$here"/*.patch; do
     name="$(basename "$patch")"
     echo "=== mutation: $name"
@@ -174,6 +208,7 @@ for patch in "$here"/*.patch; do
     echo "    killed by:"
     echo "$killers" | sed 's/^/        /'
     sed -n 's/^test result: /    /p' "$out"
+    measured=$((measured + 1))
 done
 
 if [ "$unmeasured" -ne 0 ]; then
@@ -185,5 +220,11 @@ if [ "$survivors" -ne 0 ]; then
     echo "$survivors mutation(s) survived: the join does not gate what it claims to" >&2
     exit 1
 fi
-echo "ok: every mutation beside this script makes tests/attach_join.rs fail, and each"
-echo "    failure names the gate:: test that caught it"
+if [ "$measured" -ne "$floor" ]; then
+    echo "$measured of $floor mutations reached a kill. Nothing above reported a" >&2
+    echo "survivor or an unmeasured patch, so the loop did not run over the set this" >&2
+    echo "script checked before it started: the count is what is left to notice that." >&2
+    exit 1
+fi
+echo "ok: all $floor mutations named by mutation_manifest.rs make tests/attach_join.rs"
+echo "    fail, and each failure names the gate:: test that caught it"
