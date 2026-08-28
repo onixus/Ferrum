@@ -142,18 +142,42 @@ pub fn encode_event(event: &Event) -> Vec<u8> {
     out
 }
 
+/// Whether this record's path did not fit, read from the flag AND from the
+/// buffer, because for one producer still deployed the flag is not written.
+///
+/// `bpf_probe_read_user_str` always terminates what it copies: it writes at
+/// most `PATH_LEN` bytes and spends the last of them on the NUL. So a string
+/// that reached the last usable byte — `PATH_LEN - 1` bytes before a
+/// terminator, or no terminator at all — is a string the buffer could not
+/// prove whole. That is the comparison the datapath's `emit()` makes on the
+/// helper's return value (`len < PATH_LEN - 1` fits), restated against the
+/// bytes that arrived, so the two halves cannot disagree about one record.
+///
+/// It is derived rather than trusted because the flag is the *newer* half. An
+/// ELF built before `emit()` learned that the helper reports truncation as
+/// success writes the head and no flag, and after a rolling upgrade this
+/// decoder runs in front of exactly that object — measured on Linux 6.18: a
+/// 384-byte `openat` pathname arrived as a 255-byte head with the flag unset,
+/// leaving `path_suffix` free to reject a `docker.sock` rule on a tail nobody
+/// saw. Reading the buffer closes that window on objects already deployed,
+/// which no new kernel flag can reach.
+///
+/// The cost is a path that really did occupy exactly `PATH_LEN - 1` bytes: it
+/// is called truncated, so every rule naming a path applies to it and the
+/// decision is marked `path_unknown`. That is the trade this flag already
+/// makes — over-enforce with a signal rather than under-enforce in silence —
+/// and the datapath makes it identically, because the helper's return value
+/// cannot separate those two cases either.
+pub fn path_truncated(event: &Event) -> bool {
+    event.path_truncated() || path_bytes(&event.path).len() >= PATH_LEN - 1
+}
+
 /// Bridge a decoded record to the policy-evaluation view. Unknown syscall nrs
 /// map to [`SYSCALL_UNKNOWN`] instead of failing: the record still reaches the
 /// spec's default action.
 ///
-/// `path_truncated` is the datapath's flag and nothing else. An ELF built
-/// before `emit()` learned that `bpf_probe_read_user_str` reports truncation
-/// as success does not set it, and a record whose path fills the buffer is
-/// then indistinguishable here from an honest one — see the note on
-/// [`ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED`]. Deriving the fact from
-/// the buffer shape would close that window during a rolling upgrade; it also
-/// contradicts a `ferrum-testkit` replay anchor that requires such a record to
-/// be audited, so it is not done here.
+/// `path_truncated` is [`path_truncated`], not the raw flag: see there for why
+/// the buffer is read as well.
 pub fn syscall_event(event: &Event, arch: SyscallArch) -> SyscallEvent<'_> {
     SyscallEvent {
         syscall: syscall_name(arch, event.syscall_nr).unwrap_or(SYSCALL_UNKNOWN),
@@ -161,7 +185,7 @@ pub fn syscall_event(event: &Event, arch: SyscallArch) -> SyscallEvent<'_> {
         path: nul_trimmed_str(&event.path),
         in_container: event.in_container(),
         agent_self: event.agent_self(),
-        path_truncated: event.path_truncated(),
+        path_truncated: path_truncated(event),
     }
 }
 
@@ -178,15 +202,22 @@ pub fn event_meta(event: &Event) -> EventMeta {
         tgid: event.tgid,
         in_container: event.in_container(),
         agent_self: event.agent_self(),
-        path_truncated: event.path_truncated(),
+        path_truncated: path_truncated(event),
     }
+}
+
+/// Bytes the datapath wrote, up to the first NUL. Not the string view: a
+/// non-UTF-8 tail is still bytes the helper copied, and buffer shape must be
+/// read from the bytes, never from what survives UTF-8 validation.
+fn path_bytes(buf: &[u8]) -> &[u8] {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    &buf[..end]
 }
 
 /// Bytes up to the first NUL; a non-UTF-8 tail is cut, not propagated, so a
 /// hostile comm/path cannot poison the export path.
 fn nul_trimmed_str(buf: &[u8]) -> &str {
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let trimmed = &buf[..end];
+    let trimmed = path_bytes(buf);
     match core::str::from_utf8(trimmed) {
         Ok(s) => s,
         Err(err) => core::str::from_utf8(&trimmed[..err.valid_up_to()]).unwrap_or(""),
@@ -414,46 +445,105 @@ mod tests {
         assert!(!event_meta(&clean).path_truncated);
     }
 
-    /// The window this decoder does NOT close, pinned so it cannot widen or
-    /// be forgotten.
+    /// The rolling-upgrade window, closed here rather than in the kernel.
     ///
     /// The record below is what an ELF built before `emit()` flagged a short
     /// read writes for an over-long path: the head fills the buffer and no
-    /// flag is set. Nothing here can tell it from an honest 255-byte path, so
-    /// `path_suffix` is free to reject on a tail the datapath never saw — the
-    /// measured fail-open. The datapath no longer produces this record, but a
-    /// rolling upgrade puts this decoder in front of the object that does.
+    /// flag is set. The datapath in this tree no longer produces it, but a
+    /// rolling upgrade — new agent, old ELF still in the image — puts this
+    /// decoder in front of the object that does, and a new kernel flag cannot
+    /// reach an object already deployed. So the fact is derived from the
+    /// buffer: the helper spends the last byte on a terminator, so a string
+    /// occupying `PATH_LEN - 1` bytes had nowhere to put one.
     ///
-    /// `Event::path` carries the evidence to derive it (a full buffer is a
-    /// buffer that had nowhere to put a terminator), and that derivation is
-    /// not made here: `ferrum-testkit`'s replay anchor requires exactly this
-    /// record to be audited rather than killed, and that anchor is the next
-    /// thing that has to move.
+    /// Both views must derive it, and both must agree with the flagged record
+    /// they are standing in for: the flag becomes the *only* difference that
+    /// makes no difference.
     #[test]
-    fn a_buffer_filling_path_is_not_yet_read_as_truncated() {
+    fn a_buffer_filling_path_is_read_as_truncated_without_the_flag() {
         let mut event = sample();
         event.path = [0; PATH_LEN];
         let head = format!("/var/run/{}", "./".repeat(130));
         event.path[..PATH_LEN - 1].copy_from_slice(&head.as_bytes()[..PATH_LEN - 1]);
         assert_eq!(
             event.flags & ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED,
-            0
+            0,
+            "a pre-fix ELF sets nothing"
         );
 
         let back = decode_event(&encode_event(&event)).expect("decode");
         let view = syscall_event(&back, SyscallArch::X86_64);
         assert_eq!(view.path.len(), PATH_LEN - 1, "the head fills the buffer");
-        // Observed, not desired.
-        assert!(!view.path_truncated);
-        assert!(!event_meta(&back).path_truncated, "the two views disagree");
+        assert!(view.path_truncated, "no flag, but the buffer says so");
+        assert!(event_meta(&back).path_truncated, "and both views say it");
+        assert!(path_truncated(&back));
 
-        // The same record from the current datapath: the flag is there, and
-        // it is the only thing that changed.
+        // The same record from the current datapath: the flag is the only
+        // thing that changed, and it changes nothing.
         let mut flagged = event;
         flagged.flags |= ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED;
         let back = decode_event(&encode_event(&flagged)).expect("decode");
         assert!(syscall_event(&back, SyscallArch::X86_64).path_truncated);
         assert!(event_meta(&back).path_truncated);
+    }
+
+    /// The derivation is the datapath's own comparison restated, so it must
+    /// break where `emit()` breaks and nowhere else: `emit()` calls a read
+    /// short when `len < PATH_LEN - 1`, so a path one byte under the buffer's
+    /// usable size is whole and every longer one is not.
+    ///
+    /// The lower bound matters as much as the upper: a decoder that called
+    /// every path truncated would pin the node to Degraded and make every
+    /// path rule unconditional, which is not enforcement, it is noise.
+    #[test]
+    fn the_derivation_breaks_where_the_datapath_breaks() {
+        for len in [0usize, 1, 7, PATH_LEN - 2] {
+            let mut event = sample();
+            event.path = [0; PATH_LEN];
+            event.path[..len].fill(b'a');
+            assert!(
+                !path_truncated(&event),
+                "{len} bytes plus a terminator fits in {PATH_LEN}"
+            );
+            assert!(!syscall_event(&event, SyscallArch::X86_64).path_truncated);
+            assert!(!event_meta(&event).path_truncated);
+        }
+
+        // PATH_LEN - 1 bytes: the terminator took the last byte, so the
+        // datapath's helper returned the buffer size and `emit()` flags it.
+        // No NUL at all is the same shape one byte further on.
+        for len in [PATH_LEN - 1, PATH_LEN] {
+            let mut event = sample();
+            event.path = [0; PATH_LEN];
+            event.path[..len].fill(b'a');
+            assert!(path_truncated(&event), "{len} bytes had nowhere to end");
+        }
+
+        // An unreadable pointer left the buffer empty and only the flag says
+        // so. The derivation must not swallow it: `path_unreadable` in
+        // `eval` is exactly "flag set and buffer empty".
+        let mut efault = sample();
+        efault.path = [0; PATH_LEN];
+        efault.flags |= ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED;
+        assert!(path_truncated(&efault));
+        let view = syscall_event(&efault, SyscallArch::X86_64);
+        assert!(view.path_truncated);
+        assert!(view.path.is_empty());
+    }
+
+    /// Buffer shape is a fact about bytes, not about UTF-8. A hostile path
+    /// that fills the buffer with invalid UTF-8 is trimmed to nothing for the
+    /// export, and must still be read as truncated — otherwise writing one
+    /// bad byte into a long path turns the derivation off.
+    #[test]
+    fn a_non_utf8_full_buffer_is_still_truncated() {
+        let mut event = sample();
+        event.path = [0xff; PATH_LEN];
+        event.path[..2].copy_from_slice(b"/a");
+        let view = syscall_event(&event, SyscallArch::X86_64);
+        assert_eq!(view.path, "/a", "the tail is cut for the export");
+        assert!(view.path_truncated);
+        assert!(event_meta(&event).path_truncated);
     }
 
     /// The decode table is one of the three places the datapath's syscall set
