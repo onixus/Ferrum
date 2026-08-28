@@ -201,14 +201,18 @@ impl RelistDebt for crate::labels::LabelCache {
 /// control-plane upgrade into a reconnect storm against the apiserver,
 /// authored by the component that is supposed to protect it.
 ///
-/// So the debt is raised and the stream reads on. It is also *scheduled*:
-/// [`RELIST_DEBT_HOLDDOWN`] after it was raised, the next frame ends the stream
-/// with [`WatchOutcome::MustRelist`] and the cycle's own relist discharges it.
-/// Nothing else would — a stream that never fails is the healthy case, and the
-/// cache would otherwise stay unwarm for the life of the connection, denying
-/// every selected Pod cluster-wide. The hold-down is what keeps that bounded in
-/// both directions: at most one reconnect per hold-down however many unreadable
-/// frames arrive, and at most one hold-down of failing closed per burst.
+/// So the debt is raised here and the stream reads on. Discharging it is not
+/// this function's job and deliberately not this function's frame:
+/// [`relist_if_due`] runs on *every* frame, so [`RELIST_DEBT_HOLDDOWN`] after
+/// the debt was raised the next frame of any kind ends the stream with
+/// [`WatchOutcome::MustRelist`] and the cycle's own relist discharges it.
+/// Checking it here instead — which is what cycle 11 did — means the debt is
+/// only ever looked at again by a *second* unreadable frame: one bad frame on a
+/// stream that then stays healthy leaves the cache unwarm for the life of the
+/// connection, denying every selected Pod cluster-wide, which is the fault the
+/// hold-down exists to bound. Bounded in both directions: at most one reconnect
+/// per hold-down however many unreadable frames arrive, and at most one
+/// hold-down of failing closed per burst.
 ///
 /// [`RELIST_DEBT_HOLDDOWN`]: crate::labels::RELIST_DEBT_HOLDDOWN
 fn note_unreadable_frame<C: RelistDebt + ?Sized>(
@@ -221,13 +225,6 @@ fn note_unreadable_frame<C: RelistDebt + ?Sized>(
     // the burst that would fill the log.
     let first = !cache.relist_pending();
     cache.raise_relist_pending_at(now);
-    if cache.relist_due_at(now) {
-        eprintln!(
-            "ferrum-k8smeta: unreadable {resource} watch frame, relist debt stood past              {:?}; ending the stream to relist: {err}",
-            crate::labels::RELIST_DEBT_HOLDDOWN
-        );
-        return WatchOutcome::MustRelist;
-    }
     if first {
         eprintln!(
             "ferrum-k8smeta: unreadable {resource} watch frame, relist pending within {:?};              the stream keeps reading and the cache is not warm until it lands: {err}",
@@ -235,6 +232,35 @@ fn note_unreadable_frame<C: RelistDebt + ?Sized>(
         );
     }
     WatchOutcome::Ignored
+}
+
+/// The standing debt, checked on every frame rather than only on the ones the
+/// parser rejects. A debt raised by an unreadable frame is discharged by a
+/// relist, and nothing on a healthy stream asks for one: `Applied` and
+/// `Ignored` are not outcomes `cycle()` relists on, so a debt only this frame's
+/// successor-in-failure could see is a debt that stands until the connection
+/// does — the cache unwarm, admission denying every selected Pod, and
+/// `PodCache::snapshot()` naming no cgroups, for hours.
+///
+/// It stays cheap in the other direction because the answer is still the
+/// hold-down and not the frame: inside [`RELIST_DEBT_HOLDDOWN`] this returns
+/// `None` however many frames arrive, so a burst of unreadable frames costs one
+/// reconnect per hold-down, not one per frame.
+///
+/// [`RELIST_DEBT_HOLDDOWN`]: crate::labels::RELIST_DEBT_HOLDDOWN
+fn relist_if_due<C: RelistDebt + ?Sized>(
+    cache: &C,
+    resource: &str,
+    now: Instant,
+) -> Option<WatchOutcome> {
+    if !cache.relist_due_at(now) {
+        return None;
+    }
+    eprintln!(
+        "ferrum-k8smeta: {resource} relist debt stood past {:?}; ending the stream to relist",
+        crate::labels::RELIST_DEBT_HOLDDOWN
+    );
+    Some(WatchOutcome::MustRelist)
 }
 
 /// One line of a pod `watch=1` stream, folded in. The single place a pod frame
@@ -247,6 +273,9 @@ pub fn apply_watch_line(cache: &mut PodCache, line: &[u8]) -> WatchOutcome {
 /// Same, at an explicit instant, so the relist hold-down can be exercised
 /// without sleeping through it.
 pub fn apply_watch_line_at(cache: &mut PodCache, line: &[u8], now: Instant) -> WatchOutcome {
+    if let Some(outcome) = relist_if_due(cache, "pods", now) {
+        return outcome;
+    }
     let event = match parse_watch_event(line) {
         Ok(event) => event,
         Err(err) => return note_unreadable_frame(cache, "pods", &err, now),
@@ -276,6 +305,9 @@ pub fn apply_labels_line_at(
     line: &[u8],
     now: Instant,
 ) -> Result<WatchOutcome> {
+    if let Some(outcome) = relist_if_due(cache, resource, now) {
+        return Ok(outcome);
+    }
     let event = match parse_labels_watch_event(line) {
         Ok(event) => event,
         Err(err) => return Ok(note_unreadable_frame(cache, resource, &err, now)),
@@ -663,6 +695,104 @@ mod freshness_tests {
         cache.mark_applied_at(start + RELIST_DEBT_HOLDDOWN);
         assert!(!cache.relist_pending());
         assert!(cache.snapshot().is_ok(), "the cache is warm again");
+    }
+
+    /// The hold-down only ever ran on a *second* unreadable frame: the due
+    /// check lived in the `Err` arm of the parser, so a single bad frame on a
+    /// stream that then stays healthy raised a debt nothing would ever look at
+    /// again. The cache stayed unwarm for the life of the connection, which is
+    /// `review.rs` denying every Pod under a namespaceSelector and
+    /// `PodCache::snapshot()` refusing to name a cgroup — the very fault the
+    /// hold-down was written to bound. So the debt is checked where a frame is
+    /// folded in, not where it fails to parse: any frame past the hold-down
+    /// ends the stream.
+    #[test]
+    fn one_unreadable_frame_on_an_otherwise_healthy_stream_still_relists() {
+        let start = Instant::now();
+        let mut cache = PodCache::new("node-a");
+        cache.replace_all(Vec::new());
+        cache.mark_applied_at(start);
+
+        assert_eq!(
+            apply_watch_line_at(
+                &mut cache,
+                br#"{"type":"PATCHED","object":{"metadata":{}}}"#,
+                start
+            ),
+            WatchOutcome::Ignored,
+            "one bad frame still costs no reconnect of its own"
+        );
+        assert!(cache.relist_pending());
+
+        // From here the stream is healthy: readable frames and bookmarks, the
+        // case that used to leave the debt standing forever.
+        let added = br#"{"type":"ADDED","object":{"metadata":{"uid":"u1","name":"web-0","namespace":"prod","resourceVersion":"11"},"spec":{"nodeName":"node-a"}}}"#;
+        let bookmark = br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"12"}}}"#;
+        assert_eq!(
+            apply_watch_line_at(&mut cache, added, start + RELIST_DEBT_HOLDDOWN / 4),
+            WatchOutcome::Applied,
+            "inside the hold-down the stream reads on"
+        );
+        assert_eq!(
+            apply_watch_line_at(&mut cache, bookmark, start + RELIST_DEBT_HOLDDOWN / 2),
+            WatchOutcome::Ignored
+        );
+        assert!(
+            cache.snapshot().is_err(),
+            "and while the debt stands the cache still denies"
+        );
+
+        // Past the hold-down, and the next healthy frame ends the stream.
+        assert_eq!(
+            apply_watch_line_at(&mut cache, added, start + RELIST_DEBT_HOLDDOWN),
+            WatchOutcome::MustRelist,
+            "a healthy frame past the hold-down must relist, not read on forever"
+        );
+        cache.replace_all(Vec::new());
+        cache.mark_applied_at(start + RELIST_DEBT_HOLDDOWN);
+        assert!(!cache.relist_pending());
+        assert!(cache.snapshot().is_ok(), "the cache is warm again");
+
+        // The label stream, whose unwarm cache is what denies Pods in
+        // admission, answers the same way on the same shape of stream.
+        let mut labels = LabelCache::new();
+        labels.try_replace_all(Vec::new()).expect("list fits");
+        assert_eq!(
+            apply_labels_line_at(
+                &mut labels,
+                "namespaces",
+                br#"{"type":"PATCHED","object":{"metadata":{"name":"prod"}}}"#,
+                start
+            )
+            .expect("an unreadable frame is not a stream error"),
+            WatchOutcome::Ignored
+        );
+        let healthy = br#"{"type":"MODIFIED","object":{"metadata":{"name":"prod","resourceVersion":"77"},"labels":{}}}"#;
+        assert_ne!(
+            apply_labels_line_at(
+                &mut labels,
+                "namespaces",
+                healthy,
+                start + RELIST_DEBT_HOLDDOWN / 2
+            )
+            .expect("healthy frame"),
+            WatchOutcome::MustRelist,
+            "inside the hold-down a healthy frame is not a reconnect"
+        );
+        assert!(!labels.is_warm_at(start + RELIST_DEBT_HOLDDOWN / 2));
+        assert_eq!(
+            apply_labels_line_at(
+                &mut labels,
+                "namespaces",
+                healthy,
+                start + RELIST_DEBT_HOLDDOWN
+            )
+            .expect("healthy frame"),
+            WatchOutcome::MustRelist,
+            "otherwise is_warm stays false for the life of the connection"
+        );
+        labels.try_replace_all(Vec::new()).expect("relist fits");
+        assert!(labels.is_warm_at(start + RELIST_DEBT_HOLDDOWN));
     }
 
     /// The other direction, which the fix must not break: a rolling

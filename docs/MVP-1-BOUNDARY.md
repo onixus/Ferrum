@@ -204,6 +204,7 @@
 | FD027 читает токен по пути, а не по факту automount: явная `projected` проекция, смонтированная туда, откуда её читает код, — не находка, а смонтированная в другое место — находка | U | U `lint_deploy.rs::a_projected_token_where_the_code_reads_it_is_not_a_finding` · U `lint_deploy.rs::a_projected_token_mounted_somewhere_else_is_still_a_finding` · U `lint_deploy.rs::a_projected_token_no_container_mounts_is_still_a_finding` |
 | Под, чьему ServiceAccount это дерево выдало RBAC, обязан нести токен, даже если не называет ни одного флага watch — иначе он аутентифицируется как `system:anonymous`, а выданный грант описывает личность, которую никто не предъявляет | U | U `lint_deploy.rs::a_granted_service_account_with_no_projected_token_is_a_finding` · U `lint_deploy.rs::a_service_account_this_tree_grants_nothing_needs_no_token` · U `lint_deploy.rs::a_binding_to_a_ruleless_role_is_not_a_grant` |
 | `ApiserverConfig` без спроецированного токена — ошибка старта, называющая файл, а не бесконечный backoff | U | U `ferrum-k8smeta/src/watch.rs::a_config_without_a_projected_token_is_an_error_that_names_the_file` |
+| Долг relist, поднятый нечитаемым кадром, гасится истечением hold-down на любом следующем кадре, а не приходом второго нечитаемого: одиночный плохой кадр на здоровом потоке не оставляет кэш нетёплым на всё время соединения, и при этом всплеск нечитаемых кадров не стоит переподключения на кадр | U | U `ferrum-k8smeta/src/watch.rs::one_unreadable_frame_on_an_otherwise_healthy_stream_still_relists` · U `ferrum-k8smeta/src/watch.rs::an_unreadable_pod_frame_ends_the_stream_once_its_debt_stands` · U `ferrum-k8smeta/src/watch.rs::a_rolling_stream_of_unknown_frames_is_not_a_reconnect_per_frame` |
 | `status.json` пишется целиком, переживает сбой записи и не держит замок на агенте | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::the_status_write_holds_no_lock_on_the_shared_agent` |
 
 ### Сигналы деградации
@@ -516,6 +517,20 @@ model этого проекта. То же самое и той же формы 
   Firecracker microVM без `CONFIG_MODULES`: `init_module` и `finit_module`
   там сообщаются незацепленными, потому что tracepoint для них не существует,
   а не потому, что attach проверен и отказал. Второго ядра здесь не было.
+- **Всплеск нечитаемых кадров всё ещё запрещает каждый выбранный Pod — до
+  одного hold-down.** `RELIST_DEBT_HOLDDOWN` — 5 секунд
+  (`crates/ferrum-k8smeta/src/labels.rs:40`). Пока долг стоит,
+  `LabelCache::is_warm` ложен, `review.rs` отказывает каждому Pod под
+  namespaceSelector, а `PodCache::snapshot()` возвращает `Err`, и
+  `containerOnly` не матчится. Ограниченно, не навсегда, но не ноль. На
+  молчащем потоке hold-down не срабатывает вовсе — гасит долг не он, а
+  read-дедлайн сокета: `IO_TIMEOUT` = `POD_WATCH_BUDGET / 2` = 150 секунд
+  (`crates/ferrum-k8smeta/src/watch.rs:996`), после которых `read` возвращает
+  ошибку, `watch_once` — `Err`, и `watch_loop` переподключается и делает
+  relist. Отдельного таймаута «долг просрочен, кадров нет» этот слайс не
+  добавлял: он был бы вторым дедлайном на том же сокете. Значит окно отказов
+  на молчащем потоке — до 150 секунд, а не до 5.
+
 - **Ничто и никогда не обращалось к API server.** Ни webhook под нагрузкой
   admission, ни watch, ни запись status.
 
