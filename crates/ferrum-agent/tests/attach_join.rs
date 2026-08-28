@@ -64,14 +64,14 @@ mod gate {
 
     use ferrum_agent::{
         encode_fsig, pump_records, Agent, AgentConfig, AgentRole, ProcCgroupCheck, SignalResponder,
-        REFUSE_STALE_TARGET,
+        DEGRADED_RECOVERY, DEG_PATH_TRUNCATED, REFUSE_STALE_TARGET,
     };
     use ferrum_api::PolicyMode;
     use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
     use ferrum_crypto::{public_key_from_secret, sign_bundle};
     use ferrum_ebpf::{
         decode_event, syscall_name, Event, KernelHandle, RingReader, SyscallArch,
-        EVENT_FLAG_CONTAINER, PATH_LEN,
+        EVENT_FLAGS_OFFSET, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, PATH_LEN,
     };
     use ferrum_export::MemorySink;
     use ferrum_ids::{Digest, ADMISSION_ABI, AGENT_ABI};
@@ -575,6 +575,21 @@ mod gate {
         );
     }
 
+    /// The line a stage outside this file greps for to tell a run that carried
+    /// a record to a signal from one that skipped every test and exited 0.
+    ///
+    /// Every skip in `live()` is an early `return` from a `#[test]`, so the
+    /// pass count cannot tell those apart; only `waitpid` having reported a
+    /// SIGKILL can. One line per test that got that far, in one shape, so the
+    /// stage can require a *count* rather than the presence of one test's
+    /// line. `Jenkinsfile` currently greps for `no-shell: kernel record`,
+    /// which is what this prints for that test — the text is unchanged.
+    fn signalled(what: &str, pid: libc::pid_t) {
+        println!(
+            "{what}: kernel record → signed bundle → SIGKILL, confirmed by waitpid on pid {pid}"
+        );
+    }
+
     /// RFC §D: `kubectl exec` + `/bin/sh` → kill.
     ///
     /// The shell is a real `/bin/sh`, not a process renamed to look like one:
@@ -643,10 +658,7 @@ mod gate {
             "the probe died of signal {}, not SIGKILL",
             libc::WTERMSIG(status)
         );
-        println!(
-            "no-shell: kernel record → signed bundle → SIGKILL, confirmed by waitpid on pid {}",
-            probe.pid
-        );
+        signalled("no-shell", probe.pid);
         let _ = live.handle.events_dropped_total();
     }
 
@@ -696,6 +708,7 @@ mod gate {
         let status = probe.wait_for_death("no-runtime-sock");
         assert!(libc::WIFSIGNALED(status), "the probe exited on its own");
         assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        signalled("no-runtime-sock", probe.pid);
     }
 
     /// The same case with a path the datapath cannot carry whole.
@@ -786,6 +799,174 @@ mod gate {
         let status = probe.wait_for_death("no-runtime-sock (truncated path)");
         assert!(libc::WIFSIGNALED(status), "the probe exited on its own");
         assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        signalled("no-runtime-sock (truncated path)", probe.pid);
+    }
+
+    /// The same over-long path again, with the datapath's flag taken away:
+    /// what a node still running a pre-cycle-8 ELF writes.
+    ///
+    /// Cycle 8 closed the fail-open twice. `emit()` sets
+    /// `EVENT_FLAG_PATH_TRUNCATED` from the length the helper returned — the
+    /// test above measures that — and `ferrum_ebpf::path_truncated` derives the
+    /// same answer from the shape of the buffer that arrived. The second half
+    /// exists for one reason: an image is replaced on its own schedule, so
+    /// after a rolling upgrade this agent runs in front of an object that
+    /// predates the fix, and no new kernel flag can reach an object already
+    /// deployed. Until now that half had no kernel-level proof at all. Its only
+    /// demonstration was a unit test on a record Rust had written
+    /// (`ferrum-ebpf/src/event.rs`), which cannot say whether a *kernel* record
+    /// with no flag on it still reaches a signal.
+    ///
+    /// So the record here is this kernel's. The probe opens the same over-long
+    /// `docker.sock` path, the ring is drained, and then exactly one bit is
+    /// cleared in the bytes — `EVENT_FLAG_PATH_TRUNCATED`, at
+    /// `EVENT_FLAGS_OFFSET`, asserted below to be the only byte that moved.
+    /// Nothing is rebuilt from parts: an `Event` re-encoded with the flag
+    /// dropped is a synthesised record and would prove no more than
+    /// `replay.rs` already does. The head, the cgroup id, the tgid, the syscall
+    /// nr and the ABI stamp are all still the ones the kernel wrote, and the
+    /// verdict below is decided on them.
+    ///
+    /// The test above must keep asserting the raw flag, and does; this one does
+    /// not repeat that assertion, because a record that still carried the flag
+    /// would make everything below vacuous. It asserts instead that there *was*
+    /// a flag to clear, which is the same fact stated as this test's premise.
+    #[test]
+    fn a_kernel_record_stripped_of_the_flag_is_still_read_as_truncated() {
+        let _serial = serialized();
+        let Some(mut live) = live("prefix") else {
+            return;
+        };
+        let arch = live.arch;
+
+        let prefix = format!("/tmp/ferrum-join-{}-prefix/", std::process::id());
+        let mut target = prefix.clone();
+        while target.len() < PATH_LEN + 64 {
+            target.push('a');
+        }
+        target.push_str("/docker.sock");
+        let c_target = CString::new(target.clone()).expect("no NUL");
+        let mut probe = live.spawn_probe(move || unsafe {
+            libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
+        });
+        let tgid = probe.tgid();
+
+        let head = prefix.clone();
+        let records = live.records_of(tgid, "openat of an over-long path", move |event, arch| {
+            syscall_name(arch, event.syscall_nr) == Some("openat")
+                && nul_trimmed(&event.path).starts_with(head.as_bytes())
+        });
+
+        // One bit, in the bytes off the ring. Everything else is the kernel's,
+        // and the assertion is that this is literally true: a single byte
+        // differs, and re-decoding it gives back the same record minus the flag.
+        let mut flagless: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+        let mut had_the_flag = 0usize;
+        for bytes in &records {
+            let mut stripped = bytes.clone();
+            stripped[EVENT_FLAGS_OFFSET] &= !EVENT_FLAG_PATH_TRUNCATED;
+            let moved = bytes
+                .iter()
+                .zip(&stripped)
+                .filter(|(before, after)| before != after)
+                .count();
+            assert!(
+                moved <= 1,
+                "clearing EVENT_FLAG_PATH_TRUNCATED changed {moved} bytes: the offset no longer \
+                 addresses flags, so this record is not the one a pre-fix ELF writes"
+            );
+            had_the_flag += moved;
+
+            let before = decode_event(bytes).expect("decode the ring record");
+            let after = decode_event(&stripped).expect("decode the stripped record");
+            assert_eq!(after.flags, before.flags & !EVENT_FLAG_PATH_TRUNCATED);
+            assert_eq!(after.cgroup_id, before.cgroup_id);
+            assert_eq!(after.tgid, before.tgid);
+            assert_eq!(after.syscall_nr, before.syscall_nr);
+            assert_eq!(after.path, before.path, "the kernel's bytes are untouched");
+            flagless.push(stripped);
+        }
+        assert!(
+            had_the_flag >= 1,
+            "no record from this probe carried EVENT_FLAG_PATH_TRUNCATED, so nothing was cleared \
+             and this test is standing in for a producer that does not exist. The datapath half \
+             has stopped setting the flag — see \
+             a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted"
+        );
+
+        // The record as a pre-fix ELF would have written it: the head fills the
+        // buffer, the suffix the rule names is gone, and nothing in the record
+        // says so. This is the state in which cycle 8 measured `path_suffix`
+        // rejecting a §D kill rule on a tail nobody saw.
+        let pre_fix = flagless
+            .iter()
+            .map(|bytes| decode_event(bytes).expect("decode"))
+            .find(|event| nul_trimmed(&event.path).starts_with(prefix.as_bytes()))
+            .expect("the record we waited for");
+        assert_probe_record(&pre_fix, &live.cgroup, tgid);
+        let path = nul_trimmed(&pre_fix.path);
+        assert_eq!(
+            path.len(),
+            PATH_LEN - 1,
+            "the head does not fill the buffer"
+        );
+        assert!(!pre_fix.path_truncated(), "the flag is still on the record");
+        assert!(
+            !path.ends_with(b"docker.sock"),
+            "the suffix survived truncation, so this record does not exercise the asserted match"
+        );
+
+        let agent = join_agent(&live);
+        let sink = MemorySink::new();
+        let stats = pump_records(&agent, arch, &flagless, &sink);
+        assert_eq!(stats.decode_failed, 0, "a kernel record failed to decode");
+
+        let events = sink.events();
+        let killed = only_rule(&events, "no-runtime-sock");
+        assert_killed(killed, "no-runtime-sock", tgid);
+        assert!(
+            killed.path_unknown,
+            "the flag is the only thing missing and the buffer is unchanged, so the match is \
+             still asserted rather than proven and the export must still say so"
+        );
+        assert!(
+            agent.path_truncated_total() >= 1,
+            "the node counter for truncated paths did not move on a record whose only defect is \
+             that its producer predates the flag"
+        );
+
+        // Degraded on this reason, and decaying: a node running an old ELF must
+        // say so while the traffic lasts and recover on its own once it stops,
+        // exactly as one running the current ELF does. A latch here would pin
+        // every pre-upgrade node to Degraded forever.
+        let now = Instant::now();
+        assert!(agent.path_truncated_recent_at(now));
+        assert!(
+            agent
+                .degraded_reasons_at(now)
+                .iter()
+                .any(|reason| reason == DEG_PATH_TRUNCATED),
+            "the node does not name the truncation: {:?}",
+            agent.degraded_reasons_at(now)
+        );
+        let later = now + DEGRADED_RECOVERY;
+        assert!(!agent.path_truncated_recent_at(later));
+        assert!(
+            !agent
+                .degraded_reasons_at(later)
+                .iter()
+                .any(|reason| reason == DEG_PATH_TRUNCATED),
+            "the truncation signal is latched, not decaying"
+        );
+        assert!(
+            agent.path_truncated_total() >= 1,
+            "the total decayed with the window"
+        );
+
+        let status = probe.wait_for_death("no-runtime-sock (pre-fix ELF record)");
+        assert!(libc::WIFSIGNALED(status), "the probe exited on its own");
+        assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        signalled("no-runtime-sock (flagless truncated path)", probe.pid);
     }
 
     /// The guard between killing a workload and killing whatever inherited its
