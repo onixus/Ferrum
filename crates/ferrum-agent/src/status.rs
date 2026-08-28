@@ -18,6 +18,16 @@
 //! recoverable (cold caches, a burst) or terminal (a wrong ELF), and a restart
 //! on the first turns a node's first seconds into a crash loop while a restart
 //! on the second is an infinite loop that never lives long enough to log why.
+//!
+//! "Never acts" includes not stalling the datapath. A tick is two halves for
+//! that reason: `StatusPublisher::tick` reads the agent and renders the JSON,
+//! `StatusPublisher::commit` writes the file and takes no `Agent` at all. The
+//! poll loops drop every guard on the shared `Agent` between the two, so the
+//! `fsync` in `write_status` — which on a hostPath under IO pressure takes
+//! anything from a millisecond to seconds — is never inside a window holding
+//! the write lock that the ring-drain and pump threads need in order to take
+//! a read guard. A reporting surface that can make the kernel drop records is
+//! not reporting.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -102,6 +112,22 @@ pub fn status_json(
         map.insert("exportQueueDroppedTotal".into(), json!(queue_dropped));
         map.insert("exportWriteFailedTotal".into(), json!(write_failed));
         map.insert("exportWriterLostTotal".into(), json!(writer_lost));
+        map.insert(
+            "waiversInertTotal".into(),
+            json!(agent.waivers_inert_total()),
+        );
+        // False in any file that got written — the flag is set after the
+        // write it describes — so this reads as "the previous publish
+        // failed", and the count as "how many have since boot". A reader
+        // that finds no file at all has the other half of the answer.
+        map.insert(
+            "statusWriteFailed".into(),
+            json!(agent.status_write_failed()),
+        );
+        map.insert(
+            "statusWriteFailedTotal".into(),
+            json!(agent.status_write_failed_total()),
+        );
     }
     out
 }
@@ -136,11 +162,12 @@ pub fn write_status(dir: &Path, value: &Value) -> io::Result<()> {
 
 /// Publishes the poll tick's view of the node: envelope context, the stderr
 /// line on a degraded transition, and `status.json`. Holds only the "already
-/// complained about the status file" flag, so a directory that cannot be
-/// written logs once instead of once per tick.
+/// complained about it" flags, so a directory that cannot be written logs
+/// once instead of once per tick.
 #[derive(Default)]
 pub struct StatusPublisher {
     status_error_logged: bool,
+    no_status_dir_logged: bool,
 }
 
 /// Where a poll tick publishes to. Every part is optional: a build with no
@@ -152,14 +179,35 @@ pub struct StatusOutput<'a> {
     /// stops receiving events must not stop noticing that its exports are
     /// being lost.
     pub sink: Option<&'a (dyn EventSink + Sync)>,
-    /// `--export-dir`. None means no `status.json` (stdout export).
+    /// `--export-dir`. None means no `status.json`: see `commit`, which says
+    /// so once and then puts the whole object on stderr on every state
+    /// change, because a stdout-export agent is otherwise the one shipped
+    /// configuration where these counters still have no reader at all.
     pub status_dir: Option<&'a Path>,
 }
 
+/// One tick's decision, carrying no borrow of the agent: the state already
+/// computed, the JSON already rendered. This is what crosses the lock
+/// boundary, so `commit` can do the filesystem work with every guard on the
+/// shared `Agent` dropped.
+pub struct StatusTick {
+    pub state: DegradedState,
+    json: Option<Value>,
+}
+
+impl StatusTick {
+    /// The rendered object, when one was rendered: an export directory is
+    /// configured, or the state changed and stderr is the only reader.
+    pub fn json(&self) -> Option<&Value> {
+        self.json.as_ref()
+    }
+}
+
 impl StatusPublisher {
-    /// One tick. Returns the state it published, so a caller (and a test) can
-    /// assert on it without recomputing.
-    pub fn publish(&mut self, agent: &Agent, out: &StatusOutput<'_>) -> DegradedState {
+    /// The half of a tick that reads the agent: export losses, degraded state,
+    /// the transition line, the envelope context, and the JSON. No filesystem
+    /// work happens here, so a caller may hold a lock across it.
+    pub fn tick(&mut self, agent: &Agent, out: &StatusOutput<'_>) -> StatusTick {
         let now = Instant::now();
         if let Some(sink) = out.sink {
             agent.note_export_state_at(sink, now);
@@ -172,20 +220,81 @@ impl StatusPublisher {
             ctx.set_bundle_digest(agent.last_good_digest().cloned());
             ctx.set_degraded(state.degraded);
         }
-        if let Some(dir) = out.status_dir {
-            match write_status(dir, &status_json(agent, out.ctx, out.sink, &state)) {
-                Ok(()) => self.status_error_logged = false,
-                Err(err) if !self.status_error_logged => {
+        let render = out.status_dir.is_some() || state.transition.is_some();
+        let json = render.then(|| status_json(agent, out.ctx, out.sink, &state));
+        StatusTick { state, json }
+    }
+
+    /// The half of a tick that touches the filesystem. Takes no `Agent`, by
+    /// signature: nothing reachable from here can hold a lock the datapath
+    /// needs. Returns whether the node state is published, which the caller
+    /// feeds back with `Agent::note_status_write`.
+    ///
+    /// A failed write does not stop the tick — a status surface that stalls
+    /// the poll loop would be worse than one that lies — but it must not
+    /// leave the previous tick's file behind either. That file is
+    /// byte-identical, says `"degraded": false`, and the dominant real cause
+    /// of the failure is ENOSPC on the export directory, which is the same
+    /// condition that fails every event write: the exact scenario this reader
+    /// was built for is the one in which it would freeze on its last healthy
+    /// snapshot. So the stale file is removed. Absence is unambiguous where a
+    /// frozen `ts` is not, and `unlink` still works on a full filesystem when
+    /// `write` does not.
+    pub fn commit(&mut self, tick: &StatusTick, out: &StatusOutput<'_>) -> bool {
+        let Some(dir) = out.status_dir else {
+            if !self.no_status_dir_logged {
+                self.no_status_dir_logged = true;
+                eprintln!(
+                    "ferrum-agent: no --export-dir, so {STATUS_NAME} is not written: the only \
+                     reader for this node's counters is the object logged here on each state \
+                     change"
+                );
+            }
+            if let Some(json) = &tick.json {
+                eprintln!("ferrum-agent: {json}");
+            }
+            // Nothing was asked for, so nothing failed to be published.
+            return true;
+        };
+        let Some(json) = &tick.json else {
+            return true;
+        };
+        match write_status(dir, json) {
+            Ok(()) => {
+                self.status_error_logged = false;
+                true
+            }
+            Err(err) => {
+                let published = dir.join(STATUS_NAME);
+                let removed = match fs::remove_file(&published) {
+                    Ok(()) => true,
+                    Err(rm) => rm.kind() == io::ErrorKind::NotFound,
+                };
+                if !self.status_error_logged {
                     self.status_error_logged = true;
+                    let tail = if removed {
+                        "the last one was removed rather than left asserting the state it had"
+                    } else {
+                        "and the last one could not be removed either, so it is stale on disk: \
+                         check its ts against wall-clock before believing it"
+                    };
                     eprintln!(
-                        "ferrum-agent: cannot write {}: {err}; node state is not readable on this \
-                         node until it succeeds",
-                        dir.join(STATUS_NAME).display()
+                        "ferrum-agent: cannot write {}: {err}; node state is not readable on \
+                         this node until it succeeds, {tail}",
+                        published.display()
                     );
                 }
-                Err(_) => {}
+                false
             }
         }
-        state
+    }
+
+    /// Both halves, for a caller that owns the agent outright: no shared lock
+    /// to hold, so nothing to drop between them.
+    pub fn publish(&mut self, agent: &Agent, out: &StatusOutput<'_>) -> DegradedState {
+        let tick = self.tick(agent, out);
+        let ok = self.commit(&tick, out);
+        agent.note_status_write(ok);
+        tick.state
     }
 }
