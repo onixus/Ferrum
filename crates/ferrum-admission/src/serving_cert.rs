@@ -109,6 +109,7 @@ pub struct TlsSource {
     expiry_warnings: AtomicU64,
     rollbacks: AtomicU64,
     mount_unreadable: AtomicU64,
+    mount_absent: AtomicU64,
 }
 
 impl TlsSource {
@@ -132,6 +133,7 @@ impl TlsSource {
             expiry_warnings: AtomicU64::new(0),
             rollbacks: AtomicU64::new(0),
             mount_unreadable: AtomicU64::new(0),
+            mount_absent: AtomicU64::new(0),
         });
         source.check_expiry();
         Ok(source)
@@ -171,6 +173,15 @@ impl TlsSource {
     /// creation cluster-wide.
     pub fn mount_unreadable(&self) -> u64 {
         self.mount_unreadable.load(Ordering::Relaxed)
+    }
+
+    /// How many times the serving material has gone missing from the mount.
+    /// Holding the loaded certificate across it is deliberate — a Secret mid
+    /// rewrite looks exactly like a deleted key — but a Secret somebody really
+    /// deleted looks the same, and then the material in memory has no rotation
+    /// source left and its expiry stops Pod creation cluster-wide.
+    pub fn mount_absent(&self) -> u64 {
+        self.mount_absent.load(Ordering::Relaxed)
     }
 
     /// Re-read both files and swap on success. Errors leave the old material
@@ -289,7 +300,19 @@ fn poll_loop(source: Arc<TlsSource>, interval: Duration) {
             MountStat::Present(_) => {}
             // A key missing from the mount keeps the material already loaded:
             // the certificate is in memory, and the Secret is mid-rewrite.
-            MountStat::Absent => continue,
+            // That is the policy; saying nothing was the defect — a deleted
+            // Secret looks identical and leaves this certificate with no
+            // rotation source at all.
+            MountStat::Absent => {
+                let total = source.mount_absent.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!(
+                    "ferrum-admission: serving certificate mount carries no key material; the \
+                     certificate in memory keeps serving and has nothing left to rotate from, \
+                     and it expires at unix {} (serving_cert_absent_total={total})",
+                    source.facts().not_after
+                );
+                continue;
+            }
             MountStat::Unreadable => {
                 let total = source.mount_unreadable.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!(

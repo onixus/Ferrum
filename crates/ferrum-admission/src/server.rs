@@ -33,6 +33,7 @@ pub struct WebhookState {
     exceptions_resets: std::sync::atomic::AtomicU64,
     exceptions_cleared: std::sync::atomic::AtomicU64,
     bundle_unreadable: std::sync::atomic::AtomicU64,
+    bundle_absent: std::sync::atomic::AtomicU64,
     config: ReviewConfig,
 }
 
@@ -50,6 +51,7 @@ impl WebhookState {
             exceptions_resets: std::sync::atomic::AtomicU64::new(0),
             exceptions_cleared: std::sync::atomic::AtomicU64::new(0),
             bundle_unreadable: std::sync::atomic::AtomicU64::new(0),
+            bundle_absent: std::sync::atomic::AtomicU64::new(0),
             config,
         }
     }
@@ -109,6 +111,22 @@ impl WebhookState {
 
     fn note_bundle_unreadable(&self) -> u64 {
         self.bundle_unreadable
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// How many times the bundle key has gone missing from the mount. Keeping
+    /// the last-known-good program across it is deliberate — a Secret mid
+    /// rewrite looks exactly like a deleted key — but the webhook then enforces
+    /// a program whose source is gone, and without this nothing moves and
+    /// nothing is logged while it does.
+    pub fn bundle_absent(&self) -> u64 {
+        self.bundle_absent
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn note_bundle_absent(&self) -> u64 {
+        self.bundle_absent
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1
     }
@@ -352,7 +370,19 @@ fn poll_loop(path: PathBuf, interval: Duration, state: Arc<WebhookState>) {
             }
             // A key that vanished from the mount is a Secret mid-rewrite: keep
             // the last-known-good program and wait for the next Present tick.
-            MountStat::Absent => {}
+            // That is the policy; saying nothing was the defect. A Secret key
+            // that was deleted looks the same from here, and the webhook then
+            // enforces a program with no source behind it for the rest of the
+            // process — absent collapsed into nothing happened.
+            MountStat::Absent => {
+                let total = state.note_bundle_absent();
+                eprintln!(
+                    "ferrum-admission: bundle mount {} carries no bundle; the webhook keeps \
+                     enforcing the last-known-good program, which no longer has a source \
+                     (bundle_absent_total={total})",
+                    path.display()
+                );
+            }
             MountStat::Unreadable => {
                 let total = state.note_bundle_unreadable();
                 eprintln!(

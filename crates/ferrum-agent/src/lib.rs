@@ -2541,6 +2541,22 @@ struct PollStamps {
     publisher: StatusPublisher,
 }
 
+/// Record an unreadable bundle stat and answer whether this tick is the one
+/// that changed the answer.
+///
+/// The webhook's copy of this arm logs once per transition because its poll
+/// loop compares stamps and only enters the arm on a change. This loop is
+/// reached on every tick, so the shape was copied and the rate limiting was
+/// not: a node whose bundle Secret went unreadable printed the same line
+/// forever, at the poll interval, which is how the one line that matters gets
+/// lost. `bundle_stat_failed_total` still counts every tick, so "for how long"
+/// stays readable where a count belongs.
+fn note_unreadable_bundle_mount(agent: &Agent) -> bool {
+    let was_unreadable = agent.bundle_unreadable();
+    agent.note_bundle_stat(false);
+    !was_unreadable
+}
+
 /// Returns the tick to `commit` rather than committing it: the filesystem
 /// half runs at the caller, after every guard on the agent is dropped.
 fn poll_once(
@@ -2571,11 +2587,13 @@ fn poll_once(
         // claimed about it.
         source::BundleStamp::Absent => agent.note_bundle_stat(true),
         source::BundleStamp::Unreadable => {
-            agent.note_bundle_stat(false);
-            eprintln!(
-                "ferrum-agent: bundle mount {} will not stat; no policy update can reach this node",
-                path.display()
-            );
+            if note_unreadable_bundle_mount(agent) {
+                eprintln!(
+                    "ferrum-agent: bundle mount {} will not stat; no policy update can reach \
+                     this node until that stops",
+                    path.display()
+                );
+            }
         }
     }
     // Every change of answer goes through `reload_exceptions_path`, including
@@ -5197,6 +5215,36 @@ mod tests {
         assert!(!agent.bundle_unreadable());
         assert_eq!(agent.bundle_stat_failed_total(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// N5: the webhook logs this condition once per transition because its poll
+    /// loop only enters the arm on a change of answer. This loop runs the arm
+    /// every tick, so the copied shape printed the same line at the poll
+    /// interval for as long as the mount stayed unreadable — the one line an
+    /// operator needs buried under thousands of identical ones. The count is
+    /// where "for how long" belongs and still moves every tick.
+    #[test]
+    fn an_unreadable_bundle_mount_is_logged_once_per_transition_not_once_per_tick() {
+        let agent = healthy_respond_agent();
+        assert!(
+            note_unreadable_bundle_mount(&agent),
+            "the tick that changes the answer is the one worth a line"
+        );
+        for _ in 0..50 {
+            assert!(
+                !note_unreadable_bundle_mount(&agent),
+                "the same unreadable mount does not earn another line"
+            );
+        }
+        assert_eq!(
+            agent.bundle_stat_failed_total(),
+            51,
+            "every refused stat is still counted; only the line is rate limited"
+        );
+        // A stat that answers clears it, so the mount going unreadable again is
+        // a new event and says so.
+        agent.note_bundle_stat(true);
+        assert!(note_unreadable_bundle_mount(&agent));
     }
 
     /// The monotonic floor is the anti-rollback defence, and it reached disk

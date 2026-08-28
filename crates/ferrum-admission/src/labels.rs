@@ -29,8 +29,11 @@ pub enum LabelWarmth {
     Stale {
         age: Duration,
     },
-    /// Listed and recently alive, but the watch reported `410 Gone` and no
-    /// relist has completed: objects changed unseen.
+    /// Listed and recently alive, but the watch owes a relist nobody has
+    /// completed: objects changed unseen. Two producers, not one — `410 Gone`,
+    /// and a frame the watch parser could not read — and the message names
+    /// both, because an operator sent to look at watch expiry for a frame a
+    /// rolling control-plane upgrade emitted finds nothing wrong there.
     RelistPending,
     Warm,
 }
@@ -49,9 +52,9 @@ impl LabelWarmth {
                 "label cache last refreshed {}s ago, past its freshness budget",
                 age.as_secs()
             ),
-            Self::RelistPending => {
-                "label cache missed events (410 Gone) and has not relisted".into()
-            }
+            Self::RelistPending => "label cache missed events (410 Gone, or a frame this build \
+                 could not read) and has not relisted"
+                .into(),
             Self::Warm => "label cache is warm".into(),
         }
     }
@@ -90,12 +93,27 @@ pub trait LabelSource: std::fmt::Debug + Send + Sync {
         service_account: &str,
     ) -> BTreeMap<String, String>;
     fn cluster_labels(&self) -> BTreeMap<String, String>;
-    /// Warmth and its cause, sampled once. Implementations answer this one and
-    /// inherit `is_warm`, so the decision and the message it produces cannot
-    /// disagree about which state the cache was in.
+    /// Warmth and its cause, sampled once. The only state question an
+    /// implementor answers: `is_warm` is derived from it and is not a member of
+    /// this trait, so the decision and the message it produces cannot disagree
+    /// about which state the cache was in.
     fn warmth(&self) -> LabelWarmth;
+}
+
+/// `is_warm` for every [`LabelSource`], derived and not overridable.
+///
+/// As a provided method it was only a convention: an implementor could write
+/// `fn is_warm(&self) -> bool { true }` beside a `warmth()` returning `Cold`
+/// and the deny message would then describe a cache the decision had already
+/// disagreed with. A blanket impl cannot be overridden — a second impl for a
+/// concrete type overlaps and coherence rejects it — so the two are one fact.
+pub trait LabelWarmthCheck {
     /// False until every backing list has completed at least once and is still
     /// fresh.
+    fn is_warm(&self) -> bool;
+}
+
+impl<T: LabelSource + ?Sized> LabelWarmthCheck for T {
     fn is_warm(&self) -> bool {
         self.warmth().is_warm()
     }
@@ -316,6 +334,52 @@ mod tests {
         // A stale cache must never be described as one that never listed.
         assert!(!stale.contains("has not listed yet"), "{stale}");
         assert!(!relist.contains("has not listed yet"), "{relist}");
+    }
+
+    /// B2: slice B gave `RelistPending` a second producer — a frame the watch
+    /// parser refused — and left the message naming only the first. The deny
+    /// reply is admission's only operator channel, so an operator reading it
+    /// went to look at watch expiry and `--min-request-timeout` and found
+    /// nothing wrong, while the actual fault's only trace was an `eprintln!`
+    /// on the webhook Pod. The sibling message on `PodCache` was widened this
+    /// cycle; this is the same sentence on the label side.
+    #[test]
+    fn relist_pending_names_both_of_the_causes_that_produce_it() {
+        let message = LabelWarmth::RelistPending.reason();
+        assert!(message.contains("410 Gone"), "{message}");
+        assert!(
+            message.contains("could not read"),
+            "a frame the parser refused raises this too, and an operator sent to look at \
+             resourceVersion expiry for it finds nothing: {message}"
+        );
+    }
+
+    /// M4: as a provided method `is_warm` could be overridden beside a
+    /// `warmth()` that disagrees with it — the invariant was a convention. It
+    /// is not a member of `LabelSource` any more; the blanket impl below is the
+    /// only definition there can be, and coherence is what seals it.
+    #[test]
+    fn warmth_is_the_only_state_answer_an_implementor_gives() {
+        #[derive(Debug)]
+        struct Lying;
+        // The whole trait: there is no `is_warm` here to override.
+        impl LabelSource for Lying {
+            fn namespace_labels(&self, _: &str) -> BTreeMap<String, String> {
+                BTreeMap::new()
+            }
+            fn service_account_labels(&self, _: &str, _: &str) -> BTreeMap<String, String> {
+                BTreeMap::new()
+            }
+            fn cluster_labels(&self) -> BTreeMap<String, String> {
+                BTreeMap::new()
+            }
+            fn warmth(&self) -> LabelWarmth {
+                LabelWarmth::Cold
+            }
+        }
+        let source: &dyn LabelSource = &Lying;
+        assert!(!source.is_warm());
+        assert_eq!(source.warmth(), LabelWarmth::Cold);
     }
 
     #[test]

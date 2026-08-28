@@ -1391,6 +1391,54 @@ fn unreadable_bundle_mount_is_counted_and_a_deleted_one_is_not() {
     let _ = std::fs::remove_dir_all(&broken);
 }
 
+/// M3: keeping the last-known-good across an absent key is the right policy —
+/// a Secret mid-rewrite looks exactly like a deleted one — but the arm said
+/// nothing and moved nothing. Delete the key for real and the webhook goes on
+/// enforcing a program with no source behind it, forever, with no trace: absent
+/// collapsed into nothing happened.
+#[test]
+fn a_bundle_key_that_vanished_is_counted_not_silent() {
+    let (fsig, pk, digest) = make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let body = review(
+        pod(IMAGE, image_annotations(IMAGE, &SK), true),
+        "uid-absent",
+    );
+
+    let dir = temp_dir("bundle-absent-counted");
+    write_secret_dir(&dir, &fsig, &digest);
+    let state = Arc::new(webhook_state(&fsig, &pk));
+    poll_bundle_file(dir.clone(), Duration::from_millis(50), Arc::clone(&state));
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(state.bundle_absent(), 0, "nothing is missing yet");
+
+    std::fs::remove_file(dir.join(BUNDLE_FSIG_KEY)).expect("remove fsig");
+    std::fs::remove_file(dir.join(BUNDLE_DIGEST_KEY)).expect("remove digest");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state.bundle_absent() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "a bundle key that vanished must move something; the webhook is enforcing a \
+             program whose source is gone"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "and the last-known-good still enforces, which is the policy that must not change"
+    );
+    assert_eq!(
+        state.bundle_unreadable(),
+        0,
+        "an absent key is still not a broken mount"
+    );
+    // The poll loop dedupes by stat, so this is a transition count, not a tick
+    // count: the same missing key does not keep filling the log.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(state.bundle_absent(), 1, "counted once per transition");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// B2, exceptions mount: emptying the whole waiver table must not be quieter
 /// than failing to reload it. Absent and unreadable both end with no waivers
 /// applying, and they are different events.

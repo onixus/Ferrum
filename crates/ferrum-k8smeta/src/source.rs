@@ -105,6 +105,10 @@ pub struct PodCache {
     /// alive *and* that events were missed, so the freshness stamp alone would
     /// keep answering for a cache known to be behind.
     relist_pending: bool,
+    /// When `relist_pending` was first raised, and `None` while nothing is
+    /// owed. Re-raising does not move it: a stream that keeps producing frames
+    /// this build cannot read must not push its own deadline out forever.
+    debt_raised_at: Option<Instant>,
 }
 
 impl Clone for PodCache {
@@ -118,6 +122,7 @@ impl Clone for PodCache {
             labels_unknown: AtomicU64::new(self.labels_unknown_total()),
             last_applied: self.last_applied,
             relist_pending: self.relist_pending,
+            debt_raised_at: self.debt_raised_at,
         }
     }
 }
@@ -171,7 +176,26 @@ impl PodCache {
     /// Raise the obligation. There is deliberately no public way to lower it:
     /// only a completed [`PodCache::replace_all`] discharges it.
     pub fn raise_relist_pending(&mut self) {
-        self.relist_pending = true;
+        self.raise_relist_pending_at(Instant::now());
+    }
+
+    /// Same, at an explicit instant, so a caller (or a test) can age a debt
+    /// without waiting for it.
+    pub fn raise_relist_pending_at(&mut self, at: Instant) {
+        if !self.relist_pending {
+            self.relist_pending = true;
+            self.debt_raised_at = Some(at);
+        }
+    }
+
+    /// The outstanding debt has stood for
+    /// [`crate::labels::RELIST_DEBT_HOLDDOWN`], so the watch feeding this cache
+    /// should end its stream and relist. False during the hold-down: the frames
+    /// that raised it keep being read instead of costing a reconnect each.
+    pub fn relist_due_at(&self, now: Instant) -> bool {
+        self.debt_raised_at.is_some_and(|at| {
+            now.saturating_duration_since(at) >= crate::labels::RELIST_DEBT_HOLDDOWN
+        })
     }
 
     /// Time since the last watch frame. `None` until the first list lands.
@@ -260,6 +284,7 @@ impl PodCache {
         // Last, so that a future ceiling that can refuse the list above leaves
         // the obligation standing rather than discharging it on a partial cache.
         self.relist_pending = false;
+        self.debt_raised_at = None;
     }
 
     fn owns(&self, pod: &PodRecord) -> bool {
