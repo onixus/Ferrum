@@ -2925,6 +2925,10 @@ mod tests {
         id.namespace = "prod".into();
         id.namespace_labels
             .insert("ferrum.io/zone".into(), "pci".into());
+        // Read off a listed namespace: the labels and the fact that they were
+        // observed travel together, so an identity that has one has both.
+        id.namespace_labels_observed = true;
+        id.service_account_labels_observed = true;
         id.image = "registry.internal.example/app@sha256:abc".into();
         id.image_digest = "sha256:abc".into();
         id
@@ -5870,9 +5874,14 @@ mod tests {
     }
 
     /// The label caches are cold, relisting after a 410 or dead: the pod is
-    /// known, its namespace labels are not. Empty labels are not a non-match -
-    /// admission fails closed on exactly this — so the rule must still be
-    /// applied, and the plane must say it is Degraded.
+    /// known, its namespace labels are not. Unobserved labels are not a
+    /// non-match - admission fails closed on exactly this — so the rule must
+    /// still be applied, and the plane must say it is Degraded.
+    ///
+    /// What states the condition changed this cycle: it used to be an empty
+    /// map, which also described a namespace that simply carries no labels, so
+    /// this reason was true forever on such a cluster. It is the observedness
+    /// flag now; the assertions below are the ones this test always made.
     #[test]
     fn unobserved_namespace_labels_do_not_skip_a_rule() {
         let mut agent = Agent::new(cfg());
@@ -5880,6 +5889,7 @@ mod tests {
         agent.set_attached(true);
         let mut cold = pci_identity();
         cold.namespace_labels.clear();
+        cold.namespace_labels_observed = false;
         agent.insert_cgroup(1, cold);
         agent.set_container_map_synced(1);
         assert!(!agent.is_degraded());

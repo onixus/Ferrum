@@ -82,6 +82,10 @@ pub fn payments_identity() -> WorkloadIdentity {
     };
     id.namespace_labels
         .insert("ferrum.io/zone".into(), "pci".into());
+    // Read off a listed namespace and a listed ServiceAccount: without the
+    // fact, the selector is unresolved and every replay decision is flagged.
+    id.namespace_labels_observed = true;
+    id.service_account_labels_observed = true;
     id.image = "registry.internal.example/app@sha256:abc".into();
     id.image_digest = "sha256:abc".into();
     id

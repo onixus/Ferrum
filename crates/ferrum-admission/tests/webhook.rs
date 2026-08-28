@@ -3,13 +3,13 @@
 mod common;
 
 use chrono::{DateTime, Days, TimeZone, Utc};
-use ferrum_admission::StaticLabels;
 use ferrum_admission::{
     encode_fsig, handle_review_bytes, load_bundle, load_path, load_source, parse_program,
     poll_bundle_file, poll_exceptions_file, AdmissionProgram, ReviewConfig, WebhookState,
     ADMISSION_ABI, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, EXCEPTIONS_FSIG_KEY,
     IMAGE_SIGNATURE_ANNOTATION, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED, RULE_UNSIGNED,
 };
+use ferrum_admission::{ClusterLabels, StaticLabels};
 use ferrum_api::{
     AdmitDeny, AdmitMutate, AdmitSpec, ClusterSecurityPolicy, ClusterSecurityPolicySpec,
     ExceptionTarget, FailurePolicy, PolicyExceptionSpec, PolicyMode, PssProfile, SupplySpec,
@@ -1703,4 +1703,177 @@ mod watched_labels {
         assert!(relist_msg.contains("410 Gone"), "{relist_msg}");
         assert_ne!(stale_msg, relist_msg);
     }
+}
+
+/// B: the mirror of this tree's defect class. A cause that is true always
+/// decides nothing, and "namespace labels are missing" was true for every
+/// namespace that carries no labels, on a cache that had listed it and knew
+/// exactly that. The webhook answered an integrity failure where the honest
+/// answer is "the selector did not match".
+#[test]
+fn a_warm_cache_that_listed_an_unlabelled_namespace_does_not_deny_a_selected_policy() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .namespace_selector
+            .match_labels
+            .insert(ZONE.into(), "pci".into());
+    });
+    let cfg = cfg_with(
+        StaticLabels::default()
+            .with_namespace("pci-ns", labels(&[(ZONE, "pci")]))
+            .with_namespace("plain-ns", std::collections::BTreeMap::new())
+            .warm(),
+    );
+
+    let allowed = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("plain-ns", "default"),
+        "uid-plain",
+    );
+    assert_eq!(
+        allowed["response"]["allowed"],
+        true,
+        "a namespace the cache listed and found unlabelled is a selector miss, not an integrity \
+         failure: {}",
+        deny_msg(&allowed)
+    );
+
+    // The same policy still bites where the selector does match, so the row
+    // above is not "the selector stopped working".
+    let denied = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("pci-ns", "default"),
+        "uid-pci",
+    );
+    assert_eq!(denied["response"]["allowed"], false);
+    let msg = deny_msg(&denied);
+    assert!(
+        msg.contains(RULE_PRIVILEGED) || msg.contains("privileged"),
+        "denied by the rule, not by a missing-label fallback: {msg}"
+    );
+}
+
+/// The half that must not be weakened by the one above: a warm cache is not
+/// an omniscient one. A namespace no list ever named is still unknown, and a
+/// policy that selects on namespace labels still fails closed there.
+#[test]
+fn a_namespace_a_warm_cache_never_listed_is_still_a_fail_closed_deny() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .namespace_selector
+            .match_labels
+            .insert(ZONE.into(), "pci".into());
+    });
+    let cfg = cfg_with(
+        StaticLabels::default()
+            .with_namespace("pci-ns", labels(&[(ZONE, "pci")]))
+            .warm(),
+    );
+
+    let reply = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("ghost-ns", "default"),
+        "uid-ghost",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    let msg = deny_msg(&reply);
+    assert!(
+        msg.contains("never observed"),
+        "the deny must say the labels were never seen, not that the namespace has none: {msg}"
+    );
+    assert!(
+        !msg.contains(RULE_PRIVILEGED),
+        "this is an integrity refusal, not a rule hit: {msg}"
+    );
+
+    // Same for a ServiceAccount the cache never listed.
+    let sa_program = selected_program(|spec| {
+        spec.selector
+            .service_account_selector
+            .match_labels
+            .insert(TIER.into(), "frontend".into());
+    });
+    let sa_cfg = cfg_with(
+        StaticLabels::default()
+            .with_service_account("prod", "web-sa", labels(&[(TIER, "frontend")]))
+            .warm(),
+    );
+    let reply = decide(
+        &sa_cfg,
+        &sa_program,
+        privileged_pod_in("prod", "other-sa"),
+        "uid-ghost-sa",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    assert!(
+        deny_msg(&reply).contains("never observed"),
+        "{}",
+        deny_msg(&reply)
+    );
+}
+
+/// Cluster labels have no cache behind them, so nothing about a map can say
+/// whether the operator stated any: `--cluster-label` absent and
+/// `--cluster-label` naming a cluster with no labels both leave it empty. The
+/// flag being passed is therefore its own fact, and without it the cluster
+/// branch of `require_labels_if_selected` keeps deciding by emptiness — the
+/// defect the namespace branch was just fixed for, left standing one selector
+/// over.
+#[test]
+fn a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .cluster_selector
+            .match_labels
+            .insert("env".into(), "prod".into());
+    });
+
+    // No flag: unknown, and a policy that selects on it fails closed. A warm
+    // namespace cache does not help — it is not where these come from.
+    let unstated = cfg_with(StaticLabels::cluster(ClusterLabels::unstated()).warm());
+    let reply = decide(
+        &unstated,
+        &program,
+        privileged_pod_in("any-ns", "default"),
+        "uid-no-flag",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    let msg = deny_msg(&reply);
+    assert!(
+        msg.contains("cluster") && msg.contains("never observed"),
+        "the deny must name the cluster labels as unobserved: {msg}"
+    );
+
+    // The flag passed, naming a cluster that carries no labels: observed, so
+    // the selector is answered — with a miss, which is a decision, not a
+    // refusal.
+    let stated_empty = cfg_with(
+        StaticLabels::cluster(ClusterLabels::stated(std::collections::BTreeMap::new())).warm(),
+    );
+    let reply = decide(
+        &stated_empty,
+        &program,
+        privileged_pod_in("any-ns", "default"),
+        "uid-stated-empty",
+    );
+    assert_eq!(
+        reply["response"]["allowed"],
+        true,
+        "an operator who stated a cluster with no labels has been heard: {}",
+        deny_msg(&reply)
+    );
+
+    // And the flag that does match still applies the policy.
+    let stated = cfg_with(StaticLabels::cluster(labels(&[("env", "prod")])));
+    let reply = decide(
+        &stated,
+        &program,
+        privileged_pod_in("any-ns", "default"),
+        "uid-stated",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    assert!(!deny_msg(&reply).contains("never observed"));
 }
