@@ -1,0 +1,32 @@
+# Mutation: `emit()` never sets EVENT_FLAG_PATH_TRUNCATED. Rebuilding the bpf
+# ELF is required for this one; `run.sh` does it.
+#
+# This is the survivor, and the measurement is the point. Cycle 8 closed the
+# fail-open twice: `emit()` sets the flag from the length it read, AND
+# `ferrum_ebpf::path_truncated` derives the same answer from the bytes that
+# arrived, so an ELF predating the fix cannot fail open. Measured on this
+# kernel with this patch applied: the docker.sock verdict on an over-long path
+# is still `kill`, still `path_unknown`, and the probe still dies of SIGKILL.
+# The datapath half of the pair is gone and no verdict changes.
+#
+# Must fail: `a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted`,
+# and only at the one assertion that reads the raw record flag. That assertion
+# exists because a silent fallback is a defect waiting for the next producer
+# that has no fallback.
+diff --git a/crates/ferrum-ebpf-progs/src/main.rs b/crates/ferrum-ebpf-progs/src/main.rs
+index fe1cdd4..d741930 100644
+--- a/crates/ferrum-ebpf-progs/src/main.rs
++++ b/crates/ferrum-ebpf-progs/src/main.rs
+@@ -130,9 +130,9 @@ mod progs {
+                 Ok(len) => len < PATH_LEN - 1,
+                 Err(_) => false,
+             };
+-            if !fits {
+-                event.flags |= EVENT_FLAG_PATH_TRUNCATED;
+-            }
++            // MUTATION: a path the helper could not carry whole is recorded
++            // as if it had arrived intact.
++            let _ = fits;
+         }
+         match FERRUM_EVENTS.reserve::<Event>(0) {
+             Some(mut slot) => {
