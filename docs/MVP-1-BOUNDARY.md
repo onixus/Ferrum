@@ -292,11 +292,22 @@
 не константу — в единственной форме, которая решаема по дереву: ни один субъект
 не держит право записи в `<kind>/status`, которого ничто в нём не пишет.
 
+Третье утверждение идёт по всем трём субъектам, и цикл до этого шло по одному:
+оно читало `deploy/controller/rbac.yaml` по имени и список ресурсов `ferrum.io`,
+поэтому `ferrum-agent` и `ferrum-admission` его проходили ровно потому, что
+назвать их в том цикле было нечем, — «зелёное, потому что проверять нечего», два
+субъекта из трёх, внутри теста, docstring которого об этом же и написан. Теперь
+путь идёт от `serviceAccountName` в pod spec к биндингам, от биндингов к
+правилам, и грант, добавленный агенту или webhook, видит то же правило, что
+видит грант контроллера. «Пишет» тоже перестало быть подстрокой: нужна ручка,
+которой запись делается — `GroupVersionKind::gvk(…, "Kind")` плюс вызов
+`patch_status`, — а не имя типа статуса в сигнатуре.
+
 | Субъект | Канал | Метка | Исполняется |
 |---|---|---|---|
 | `ferrum-agent` | `status.json` и флаг `degraded` в конверте экспорта | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::a_degraded_node_that_changes_why_says_so` |
 | `ferrum-admission` | текст `message` в отказе — то, что видит человек, запустивший `kubectl` | U | U `webhook.rs::a_warm_watch_decides_and_a_cold_one_denies_with_the_cold_reason` · U `webhook.rs::unsigned_image_deny` |
-| `ferrum-controller` | код выхода и строка `error: <причина>` в stderr | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` |
+| `ferrum-controller` | stderr, и обе его половины: до входа в watch — `error: <причина>` и выход 1; после — строка `ferrum-controller: <причина>` на каждый отказавший event, процесс продолжает | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` · U `boundary_gate.rs::the_controllers_channel_is_stderr_and_a_failed_event_never_reaches_the_exit_code` |
 
 Строка контроллера — единственная, которая до этого цикла не проходила третье
 утверждение, и не тем каналом, который в ней стоит: `deploy/controller/rbac.yaml`
@@ -307,9 +318,32 @@
 функция, а клиент к API server, которого в этом workspace не было никогда (см.
 «Ничто и никогда не обращалось к API server» ниже), а грант, которым никто не
 пользуется, — право без назначения, то есть цель бокового движения по threat
-model этого проекта. Канал контроллера — тот, который у него действительно
-есть: `run()` возвращает `Err(String)`, `main` печатает его как
-`error: <причина>` и выходит с 1.
+model этого проекта. То же самое и той же формы — `runtimeprofiles/status`:
+он пережил ту прополку, потому что правило спрашивало, назван ли *тип статуса*
+где-нибудь в crate, а `pub fn runtime_profile_status(…) -> RuntimeProfileStatus`
+его называет. Результат этой функции — поле, которое читают два юнит-теста;
+`ApiResource` для `runtimeprofiles` нет, watch нет, PATCH нет. Правило теперь
+спрашивает про ручку, которая нужна записи (`GroupVersionKind::gvk(…, "Kind")`
+плюс `patch_status`), и грант удалён — та же починка по той же причине.
+
+Строка контроллера переписана в том же цикле, и не потому, что канал сменился,
+а потому, что она называла одну его половину целым. `код выхода и error:
+<причина>` верно ровно для отказов **до** входа в watch: их возвращает `run()`,
+`main` печатает и выходит с 1, и цитируемый argv-тест — про этот путь. После
+старта процесс — три `tokio::select!`-нутых цикла watch; `kube::runtime::watcher`
+переспрашивает сам и не завершается, поэтому каждый отказ, ради которого канал
+и нужен — не сошедшийся reconcile, 403 на PATCH статуса (ровно то, что даёт
+криво отредактированный RBAC), ошибка watch, — это один `eprintln!` с префиксом
+`ferrum-controller:` и следующий виток. Код выхода туда не доходит. Так что
+второе утверждение инвентаря — «канал достижим» — держалось на единственном
+классе отказов, ради которого канал оператору не нужен.
+
+Канал у контроллера один и это stderr; обе половины держит
+`boundary_gate.rs::the_controllers_channel_is_stderr_and_a_failed_event_never_reaches_the_exit_code`.
+Чего эта починка не делает и сделать не может из этого слайса: после старта
+403 на PATCH статуса — строка в логе и больше ничего. Ни выхода, ни счётчика,
+ни статуса, ни чего-либо, что оператор опрашивает. Это правка в
+`crates/ferrum-controller/src`, а не в этом документе.
 
 Чего инвентарь не делает: он не утверждает, что канал субъекта достаточен.
 У webhook нет ни последнего-известного-хорошего, ни списка причин; у
@@ -319,15 +353,22 @@ model этого проекта. Канал контроллера — тот, �
 
 ### Гейты этого дерева
 
-Каждый `#[test]` в `crates/ferrum-testkit/tests` и `crates/ferrum-agent/tests`
-обязан стоять в какой-то строке этого документа. Это обратное направление
-гейта, закрытое впервые: раньше он требовал, чтобы процитированное
-существовало, и не мог потребовать, чтобы существующее было процитировано, —
-то направление, в котором документ гниёт молча. Оно закрыто только для этих
-двух каталогов, и это не произвол: в них нет ничего, кроме гейтов, поэтому
-каждый тест там — утверждение о продукте, а не о функции. Тридцать пять тестов
-были не процитированы в момент, когда гейт написали; ниже — строки, которыми
-на них ответили.
+Каждый `#[test]` в `crates/ferrum-testkit/tests`, `crates/ferrum-agent/tests` и
+`crates/ferrum-admission/tests` обязан стоять в какой-то строке этого
+документа. Это обратное направление гейта: раньше он требовал, чтобы
+процитированное существовало, и не мог потребовать, чтобы существующее было
+процитировано, — то направление, в котором документ гниёт молча. Оно закрыто
+только для этих трёх каталогов, и это не произвол: в них нет ничего, кроме
+гейтов и приёмки, поэтому каждый тест там — утверждение о продукте, а не о
+функции. Тридцать пять тестов были не процитированы в момент, когда гейт
+написали; ниже — строки, которыми на них ответили.
+
+Каталог `ferrum-admission/tests` вошёл сюда циклом позже остальных, и его
+отсутствие было той же дырой, что гейт закрывает: обоснование «в них нет
+ничего, кроме гейтов» держалось для него ровно так же, а семьдесят два теста —
+включая три из восьми случаев §D, четыре теста кеша меток и три теста
+`MountStat`, — не были видны обратному направлению вообще. Одна строка в
+`CITED_TEST_DIRS`; строки ниже — то, чем за неё заплачено.
 
 | Утверждение | Метка | Исполняется |
 |---|---|---|
@@ -354,9 +395,31 @@ model этого проекта. Канал контроллера — тот, �
 | Манифест не может объявить `optional: true` на томе, обслуживающем путь, без которого бинарь не стартует, — FD028, находка, а не предупреждение; том, который бинарь действительно терпит, находкой не является | U | U `lint_deploy.rs::a_required_mount_declared_optional_is_a_finding` · U `lint_deploy.rs::the_webhooks_bundle_mount_is_the_same_finding` · U `lint_deploy.rs::an_optional_serving_certificate_is_a_finding_too` · U `lint_deploy.rs::a_mount_the_binary_tolerates_may_be_optional` · U `lint_deploy.rs::a_file_is_served_by_the_longest_mount_that_covers_it` |
 | Каждая цитата «Делает» разрешается в определение `fn` или в стадию, а список §D здесь — ровно `AcceptanceCase::ALL` | U | U `boundary_gate.rs::every_claim_in_the_does_section_cites_something_that_exists` · U `boundary_gate.rs::the_document_lists_exactly_the_rfc_d_cases` |
 | Каждая причина деградации, которую агент может объявить, названа здесь — по префиксу `DEG_`, по телу `degraded_reasons_at` и по аргументам `mark_terminal_fault` | U | U `boundary_gate.rs::every_degraded_reason_the_agent_can_raise_is_named_in_the_document` |
-| Обратное направление: каждый `#[test]` в `ferrum-testkit/tests` и `ferrum-agent/tests` процитирован строкой или назван в списке исключений с причиной, а список исключений пуст | U | U `boundary_gate.rs::every_gate_in_this_tree_is_cited_by_a_row` · U `boundary_gate.rs::a_test_is_found_under_its_attributes_and_a_plain_fn_is_not` · U `boundary_gate.rs::an_exemption_from_citation_is_named_one_at_a_time` |
+| Обратное направление: каждый `#[test]` в `ferrum-testkit/tests`, `ferrum-agent/tests` и `ferrum-admission/tests` процитирован строкой или назван в списке исключений с причиной; само правило исключения проверено на входах, ответ на которых известен, а не только на пустом списке | U | U `boundary_gate.rs::every_gate_in_this_tree_is_cited_by_a_row` · U `boundary_gate.rs::a_test_is_found_under_its_attributes_and_a_plain_fn_is_not` · U `boundary_gate.rs::an_exemption_from_citation_is_named_one_at_a_time` |
 | У каждого поставляемого бинаря ровно один канал отказа, он достижим и несёт причину, а не константу | U | U `boundary_gate.rs::every_shipped_subject_has_one_reachable_channel_that_carries_a_cause` |
 | Грамматика ячейки закрыта: проза не доказательство, цитата разрешается в определение, а не в упоминание, прочерк — только у названного субъекта, а метка суммирует все цитаты строки | U | U `boundary_gate.rs::prose_is_not_evidence` · U `boundary_gate.rs::a_mention_of_a_test_is_not_a_definition_of_one` · U `boundary_gate.rs::only_a_named_subject_may_cite_nothing` · U `boundary_gate.rs::a_marker_summarises_every_citation_it_covers` |
+| Решение admission зависит от режима, а не от находки: `enforce` отказывает, `observe` и `audit` пропускают тот же Pod и не роняют запрос | U | U `mvp.rs::privileged_enforce_denies` · U `mvp.rs::observe_mode_does_not_deny_privileged` · U `mvp.rs::audit_mode_does_not_deny_privileged` · U `mvp.rs::pss_restricted_observe_and_audit_do_not_fail_request` |
+| Supply-часть отказывает неподписанному образу, тегу `latest` — явному и подразумеваемому, — пустому ожидаемому digest и `requireSigned` без ключей; парсер читает публичные ключи и после keyless-издателей | U | U `mvp.rs::unsigned_image_denies_when_deny_unsigned` · U `mvp.rs::latest_tag_denies_when_deny_latest_tag` · U `mvp.rs::implicit_latest_and_hostpid_and_caps_deny` · U `mvp.rs::empty_expected_digest_denies` · U `mvp.rs::require_signed_without_public_keys_denies_even_if_marked_signed` · U `mvp.rs::parser_reads_public_keys_after_keyless_issuers` |
+| Совместимый Pod проходит и получает мутации, а не просто «не отказано»; подписанный `FRMB` и пара подпись+digest оцениваются как есть | U | U `mvp.rs::compliant_pod_allowed_with_mutations` · U `mvp.rs::valid_signature_and_digest_allow_compliant` · U `mvp.rs::signed_frmb_bundle_evaluates` |
+| Bundle, который не проверяется, закрывает admission, а не открывает: битый, с чужим ABI, обрезанный, с лишними байтами, с плохой, пустой подписью и с несходящимся digest | U | U `mvp.rs::invalid_bundle_denies_fail_closed` · U `mvp.rs::abi_mismatch_denies_fail_closed` · U `mvp.rs::truncated_and_trailing_bytes_deny` · U `mvp.rs::bad_signature_denies_fail_closed` · U `mvp.rs::empty_signature_denies_fail_closed` · U `mvp.rs::digest_mismatch_denies_fail_closed` |
+| Exception освобождает только в своём scope и до `expiresAt`: истёкший, с пустым target и namespaced против кластерного попадания не освобождают | U | U `mvp.rs::in_scope_exception_waives_privileged_before_expiry` · U `mvp.rs::expired_exception_does_not_waive` · U `mvp.rs::empty_target_exception_does_not_waive` · U `mvp.rs::namespaced_exception_does_not_waive_cluster_hit` |
+| `failurePolicy: Ignore` — break-glass политики, а не обход целостности: namespaced не может им fail-open, кластерный не открывает им непроверенный bundle | U | U `mvp.rs::namespaced_ignore_does_not_fail_open` · U `mvp.rs::cluster_ignore_is_break_glass_not_integrity_bypass` |
+| Bind `cluster-admin` отказывается на движке, а не только на HTTP-слое | U | U `mvp.rs::cluster_admin_bind_denies` |
+| Промах селектора не применяет политику, а не применяет её мягче | U | U `mvp.rs::selector_miss_does_not_apply_policy` |
+| Пустая PSS-политика — не пустое решение: `restricted` отказывает privileged, root, hostPath и capabilities, `baseline` — hostPID+hostPath и capabilities, `privileged` пропускает privileged | U | U `mvp.rs::pss_restricted_empty_deny_privileged` · U `mvp.rs::pss_restricted_empty_deny_run_as_root` · U `mvp.rs::pss_restricted_empty_deny_host_path` · U `mvp.rs::pss_restricted_empty_deny_capabilities` · U `mvp.rs::pss_baseline_empty_deny_host_pid_and_host_path` · U `mvp.rs::pss_baseline_empty_deny_capabilities` · U `mvp.rs::pss_privileged_empty_deny_allows_privileged` |
+| Поставляемый пример `prod-restricted` в режиме audit записывает privileged, а не молчит | U | U `mvp.rs::prod_restricted_example_audit_records_privileged` |
+| Приёмка §D на HTTP-слое webhook, а не только на движке: неподписанный образ, privileged и bind cluster-admin отказываются через `AdmissionReview`, совместимый подписанный образ проходит с патчами, а мусор в теле — отказ | U | U `webhook.rs::privileged_deny` · U `webhook.rs::cluster_admin_bind_deny` · U `webhook.rs::compliant_signed_digested_image_allow_with_enforce_patches` · U `webhook.rs::observe_privileged_allowed_no_patches` · U `webhook.rs::garbage_body_deny` · U `webhook.rs::in_scope_exception_waives_only_that_rule` |
+| Замена bundle на живом webhook: подходящий `fsig` и подходящий каталог встают и решают по-новому, а обрезанный, с чужим ключом, с несошедшимся digest и с несошедшимся каталогом не подменяют last-known-good | U | U `webhook.rs::truncated_and_wrong_key_fsig_fail_closed` · U `webhook.rs::successful_second_fsig_swaps_and_handle_uses_new_program` · U `webhook.rs::digest_mismatch_truncated_wrong_pin_do_not_swap` · U `webhook.rs::dir_matching_digest_loads_and_denies_unsigned` · U `webhook.rs::dir_mismatched_digest_does_not_swap` · U `webhook.rs::failed_reload_keeps_last_good_mvp_denies` · U `webhook.rs::poll_reloads_on_mtime_len_and_keeps_lkg_if_file_vanishes` |
+| Secret контроллера читается webhook как есть; пустой, отсутствующий и неподписанный `FRMB`/`FADM` в нём — целостность, а не пустая политика | U | U `webhook.rs::controller_secret_json_loads_and_denies_unsigned_pod` · U `webhook.rs::empty_or_missing_bundle_fsig_is_integrity` · U `webhook.rs::unsigned_frmb_or_fadm_in_secret_is_integrity` |
+| Без bundle webhook не поднимается, а не поднимается пустым: `serve` выходит с 2 | U | U `webhook.rs::serve_missing_bundle_exits_2` |
+| Монтирование исключений перечитывается и продолжает проверять scope и TTL; пропавший файл — пустой список, непроверяемый — сброс | U | U `webhook.rs::exceptions_mount_rotation_gates_scope_and_ttl` · U `webhook.rs::exceptions_reload_missing_file_is_empty_and_unverifiable_resets` |
+| Кеш меток решает только по тому, что перечислил: тёплый применяет namespace-селектор в своём namespace и держит метки ServiceAccount внутри его namespace, холодный отказывает выбранной политике и не трогает невыбранную, а метки кластера приходят из флага и тёплого кеша не требуют | U | U `webhook.rs::warm_cache_applies_a_namespace_selector_to_its_own_namespace_only` · U `webhook.rs::warm_cache_keeps_service_account_labels_inside_their_namespace` · U `webhook.rs::cold_cache_denies_a_selected_policy_but_not_an_unselected_one` · U `webhook.rs::cluster_labels_come_from_the_flag_and_need_no_warm_cache` · U `webhook.rs::prod_restricted_namespace_selector_without_labels_fail_closed` · U `webhook.rs::cold_stale_and_relist_pending_deny_with_different_causes` · U `webhook.rs::a_stale_watch_says_stale_and_a_gone_watch_says_relist` |
+| Нечитаемое монтирование считается отдельно от удалённого — по bundle, по исключениям и по серверному сертификату: пустой том и пропавший том разной природы, и `MountStat` их не смешивает | U | U `webhook.rs::unreadable_bundle_mount_is_counted_and_a_deleted_one_is_not` · U `webhook.rs::absent_and_unreadable_exceptions_mounts_are_counted_apart` · U `ferrum-admission/tests/serving_cert.rs::an_unreadable_serving_mount_is_counted_and_a_deleted_one_is_not` |
+| Том bundle у webhook не может быть `optional`, и это проверяется из самого манифеста, а не только линтом | U | U `webhook.rs::bundle_secret_mount_is_not_optional` |
+| Пропавший ключ в смонтированном томе не молчит: webhook продолжает охранять по last-known-good и продолжает служить сертификатом, но говорит, что источника у них больше нет — счётчиком и строкой на переход, а не на каждый тик | U | U `webhook.rs::a_bundle_key_that_vanished_is_counted_not_silent` · U `ferrum-admission/tests/serving_cert.rs::a_serving_key_that_vanished_is_counted_not_silent` |
+| Граница hot path webhook держится его же `Cargo.toml`: компилятор и живой кластер туда не заезжают | U | U `webhook.rs::cargo_toml_hot_path_keeps_boundary` |
+| Серверный сертификат: просроченный не даёт стартовать, далёкий срок не шумит, ротация доходит до новых соединений, поллер подхватывает переписанный том, откат возможен, а негодный материал оставляет действующий сертификат | U | U `ferrum-admission/tests/serving_cert.rs::an_expired_certificate_refuses_to_start` · U `ferrum-admission/tests/serving_cert.rs::a_far_off_expiry_does_not_warn` · U `ferrum-admission/tests/serving_cert.rs::rotation_reaches_new_connections` · U `ferrum-admission/tests/serving_cert.rs::the_poller_picks_up_a_rotated_mount` · U `ferrum-admission/tests/serving_cert.rs::a_swap_can_be_undone` · U `ferrum-admission/tests/serving_cert.rs::unusable_material_keeps_the_current_certificate` |
+| Читатель argv манифеста видит обе законные записи Kubernetes — `command:` и `args:`, — а таблица feature-флагов держится за сами `#[cfg(feature = …)]`-места | U | U `deploy_gate.rs::a_containers_argv_is_command_then_args_and_either_alone` · U `deploy_gate.rs::every_flag_read_under_a_cfg_feature_is_in_the_table` |
 
 ## Не делает
 

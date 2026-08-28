@@ -53,7 +53,9 @@
 //! which is why the document says so in its own words as well.
 
 use ferrum_testkit::AcceptanceCase;
-use std::collections::BTreeMap;
+use serde::Deserialize;
+use serde_yaml::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -402,7 +404,11 @@ fn every_claim_in_the_does_section_cites_something_that_exists() {
 /// about a function, which is exactly the kind of claim this document is a
 /// list of. A test here that no row cites is either a claim the document is
 /// missing or a test that has stopped being about the product.
-const CITED_TEST_DIRS: [&str; 2] = ["crates/ferrum-testkit/tests", "crates/ferrum-agent/tests"];
+const CITED_TEST_DIRS: [&str; 3] = [
+    "crates/ferrum-testkit/tests",
+    "crates/ferrum-agent/tests",
+    "crates/ferrum-admission/tests",
+];
 
 /// Tests in those directories that no row cites, each with the reason it is
 /// not a boundary claim.
@@ -417,6 +423,19 @@ const CITED_TEST_DIRS: [&str; 2] = ["crates/ferrum-testkit/tests", "crates/ferru
 /// into — with a sentence, one entry at a time, the way `NOT_EXECUTED_SUBJECTS`
 /// works above.
 const UNCITED_TESTS: [(&str, &str); 0] = [];
+
+/// Whether a test is answered: cited by a row that names the file it lives in,
+/// or exempt with a reason.
+///
+/// A function rather than two conditions inline, because it is the only part of
+/// the rule that can be exercised on inputs whose answer is known. The
+/// exemption arm of it runs zero times against the tree — `UNCITED_TESTS` is
+/// empty and is supposed to stay that way — so a gate that only ran against the
+/// tree would never execute it, and the document's claim that the empty list is
+/// *held* by something would be a claim about code nothing runs.
+fn is_answered(test: &str, cited: &[String], exempt: &[(&str, &str)]) -> bool {
+    cited.iter().any(|name| name == test) || exempt.iter().any(|(name, _)| *name == test)
+}
 
 /// Every `#[test]` in `text`, by the name of the function under the attribute.
 ///
@@ -520,7 +539,7 @@ fn every_gate_in_this_tree_is_cited_by_a_row() {
             let names = cited.get(&file).unwrap_or(&empty);
             for test in tests_in(&body) {
                 found += 1;
-                if names.contains(&test) || UNCITED_TESTS.iter().any(|(n, _)| *n == test) {
+                if is_answered(&test, names, &UNCITED_TESTS) {
                     continue;
                 }
                 orphans.push(format!(
@@ -553,44 +572,275 @@ fn every_gate_in_this_tree_is_cited_by_a_row() {
 /// evidence.
 const INVENTORY_HEADING: &str = "### Инвентарь субъектов";
 
-/// A `<resource>/status` a manifest may grant, and the type in `ferrum-api`
-/// whose presence in a subject's sources is what writing it looks like here.
+/// A `<resource>/status` a subject's RBAC may grant, the Kind whose
+/// `ApiResource` a writer of it needs, and the `ferrum-api` status type it
+/// carries.
 ///
 /// Both policy kinds share `PolicyStatus`, which is why this is a table and
 /// not a name transformation.
-const STATUS_TYPES: [(&str, &str); 7] = [
-    ("clustersecuritypolicies/status", "PolicyStatus"),
-    ("securitypolicies/status", "PolicyStatus"),
-    ("policyexceptions/status", "PolicyExceptionStatus"),
-    ("policylibraries/status", "PolicyLibraryStatus"),
-    ("runtimeprofiles/status", "RuntimeProfileStatus"),
-    ("ferrumclusters/status", "FerrumClusterStatus"),
-    ("compliancesnapshots/status", "ComplianceSnapshotStatus"),
+///
+/// The middle column is the one that decides. Naming the status *type* was
+/// what this table held for one cycle, and a type name in a source file is not
+/// a write: `runtimeprofiles/status` survived a cull that deleted three grants
+/// of exactly its shape because `crates/ferrum-controller/src/lib.rs` contains
+/// `pub fn runtime_profile_status(…) -> RuntimeProfileStatus`, whose only
+/// consumer is a field two unit tests read. There is no `ApiResource` for
+/// `runtimeprofiles`, no watch and no PATCH. A `pub fn` returning the type, a
+/// `use` line or a doc comment mentioning it satisfied the rule forever.
+const STATUS_TYPES: [(&str, &str, &str); 7] = [
+    (
+        "clustersecuritypolicies/status",
+        "ClusterSecurityPolicy",
+        "PolicyStatus",
+    ),
+    ("securitypolicies/status", "SecurityPolicy", "PolicyStatus"),
+    (
+        "policyexceptions/status",
+        "PolicyException",
+        "PolicyExceptionStatus",
+    ),
+    (
+        "policylibraries/status",
+        "PolicyLibrary",
+        "PolicyLibraryStatus",
+    ),
+    (
+        "runtimeprofiles/status",
+        "RuntimeProfile",
+        "RuntimeProfileStatus",
+    ),
+    (
+        "ferrumclusters/status",
+        "FerrumCluster",
+        "FerrumClusterStatus",
+    ),
+    (
+        "compliancesnapshots/status",
+        "ComplianceSnapshot",
+        "ComplianceSnapshotStatus",
+    ),
 ];
 
-/// Every crate a manifest under `deploy/` asks the cluster to run, by the
-/// `image:` lines that name them.
-fn shipped_subjects(root: &Path) -> BTreeMap<String, ()> {
+/// RBAC verbs that write. `get`, `list` and `watch` on a status subresource are
+/// a read grant and not the finding here.
+const WRITE_VERBS: [&str; 5] = ["create", "update", "patch", "delete", "*"];
+
+/// How a subject's sources say it writes `<Kind>/status`, and it is two things
+/// at once, neither sufficient alone.
+///
+/// A status PATCH in this workspace is `api.patch_status(...)` on an
+/// `Api<DynamicObject>` built from an `ApiResource`, and an `ApiResource` is
+/// built from a `GroupVersionKind::gvk(GROUP, VERSION, "<Kind>")`. So the Kind
+/// must appear as the literal of a `gvk` call — the handle the write needs,
+/// which a `pub fn` returning a status struct, a `use` line and a doc comment
+/// cannot produce — and the crate must contain a status-patching call at all.
+///
+/// What this cannot do, stated rather than left to be read into it: it does not
+/// follow the handle to the call. A `gvk` literal for a Kind the crate never
+/// patches would satisfy it. That is a far narrower hole than the one it
+/// replaces — the literal constructs a cluster API handle, it is not a name in
+/// a signature — and closing it needs dataflow this file has no business
+/// carrying.
+fn writes_status(sources: &str, kind: &str) -> bool {
+    let quoted = format!("\"{kind}\"");
+    let has_handle = sources
+        .match_indices("GroupVersionKind::gvk(")
+        .any(|(at, _)| {
+            let rest = &sources[at..];
+            // The `;` that ends the statement the call is part of, whatever
+            // rustfmt did to the line breaks inside the argument list.
+            let end = rest.find(';').unwrap_or(rest.len());
+            rest[..end].contains(&quoted)
+        });
+    has_handle && sources.contains("patch_status")
+}
+
+/// `text` with its comments removed, so a sentence describing a write is not
+/// one.
+///
+/// `//` inside a string literal is left alone in the one shape this tree has, a
+/// URL scheme, by not treating `://` as a comment opener. That is the whole of
+/// it: a `//` inside any other string literal would over-strip, which fails
+/// this scan closed — toward reporting a missing writer — and never open.
+fn strip_rust_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let chars: Vec<char> = line.chars().collect();
+        let cut = (1..chars.len())
+            .find(|i| chars[*i] == '/' && chars[i - 1] == '/' && (*i < 2 || chars[i - 2] != ':'));
+        match cut {
+            Some(i) => out.extend(chars[..i - 1].iter()),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A `(Cluster)RoleBinding`, reduced to what the census needs: the role it
+/// points at and the ServiceAccounts it points at it from.
+struct Binding {
+    role_kind: String,
+    role_name: String,
+    accounts: Vec<String>,
+}
+
+fn scalar(node: &Value, key: &str) -> String {
+    node.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn sequence<'a>(node: &'a Value, key: &str) -> &'a [Value] {
+    node.get(key)
+        .and_then(Value::as_sequence)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// Every value of `key` in one document, however deep the pod template is
+/// nested.
+fn collect_field(node: &Value, key: &str, out: &mut BTreeSet<String>) {
+    match node {
+        Value::Mapping(map) => {
+            if let Some(Value::String(value)) = map.get(&Value::from(key)) {
+                out.insert(value.clone());
+            }
+            for (_, value) in map.iter() {
+                collect_field(value, key, out);
+            }
+        }
+        Value::Sequence(items) => {
+            for item in items {
+                collect_field(item, key, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every YAML document under `deploy/`, one entry per `---`.
+fn documents(root: &Path) -> Vec<Value> {
     let mut files = Vec::new();
     yaml_files(&root.join("deploy"), &mut files);
-    let mut out = BTreeMap::new();
+    files.sort();
+    let mut out = Vec::new();
     for file in files {
         let body = fs::read_to_string(&file).expect("manifest");
-        for line in body.lines() {
-            let Some(reference) = line.trim().strip_prefix("image:") else {
-                continue;
-            };
+        for doc in serde_yaml::Deserializer::from_str(&body) {
+            if let Ok(value) = Value::deserialize(doc) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+/// Every crate a manifest under `deploy/` asks the cluster to run, by the
+/// `image:` lines that name them, mapped to the ServiceAccounts the pod specs
+/// carrying those images run as.
+///
+/// The accounts are what turns a name into a subject: RBAC binds a
+/// ServiceAccount and not an image, so without them the grant census below
+/// cannot ask what any subject but the one whose file it hardcoded may write.
+fn shipped_subjects(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for doc in documents(root) {
+        let mut images = BTreeSet::new();
+        let mut accounts = BTreeSet::new();
+        collect_field(&doc, "image", &mut images);
+        collect_field(&doc, "serviceAccountName", &mut accounts);
+        for reference in images {
             let reference = reference.trim().trim_matches('"');
             let repo = match reference.rfind(':') {
                 Some(colon) if colon > reference.rfind('/').unwrap_or(0) => &reference[..colon],
                 _ => reference,
             };
             if let Some(name) = repo.rsplit('/').next() {
-                out.insert(name.to_string(), ());
+                out.entry(name.to_string())
+                    .or_default()
+                    .extend(accounts.iter().cloned());
             }
         }
     }
     out
+}
+
+/// Every `(Cluster)Role` under `deploy/`, by kind and name, and every
+/// `(Cluster)RoleBinding` that points at one.
+#[allow(clippy::type_complexity)]
+fn rbac(root: &Path) -> (BTreeMap<(String, String), Vec<Value>>, Vec<Binding>) {
+    let mut roles: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
+    let mut bindings = Vec::new();
+    for doc in documents(root) {
+        let kind = scalar(&doc, "kind");
+        let name = doc
+            .get("metadata")
+            .map(|m| scalar(m, "name"))
+            .unwrap_or_default();
+        match kind.as_str() {
+            "Role" | "ClusterRole" => {
+                roles.insert((kind, name), sequence(&doc, "rules").to_vec());
+            }
+            "RoleBinding" | "ClusterRoleBinding" => {
+                let role = doc.get("roleRef");
+                bindings.push(Binding {
+                    role_kind: role.map(|r| scalar(r, "kind")).unwrap_or_default(),
+                    role_name: role.map(|r| scalar(r, "name")).unwrap_or_default(),
+                    accounts: sequence(&doc, "subjects")
+                        .iter()
+                        .filter(|s| scalar(s, "kind") == "ServiceAccount")
+                        .map(|s| scalar(s, "name"))
+                        .collect(),
+                });
+            }
+            _ => {}
+        }
+    }
+    (roles, bindings)
+}
+
+/// Every `<resource>/status` a subject may write, followed from its pod spec's
+/// ServiceAccounts through the bindings to the rules, and how many rules were
+/// reached at all.
+///
+/// The count is not decoration. A graph that resolves nothing produces the same
+/// empty grant set as a subject that is granted nothing, and telling those two
+/// apart is the whole difference between this census and the hardcoded read of
+/// one file it replaces.
+fn granted_status_writes(
+    accounts: &BTreeSet<String>,
+    roles: &BTreeMap<(String, String), Vec<Value>>,
+    bindings: &[Binding],
+) -> (BTreeSet<String>, usize) {
+    let mut granted = BTreeSet::new();
+    let mut reached = 0usize;
+    for binding in bindings {
+        if !binding.accounts.iter().any(|a| accounts.contains(a)) {
+            continue;
+        }
+        let key = (binding.role_kind.clone(), binding.role_name.clone());
+        let Some(rules) = roles.get(&key) else {
+            continue;
+        };
+        for rule in rules {
+            reached += 1;
+            let writes = sequence(rule, "verbs")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|verb| WRITE_VERBS.contains(&verb));
+            if !writes {
+                continue;
+            }
+            for resource in sequence(rule, "resources").iter().filter_map(Value::as_str) {
+                if resource.contains("/status") {
+                    granted.insert(resource.to_string());
+                }
+            }
+        }
+    }
+    (granted, reached)
 }
 
 fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -637,6 +887,16 @@ fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
 ///    with no writer is a second channel that reports the zero value of its own
 ///    struct forever, and it is indistinguishable from a healthy one.
 ///
+/// The third assertion is a census over the same three subjects as the first
+/// two, and for one cycle it was not: it read `deploy/controller/rbac.yaml` by
+/// name and a list of `ferrum.io` resources, so `ferrum-agent` and
+/// `ferrum-admission` passed it because nothing in the loop could name them —
+/// «green because there is nothing to check», two subjects out of three, inside
+/// the test whose own docstring is an argument against that. It now follows
+/// each subject's pod spec to its ServiceAccounts, those to the bindings, and
+/// the bindings to the rules, so a status grant added to the agent or the
+/// webhook is seen by the same rule that sees the controller's.
+///
 /// `FerrumClusterStatus.degraded` was exactly that: `deploy/controller/rbac.yaml`
 /// granted `ferrumclusters/status` and no source file in the workspace names
 /// `FerrumCluster` at all. Two repairs were available — give `.degraded` its
@@ -645,6 +905,14 @@ fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// «Ничто и никогда не обращалось к API server» in the document), while a grant
 /// nobody exercises is a permission with no purpose, which this project's threat
 /// model calls a lateral-movement target.
+///
+/// `runtimeprofiles/status` was the same finding and survived that cull,
+/// because the rule asked whether the *status type* was named anywhere in the
+/// crate and `pub fn runtime_profile_status(…) -> RuntimeProfileStatus` names
+/// it. Its result is a struct field two unit tests read; there is no
+/// `ApiResource` for `runtimeprofiles`, no watch and no PATCH. The rule now
+/// asks for the handle a write needs — see `writes_status` — and the grant is
+/// deleted, the same repair for the same reason.
 #[test]
 fn every_shipped_subject_has_one_reachable_channel_that_carries_a_cause() {
     let doc = document();
@@ -732,41 +1000,190 @@ fn every_shipped_subject_has_one_reachable_channel_that_carries_a_cause() {
         subjects.len()
     );
 
-    // 3. A cause rather than a constant: no granted status subresource that
-    //    nothing writes.
-    let rbac = fs::read_to_string(root.join("deploy/controller/rbac.yaml")).expect("rbac.yaml");
-    let mut sources = Vec::new();
-    rs_files(&root.join("crates/ferrum-controller/src"), &mut sources);
-    let written: String = sources
-        .iter()
-        .map(|p| fs::read_to_string(p).expect("controller source"))
-        .collect();
+    // 3. A cause rather than a constant: no subject holds a write grant on a
+    //    `<kind>/status` that nothing in it writes.
+    //
+    //    Over every shipped subject, not over one hardcoded file. The loop this
+    //    replaces read `deploy/controller/rbac.yaml` and one list of `ferrum.io`
+    //    resources, so `ferrum-agent` and `ferrum-admission` passed it because
+    //    nothing in it could name them — assertion 3 was vacuous for two
+    //    subjects out of three, inside the test whose docstring is an argument
+    //    against exactly that.
+    let (roles, bindings) = rbac(&root);
     let mut dead = Vec::new();
-    for (resource, status_type) in STATUS_TYPES {
-        let granted = rbac
-            .lines()
-            .any(|l| l.trim().trim_start_matches("- ").trim_matches('"') == resource);
-        if granted && !written.contains(status_type) {
-            dead.push(format!("  {resource} (nothing names {status_type})"));
+    let mut unknown = Vec::new();
+    let mut resolved = 0usize;
+    for (subject, accounts) in &subjects {
+        let (granted, reached) = granted_status_writes(accounts, &roles, &bindings);
+        resolved += reached;
+        assert!(
+            !accounts.is_empty(),
+            "no pod spec under deploy/ that runs {subject} names a serviceAccountName, so no \
+             binding can be followed to it and this census asked nothing about it"
+        );
+        let sources_dir = root.join("crates").join(subject).join("src");
+        assert!(
+            sources_dir.is_dir(),
+            "{} does not exist, so what {subject} writes cannot be read",
+            sources_dir.display()
+        );
+        let mut files = Vec::new();
+        rs_files(&sources_dir, &mut files);
+        let sources: String = files
+            .iter()
+            .map(|path| strip_rust_comments(&fs::read_to_string(path).expect("source file")))
+            .collect();
+        for resource in &granted {
+            let Some((_, kind, status_type)) = STATUS_TYPES.iter().find(|(r, _, _)| r == resource)
+            else {
+                unknown.push(format!("  {subject}: {resource}"));
+                continue;
+            };
+            if !writes_status(&sources, kind) {
+                dead.push(format!(
+                    "  {subject}: {resource} (no GroupVersionKind::gvk(…, \"{kind}\") and \
+                     patch_status in crates/{subject}/src; carrying {status_type})"
+                ));
+            }
         }
     }
     assert!(
+        unknown.is_empty(),
+        "these subjects are granted write on a status subresource STATUS_TYPES does not \
+         name:\n{}\nThe table is what this census decides against; a grant outside it is \
+         checked by nothing.",
+        unknown.join("\n")
+    );
+    assert!(
         dead.is_empty(),
-        "deploy/controller/rbac.yaml grants write on these status subresources and no source \
-         file of ferrum-controller writes one:\n{}\nA status nobody writes reports the zero \
-         value of its own struct forever — `degraded: false` on a cluster that is down — and \
-         the grant that carries it is a permission with no purpose, which the threat model \
-         calls a lateral-movement target. Either write it, or delete the grant.",
+        "these subjects hold write on a status subresource and no source file of theirs \
+         writes one:\n{}\nA status nobody writes reports the zero value of its own struct \
+         forever — `degraded: false` on a cluster that is down — and the grant that carries \
+         it is a permission with no purpose, which the threat model calls a lateral-movement \
+         target. Either write it, or delete the grant.\n\nNaming the status type is not \
+         writing it: `runtimeprofiles/status` survived the cull that took three grants of \
+         its exact shape because a `pub fn runtime_profile_status(…) -> RuntimeProfileStatus` \
+         existed whose only consumer is a struct field two unit tests read.",
         dead.join("\n")
     );
-    // The positive control. Every check above is an absence, and an absence is
-    // also what a renamed resource list, a reworked rbac.yaml or a typo in
-    // STATUS_TYPES produces.
+
+    // The positive controls. Every check above is an absence, and an absence is
+    // also what an unresolved RBAC graph, a renamed resource list, a reworked
+    // rbac.yaml or a typo in STATUS_TYPES produces.
     assert!(
-        rbac.contains("policyexceptions/status") && written.contains("PolicyExceptionStatus"),
-        "the pair this scan is calibrated on is gone: it can no longer tell a granted \
-         status with a writer from one without, so the loop above proved nothing"
+        resolved > 0,
+        "no binding under deploy/ resolved to a role for any shipped subject, so the grant \
+         census ran over an empty rule set for all {} of them and proved nothing",
+        subjects.len()
     );
+    let controller = subjects
+        .get("ferrum-controller")
+        .expect("ferrum-controller is a shipped subject");
+    let (granted, _) = granted_status_writes(controller, &roles, &bindings);
+    assert!(
+        granted.contains("policyexceptions/status"),
+        "the grant this census is calibrated on is gone from the graph: it can no longer \
+         follow a ServiceAccount through a binding to a rule, so every subject above came \
+         back with nothing granted and the loop proved nothing. Found: {granted:?}"
+    );
+    let mut controller_sources = Vec::new();
+    rs_files(
+        &root.join("crates/ferrum-controller/src"),
+        &mut controller_sources,
+    );
+    let controller_body: String = controller_sources
+        .iter()
+        .map(|path| strip_rust_comments(&fs::read_to_string(path).expect("source file")))
+        .collect();
+    assert!(
+        writes_status(&controller_body, "PolicyException"),
+        "the writer this census is calibrated on is gone: it can no longer tell a granted \
+         status with a writer from one without"
+    );
+    assert!(
+        !writes_status(&controller_body, "RuntimeProfile"),
+        "the controller now names RuntimeProfile in a gvk call. If it genuinely watches and \
+         patches RuntimeProfile now, restore the runtimeprofiles/status grant in \
+         deploy/controller/rbac.yaml in the same change and delete this control; if it does \
+         not, this scan has stopped telling a handle from a mention and the negative half of \
+         it proves nothing"
+    );
+}
+
+/// The controller's channel is stderr, and the exit code is reachable only
+/// before the watch starts.
+///
+/// The inventory row for `ferrum-controller` said «код выхода и строка
+/// `error: <причина>` в stderr» and cited an argv test, and that is true of
+/// exactly one class of fault: the ones `run()` can return before `run_watch`
+/// is entered. After that the process is three `tokio::select!`ed watch loops.
+/// `kube::runtime::watcher` retries internally and does not terminate, so every
+/// fault an operator actually needs a channel for — a reconcile that fails, a
+/// status PATCH that 403s, which is precisely what a botched RBAC edit
+/// produces, a watch error — is one `eprintln!` and the loop continues. The
+/// exit code is never reached and the line does not carry the `error:` prefix
+/// the row named. So the row's second assertion, «the channel is reachable»,
+/// was satisfied by the one class of fault an operator never needs a channel
+/// for.
+///
+/// This is what makes the rewritten row true rather than the claim true: the
+/// channel *is* stderr, both halves of it, and the difference between them is
+/// whether the process is still running afterwards. The repair the row cannot
+/// make is in `crates/ferrum-controller/src`, which this slice does not own —
+/// a 403 on a status PATCH is a log line and nothing else: no exit, no
+/// counter, no status, nothing an operator polls.
+#[test]
+fn the_controllers_channel_is_stderr_and_a_failed_event_never_reaches_the_exit_code() {
+    let root = repo_root();
+    let main = strip_rust_comments(
+        &fs::read_to_string(root.join("crates/ferrum-controller/src/main.rs")).expect("main.rs"),
+    );
+    let watch = strip_rust_comments(
+        &fs::read_to_string(root.join("crates/ferrum-controller/src/watch.rs")).expect("watch.rs"),
+    );
+
+    // The startup half, which is the one the row used to claim was the whole
+    // channel: a returned error is printed with the `error:` prefix and the
+    // process leaves with 1.
+    assert!(
+        main.contains("eprintln!(\"error: {err}\")") && main.contains("process::exit(1)"),
+        "crates/ferrum-controller/src/main.rs no longer prints `error: <cause>` and exits 1, \
+         so the startup half of the inventory row names a channel that is gone"
+    );
+
+    // The post-startup half. Each watch loop handles a per-event failure by
+    // printing it and going round again, so the count is one per arm and the
+    // prefix is the process name rather than `error:`.
+    let loops = watch
+        .matches("while let Some(event) = stream.next().await")
+        .count();
+    assert!(
+        loops >= 3,
+        "found {loops} event loops in watch.rs; there are three, so this scan is reading \
+         something else and what follows proves nothing"
+    );
+    let printed = watch.matches("eprintln!(\"ferrum-controller").count();
+    assert!(
+        printed >= loops * 2,
+        "watch.rs has {loops} event loops and only {printed} `ferrum-controller:` lines. Each \
+         loop reports two kinds of failure — the event's own and the watch's — and a loop \
+         that reports neither swallows it entirely"
+    );
+    assert!(
+        !watch.contains("eprintln!(\"error:"),
+        "watch.rs prints an `error:` line. That prefix belongs to `main`, which exits after \
+         it; a line with the same prefix from a loop that continues tells an operator the \
+         process is gone when it is not, and the inventory row would then be naming two \
+         channels under one name"
+    );
+    for exit in ["process::exit(", "std::process::exit(", "exit(1)"] {
+        assert!(
+            !watch.contains(exit),
+            "watch.rs calls {exit}. The inventory row says the exit code is the startup \
+             channel; if a failed event can now reach it, the row is understating what an \
+             operator sees and the two halves are no longer distinguishable"
+        );
+    }
 }
 
 /// The §D case list in the document is `AcceptanceCase::ALL` and nothing else.
@@ -1080,14 +1497,50 @@ mod grammar {
         assert!(tests_in("#[test]\n#[ignore]\nfn skipped() {}\n").contains(&"skipped".to_string()));
     }
 
-    /// Adding an exemption is a deliberate act, like `NOT_EXECUTED_SUBJECTS`.
+    /// Adding an exemption is a deliberate act, like `NOT_EXECUTED_SUBJECTS`,
+    /// and the exemption actually exempts.
     ///
-    /// The list landed empty and must not be filled to make the gate pass:
-    /// seeding it with everything currently uncited is the "green having run
-    /// almost nothing" shape, and this count is what makes growing it show up
-    /// in a diff as its own decision.
+    /// This asserted nothing for a cycle. `UNCITED_TESTS` is `[(&str, &str); 0]`,
+    /// so `0 <= 3` is a compile-time truth and the `for` body never ran — while
+    /// the document carried a row saying the empty list is *held by a gate*.
+    /// Nothing was held: had the list been filled with thirty names and no
+    /// reasons, this test would have passed exactly as it did.
+    ///
+    /// So the rule is exercised on inputs whose answer is known, and the
+    /// constant is checked separately. The list landed empty and must not be
+    /// filled to make the citation gate pass: seeding it with everything
+    /// currently uncited is the "green having run almost nothing" shape, and
+    /// the count below is what makes growing it show up in a diff as its own
+    /// decision.
     #[test]
     fn an_exemption_from_citation_is_named_one_at_a_time() {
+        // The rule, on the cases that matter and with the exemption list this
+        // tree does not have.
+        let cited = vec!["a_cited_gate".to_string()];
+        assert!(is_answered("a_cited_gate", &cited, &[]));
+        assert!(
+            !is_answered("an_uncited_gate", &cited, &[]),
+            "with an empty exemption list an uncited test must be reported; if this passes, \
+             the citation gate is green because its rule answers everything"
+        );
+        assert!(
+            is_answered(
+                "an_uncited_gate",
+                &cited,
+                &[("an_uncited_gate", "a reason")]
+            ),
+            "an exemption that does not exempt would make the list unusable and push the \
+             next author toward deleting the test or the directory instead"
+        );
+        assert!(
+            !is_answered("an_uncited_gate", &cited, &[("another_test", "a reason")]),
+            "an exemption naming one test must not answer for another, or one entry would \
+             silence the whole directory"
+        );
+        // And the citation has to name the file the test lives in: `cited` is
+        // what the caller resolved for that one file, never the whole document.
+        assert!(!is_answered("a_cited_gate", &[], &[]));
+
         assert!(
             UNCITED_TESTS.len() <= 3,
             "{} tests are exempt from needing a row. The exemption list is for the rare \

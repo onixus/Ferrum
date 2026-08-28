@@ -536,6 +536,15 @@ pipeline {
                     evidence="$(wc -l < "$names")"
                     echo "ok: all $passed join tests ran and $evidence of them took a kernel"
                     echo "ok: record through a signed bundle to a confirmed SIGKILL"
+                    # The lib tests under the pair of features the DaemonSet
+                    # ships with, for the same reason the ebpf stage above runs
+                    # its own: `--test attach_join` compiles and runs exactly
+                    # one integration target. `cargo test --workspace` is
+                    # default features and both of these are off, so until this
+                    # line the agent's 150 unit tests had never been *run*
+                    # under `attach,apiserver` — only compiled, by the clippy
+                    # line, which links nothing and executes nothing.
+                    cargo test -p ferrum-agent --features attach,apiserver --lib
                 '''
             }
         }
