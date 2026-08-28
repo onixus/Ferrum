@@ -157,7 +157,14 @@ fn enforce_spec(mode: PolicyMode, pk_hex: String) -> ClusterSecurityPolicySpec {
 
 fn make_signed(spec: ClusterSecurityPolicySpec, sk: &[u8; 32]) -> (Vec<u8>, Vec<u8>, String) {
     let fadm = compile(spec);
-    let raw = bundle_digest_material(AGENT_ABI, ADMISSION_ABI, &fadm, b"", b"").expect("frmb");
+    let raw = bundle_digest_material(
+        AGENT_ABI,
+        ADMISSION_ABI,
+        &fadm,
+        b"",
+        &ferrum_wasm_abi::placeholder_module(),
+    )
+    .expect("frmb");
     let pk = public_key_from_secret(sk).expect("pk");
     let sig = sign_bundle(&raw, sk).expect("sign");
     let fsig = encode_fsig(&raw, &sig, &pk).expect("fsig");
@@ -597,7 +604,14 @@ fn empty_or_missing_bundle_fsig_is_integrity() {
 fn unsigned_frmb_or_fadm_in_secret_is_integrity() {
     let (fsig, pk) = make_fsig(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
     let fadm = compile(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)));
-    let frmb = bundle_digest_material(AGENT_ABI, ADMISSION_ABI, &fadm, b"", b"").expect("frmb");
+    let frmb = bundle_digest_material(
+        AGENT_ABI,
+        ADMISSION_ABI,
+        &fadm,
+        b"",
+        &ferrum_wasm_abi::placeholder_module(),
+    )
+    .expect("frmb");
     assert_integrity(load_source(&controller_secret(&fadm, None), &pk));
     assert_integrity(load_source(&controller_secret(&frmb, None), &pk));
     let state = webhook_state(&fsig, &pk);

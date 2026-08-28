@@ -502,6 +502,95 @@ fn cp_down_keeps_last_known_good_not_fail_open() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A signed bundle carrying a wasm module neither plane can execute is refused
+/// by both, and the agent stays on last-known-good.
+///
+/// The wasm slot rides inside FRMB and is covered by the digest, so the
+/// controller's signature is over it. Until this cycle both parsers read its
+/// length and dropped its bytes — `parse_frmb` in `ferrum-ebpf` and
+/// `extract_admission_program` in `ferrum-admission` — which meant a bundle
+/// whose slot carried a real module loaded, enforced everything except that
+/// module, and reported nothing. Signature over the bytes is not permission to
+/// ignore them: it says the controller wrote them, not that this binary can run
+/// them.
+///
+/// One byte apart on purpose. The rejected bundle is the accepted one with the
+/// slot's kind byte changed, signed with the same key over the changed
+/// material, so nothing else about it differs and the refusal cannot be coming
+/// from anywhere else.
+#[test]
+fn a_signed_bundle_whose_wasm_slot_no_plane_can_execute_is_refused_by_both() {
+    fn sign_with_slot(wasm: &[u8]) -> (Vec<u8>, Digest, Vec<u8>) {
+        let mut spec = prod_restricted().spec;
+        spec.mode = PolicyMode::Enforce;
+        let bundle = compile_cluster_policy(&spec).expect("compile prod-restricted");
+        let frmb = bundle_digest_material(
+            AGENT_ABI,
+            ADMISSION_ABI,
+            &bundle.admission_program,
+            &bundle.ebpf_spec,
+            wasm,
+        )
+        .expect("frmb material");
+        let pk = public_key_from_secret(&SK).expect("public key");
+        let sig = sign_bundle(&frmb, &SK).expect("sign");
+        // The digest of the material actually signed, not the one the compiler
+        // recorded for its own slot: otherwise the agent would refuse the
+        // bundle below on a digest mismatch and the wasm check would never run.
+        (
+            encode_fsig(&frmb, &sig, &pk).expect("fsig"),
+            ferrum_crypto::bundle_digest(&frmb),
+            pk,
+        )
+    }
+
+    let placeholder = compile_cluster_policy(&prod_restricted().spec)
+        .expect("compile")
+        .wasm;
+    let mut foreign = placeholder.clone();
+    let kind = foreign.len() - 1;
+    assert_eq!(foreign[kind], 0, "the compiler's slot is the placeholder");
+    foreign[kind] = 1;
+
+    // Both planes take the untouched slot, so the refusal below is about the
+    // one byte and not about this construction.
+    let (good_fsig, good_digest, pk) = sign_with_slot(&placeholder);
+    load_bundle(&good_fsig, &pk).expect("admission takes the placeholder slot");
+    let mut agent = respond_agent(None);
+    agent
+        .apply_fsig(&good_fsig, Some(&good_digest))
+        .expect("agent takes the placeholder slot");
+    assert_eq!(agent.last_good_digest(), Some(&good_digest));
+
+    let (bad_fsig, bad_digest, bad_pk) = sign_with_slot(&foreign);
+    assert_ne!(
+        bad_digest, good_digest,
+        "the slot is covered by the digest, or this test proves nothing about signing"
+    );
+
+    let err = load_bundle(&bad_fsig, &bad_pk).expect_err("admission must refuse the module");
+    assert!(
+        err.to_string().contains("kind 1"),
+        "the refusal must name the module it cannot run: {err}"
+    );
+
+    agent
+        .apply_fsig(&bad_fsig, Some(&bad_digest))
+        .expect_err("the agent must refuse the module");
+    assert_eq!(
+        agent.last_good_digest(),
+        Some(&good_digest),
+        "a refused bundle must not displace last-known-good"
+    );
+    assert_eq!(
+        agent
+            .matched_action(&ev("execve", "sh", "/bin/sh", false))
+            .action,
+        Action::Kill,
+        "refusing the new bundle is not fail-open: the old one still enforces"
+    );
+}
+
 /// The FSIG codec exists in four copies (controller, agent, admission, CLI)
 /// because the crate boundary forbids a shared runtime dependency. This is the
 /// gate that catches drift: bytes the controller actually publishes must be

@@ -36,11 +36,14 @@ fn parse_frmb(raw: &[u8]) -> Result<&[u8]> {
     let ebpf_len = r.u32()? as usize;
     let spec = r.take(ebpf_len)?;
     let wasm_len = r.u32()? as usize;
-    let _ = r.take(wasm_len)?;
+    let wasm = r.take(wasm_len)?;
     r.finish()?;
     if spec.len() < 4 || spec[..4] != EBPF_MAGIC {
         return Err(FerrumError::Compile("FRMB eBPF slice is not FEBP".into()));
     }
+    // Before the FEBP slice is handed to a loader, and not after: a bundle
+    // carrying a module this plane cannot execute must not be half-applied.
+    ferrum_wasm_host::accept_bundle_slot(wasm)?;
     Ok(spec)
 }
 

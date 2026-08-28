@@ -220,6 +220,7 @@
 | `ApiserverConfig` без спроецированного токена — ошибка старта, называющая файл, а не бесконечный backoff | U | U `ferrum-k8smeta/src/watch.rs::a_config_without_a_projected_token_is_an_error_that_names_the_file` |
 | Долг relist, поднятый нечитаемым кадром, гасится истечением hold-down на любом следующем кадре, а не приходом второго нечитаемого: одиночный плохой кадр на здоровом потоке не оставляет кэш нетёплым на всё время соединения, и при этом всплеск нечитаемых кадров не стоит переподключения на кадр | U | U `ferrum-k8smeta/src/watch.rs::one_unreadable_frame_on_an_otherwise_healthy_stream_still_relists` · U `ferrum-k8smeta/src/watch.rs::an_unreadable_pod_frame_ends_the_stream_once_its_debt_stands` · U `ferrum-k8smeta/src/watch.rs::a_rolling_stream_of_unknown_frames_is_not_a_reconnect_per_frame` |
 | Несосчитанный rollout отличается на проводе от сосчитанного нуля: поставляемый манифест контроллера флота не объявляет, пустой срез даёт `null` в обоих счётчиках, объявленный вставший флот — `0`, и обе CRD принимают `null`, иначе каждый PATCH статуса отказывал бы | U | U `ferrum-controller/src/lib.rs::an_undeclared_fleet_is_absent_from_status_and_a_stuck_one_is_a_counted_zero` · U `deploy_gate.rs::the_shipped_controller_declares_no_fleet_so_its_rollout_counts_are_absent_not_zero` · U `deploy_gate.rs::both_rollout_counts_are_nullable_in_every_crd_that_carries_them` |
+| Подписанный bundle, чей wasm-слот несёт модуль, которого этот бинарь не исполняет, отвергается обеими плоскостями, и агент остаётся на last-known-good; отличие от принимаемого bundle — один байт kind, подписанный тем же ключом | U | U `acceptance.rs::a_signed_bundle_whose_wasm_slot_no_plane_can_execute_is_refused_by_both` · U `ferrum-wasm-host/src/lib.rs::only_the_versioned_placeholder_is_a_loadable_slot` |
 | `status.json` пишется целиком, переживает сбой записи и не держит замок на агенте | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::the_status_write_holds_no_lock_on_the_shared_agent` |
 
 ### Сигналы деградации
@@ -720,9 +721,25 @@ watcher релистит и передаёт **каждый** объект за�
   тестов.
 - **`MAP_RULES` называет карту, которую не объявляет ни одна программа.**
   `ferrum_rules` есть в константах и в тестах и нет в ELF.
-- **У `ferrum-wasm-host` нет ни одной точки вызова в workspace**, при том что
-  `ferrum-agent` держит его в зависимостях, а 9-байтовый placeholder-модуль
-  входит в дайджест каждого подписанного bundle.
+- **Wasm-модуля этот tree не исполняет — и теперь отказывается грузить bundle,
+  который его несёт.** Прежняя редакция этой строки говорила, что у
+  `ferrum-wasm-host` нет ни одной точки вызова, а `ferrum-agent` держит его в
+  зависимостях; за этим стояла находка крупнее, чем неиспользуемый crate. Слот
+  wasm лежит внутри FRMB и покрыт дайджестом, то есть подписан контроллером, а
+  оба разборщика читали его длину и выбрасывали байты: `parse_frmb` в
+  `ferrum-ebpf` и `extract_admission_program` в `ferrum-admission` связывали
+  срез с `_`. Bundle, чей слот нёс настоящий модуль, грузился, исполнял всё,
+  кроме этого модуля, и не сообщал об этом ничем — ни счётчиком, ни
+  `Degraded`. Подпись такого не отмывает: она говорит, что байты написал
+  контроллер, а не что этот бинарь умеет их исполнить. Теперь решение принимает
+  `ferrum_wasm_host::accept_bundle_slot`, и оба разборщика его зовут: пройти
+  может только версионированный placeholder на ABI этого хоста; чужой kind и
+  чужой ABI — `Degraded` (плоскость остаётся на last-known-good), битые байты —
+  `Compile`. Прямую зависимость `ferrum-agent` на `ferrum-wasm-host`, которую
+  ничто не звало, убрали: крейт приезжает через `ferrum-ebpf`, где стоит вызов.
+  Чего по-прежнему нет: исполнителя wasm. `eval_policy` отказывает на любом
+  входе, который умеет разобрать, placeholder включительно, — и строка про
+  9-байтовый модуль в дайджесте каждого bundle остаётся верной.
 - **In-kernel prefilter инертен и поставляемую политику сузить не может.**
   Ничто не вызывает `prefilter_image` из агента; карты нет. Даже если бы
   была: флаги образа требуют, чтобы признак несло *каждое* правило, а
