@@ -655,6 +655,7 @@ dependencies = [
  "ferrum-ebpf-progs",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "libc",
 ]
 
 [[package]]
