@@ -3,13 +3,29 @@
 // Bind-mount macOS/VirtioFS ломает cargo недетерминированно (E0463 can't find crate).
 // clippy — check-only (.rmeta); cargo test после него пересоберёт .rlib — это ожидаемо.
 //
-// 'Agent binary' is the stage that links. Everything above it — clippy on
-// attach,apiserver included — stops at .rmeta or runs the default features,
-// so until that stage the one production combination had never produced an
-// object file, let alone an executable. 'Agent image' is the only stage that
-// leaves the container: it needs the docker CLI on the node, not inside the
-// rust image, and a socket mounted into this container would be the escape
-// route the runtime rules exist to kill.
+// 'Agent binary', 'Admission binary' and 'Controller binary' are the stages
+// that link. Everything above them — clippy on attach,apiserver included —
+// stops at .rmeta or runs the default features, so until those stages the
+// production combination of each shipped crate had never produced an object
+// file, let alone an executable. Two of the three were added a cycle after the
+// first, having been missing for exactly as long and for exactly the reason
+// that closed the agent's: a binary nothing has ever linked is an empty crate
+// with more steps, and `ferrum-admission --features apiserver` — the crate
+// carrying three of the eight RFC section D acceptance cases — was not compiled
+// by any stage in any mode.
+//
+// The '* image' stages are the only ones that leave the container: they need
+// the docker CLI on the node, not inside the rust image, and a socket mounted
+// into this container would be the escape route the runtime rules exist to
+// kill. Three Dockerfiles and three stages rather than one file taking a crate
+// name: what each image has to prove differs — the agent welds a bpf object to
+// a userspace that must agree with its map layout, the webhook must prove the
+// `apiserver` feature reached the binary, the controller neither — and a check
+// behind an `if` keyed on a build arg is a check a wrong argument skips.
+//
+// `deploy_gate.rs` (run by 'Test') is what keeps this list closed in both
+// directions: an `image:` in deploy/ that no `docker build -t` here produces,
+// or a crate with a `[[bin]]` that no stage links, fails by name.
 
 def RUST_IMAGE = 'rust:1.75-bookworm'
 def RUST_DOCKER_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry -v ferrum-cargo-target:/build-target'
@@ -112,6 +128,104 @@ pipeline {
             }
         }
 
+        // The webhook, in the one combination deploy/admission/deployment.yaml
+        // runs. `apiserver` is off by default, `cargo test --workspace` runs
+        // default features and clippy stops at .rmeta, so before this stage the
+        // production build of the crate that carries unsigned-deny,
+        // privileged-deny and cluster-admin-bind-deny existed in no artefact of
+        // any kind.
+        stage('Admission binary') {
+            steps {
+                sh '''
+                    set -eu
+                    target=x86_64-unknown-linux-musl
+                    rustup target add "$target"
+                    if ! command -v musl-gcc >/dev/null 2>&1; then
+                        apt-get update
+                        apt-get install -y --no-install-recommends musl-tools
+                    fi
+                    CC_x86_64_unknown_linux_musl=musl-gcc \
+                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                        cargo build --release --locked --target "$target" \
+                            -p ferrum-admission --features apiserver
+                    bin="$CARGO_TARGET_DIR/$target/release/ferrum-admission"
+                    test -x "$bin"
+                    # A dynamically linked "musl" build is a binary that will
+                    # not start on the scratch base its image uses. `file` is
+                    # not in this image; the interpreter entry is, and its
+                    # absence is the whole claim.
+                    if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
+                        echo "admission binary is dynamically linked, musl target notwithstanding" >&2
+                        exit 1
+                    fi
+                    # The feature is checked on the binary, not trusted to the
+                    # cargo line above surviving an edit. Two-sided, and the two
+                    # sides are each other's positive control: exactly one of
+                    # these strings is compiled in — the die() message only
+                    # without the feature, the apiserver error prefix only with
+                    # it. A default build fails the first; a grep that has
+                    # stopped matching anything fails the second.
+                    if grep -aq 'requires the `apiserver` feature at build time' "$bin"; then
+                        echo "the webhook linked without --features apiserver: the --apiserver" >&2
+                        echo "flag deploy/admission/deployment.yaml passes would die() on a node," >&2
+                        echo "which is a build defect arriving as a CrashLoopBackOff" >&2
+                        exit 1
+                    fi
+                    if ! grep -aq 'error: apiserver: ' "$bin"; then
+                        echo "the apiserver code path is absent from this binary, so the check" >&2
+                        echo "above cannot detect anything and proved nothing" >&2
+                        exit 1
+                    fi
+                    echo "ok: ferrum-admission linked for $target with the apiserver feature in it"
+                    mkdir -p dist
+                    cp "$bin" dist/ferrum-admission
+                '''
+                archiveArtifacts artifacts: 'dist/ferrum-admission', fingerprint: true
+            }
+        }
+
+        // The controller declares no features, so `cargo build -p
+        // ferrum-controller` is its production combination — but it had never
+        // been linked for the target it ships on either, and it is the one
+        // component that mounts the bundle signing key.
+        stage('Controller binary') {
+            steps {
+                sh '''
+                    set -eu
+                    target=x86_64-unknown-linux-musl
+                    rustup target add "$target"
+                    if ! command -v musl-gcc >/dev/null 2>&1; then
+                        apt-get update
+                        apt-get install -y --no-install-recommends musl-tools
+                    fi
+                    CC_x86_64_unknown_linux_musl=musl-gcc \
+                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+                        cargo build --release --locked --target "$target" \
+                            -p ferrum-controller
+                    bin="$CARGO_TARGET_DIR/$target/release/ferrum-controller"
+                    test -x "$bin"
+                    if readelf -lW "$bin" | grep -q 'Requesting program interpreter'; then
+                        echo "controller binary is dynamically linked, musl target notwithstanding" >&2
+                        exit 1
+                    fi
+                    # Identity, not spelling: this binary is the one handed the
+                    # signing seed, and the flags its Deployment passes are the
+                    # cheapest thing in it that no other component has.
+                    for flag in --seed-file --namespace; do
+                        if ! grep -aq -- "$flag" "$bin"; then
+                            echo "the controller binary does not know $flag, which" >&2
+                            echo "deploy/controller/deployment.yaml passes it" >&2
+                            exit 1
+                        fi
+                    done
+                    echo "ok: ferrum-controller linked for $target"
+                    mkdir -p dist
+                    cp "$bin" dist/ferrum-controller
+                '''
+                archiveArtifacts artifacts: 'dist/ferrum-controller', fingerprint: true
+            }
+        }
+
         stage('BPF ELF') {
             steps {
                 sh '''
@@ -168,7 +282,12 @@ pipeline {
                 // For .dockerignore that decides which files `COPY . .` sees at
                 // all, so the one file that shapes the whole context was the
                 // one file arriving from somewhere else.
-                stash includes: '.dockerignore,Dockerfile,Cargo.toml,Cargo.lock,rust-toolchain.toml,crates/**,dist/ferrum-ebpf-progs.bpf.o', name: 'image-context'
+                //
+                // All three image stages unstash this one context. The webhook
+                // and controller images need no bpf object, but they need the
+                // same sources and the same .dockerignore, and a second stash
+                // would be a second thing to keep in step with this list.
+                stash includes: '.dockerignore,Dockerfile,Dockerfile.admission,Dockerfile.controller,Cargo.toml,Cargo.lock,rust-toolchain.toml,crates/**,dist/ferrum-ebpf-progs.bpf.o', name: 'image-context'
             }
         }
 
@@ -222,25 +341,54 @@ pipeline {
                     fi
                     cat "$out"
                     passed="$(sed -n 's/^test result: ok\\. \\([0-9][0-9]*\\) passed.*/\\1/p' "$out" | head -1)"
-                    if [ "${passed:-0}" -lt 1 ]; then
-                        echo "BPF attach ran ${passed:-no} tests: the only stage that puts" >&2
-                        echo "the datapath in a kernel proved nothing. Check that" >&2
-                        echo "--features attach is still on the cargo test line." >&2
+                    # Every test in the gate, not "at least one". The number is
+                    # derived from the source rather than written down here, so
+                    # a test added to attach_live.rs is required by this stage
+                    # the moment it exists — and #[ignore] on any of the ones
+                    # already there drops `passed` below it and fails, which is
+                    # what "at least one" could not do. `mod gate` starts the
+                    # cfg(attach) half; the single test outside it is compiled
+                    # out under the feature this line builds with, so counting
+                    # from there is counting what actually runs.
+                    src=crates/ferrum-ebpf/tests/attach_live.rs
+                    expected="$(sed -n '/^mod gate {/,$p' "$src" \
+                        | grep -cE '^[[:space:]]*#\\[test\\][[:space:]]*$')"
+                    if [ "${expected:-0}" -lt 1 ]; then
+                        echo "counted no #[test] under mod gate in $src. This stage's own" >&2
+                        echo "idea of what it must run is broken, so it can no longer tell a" >&2
+                        echo "full run from an empty one." >&2
                         exit 1
                     fi
-                    # The positive control. Printed from the far side of a
-                    # successful attach, so a skipped run cannot emit it however
-                    # many tests it reports as passed.
-                    if ! grep -q "attached through KernelHandle on " "$out"; then
-                        echo "BPF attach reported $passed passed tests and never attached." >&2
-                        echo "Every skip in attach_live.rs is an early return from a #[test]," >&2
-                        echo "so the count alone cannot tell a skipped run from a real one." >&2
-                        echo "FERRUM_BPF_ELF_REQUIRED is what turns those skips into" >&2
-                        echo "failures: check it is still on the cargo test line, along" >&2
-                        echo "with --features attach and -- --show-output." >&2
+                    if [ "${passed:-0}" -ne "$expected" ]; then
+                        echo "BPF attach ran ${passed:-no} of the $expected kernel tests in" >&2
+                        echo "$src. A test that does not run proves nothing: #[ignore] on one" >&2
+                        echo "of them leaves the datapath rows it covers asserted by no code" >&2
+                        echo "that executed. Check --features attach is still on the cargo" >&2
+                        echo "test line, and that no test was ignored or filtered out." >&2
                         exit 1
                     fi
-                    echo "ok: $passed attach_live tests executed against this kernel"
+                    # The positive controls. Each is printed from the far side
+                    # of a successful attach, so no skip can emit one however
+                    # many tests it reports as passed. All of them, not the
+                    # first: this stage used to require only the KernelHandle
+                    # line, which is printed by exactly one of the tests above,
+                    # so gutting the other seven left it green.
+                    for evidence in \
+                        "attached through KernelHandle on " \
+                        "long path: " \
+                        "foreign records from tgid "
+                    do
+                        if ! grep -q "$evidence" "$out"; then
+                            echo "BPF attach reported $passed passed tests without printing" >&2
+                            echo "\\"$evidence\\". Every skip in attach_live.rs is an early return" >&2
+                            echo "from a #[test], so the count alone cannot tell a skipped run" >&2
+                            echo "from a real one; that line is emitted only from inside the" >&2
+                            echo "attached path. Check FERRUM_BPF_ELF_REQUIRED, --features" >&2
+                            echo "attach and -- --show-output are all still on the cargo line." >&2
+                            exit 1
+                        fi
+                    done
+                    echo "ok: all $passed attach_live tests executed against this kernel"
                     # The lib tests behind the same feature. `cargo test
                     # --workspace` runs default features, so until this line
                     # nothing ever executed the RLIMIT_MEMLOCK raise that every
@@ -299,22 +447,65 @@ pipeline {
                     fi
                     cat "$out"
                     passed="$(sed -n 's/^test result: ok\\. \\([0-9][0-9]*\\) passed.*/\\1/p' "$out" | head -1)"
-                    if [ "${passed:-0}" -lt 1 ]; then
-                        echo "BPF join ran ${passed:-no} tests: the only stage that carries a" >&2
-                        echo "kernel record to a real SIGKILL proved nothing. Check that" >&2
+                    src=crates/ferrum-agent/tests/attach_join.rs
+                    # Every test in the join, derived from the source for the
+                    # reason the same line in 'BPF attach' is: "at least one"
+                    # goes green with the other four ignored, and the boundary
+                    # rows for docker.sock, the truncated path, the flag-stripped
+                    # record and REFUSE_STALE_TARGET would then be proved by
+                    # nothing that ran. `mod gate` starts the cfg(attach) half.
+                    expected="$(sed -n '/^mod gate {/,$p' "$src" \
+                        | grep -cE '^[[:space:]]*#\\[test\\][[:space:]]*$')"
+                    if [ "${expected:-0}" -lt 1 ]; then
+                        echo "counted no #[test] under mod gate in $src. This stage's own" >&2
+                        echo "idea of what it must run is broken, so it can no longer tell a" >&2
+                        echo "full run from an empty one." >&2
+                        exit 1
+                    fi
+                    if [ "${passed:-0}" -ne "$expected" ]; then
+                        echo "BPF join ran ${passed:-no} of the $expected tests in $src. The" >&2
+                        echo "only stage that carries a kernel record to a real SIGKILL must" >&2
+                        echo "run all of them: an ignored or filtered test leaves the section D" >&2
+                        echo "row it covers asserted by no code that executed. Check that" >&2
                         echo "--features attach is still on the cargo test line." >&2
                         exit 1
                     fi
-                    if ! grep -q "no-shell: kernel record" "$out"; then
-                        echo "BPF join reported $passed passed tests and never carried a" >&2
-                        echo "record to a signal. Every skip in live() is an early return" >&2
-                        echo "from a #[test], so the count alone cannot tell a skipped run" >&2
-                        echo "from a real one; the waitpid evidence line can, and it is" >&2
-                        echo "absent. Check FERRUM_BPF_ELF_REQUIRED, --features attach and" >&2
-                        echo "-- --show-output are all still on the cargo test line." >&2
+                    # Per-test evidence, named. Each test that reaches a
+                    # confirmed SIGKILL prints one line through one helper, so
+                    # the set of lines this run must contain can be read out of
+                    # the source instead of written down here — a test that
+                    # gains or loses its kill is required, or stopped being
+                    # required, by this stage on the same commit. The line is
+                    # printed after waitpid has confirmed the signal, so it is
+                    # reachable only from the far end of record -> verdict ->
+                    # signal and no skip can emit it.
+                    #
+                    # The one join test with no line here is the stale-target
+                    # refusal, which deliberately kills nothing; the count check
+                    # above is what covers it.
+                    names=/tmp/ferrum-join-evidence.txt
+                    grep -o 'signalled("[^"]*"' "$src" \
+                        | sed 's/^signalled("//; s/"$//' | sort -u > "$names"
+                    if [ ! -s "$names" ]; then
+                        echo "no signalled(...) call sites found in $src: this stage can no" >&2
+                        echo "longer name the evidence it requires, so requiring it proves" >&2
+                        echo "nothing" >&2
                         exit 1
                     fi
-                    echo "ok: $passed join tests took kernel records to a verdict and a signal"
+                    while read -r what; do
+                        if ! grep -q "$what: kernel record" "$out"; then
+                            echo "BPF join reported $passed passed tests without the evidence" >&2
+                            echo "line for '$what'. Every skip in live() is an early return" >&2
+                            echo "from a #[test], so the count alone cannot tell a skipped run" >&2
+                            echo "from a real one; the waitpid line can, and this one is" >&2
+                            echo "absent. Check FERRUM_BPF_ELF_REQUIRED, --features attach and" >&2
+                            echo "-- --show-output are all still on the cargo test line." >&2
+                            exit 1
+                        fi
+                    done < "$names"
+                    evidence="$(wc -l < "$names")"
+                    echo "ok: all $passed join tests ran and $evidence of them took a kernel"
+                    echo "ok: record through a signed bundle to a confirmed SIGKILL"
                 '''
             }
         }
@@ -363,6 +554,38 @@ pipeline {
                     docker build \
                         --build-arg BPF_ELF=dist/ferrum-ebpf-progs.bpf.o \
                         -t "ghcr.io/ferrum/ferrum-agent:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
+                '''
+            }
+        }
+
+        // The image deploy/admission/deployment.yaml names. Nothing in this
+        // repository produced it, so the manifest referenced a tag that had
+        // never existed. Dockerfile.admission links the crate a second time, in
+        // its own container, and re-checks both the interpreter and the
+        // `apiserver` feature on the binary it is about to put in the image —
+        // the one 'Admission binary' archived is a different file and its
+        // fingerprint says nothing about this one.
+        stage('Admission image') {
+            agent any
+            steps {
+                unstash 'image-context'
+                sh '''
+                    set -eu
+                    docker build -f Dockerfile.admission \
+                        -t "ghcr.io/ferrum/ferrum-admission:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
+                '''
+            }
+        }
+
+        // The image deploy/controller/deployment.yaml names, on the same terms.
+        stage('Controller image') {
+            agent any
+            steps {
+                unstash 'image-context'
+                sh '''
+                    set -eu
+                    docker build -f Dockerfile.controller \
+                        -t "ghcr.io/ferrum/ferrum-controller:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
                 '''
             }
         }
@@ -547,6 +770,29 @@ pipeline {
                     echo "ok: gen-webhook-pki refuses to overwrite"
                     # The template is not applied; only the rendered file is.
                     rm /tmp/ferrum-pki/admission/validatingwebhookconfiguration.tmpl.yaml
+                    # FD023. Issuance leaves the CA key in the tree it wrote to,
+                    # and the lint refuses that tree until the key is moved out
+                    # — which is the rule's whole point, because the tree it
+                    # lands in is the one that gets committed. This stage went
+                    # red on exactly that, having asserted the issued tree
+                    # passes the lint without first doing the one thing an
+                    # operator must do with the key. Both halves: the tree must
+                    # fail while the key is in it, or the removal below proves
+                    # nothing about why it then passes.
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- lint-deploy /tmp/ferrum-pki >/tmp/ferrum-pki-cakey.out 2>/tmp/ferrum-pki-cakey.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "the issued tree still carries ca.key and the lint accepted it" >&2
+                        exit 1
+                    fi
+                    if ! grep -q FD023 /tmp/ferrum-pki-cakey.err /tmp/ferrum-pki-cakey.out; then
+                        echo "the issued tree failed the lint on something other than FD023" >&2
+                        exit 1
+                    fi
+                    echo "ok: the CA key issuance leaves behind is refused in the tree"
+                    rm /tmp/ferrum-pki/admission/ca.key
                     cargo run -p ferrum-cli --quiet -- lint-deploy /tmp/ferrum-pki
                     rm -rf /tmp/ferrum-pki
                     set +e
@@ -555,6 +801,10 @@ pipeline {
                     set -e
                     if [ "$status" -eq 0 ]; then
                         echo "fixtures/deploy-bad-cabundle must fail lint-deploy" >&2
+                        exit 1
+                    fi
+                    if ! grep -q FD020 /tmp/ferrum-bad-cabundle.err /tmp/ferrum-bad-cabundle.out; then
+                        echo "deploy-bad-cabundle failed on something other than FD020" >&2
                         exit 1
                     fi
                     echo "ok: caBundle placeholder rejected"
@@ -587,6 +837,28 @@ pipeline {
                         exit 1
                     fi
                     echo "ok: an attach build with no tracefs mount rejected"
+                    # FD027. --apiserver against a ServiceAccount with
+                    # automountServiceAccountToken: false is a webhook with the
+                    # feature compiled in, the RBAC granted and no credential to
+                    # use: every connect fails behind a backoff, the label cache
+                    # never lists, and each policy carrying a selector denies the
+                    # Pods it selects. The rule asserts an absence, so it needs a
+                    # tree that has it, and the exact code is grepped for the
+                    # same reason as FD026 above: a fixture failing on something
+                    # else would pass this stage having proved nothing.
+                    set +e
+                    cargo run -p ferrum-cli --quiet -- lint-deploy crates/ferrum-testkit/fixtures/deploy-bad-token >/tmp/ferrum-bad-token.out 2>/tmp/ferrum-bad-token.err
+                    status=$?
+                    set -e
+                    if [ "$status" -eq 0 ]; then
+                        echo "fixtures/deploy-bad-token must fail lint-deploy" >&2
+                        exit 1
+                    fi
+                    if ! grep -q FD027 /tmp/ferrum-bad-token.err /tmp/ferrum-bad-token.out; then
+                        echo "deploy-bad-token failed on something other than FD027" >&2
+                        exit 1
+                    fi
+                    echo "ok: an --apiserver webhook with no projected token rejected"
                 '''
             }
         }

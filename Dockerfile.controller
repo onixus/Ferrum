@@ -1,0 +1,77 @@
+# The controller image. Produces ghcr.io/ferrum/ferrum-controller, which
+# deploy/controller/deployment.yaml names and which nothing in this repository
+# built until now.
+#
+# Its own file rather than a `--build-arg CRATE` on the agent's, for the reason
+# spelled out in Dockerfile.admission: the three images differ by what each has
+# to prove, not by a crate name, and a conditional keyed on a build arg is a
+# check that can be skipped by passing the wrong argument.
+#
+# What this one has to prove is the narrowest of the three, and it is worth
+# saying why there is no feature check here: `ferrum-controller` declares no
+# features, so `cargo build -p ferrum-controller` *is* the production
+# combination. If that changes, this file is where the new combination has to
+# be named, because it is the only place in the repository that links this
+# crate for the target it ships on.
+#
+#   docker build -f Dockerfile.controller \
+#       -t ghcr.io/ferrum/ferrum-controller:v0.1.0 .
+
+ARG RUST_IMAGE=rust:1.75-bookworm
+ARG TARGET=x86_64-unknown-linux-musl
+
+FROM ${RUST_IMAGE} AS build
+ARG TARGET
+
+# musl, not gnu: AGENTS.md requires it of userspace. kube reaches the apiserver
+# through hyper-rustls, which pulls ring, and ring compiles C — so the target
+# needs its own cc as well as the Rust std.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends musl-tools \
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup target add "${TARGET}"
+
+WORKDIR /src
+COPY . .
+
+# --locked because the image is a release artefact, and a build that may resolve
+# a different dependency set than the one CI tested is not one.
+RUN CC_x86_64_unknown_linux_musl=musl-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+    cargo build --release --locked --target "${TARGET}" \
+        -p ferrum-controller \
+ && cp "target/${TARGET}/release/ferrum-controller" /ferrum-controller
+
+# The base below is scratch: a dynamically linked "musl" build would produce an
+# image whose only executable cannot start, and nothing in the image could say
+# why. `file` is not in this image; the interpreter entry is, and its absence is
+# the whole claim. This repeats the check the 'Controller binary' stage makes
+# because that stage checks a different file — its binary is archived, not
+# copied here, and `docker build` links a second one from the same sources.
+RUN if readelf -lW /ferrum-controller | grep -q 'Requesting program interpreter'; then \
+        echo "the controller linked for ${TARGET} requests an interpreter: it would" >&2; \
+        echo "not start on the scratch base this image is built on" >&2; \
+        exit 1; \
+    fi
+
+# Identity, not spelling: this image is the one component that mounts the bundle
+# signing key, so a COPY that picked up some other binary would be a Deployment
+# handing the seed to something that is not the controller. The flags the
+# Deployment passes are the cheapest thing in the binary that only the
+# controller has.
+RUN for flag in --seed-file --namespace; do \
+        if ! grep -aq -- "$flag" /ferrum-controller; then \
+            echo "the binary in this image does not know $flag, which" >&2; \
+            echo "deploy/controller/deployment.yaml passes it" >&2; \
+            exit 1; \
+        fi; \
+    done
+
+# scratch, not distroless: the binary is static-pie musl and the only root it
+# trusts towards the apiserver is the cluster CA projected with its
+# ServiceAccount token, so there is nothing for a base image to provide.
+FROM scratch
+COPY --from=build /ferrum-controller /usr/local/bin/ferrum-controller
+# No USER: the Deployment sets runAsNonRoot with a numeric runAsUser, which
+# needs no passwd entry and is the bound that actually holds.
+ENTRYPOINT ["/usr/local/bin/ferrum-controller"]
