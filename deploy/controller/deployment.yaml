@@ -33,6 +33,17 @@ spec:
             - /etc/ferrum/signing/seed
             - --namespace
             - ferrum
+            # Where this controller publishes what it knows about itself:
+            # counters per failure class, the run of each, and the reasons.
+            # Deliberately a file and not a port — a listening socket is a
+            # second attack surface and an HTTP stack a dependency this crate's
+            # boundary does not carry — and deliberately not wired to any
+            # probe. Every degradation here is either recoverable, in which
+            # case a restart is a crash loop, or the deployment being wrong, in
+            # which case the process ends itself once and says which class
+            # failed. See `crates/ferrum-controller/src/health.rs`.
+            - --status-dir
+            - /run/ferrum
           resources:
             requests:
               cpu: 100m
@@ -49,6 +60,11 @@ spec:
             - name: signing-key
               mountPath: /etc/ferrum/signing
               readOnly: true
+            # The one writable path in this container. `readOnlyRootFilesystem`
+            # above stays true: the status file gets a volume, not a writable
+            # root.
+            - name: status
+              mountPath: /run/ferrum
       volumes:
         # The bundle signing key. Whoever reads this Secret can sign policy, so
         # it is mounted nowhere else in this tree.
@@ -56,3 +72,8 @@ spec:
           secret:
             secretName: ferrum-signing-key
             defaultMode: 0400
+        # Pod-lifetime, like the state it holds: these counters are about this
+        # process, and a status file that outlived the process would report a
+        # controller that is not running.
+        - name: status
+          emptyDir: {}

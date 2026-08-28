@@ -456,7 +456,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         let plan = plan_apply("prod-restricted", DEFAULT_NAMESPACE, &outcome, &pk());
         let secret = plan.secret.expect("Secret on Applied");
@@ -516,7 +515,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         assert!(matches!(outcome, ReconcileOutcome::Failed(_)));
         let plan = plan_apply("kill-all", DEFAULT_NAMESPACE, &outcome, &pk());
@@ -550,7 +548,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         let plan = plan_apply("prod-restricted", DEFAULT_NAMESPACE, &outcome, &wrong);
         assert!(plan.secret.is_none());
@@ -569,7 +566,6 @@ mod tests {
             secret_key: &[0u8; ED25519_SECRET_KEY_LEN],
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         let plan = plan_apply("prod-restricted", DEFAULT_NAMESPACE, &outcome, &pk());
         assert!(plan.secret.is_none());
@@ -596,7 +592,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: Some(&lib),
             clusters: &clusters,
-            runtime_profile: None,
         });
         match &outcome {
             ReconcileOutcome::Applied(a) => {

@@ -5,6 +5,7 @@
 
 mod apply;
 mod bundle;
+mod health;
 mod key;
 mod watch;
 
@@ -17,6 +18,10 @@ pub use apply::{
 pub use bundle::{
     decode_fsig_envelope, encode_fsig_envelope, verify_fsig_envelope, verify_signed_bundle,
     SignedBundle, SIGNED_FORMAT, SIGNED_MAGIC,
+};
+pub use health::{
+    write_status, ControllerHealth, FailureClass, REASON_STATUS_UNWRITABLE, STATUS_NAME,
+    STATUS_TMP_NAME, TERMINAL_RUN,
 };
 pub use key::{
     hex_decode, hex_encode, load_seed, load_seed_file, parse_public_key_hex, parse_seed_bytes,
@@ -31,12 +36,12 @@ pub use watch::{
 use bundle::parse_framb_abis;
 use ferrum_api::{
     ClusterSecurityPolicySpec, CompileStatus, PolicyExceptionSpec, PolicyExceptionStatus,
-    PolicyLibrarySpec, PolicyMode, PolicyStatus, RolloutStatus, RuntimeProfileSpec,
-    RuntimeProfileStatus, SecurityPolicySpec,
+    PolicyLibrarySpec, PolicyMode, PolicyStatus, RolloutStatus, SecurityPolicySpec,
 };
 use ferrum_common::{FerrumError, Result};
 use ferrum_compiler::CompiledBundle;
 use ferrum_ids::{ADMISSION_ABI, AGENT_ABI};
+use std::path::PathBuf;
 
 /// Workspace version of the compiler that produced `CompileStatus.compilerVersion`.
 pub const COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -166,21 +171,17 @@ fn count_i32(n: usize) -> i32 {
     i32::try_from(n).expect("rollout cluster count fits i32")
 }
 
-/// RuntimeProfile never writes PolicyMode. Promote is a human spec edit.
-pub fn retain_policy_mode(
-    spec_mode: PolicyMode,
-    _profile: Option<&RuntimeProfileSpec>,
-) -> PolicyMode {
-    spec_mode
-}
-
-/// Observe-only status. `readyForPromote` stays false: no telemetry, no auto-enforce.
-pub fn runtime_profile_status(_profile: &RuntimeProfileSpec) -> RuntimeProfileStatus {
-    RuntimeProfileStatus {
-        ready_for_promote: false,
-        drift_count: 0,
-    }
-}
+// `retain_policy_mode` and `runtime_profile_status` stood here. Both took a
+// RuntimeProfile spec, ignored it and returned a constant — the mode they were
+// handed, and a `RuntimeProfileStatus` that was `false, 0` for every input.
+// `reconcile` called them on every pass, so a profile travelled the whole way
+// through the controller and changed nothing, and the field the second one
+// filled was read by two unit tests and by no caller. Removed with the
+// `runtime_profile` input and the `profile_status` output, so that «a
+// RuntimeProfile never promotes a policy» is a property of the type this
+// controller reconciles rather than of a function that could be edited to be
+// false. Its RBAC went the same way: nothing here can address the kind
+// (`deploy/controller/rbac.yaml`).
 
 /// ClusterSecurityPolicy fields read from a DynamicObject. Not a kube type.
 #[derive(Debug, Clone, PartialEq)]
@@ -217,6 +218,10 @@ pub struct WatchConfig {
     pub trust_root: Vec<u8>,
     pub library: Option<PolicyLibrarySpec>,
     pub clusters: Vec<ClusterAbi>,
+    /// Where `status.json` is published. `None` means the counters have no
+    /// reader outside the process, which is the shipped default for anyone
+    /// running this binary by hand; the manifest passes `--status-dir`.
+    pub status_dir: Option<PathBuf>,
 }
 
 pub struct ReconcileInput<'a> {
@@ -225,7 +230,6 @@ pub struct ReconcileInput<'a> {
     pub secret_key: &'a [u8],
     pub library: Option<&'a PolicyLibrarySpec>,
     pub clusters: &'a [ClusterAbi],
-    pub runtime_profile: Option<&'a RuntimeProfileSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,7 +237,6 @@ pub struct ReconcileApplied {
     pub bundle: SignedBundle,
     pub status: PolicyStatus,
     pub mode: PolicyMode,
-    pub profile_status: Option<RuntimeProfileStatus>,
     pub deliver: Vec<String>,
     pub keep_lkg: Vec<String>,
 }
@@ -257,8 +260,7 @@ pub fn reconcile(input: ReconcileInput<'_>) -> ReconcileOutcome {
             ReconcileOutcome::Applied(ReconcileApplied {
                 bundle,
                 status,
-                mode: retain_policy_mode(input.spec.mode, input.runtime_profile),
-                profile_status: input.runtime_profile.map(runtime_profile_status),
+                mode: input.spec.mode,
                 deliver: plan.deliver,
                 keep_lkg: plan.keep_lkg,
             })
@@ -294,7 +296,6 @@ pub fn reconcile_namespaced(input: NamespacedReconcileInput<'_>) -> ReconcileOut
                 bundle,
                 status,
                 mode: input.spec.mode,
-                profile_status: None,
                 deliver: plan.deliver,
                 keep_lkg: plan.keep_lkg,
             })
@@ -343,9 +344,7 @@ pub fn exception_status_patch(status: &PolicyExceptionStatus) -> serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_api::{
-        ClusterSecurityPolicy, PolicyLibrarySpec, RuntimeAction, RuntimeProfileSpec, RuntimeSpec,
-    };
+    use ferrum_api::{ClusterSecurityPolicy, PolicyLibrarySpec, RuntimeAction, RuntimeSpec};
     use ferrum_crypto::{ED25519_PUBLIC_KEY_LEN, ED25519_SECRET_KEY_LEN, ED25519_SIGNATURE_LEN};
     use ferrum_testkit::spec_from_yaml;
 
@@ -395,13 +394,6 @@ runtime:
             digest: String::new(),
             min_agent_abi: min_agent,
             min_admission_abi: min_admission,
-        }
-    }
-
-    fn profile() -> RuntimeProfileSpec {
-        RuntimeProfileSpec {
-            source_policy: "prod-restricted".into(),
-            window: "7d".into(),
         }
     }
 
@@ -508,7 +500,6 @@ runtime:
             secret_key: &RFC8032_SK,
             library: Some(&lib),
             clusters: &clusters,
-            runtime_profile: None,
         }));
         assert!(out.status.compile.ready);
         assert_eq!(out.status.observed_generation, 7);
@@ -564,7 +555,6 @@ runtime:
             secret_key: &RFC8032_SK,
             library: Some(&lib),
             clusters: &clusters,
-            runtime_profile: None,
         }));
         assert_eq!(out.status.rollout.clusters_ready, 2);
         assert_eq!(out.status.rollout.clusters_degraded, 0);
@@ -572,31 +562,26 @@ runtime:
         assert_eq!(out.deliver, vec!["a".to_string(), "b".to_string()]);
     }
 
+    /// A policy's mode is the mode its spec carries, and nothing in this
+    /// controller may raise it.
+    ///
+    /// This stood as `runtime_profile_does_not_auto_enforce` and asserted the
+    /// same thing about two functions that took a RuntimeProfile and returned
+    /// a constant. Both are gone with the input they ignored, so the property
+    /// is now the type's: `reconcile` has nowhere to read a promotion from.
     #[test]
-    fn runtime_profile_does_not_auto_enforce() {
+    fn a_policy_is_reconciled_in_the_mode_its_spec_carries() {
         let spec = observe_spec();
         assert_eq!(spec.mode, PolicyMode::Observe);
-        let p = profile();
         let out = applied(reconcile(ReconcileInput {
             spec: &spec,
             observed_generation: 1,
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: Some(&p),
         }));
         assert_eq!(out.mode, PolicyMode::Observe);
         assert_ne!(out.mode, PolicyMode::Enforce);
-        let profile_status = out.profile_status.expect("profile status");
-        assert!(!profile_status.ready_for_promote);
-        assert_eq!(
-            retain_policy_mode(PolicyMode::Audit, Some(&p)),
-            PolicyMode::Audit
-        );
-        assert_eq!(
-            retain_policy_mode(PolicyMode::Observe, Some(&p)),
-            PolicyMode::Observe
-        );
     }
 
     #[test]
@@ -614,7 +599,6 @@ runtime:
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         }));
         assert_eq!(status.observed_generation, 3);
         assert!(!status.compile.ready);
@@ -638,7 +622,6 @@ runtime:
             secret_key: &[0u8; ED25519_SECRET_KEY_LEN],
             library: None,
             clusters: &[],
-            runtime_profile: None,
         }));
         assert!(!status.compile.ready);
         assert!(status.compile.bundle_digest.is_empty());
@@ -653,21 +636,18 @@ runtime:
             agent_abi: AGENT_ABI,
             admission_abi: ADMISSION_ABI,
         }];
-        let p = profile();
         let out = applied(reconcile(ReconcileInput {
             spec: &spec,
             observed_generation: 2,
             secret_key: &RFC8032_SK,
             library: Some(&lib),
             clusters: &clusters,
-            runtime_profile: Some(&p),
         }));
         assert_eq!(out.mode, PolicyMode::Observe);
         assert!(out.status.compile.ready);
         assert_eq!(out.status.compile.bundle_digest, out.bundle.digest.as_str());
         assert_eq!(out.status.rollout.clusters_ready, 1);
         assert_eq!(out.deliver, vec!["c1".to_string()]);
-        assert!(!out.profile_status.expect("profile").ready_for_promote);
     }
 
     #[test]

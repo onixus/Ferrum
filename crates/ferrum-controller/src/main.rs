@@ -71,6 +71,7 @@ fn run() -> Result<(), String> {
 
 struct RunOpts {
     seed_file: Option<PathBuf>,
+    status_dir: Option<PathBuf>,
     namespace: String,
     clusters: Vec<ClusterAbi>,
     min_agent_abi: u32,
@@ -81,6 +82,7 @@ struct RunOpts {
 fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> {
     let mut opts = RunOpts {
         seed_file: None,
+        status_dir: None,
         namespace: DEFAULT_NAMESPACE.to_string(),
         clusters: Vec::new(),
         min_agent_abi: 0,
@@ -96,6 +98,9 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
             }
             "--namespace" => {
                 opts.namespace = require_val("--namespace", it.next())?;
+            }
+            "--status-dir" => {
+                opts.status_dir = Some(PathBuf::from(require_val("--status-dir", it.next())?));
             }
             "--cluster" => {
                 opts.clusters
@@ -143,6 +148,7 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
         trust_root,
         library,
         clusters: opts.clusters,
+        status_dir: opts.status_dir,
     })
 }
 
@@ -227,7 +233,7 @@ fn yaml_kind(raw: &str) -> Result<String, String> {
 }
 
 fn usage() -> String {
-    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--cluster name:agentAbi:admissionAbi]...".into()
+    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--status-dir /run/ferrum] [--cluster name:agentAbi:admissionAbi]...".into()
 }
 
 #[cfg(test)]
@@ -277,6 +283,7 @@ mod tests {
         for flag in [
             "--seed-file",
             "--namespace",
+            "--status-dir",
             "--cluster",
             "--min-agent-abi",
             "--min-admission-abi",
