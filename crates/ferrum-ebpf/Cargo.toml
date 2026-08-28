@@ -19,3 +19,9 @@ ferrum-crypto.workspace = true
 ferrum-ebpf-progs.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+
+[dev-dependencies]
+# tests/attach_live.rs makes the hooked syscalls by hand: a path longer than
+# PATH_LEN and a pointer into a non-resident page cannot be produced through
+# std::fs. Test-only; nothing in the crate graph gains libc.
+libc.workspace = true

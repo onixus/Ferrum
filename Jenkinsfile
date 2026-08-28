@@ -114,6 +114,30 @@ pipeline {
             }
         }
 
+        // The only stage that puts the datapath in a kernel. Everything before
+        // it reads the ELF; four of the RFC section D acceptance cases run through
+        // Bpf::load, and nothing else in this pipeline executes a single one of
+        // its instructions.
+        //
+        // Requires of the agent: CAP_BPF (or root), tracefs mounted at
+        // /sys/kernel/tracing, and a kernel with CONFIG_MODULES=y: without
+        // loadable modules there is no init_module/finit_module tracepoint and
+        // KernelHandle::attach_for_arch, which is all-or-nothing, cannot
+        // produce a handle. FERRUM_BPF_ELF_REQUIRED turns every one of those
+        // into a stage failure instead of a silent skip: a green no-op here is
+        // exactly the fail-open the stage exists to close.
+        stage('BPF attach') {
+            steps {
+                sh '''
+                    set -eu
+                    elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
+                    test -f "$elf"
+                    FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
+                        cargo test -p ferrum-ebpf --features attach --test attach_live
+                '''
+            }
+        }
+
         stage('Crate boundary') {
             steps {
                 sh '''
