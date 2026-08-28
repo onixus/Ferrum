@@ -236,12 +236,6 @@ impl LabelCache {
         self.by_name.get(&label_key(namespace, name))
     }
 
-    /// Labels or an empty map. The caller cannot tell a miss from an unlabelled
-    /// object here; use [`LabelCache::labels_of`] when that matters.
-    pub fn labels_or_empty(&self, namespace: &str, name: &str) -> BTreeMap<String, String> {
-        self.labels_of(namespace, name).cloned().unwrap_or_default()
-    }
-
     /// Insert or replace. False when the object is unusable or does not fit
     /// the ceilings; [`LabelCache::overflow`] then carries the reason.
     pub fn upsert(&mut self, object: LabelObject) -> bool {
@@ -328,14 +322,17 @@ impl LabelCache {
 }
 
 /// Fold one event in. DELETE drops the entry rather than leaving stale labels
-/// that would keep matching a selector after the object is gone.
-pub fn apply_labels_event(cache: &mut LabelCache, event: LabelWatchEvent) -> WatchOutcome {
-    try_apply_labels_event(cache, event).unwrap_or(WatchOutcome::Ignored)
-}
-
-/// Same, but an event the cache refuses to hold is `Degraded`: the stream feeding
-/// it has to end and relist instead of quietly dropping objects on the floor.
-pub fn try_apply_labels_event(
+/// that would keep matching a selector after the object is gone. An event the
+/// cache refuses to hold is `Degraded`: the stream feeding it has to end and
+/// relist instead of quietly dropping objects on the floor.
+///
+/// Crate-private, like its pod twin: it is the second half of
+/// [`crate::watch::apply_labels_line_at`] and knows nothing about the relist
+/// debt, so a caller reaching it directly gets a fold that never checks the
+/// debt and never raises one. The infallible `apply_labels_event` beside it is
+/// gone with the same reasoning taken one step further: it answered a refusal
+/// with `Ignored` and no debt, which is the fold's answer to nothing.
+pub(crate) fn try_apply_labels_event(
     cache: &mut LabelCache,
     event: LabelWatchEvent,
 ) -> Result<WatchOutcome> {
@@ -363,19 +360,41 @@ pub fn try_apply_labels_event(
     })
 }
 
-/// Feed a recorded stream (one JSON object per line). Stops at the first event
+/// Feed a recorded stream (one JSON object per line). Stops at the first frame
 /// demanding a relist and reports it.
-pub fn apply_labels_stream(cache: &mut LabelCache, body: &[u8]) -> Result<WatchOutcome> {
+///
+/// Every line goes through [`crate::watch::apply_labels_line_at`], the fold the
+/// network loop runs, for the reason spelled out on
+/// [`crate::watch::apply_watch_stream`]: this used to answer an unreadable
+/// frame with `Err` where the fold raises a debt and reads on, and it never
+/// looked at a standing debt at all. `Err` still means an object the cache
+/// refuses to hold, which does end the stream.
+///
+/// `resource` names the watch in the messages the debt produces, as it does on
+/// the line fold: "namespaces" and "serviceaccounts" ask an operator to look at
+/// different watches.
+pub fn apply_labels_stream(
+    cache: &mut LabelCache,
+    resource: &str,
+    body: &[u8],
+) -> Result<WatchOutcome> {
+    apply_labels_stream_at(cache, resource, body, Instant::now())
+}
+
+/// Same, at an explicit instant, so a replayed stream can be aged past
+/// [`RELIST_DEBT_HOLDDOWN`] without sleeping through it.
+pub fn apply_labels_stream_at(
+    cache: &mut LabelCache,
+    resource: &str,
+    body: &[u8],
+    now: Instant,
+) -> Result<WatchOutcome> {
     let mut outcome = WatchOutcome::Ignored;
     for line in body.split(|b| *b == b'\n') {
         if line.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
-        let event = crate::watch::parse_labels_watch_event(line)?;
-        if let Some(rv) = label_event_resource_version(&event) {
-            cache.set_resource_version(rv);
-        }
-        outcome = try_apply_labels_event(cache, event)?;
+        outcome = crate::watch::apply_labels_line_at(cache, resource, line, now)?;
         if outcome == WatchOutcome::MustRelist {
             return Ok(outcome);
         }
@@ -396,6 +415,22 @@ pub(crate) fn label_event_resource_version(event: &LabelWatchEvent) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One label off an observed object. `None` covers both "the object was
+    /// never listed" and "it was, and carries no such label"; every assertion
+    /// below that needs those apart asks `labels_of` directly, which is the
+    /// distinction this crate exists to keep.
+    fn label_of<'a>(
+        cache: &'a LabelCache,
+        namespace: &str,
+        name: &str,
+        key: &str,
+    ) -> Option<&'a str> {
+        cache
+            .labels_of(namespace, name)
+            .and_then(|labels| labels.get(key))
+            .map(String::as_str)
+    }
 
     fn object(namespace: &str, name: &str, key: &str, value: &str) -> LabelObject {
         LabelObject {
@@ -423,14 +458,8 @@ mod tests {
                 object("dev", "default", "zone", "public"),
             ])
             .expect("list fits");
-        assert_eq!(
-            cache.labels_or_empty("prod", "default").get("zone"),
-            Some(&"pci".to_string())
-        );
-        assert_eq!(
-            cache.labels_or_empty("dev", "default").get("zone"),
-            Some(&"public".to_string())
-        );
+        assert_eq!(label_of(&cache, "prod", "default", "zone"), Some("pci"));
+        assert_eq!(label_of(&cache, "dev", "default", "zone"), Some("public"));
         assert!(cache.labels_of("staging", "default").is_none());
     }
 
@@ -440,13 +469,13 @@ mod tests {
         cache
             .try_replace_all(vec![object("", "prod", "zone", "pci")])
             .expect("list fits");
-        let outcome = apply_labels_event(
+        let outcome = try_apply_labels_event(
             &mut cache,
             LabelWatchEvent::Deleted(object("", "prod", "zone", "pci")),
-        );
+        )
+        .expect("a delete is not a refusal");
         assert_eq!(outcome, WatchOutcome::Removed);
         assert!(cache.labels_of("", "prod").is_none());
-        assert!(cache.labels_or_empty("", "prod").is_empty());
     }
 
     #[test]
@@ -455,10 +484,11 @@ mod tests {
         cache
             .try_replace_all(vec![object("", "prod", "zone", "pci")])
             .expect("list fits");
-        let outcome = apply_labels_event(
+        let outcome = try_apply_labels_event(
             &mut cache,
             LabelWatchEvent::Gone("too old resource version".into()),
-        );
+        )
+        .expect("a 410 is not a refusal");
         assert_eq!(outcome, WatchOutcome::MustRelist);
         assert_eq!(cache.len(), 1);
         // Kept, but no longer warm: the stream said we missed changes, and
@@ -479,7 +509,8 @@ mod tests {
         cache
             .try_replace_all(vec![object("", "prod", "zone", "pci")])
             .expect("list fits");
-        apply_labels_event(&mut cache, LabelWatchEvent::Gone("expired".into()));
+        try_apply_labels_event(&mut cache, LabelWatchEvent::Gone("expired".into()))
+            .expect("a 410 is not a refusal");
         let mut fat = object("", "dev", "zone", "public");
         fat.labels
             .insert("bloat".into(), "x".repeat(MAX_OBJECT_LABEL_BYTES));
@@ -524,10 +555,7 @@ mod tests {
             LabelWatchEvent::Modified(object("", "ns-0", "zone", "public")),
         )
         .expect("replacing an existing entry is not growth");
-        assert_eq!(
-            cache.labels_or_empty("", "ns-0").get("zone"),
-            Some(&"public".to_string())
-        );
+        assert_eq!(label_of(&cache, "", "ns-0", "zone"), Some("public"));
     }
 
     #[test]
@@ -585,10 +613,7 @@ mod tests {
         assert!(cache.age_at(later).expect("listed") > cache.max_age());
         assert!(cache.is_warm_at(Instant::now() + Duration::from_secs(1)));
         // Stale is not empty: the labels stay for anyone willing to say so.
-        assert_eq!(
-            cache.labels_or_empty("", "prod").get("zone"),
-            Some(&"pci".to_string())
-        );
+        assert_eq!(label_of(&cache, "", "prod", "zone"), Some("pci"));
 
         // A bookmark at that moment refreshes it without a relist.
         cache.mark_fresh_at(later);

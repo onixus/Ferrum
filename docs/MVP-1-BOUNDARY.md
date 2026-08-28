@@ -225,7 +225,7 @@
 | `DEG_EXPORT_DEAD` — writer мёртв: enforcement идёт и не записывается | U | U `ferrum-agent/src/lib.rs::a_dead_export_writer_degrades_the_agent` |
 | `DEG_EXPORT_LOSSY` — экспорт терял события: kill мог не оставить записи | U | U `ferrum-agent/src/lib.rs::a_lossy_export_degrades_and_then_recovers` |
 | `DEG_DECODE_FAILURES` — записи не декодировались: их не видело ни одно правило | U | U `ferrum-agent/src/lib.rs::a_run_of_records_that_all_fail_to_decode_is_degraded_without_more_traffic` |
-| `DEG_LABELS_UNKNOWN` — неразрешённые label: правила применены fail-closed | U | U `ferrum-agent/src/lib.rs::unobserved_namespace_labels_do_not_skip_a_rule` |
+| `DEG_LABELS_UNKNOWN` — неразрешённые label: правила применены fail-closed; вечно-истинной эта причина быть больше не может — ветку кластера снял запрет `clusterSelector` при компиляции, ветку namespace/ServiceAccount гасит список, который доехал | U | U `ferrum-agent/src/lib.rs::unobserved_namespace_labels_do_not_skip_a_rule` · U `ferrum-policy/src/lib.rs::a_cluster_selector_is_refused_on_both_kinds` · U `ferrum-compiler/src/lib.rs::a_cluster_selector_does_not_compile` |
 | `DEG_RING_DROPS` — дропы в ядре: записи, которых не видело ни одно правило | U | U `ferrum-agent/src/lib.rs::ring_drops_degrade_and_then_recover` |
 | `DEG_PATH_TRUNCATED` — путь не поместился: suffix-правило решено без байтов, которые называет | U | U `ferrum-agent/src/lib.rs::path_truncation_degrades_and_then_recovers` · U `replay.rs::a_truncated_docker_sock_path_still_kills_and_degrades` |
 | `DEG_IDENTITY_UNKNOWN` — cgroup, которую индекс не может назвать | U | U `replay.rs::a_cgroup_missing_from_the_index_is_counted_and_degrades` |
@@ -448,6 +448,7 @@ PolicyException; статус политики, у плана которой н�
 | Тег-половина замыкания образов открыта, и обе посылки, делающие её незакрываемой здесь, держатся тестом, а не doc-комментарием | U | U `deploy_gate.rs::the_tag_half_of_the_closure_is_open_and_says_why` |
 | Флаг, который даёт только cargo feature, вкомпилирован в образ, которому манифест его передаёт | U | U `deploy_gate.rs::a_flag_only_a_feature_provides_is_built_into_the_image_that_is_passed_it` |
 | Каждый non-default feature, который выбирает argv поставляемого манифеста, компилируется и как lint-таргет (`clippy --all-targets`), и как test-таргет: `cargo build` этого не засчитывает, потому что не компилирует ни одного тестового таргета, а `cargo tree` не компилирует вообще ничего | U | U `deploy_gate.rs::every_feature_a_manifest_selects_is_a_lint_and_test_target` · U `deploy_gate.rs::a_build_is_not_a_test_and_a_tree_is_not_a_compile` · U `Jenkinsfile::Clippy` · U `Jenkinsfile::Test` |
+| То же утверждение, исполненное, а не прочитанное: гейт сам запускает `cargo clippy --features … --all-targets -- -D warnings` и `cargo test --features …` для каждой пары (crate, feature), которую выбирает поставляемый манифест, и требует успеха. Строка в Jenkinsfile присутствовала и была верна ровно в тот цикл, когда её таргеты не собирались | U | U `deploy_gate.rs::every_feature_a_manifest_selects_actually_compiles_and_passes` |
 | Манифест не может объявить `optional: true` на томе, обслуживающем путь, без которого бинарь не стартует, — FD028, находка, а не предупреждение; том, который бинарь действительно терпит, находкой не является | U | U `lint_deploy.rs::a_required_mount_declared_optional_is_a_finding` · U `lint_deploy.rs::the_webhooks_bundle_mount_is_the_same_finding` · U `lint_deploy.rs::an_optional_serving_certificate_is_a_finding_too` · U `lint_deploy.rs::a_mount_the_binary_tolerates_may_be_optional` · U `lint_deploy.rs::a_file_is_served_by_the_longest_mount_that_covers_it` |
 | Каждая цитата «Делает» разрешается в определение `fn` или в стадию, а список §D здесь — ровно `AcceptanceCase::ALL` | U | U `boundary_gate.rs::every_claim_in_the_does_section_cites_something_that_exists` · U `boundary_gate.rs::the_document_lists_exactly_the_rfc_d_cases` |
 | Каждая причина деградации, которую агент может объявить, названа здесь — по префиксу `DEG_`, по телу `degraded_reasons_at` и по аргументам `mark_terminal_fault` | U | U `boundary_gate.rs::every_degraded_reason_the_agent_can_raise_is_named_in_the_document` |
@@ -470,7 +471,7 @@ PolicyException; статус политики, у плана которой н�
 | Без bundle webhook не поднимается, а не поднимается пустым: `serve` выходит с 2 | U | U `webhook.rs::serve_missing_bundle_exits_2` |
 | Монтирование исключений перечитывается и продолжает проверять scope и TTL; пропавший файл — пустой список, непроверяемый — сброс | U | U `webhook.rs::exceptions_mount_rotation_gates_scope_and_ttl` · U `webhook.rs::exceptions_reload_missing_file_is_empty_and_unverifiable_resets` |
 | Кеш меток решает только по тому, что перечислил: тёплый применяет namespace-селектор в своём namespace и держит метки ServiceAccount внутри его namespace, холодный отказывает выбранной политике и не трогает невыбранную, а метки кластера приходят из флага и тёплого кеша не требуют | U | U `webhook.rs::warm_cache_applies_a_namespace_selector_to_its_own_namespace_only` · U `webhook.rs::warm_cache_keeps_service_account_labels_inside_their_namespace` · U `webhook.rs::cold_cache_denies_a_selected_policy_but_not_an_unselected_one` · U `webhook.rs::cluster_labels_come_from_the_flag_and_need_no_warm_cache` · U `webhook.rs::prod_restricted_namespace_selector_without_labels_fail_closed` · U `webhook.rs::cold_stale_and_relist_pending_deny_with_different_causes` · U `webhook.rs::a_stale_watch_says_stale_and_a_gone_watch_says_relist` |
-| Кеш меток решает только по тому, что перечислил, и «перечислен без меток» — не «не перечислен»: тёплый кеш, назвавший непомеченный namespace, не отказывает выбранной политике, а namespace, которого он не называл, отказывает по-прежнему; обе плоскости отвечают на это одинаково | U | U `webhook.rs::a_warm_cache_that_listed_an_unlabelled_namespace_does_not_deny_a_selected_policy` · U `webhook.rs::a_namespace_a_warm_cache_never_listed_is_still_a_fail_closed_deny` · U `webhook.rs::a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map` · U `resolve.rs::an_unlabelled_namespace_resolves_as_observed_and_empty_not_as_unknown` · U `ferrum-ebpf/src/eval.rs::an_observed_namespace_without_labels_is_a_non_match_not_labels_unknown` · U `acceptance.rs::both_planes_answer_an_unlabelled_namespace_the_same_way` |
+| Кеш меток решает только по тому, что перечислил, и «перечислен без меток» — не «не перечислен»: тёплый кеш, назвавший непомеченный namespace, не отказывает выбранной политике, а namespace, которого он не называл, отказывает по-прежнему; обе плоскости отвечают на это одинаково | U | U `webhook.rs::a_warm_cache_that_listed_an_unlabelled_namespace_does_not_deny_a_selected_policy` · U `webhook.rs::a_namespace_a_warm_cache_never_listed_is_still_a_fail_closed_deny` · U `webhook.rs::a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map` · U `resolve.rs::an_unlabelled_namespace_resolves_as_observed_and_empty_not_as_unknown` · U `ferrum-ebpf/src/eval.rs::an_observed_namespace_without_labels_is_a_non_match_not_labels_unknown` · U `acceptance.rs::both_planes_answer_an_unlabelled_namespace_the_same_way` · U `acceptance.rs::both_planes_agree_on_every_label_group_and_on_a_match` |
 | Нечитаемое монтирование считается отдельно от удалённого — по bundle, по исключениям и по серверному сертификату: пустой том и пропавший том разной природы, и `MountStat` их не смешивает | U | U `webhook.rs::unreadable_bundle_mount_is_counted_and_a_deleted_one_is_not` · U `webhook.rs::absent_and_unreadable_exceptions_mounts_are_counted_apart` · U `ferrum-admission/tests/serving_cert.rs::an_unreadable_serving_mount_is_counted_and_a_deleted_one_is_not` |
 | Том bundle у webhook не может быть `optional`, и это проверяется из самого манифеста, а не только линтом | U | U `webhook.rs::bundle_secret_mount_is_not_optional` |
 | Пропавший ключ в смонтированном томе не молчит: webhook продолжает охранять по last-known-good и продолжает служить сертификатом, но говорит, что источника у них больше нет — счётчиком и строкой на переход, а не на каждый тик | U | U `webhook.rs::a_bundle_key_that_vanished_is_counted_not_silent` · U `ferrum-admission/tests/serving_cert.rs::a_serving_key_that_vanished_is_counted_not_silent` |
@@ -478,6 +479,10 @@ PolicyException; статус политики, у плана которой н�
 | Серверный сертификат: просроченный не даёт стартовать, далёкий срок не шумит, ротация доходит до новых соединений, поллер подхватывает переписанный том, откат возможен, а негодный материал оставляет действующий сертификат | U | U `ferrum-admission/tests/serving_cert.rs::an_expired_certificate_refuses_to_start` · U `ferrum-admission/tests/serving_cert.rs::a_far_off_expiry_does_not_warn` · U `ferrum-admission/tests/serving_cert.rs::rotation_reaches_new_connections` · U `ferrum-admission/tests/serving_cert.rs::the_poller_picks_up_a_rotated_mount` · U `ferrum-admission/tests/serving_cert.rs::a_swap_can_be_undone` · U `ferrum-admission/tests/serving_cert.rs::unusable_material_keeps_the_current_certificate` |
 | Читатель argv манифеста видит обе законные записи Kubernetes — `command:` и `args:`, — а таблица feature-флагов держится за сами `#[cfg(feature = …)]`-места | U | U `deploy_gate.rs::a_containers_argv_is_command_then_args_and_either_alone` · U `deploy_gate.rs::every_flag_read_under_a_cfg_feature_is_in_the_table` |
 | Перепись грантов читает все глаголы, а не только пишущие: грант на `ferrum.io`-ресурс, для которого у субъекта нет литерала `GroupVersionKind::gvk`, — право без назначения, потому что ни один запрос его не достигает | U | U `boundary_gate.rs::a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose` |
+| Тепло кеша меток — часть join'а узла, а не украшение над ним: кеш, который протух или должен relist, отдаёт метки как ненаблюдённые, поэтому рантайм отвечает `LabelsUnknown` там, где admission отказывает, а не `Match`; каждая группа отвечает за себя | U | U `ferrum-k8smeta/src/source.rs::a_stale_label_cache_does_not_report_its_labels_as_observed` · U `ferrum-k8smeta/src/source.rs::a_label_cache_owing_a_relist_does_not_report_its_labels_as_observed` · U `ferrum-k8smeta/src/source.rs::one_cold_group_does_not_unobserve_the_other` |
+| `clusterSelector` вне MVP-1 и отвергается при авторстве обеими копиями гейта — валидатором и вторым гейтом компилятора, — а остальные три группы селектора остаются авторуемыми; разбор и fail-closed обеих плоскостей остаются для байтов, которых этот компилятор не производил | U | U `ferrum-policy/src/lib.rs::a_cluster_selector_is_refused_on_both_kinds` · U `ferrum-policy/src/lib.rs::the_other_selector_groups_are_still_authorable` · U `ferrum-compiler/src/lib.rs::a_cluster_selector_does_not_compile` · U `webhook.rs::a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map` |
+| `--cluster-label`, съеденный соседним флагом, — отказ, а не заявленный кластер без меток; повторы накапливаются, а не побеждают последним; `--cluster-label ''` по-прежнему заявляет кластер без меток, а отсутствие флага по-прежнему fail-closed | U | U `ferrum-admission/src/main.rs::a_cluster_label_whose_value_was_eaten_is_refused_not_stated` · U `ferrum-admission/src/main.rs::an_explicitly_empty_cluster_label_is_still_a_stated_cluster` · U `ferrum-admission/src/main.rs::repeated_cluster_labels_accumulate_and_disagreements_are_refused` · U `ferrum-admission/src/main.rs::other_flags_keep_the_semantics_the_deploy_lint_models` |
+| Переигранный поток встречает долг relist там же, где живой: нечитаемый кадр поднимает долг и поток читается дальше, а первый кадр после hold-down заканчивает поток — обе половины на обоих потоках | U | U `resolve.rs::a_replayed_stream_answers_an_unreadable_frame_the_way_the_node_does` |
 
 ## Не делает
 
@@ -579,7 +584,14 @@ PolicyException; статус политики, у плана которой н�
   (`crates/ferrum-k8smeta/src/labels.rs:40`). Пока долг стоит,
   `LabelCache::is_warm` ложен, `review.rs` отказывает каждому Pod под
   namespaceSelector, а `PodCache::snapshot()` возвращает `Err`, и
-  `containerOnly` не матчится. Ограниченно, не навсегда, но не ноль. На
+  `containerOnly` не матчится. С этого цикла холодность кеша меток стоит и на
+  рантайме: `snapshot()` спрашивает `is_warm_at` у обоих вложенных кешей и
+  отдаёт группу как ненаблюдённую, пока она не тёплая, — то есть узел на этот
+  же долг отвечает `LabelsUnknown` и Degraded, а не совпадением селектора по
+  меткам, про которые уже известно, что они отстали. Раньше видна была только
+  холодность: протухший и должный relist кеш держал записи от прежнего листа,
+  `labels_of` отвечал `Some`, и одно состояние кеша давало admission отказ, а
+  агенту — `Match`. Ограниченно, не навсегда, но не ноль. На
   молчащем потоке hold-down не срабатывает вовсе — гасит долг не он, а
   read-дедлайн сокета: `IO_TIMEOUT` = `POD_WATCH_BUDGET / 2` = 150 секунд
   (`crates/ferrum-k8smeta/src/watch.rs:996`), после которых `read` возвращает
@@ -588,6 +600,20 @@ PolicyException; статус политики, у плана которой н�
   добавлял: он был бы вторым дедлайном на том же сокете. Значит окно отказов
   на молчащем потоке — до 150 секунд, а не до 5.
 
+- **Меток кластера у узла нет и не заведено.** `PodRecord::identity` зашивает
+  `cluster_labels_observed: false`, и это честно: объекта «кластер» Kubernetes
+  не отдаёт, а `--cluster-label` — заявление оператора, которое доезжает
+  только до admission. Разошлось это в разные стороны на обеих плоскостях
+  сразу: `selector_match` возвращал `LabelsUnknown` на любой `clusterSelector`
+  — и на подходящий, и на заведомо чужой, — `decide_with` на `LabelsUnknown`
+  программу применяет, поэтому политика матчилась на каждый workload каждого
+  узла и держала `DEG_LABELS_UNKNOWN` истинной, пока лежала в bundle; в
+  admission та же политика отказывала каждому Pod, потому что отгружаемая
+  установка флага не передаёт. Закрыто отказом при авторстве, а не доставкой:
+  метка кластера, заявляемая каждым узлом отдельно, — новое непроверяемое
+  утверждение, которому понадобился бы собственный гейт. Разбор и fail-closed
+  обеих плоскостей остались для байтов, которых этот компилятор не
+  производил.
 - **Ничто и никогда не обращалось к API server.** Ни webhook под нагрузкой
   admission, ни watch, ни запись status.
 

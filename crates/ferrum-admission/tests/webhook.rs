@@ -1128,6 +1128,27 @@ fn selected_program(mutate: impl FnOnce(&mut ClusterSecurityPolicySpec)) -> Admi
     load_ok(&fsig, &pk)
 }
 
+/// A program carrying a cluster selector, written into the *decoded* program
+/// rather than into the spec it was compiled from.
+///
+/// `ferrum_policy::validate_selector` and the compiler's own second gate now
+/// refuse to emit a bundle with a `clusterSelector`: nothing on either plane
+/// observes cluster labels, so such a policy denies every Pod here and applies
+/// to every workload on the runtime plane while holding `DEG_LABELS_UNKNOWN`
+/// true. What the two tests below assert is the other half of that decision —
+/// the fail-closed floor stays, because these bytes can still arrive: a
+/// last-known-good bundle compiled by an older build, or a FADM this tree did
+/// not produce. Authorship is refused; parsing and deciding are not.
+fn program_with_cluster_selector(key: &str, value: &str) -> AdmissionProgram {
+    let mut program = selected_program(|_| {});
+    program
+        .selector
+        .cluster_selector
+        .match_labels
+        .insert(key.into(), value.into());
+    program
+}
+
 fn cfg_with(labels: StaticLabels) -> ReviewConfig {
     ReviewConfig {
         policy_name: "prod-restricted".into(),
@@ -1257,12 +1278,7 @@ fn cold_cache_denies_a_selected_policy_but_not_an_unselected_one() {
 
 #[test]
 fn cluster_labels_come_from_the_flag_and_need_no_warm_cache() {
-    let program = selected_program(|spec| {
-        spec.selector
-            .cluster_selector
-            .match_labels
-            .insert("env".into(), "prod".into());
-    });
+    let program = program_with_cluster_selector("env", "prod");
     let cfg = cfg_with(StaticLabels::cluster(ClusterLabels::stated(labels(&[(
         "env", "prod",
     )]))));
@@ -1828,12 +1844,7 @@ fn a_namespace_a_warm_cache_never_listed_is_still_a_fail_closed_deny() {
 /// over.
 #[test]
 fn a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map() {
-    let program = selected_program(|spec| {
-        spec.selector
-            .cluster_selector
-            .match_labels
-            .insert("env".into(), "prod".into());
-    });
+    let program = program_with_cluster_selector("env", "prod");
 
     // No flag: unknown, and a policy that selects on it fails closed. A warm
     // namespace cache does not help — it is not where these come from.

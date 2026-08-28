@@ -7,7 +7,7 @@ mod eval;
 use chrono::{Days, Utc};
 use ferrum_api::{
     AdmitSpec, ClusterSecurityPolicySpec, FailurePolicy, PolicyExceptionSpec, PolicyMode,
-    RuntimeAction, RuntimeSpec, SecurityPolicySpec, SupplySpec,
+    PolicySelector, RuntimeAction, RuntimeSpec, SecurityPolicySpec, SupplySpec,
 };
 use ferrum_common::{FerrumError, Result};
 
@@ -24,6 +24,7 @@ pub fn validate_cluster_policy(spec: &ClusterSecurityPolicySpec) -> Result<()> {
     validate_common(
         spec.mode,
         spec.disabled,
+        &spec.selector,
         &spec.supply,
         &spec.admit,
         &spec.runtime,
@@ -34,6 +35,7 @@ pub fn validate_namespaced_policy(spec: &SecurityPolicySpec) -> Result<()> {
     validate_common(
         spec.mode,
         spec.disabled,
+        &spec.selector,
         &spec.supply,
         &spec.admit,
         &spec.runtime,
@@ -97,6 +99,7 @@ pub fn validate_exception(spec: &PolicyExceptionSpec) -> Result<()> {
 fn validate_common(
     mode: PolicyMode,
     disabled: bool,
+    selector: &PolicySelector,
     supply: &SupplySpec,
     admit: &AdmitSpec,
     runtime: &RuntimeSpec,
@@ -106,9 +109,57 @@ fn validate_common(
             "disabled=true вместе с mode=enforce: выключите политику или не притворяйтесь".into(),
         ));
     }
+    validate_selector(selector)?;
     validate_supply(supply)?;
     validate_admit(admit)?;
     validate_runtime(runtime)?;
+    Ok(())
+}
+
+/// `selector.clusterSelector` вне MVP-1, и это ошибка валидации, а не
+/// вечная причина деградации.
+///
+/// Kubernetes не отдаёт объекта «кластер», так что источника этих меток нет
+/// ни у одной плоскости. Admission можно *заявить* их флагом
+/// `--cluster-label`; узлу — нечем: `PodRecord::identity` зашивает
+/// `cluster_labels_observed: false`, потому что говорить правду больше не о
+/// чем. Отсюда обе половины одного дефекта, и обе измерены:
+///
+///   * на рантайме `selector_match` возвращает `LabelsUnknown` на любой
+///     `clusterSelector` — и на подходящий, и на заведомо чужой, — а
+///     `decide_with` на `LabelsUnknown` программу *применяет*: политика
+///     матчится на каждый workload каждого узла;
+///   * каждая такая запись поднимает `labels_unknown`, то есть
+///     `DEG_LABELS_UNKNOWN` истинна, пока такая политика лежит в bundle.
+///     Причина деградации, которую нельзя погасить действием оператора, —
+///     это не сигнал, а шум, который учит игнорировать `Degraded`.
+///
+/// Отгружаемая установка не передаёт `--cluster-label` нигде, так что в
+/// admission та же политика отказывает каждому Pod. Одно состояние, два
+/// противоположных ответа.
+///
+/// Второй путь — довезти метки до узла тем же флагом — добавил бы
+/// пооперационное утверждение о кластере, которое каждый узел делает
+/// отдельно и которое ничем не проверяемо: DaemonSet и Deployment могли бы
+/// разойтись, и это потребовало бы собственного гейта. Запрет убирает класс,
+/// доставка добавила бы ещё один.
+///
+/// Обработка `clusterSelector` в обеих плоскостях остаётся и остаётся
+/// fail-closed: байты FEBP/FADM поле по-прежнему несут, и bundle может
+/// приехать из last-known-good, собранного другим компилятором. Запрещено
+/// авторство, а не разбор.
+fn validate_selector(selector: &PolicySelector) -> Result<()> {
+    let cluster = &selector.cluster_selector;
+    if !cluster.match_labels.is_empty() || !cluster.match_expressions.is_empty() {
+        return Err(FerrumError::Validation(
+            "selector.clusterSelector вне MVP-1: у меток кластера нет источника ни на одной \
+             плоскости — admission может их только заявить флагом --cluster-label, а узел не \
+             может и этого. Политика с ним отказывает каждому Pod в admission и применяется к \
+             каждому workload на рантайме, держа Degraded вечно истинным. Сузьте политику \
+             namespaceSelector / workloadSelector / serviceAccountSelector"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -408,6 +459,95 @@ mod tests {
             Utc::now() + Days::new(7),
         );
         assert!(validate_exception(&spec).is_ok());
+    }
+
+    fn cluster_selector(key: &str, value: &str) -> PolicySelector {
+        PolicySelector {
+            cluster_selector: ferrum_api::LabelSelector {
+                match_labels: [(key.to_string(), value.to_string())].into_iter().collect(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// `clusterSelector` is refused at authorship, on both kinds.
+    ///
+    /// It used to compile, and what it compiled into was a policy neither
+    /// plane could answer: `PodRecord::identity` hard-codes
+    /// `cluster_labels_observed: false`, so `selector_match` answers `LabelsUnknown`
+    /// for every workload on every node — matching one and not matching one
+    /// alike — and `decide_with` applies the program on `LabelsUnknown` rather
+    /// than skipping it. Every such record raised `labels_unknown`, so
+    /// `DEG_LABELS_UNKNOWN` was true for as long as the bundle was loaded and
+    /// no operator action could clear it. On the other plane the same policy
+    /// denied every Pod, because the shipped install passes no
+    /// `--cluster-label` and the source is `unstated`.
+    #[test]
+    fn a_cluster_selector_is_refused_on_both_kinds() {
+        let cluster = ClusterSecurityPolicySpec {
+            selector: cluster_selector("env", "prod"),
+            ..Default::default()
+        };
+        let err = validate_cluster_policy(&cluster).expect_err("clusterSelector is outside MVP-1");
+        assert!(format!("{err}").contains("clusterSelector"), "{err}");
+
+        let namespaced = SecurityPolicySpec {
+            selector: cluster_selector("env", "prod"),
+            ..Default::default()
+        };
+        assert!(validate_namespaced_policy(&namespaced).is_err());
+
+        // matchExpressions is the other half of the same field and was the
+        // shape the shipped example uses for its namespace selector, so a rule
+        // that only reads matchLabels would let it straight through.
+        let expressions = ClusterSecurityPolicySpec {
+            selector: PolicySelector {
+                cluster_selector: ferrum_api::LabelSelector {
+                    match_expressions: vec![ferrum_api::LabelSelectorRequirement {
+                        key: "env".into(),
+                        operator: "In".into(),
+                        values: vec!["prod".into()],
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(validate_cluster_policy(&expressions).is_err());
+    }
+
+    /// The three groups that do have a source stay authorable: the rule above
+    /// must not be "no selector at all", which would take the shipped
+    /// `prod-restricted` down with it.
+    #[test]
+    fn the_other_selector_groups_are_still_authorable() {
+        let spec = ClusterSecurityPolicySpec {
+            selector: PolicySelector {
+                namespace_selector: ferrum_api::LabelSelector {
+                    match_labels: [("ferrum.io/zone".to_string(), "pci".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                workload_selector: ferrum_api::LabelSelector {
+                    match_labels: [("app".to_string(), "web".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                service_account_selector: ferrum_api::LabelSelector {
+                    match_labels: [("tier".to_string(), "front".to_string())]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(validate_cluster_policy(&spec).is_ok());
     }
 
     #[test]
