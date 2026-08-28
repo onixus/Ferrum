@@ -42,14 +42,7 @@ pub fn compile_namespaced_policy(spec: &SecurityPolicySpec) -> Result<CompiledBu
 }
 
 fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
-    if matches!(
-        fx.runtime.default_action,
-        RuntimeAction::Kill | RuntimeAction::Isolate
-    ) {
-        return Err(FerrumError::Validation(
-            "runtime.defaultAction Kill/Isolate — это kill-all, не политика".into(),
-        ));
-    }
+    reject_kill_all(&fx)?;
     reject_unobservable_syscalls(&fx)?;
     reject_unobservable_predicates(&fx)?;
     reject_unexecutable_actions(&fx)?;
@@ -69,6 +62,47 @@ fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
         ebpf_spec,
         wasm,
     })
+}
+
+/// Second gate on `ferrum_policy`'s kill-all invariant, in both of the places
+/// that invariant lives: `runtime.defaultAction` and every rule.
+///
+/// The two halves are one gate because they are one hazard. `kill` on a rule
+/// with no match fires on every record that rule sees; `kill` on the default
+/// fires on every record *no* rule matched, which on a respond node with the
+/// cgroup index synced is the same kill-all reached by writing no rule at all.
+/// Holding them apart is how this copy came to carry only the default while
+/// the loader's copy (`ferrum_ebpf::spec::reject_kill_all`) carried only the
+/// rules, each blind to exactly what the other saw.
+///
+/// `FerrumError::Compile`, like the siblings below and unlike the validator:
+/// a second gate exists to refuse independently of the advisory first one, and
+/// the error kind is where a caller sees which of the two spoke.
+fn reject_kill_all(fx: &Effects<'_>) -> Result<()> {
+    let default_verb = match fx.runtime.default_action {
+        RuntimeAction::Kill => Some("kill"),
+        RuntimeAction::Isolate => Some("isolate"),
+        RuntimeAction::Allow | RuntimeAction::Audit | RuntimeAction::Deny => None,
+    };
+    if let Some(verb) = default_verb {
+        return Err(FerrumError::Compile(format!(
+            "runtime.defaultAction {verb} is kill-all: it decides every record no rule matched and no match can narrow it. Executable defaults are allow and audit"
+        )));
+    }
+    for rule in &fx.runtime.rules {
+        if matches!(rule.action, RuntimeAction::Kill | RuntimeAction::Isolate)
+            && rule.syscalls.is_empty()
+            && rule.match_on.comm_in.is_empty()
+            && rule.match_on.path_prefix.is_empty()
+            && rule.match_on.path_suffix.is_empty()
+        {
+            return Err(FerrumError::Compile(format!(
+                "rule '{}' kill/isolate without match is kill-all",
+                rule.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Second gate on the same invariant as `ferrum_policy::validate_rule_syscalls`.
@@ -574,6 +608,68 @@ mod tests {
                 assert!(msg.contains("defaultAction deny"), "{msg}");
             }
             other => panic!("expected Compile, got {other:?}"),
+        }
+    }
+
+    /// The kill-all half of the same family, also straight at `emit_bundle`:
+    /// going through `compile_cluster_policy` would only re-prove the
+    /// validator. Both halves of the invariant are exercised — the rule the
+    /// encoder used not to hold at all, and the default it held under the
+    /// wrong error kind.
+    #[test]
+    fn kill_all_does_not_encode() {
+        for action in [RuntimeAction::Kill, RuntimeAction::Isolate] {
+            let spec = ClusterSecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    rules: vec![RuntimeRule {
+                        id: "oops".into(),
+                        syscalls: vec![],
+                        match_on: RuntimeMatch::default(),
+                        action,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            match emit_bundle(Effects::from(&spec)) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("oops"), "{msg}");
+                    assert!(msg.contains("kill-all"), "{msg}");
+                }
+                other => panic!("expected Compile for rule {action:?}, got {other:?}"),
+            }
+
+            // A match rescues the same verb, so the gate refuses the missing
+            // match and not the action. Isolate is refused all the same, by
+            // the action gate — a different invariant, and it must be that one.
+            let mut matched = spec.clone();
+            matched.runtime.rules[0].match_on.comm_in = vec!["sh".into()];
+            let encoded = emit_bundle(Effects::from(&matched));
+            if action == RuntimeAction::Kill {
+                encoded.expect("a matched kill encodes");
+            } else {
+                match encoded {
+                    Err(FerrumError::Compile(msg)) => {
+                        assert!(msg.contains("isolate has no implementation"), "{msg}")
+                    }
+                    other => panic!("expected the action gate, got {other:?}"),
+                }
+            }
+
+            let default_spec = ClusterSecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    default_action: action,
+                    rules: vec![],
+                },
+                ..Default::default()
+            };
+            match emit_bundle(Effects::from(&default_spec)) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("defaultAction"), "{msg}");
+                    assert!(msg.contains("kill-all"), "{msg}");
+                }
+                other => panic!("expected Compile for defaultAction {action:?}, got {other:?}"),
+            }
         }
     }
 
