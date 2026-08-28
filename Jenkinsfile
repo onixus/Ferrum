@@ -855,15 +855,6 @@ pipeline {
             }
             }
         }
-    }
-
-    post {
-        success {
-            echo 'Ferrum CI passed on Jenkins :8081'
-        }
-        failure {
-            echo 'Ferrum CI failed'
-        }
 
         // Стадии, которым нужно настоящее ядро, — последними, и это не косметика.
         // Пока они стояли посреди пайплайна, их падение уносило шесть стадий,
@@ -1158,6 +1149,15 @@ pipeline {
                 }
             }
             }
+        }
+    }
+
+    post {
+        success {
+            echo 'Ferrum CI passed on Jenkins :8081'
+        }
+        failure {
+            echo 'Ferrum CI failed'
         }
 
     }
