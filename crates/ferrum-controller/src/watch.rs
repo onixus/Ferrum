@@ -3,10 +3,10 @@
 
 use crate::apply::{
     live_secret_matches, load_bundle_secret, namespaced_secret_name, patch_secret_exceptions,
-    patch_status_dynamic, persist, persist_dynamic, persist_exceptions, plan_apply,
+    patch_status_dynamic, persist, persist_class, persist_dynamic, persist_exceptions, plan_apply,
     plan_apply_namespaced, secret_name, ApplyPlan,
 };
-use crate::health::{ControllerHealth, FailureClass};
+use crate::health::{ControllerHealth, FailureClass, Requested};
 use crate::{
     compile_status_err, exception_status_patch, reconcile, reconcile_exception,
     reconcile_namespaced, NamespacedReconcileInput, ObservedException, ObservedNamespacedPolicy,
@@ -251,7 +251,10 @@ async fn run_cluster_policy_watch(
     while let Some(event) = stream.next().await {
         match event {
             Ok(obj) => {
-                health.note_success(FailureClass::Watch);
+                // The one class whose receipt is not returned by a call this
+                // file made: the request is the watch itself, and an event
+                // delivered is its answer.
+                health.note_success(Requested::of(FailureClass::Watch));
                 if let Err(failure) = reconcile_object(client, cfg, exceptions, health, obj).await {
                     eprintln!("ferrum-controller: {}", failure.err);
                     health.note_failure(failure.class, &failure.err)?;
@@ -280,7 +283,7 @@ async fn run_namespaced_policy_watch(
     while let Some(event) = stream.next().await {
         match event {
             Ok(obj) => {
-                health.note_success(FailureClass::Watch);
+                health.note_success(Requested::of(FailureClass::Watch));
                 if let Err(failure) =
                     reconcile_namespaced_object(client, cfg, exceptions, health, obj).await
                 {
@@ -310,7 +313,7 @@ async fn run_exception_watch(
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => {
-                health.note_success(FailureClass::Watch);
+                health.note_success(Requested::of(FailureClass::Watch));
                 // Reports and counts each object's own failure itself; what
                 // comes back here is the terminal case and nothing else.
                 handle_exception_event(client, cfg, exceptions, health, ev).await?;
@@ -344,14 +347,35 @@ async fn handle_exception_event(
     match &event {
         watcher::Event::Applied(obj) => objects.push(obj),
         watcher::Event::Deleted(obj) => {
-            if let (Some(ns), Some(name)) = (
+            match (
                 obj.metadata.namespace.as_deref(),
                 obj.metadata.name.as_deref(),
             ) {
-                exceptions
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&format!("{ns}/{name}"));
+                (Some(ns), Some(name)) => {
+                    exceptions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&format!("{ns}/{name}"));
+                }
+                // The set is keyed by `namespace/name`, so a deletion that
+                // carries neither cannot be applied to it — and dropping it
+                // silently is fail-open in the one direction this controller
+                // may never fail open: the exception stays in the published
+                // Secrets, keeps being signed into every bundle, and goes on
+                // overriding a deny on agents that have no way to know it was
+                // revoked. It is the same broken object `apply_exception_object`
+                // charges to `reconcile`, and it is charged there too; what
+                // changes is that it is now charged at all.
+                _ => {
+                    let err = FerrumError::Validation(
+                        "PolicyException deleted with no metadata.namespace/name: the \
+                         revoked exception cannot be removed from the published set and \
+                         stays live until the next relist"
+                            .to_string(),
+                    );
+                    eprintln!("ferrum-controller: exception delete: {err}");
+                    health.note_failure(FailureClass::Reconcile, &err)?;
+                }
             }
         }
         watcher::Event::Restarted(objs) => {
@@ -361,7 +385,7 @@ async fn handle_exception_event(
     }
     for obj in objects {
         match apply_exception_object(client, exceptions, obj).await {
-            Ok(()) => health.note_success(FailureClass::StatusPatch),
+            Ok(requested) => health.note_success(requested),
             Err(failure) => {
                 eprintln!("ferrum-controller: exception status: {}", failure.err);
                 health.note_failure(failure.class, &failure.err)?;
@@ -376,8 +400,24 @@ async fn handle_exception_event(
     )
     .await
     {
-        Ok(()) => {
-            health.note_success(FailureClass::ExceptionPublish);
+        Ok(published) => {
+            // `Requested::NONE` when the list matched no Secret: a fresh
+            // install has none, nothing was published, and counting that as a
+            // success of this class would disarm the terminal rule for it for
+            // the life of the process.
+            health.note_success(published.requested);
+            for name in &published.unscopable {
+                let err = FerrumError::Integrity(format!(
+                    "secret {name} carries {}={} and no {} label: this controller cannot \
+                     scope an exception list to it, so the list it already holds is what the \
+                     agents reading it still get",
+                    crate::apply::MANAGED_BY_KEY,
+                    crate::apply::MANAGED_BY_VALUE,
+                    crate::apply::POLICY_LABEL_KEY,
+                ));
+                eprintln!("ferrum-controller: exception publish: {err}");
+                health.note_failure(FailureClass::ExceptionPublish, &err)?;
+            }
             Ok(())
         }
         Err(err) => {
@@ -408,11 +448,15 @@ pub(crate) fn exception_disposition(
     }
 }
 
+/// `Classed`, plus the receipt for the one request this makes when it makes
+/// it.
+type ClassedRequest = std::result::Result<Requested, Classified>;
+
 async fn apply_exception_object(
     client: &Client,
     exceptions: &ExceptionSet,
     obj: &DynamicObject,
-) -> Classed {
+) -> ClassedRequest {
     // A missing name is a broken object, not a broken API call: it is counted
     // against the reconcile class so that a status subresource nobody can
     // patch stays the only thing `status_patch` reports.
@@ -443,27 +487,6 @@ async fn apply_exception_object(
     )
     .await
     .map_err(as_class(FailureClass::StatusPatch))
-}
-
-/// The class a `persist` of `plan` fails in.
-///
-/// `persist_dynamic` upserts the plan's Secret and then PATCHes the object's
-/// status. When the plan carries no Secret — a failed compile, an
-/// unverifiable bundle — that call issues exactly one request and it is the
-/// status PATCH, so a failure of it belongs to `status_patch`: this is the
-/// shape a mis-edited RBAC produces on every object it touches. When the plan
-/// does carry a Secret the call is a superset of that and the failure is a
-/// reconcile that did not converge.
-///
-/// Structural, not textual: it reads the plan, never the error. Splitting the
-/// two requests apart so that a Secret-carrying plan can report them
-/// separately is a change in `apply.rs`.
-fn persist_class(plan: &ApplyPlan) -> FailureClass {
-    if plan.secret.is_some() {
-        FailureClass::Reconcile
-    } else {
-        FailureClass::StatusPatch
-    }
 }
 
 async fn reconcile_object(
@@ -517,16 +540,16 @@ async fn reconcile_object(
     if failed_status_already_recorded(&obj, generation, &plan) {
         return Ok(());
     }
-    persist(client, &name, &cfg.namespace, &plan)
+    let persisted = persist(client, &name, &cfg.namespace, &plan)
         .await
         .map_err(as_class(persist_class(&plan)))?;
-    // The call above ends in a status PATCH whatever else it did.
-    health.note_success(FailureClass::Reconcile);
-    health.note_success(FailureClass::StatusPatch);
-    attach_exceptions(client, cfg, exceptions, &plan)
+    // One receipt for one call, from `persist_class`, which is also what a
+    // failure of it is charged to.
+    health.note_success(persisted);
+    let attached = attach_exceptions(client, cfg, exceptions, &plan)
         .await
         .map_err(as_class(FailureClass::ExceptionPublish))?;
-    health.note_success(FailureClass::ExceptionPublish);
+    health.note_success(attached);
     Ok(())
 }
 
@@ -589,7 +612,7 @@ async fn reconcile_namespaced_object(
     if failed_status_already_recorded(&obj, generation, &plan) {
         return Ok(());
     }
-    persist_dynamic(
+    let persisted = persist_dynamic(
         client,
         &security_policy_resource(),
         Some(&policy_namespace),
@@ -599,13 +622,25 @@ async fn reconcile_namespaced_object(
     )
     .await
     .map_err(as_class(persist_class(&plan)))?;
-    health.note_success(FailureClass::Reconcile);
-    health.note_success(FailureClass::StatusPatch);
-    attach_exceptions(client, cfg, exceptions, &plan)
+    health.note_success(persisted);
+    let attached = attach_exceptions(client, cfg, exceptions, &plan)
         .await
         .map_err(as_class(FailureClass::ExceptionPublish))?;
-    health.note_success(FailureClass::ExceptionPublish);
+    health.note_success(attached);
     Ok(())
+}
+
+/// The Secret `attach_exceptions` would patch, if there is one.
+///
+/// Both `None` arms are ordinary: a plan whose compile failed carries no
+/// Secret, and there is nothing to attach an exception list to. What was not
+/// ordinary is what the caller did with the `Ok(())` that came back from them
+/// — it credited `exception_publish` with a success, for a call that had made
+/// no request, which is permanent and is the whole of the terminal rule for
+/// that class. The decision is a function of the plan alone, so it is one, and
+/// it is what the unit test below reads.
+fn attach_target(plan: &ApplyPlan) -> Option<&str> {
+    plan.secret.as_ref()?.metadata.name.as_deref()
 }
 
 /// A freshly created bundle Secret must carry the current exception list too;
@@ -615,13 +650,11 @@ async fn attach_exceptions(
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
     plan: &ApplyPlan,
-) -> Result<()> {
-    let Some(secret) = &plan.secret else {
-        return Ok(());
+) -> Result<Requested> {
+    let Some(secret_name) = attach_target(plan) else {
+        return Ok(Requested::NONE);
     };
-    let Some(secret_name) = secret.metadata.name.as_deref() else {
-        return Ok(());
-    };
+    let secret = plan.secret.as_ref().expect("attach_target read the Secret");
     let scoped = match secret
         .metadata
         .labels
@@ -655,6 +688,7 @@ fn failed_outcome(generation: i64, err: &FerrumError) -> crate::ReconcileOutcome
 mod tests {
     use super::*;
     use crate::apply::{bundle_secret, plan_apply, DEFAULT_NAMESPACE};
+    use crate::health::TERMINAL_RUN;
     use crate::{reconcile, ClusterAbi, ReconcileInput, ReconcileOutcome};
     use ferrum_api::{
         ClusterSecurityPolicy, ClusterSecurityPolicySpec, PolicyLibrarySpec, RuntimeAction,
@@ -764,6 +798,85 @@ mod tests {
             }
             ReconcileOutcome::Failed(s) => panic!("{}", s.compile.message),
         }
+    }
+
+    /// A reconcile that published nothing does not mark publishing as
+    /// working.
+    ///
+    /// The plan of a policy whose compile failed carries no Secret — the
+    /// assertion `missing_spec_is_validation_no_secret` below already holds —
+    /// so `attach_exceptions` has nothing to patch and issues no request.
+    /// Before the receipt, the call site marked `exception_publish` as having
+    /// succeeded on exactly that path, and `ever_ok` is permanent: from the
+    /// first policy in the cluster that failed to compile, an RBAC that 403s
+    /// every exception publish could never reach the terminal rule again. The
+    /// same three lines held for `reconcile`, which was credited for writing
+    /// «compile failed» into a status.
+    #[test]
+    fn a_reconcile_that_published_nothing_marks_no_class_as_having_worked() {
+        let failed = ReconcileOutcome::Failed(PolicyStatus {
+            observed_generation: 1,
+            compile: compile_status_err(&FerrumError::Validation(
+                "ClusterSecurityPolicy spec is missing".into(),
+            )),
+            rollout: RolloutStatus::default(),
+        });
+        let plan = plan_apply("bare", DEFAULT_NAMESPACE, &failed, &pk());
+        assert!(plan.secret.is_none(), "a failed compile writes no Secret");
+        assert!(
+            attach_target(&plan).is_none(),
+            "there is no Secret to attach an exception list to, so no request is made"
+        );
+
+        let health = ControllerHealth::new();
+        // The receipts `reconcile_object` gets for this plan, from the two
+        // functions that would have made the requests.
+        health.note_success(Requested::of(persist_class(&plan)));
+        health.note_success(Requested::NONE);
+        assert!(
+            !health.ever_succeeded(FailureClass::ExceptionPublish),
+            "a call that made no request marked the class as having worked"
+        );
+        assert!(
+            !health.ever_succeeded(FailureClass::Reconcile),
+            "writing a failed compile into a status is a status patch, not a reconcile that \
+             converged"
+        );
+        assert!(
+            health.ever_succeeded(FailureClass::StatusPatch),
+            "the one request this plan does make is a status PATCH, and it went through"
+        );
+
+        // And that is the terminal rule, not bookkeeping: publishes that all
+        // fail must still reach it.
+        let mut last = Ok(());
+        for _ in 0..TERMINAL_RUN {
+            last = health.note_failure(FailureClass::ExceptionPublish, "secret patch: 403");
+        }
+        let err = last.expect_err("a class in which nothing ever worked must end the process");
+        assert!(
+            err.to_string().contains("exception_publish"),
+            "the terminal error must name the class: {err}"
+        );
+
+        // The other direction, so this is not an assertion that nothing ever
+        // counts: a plan that does carry a Secret makes both requests, and
+        // both receipts say so.
+        let applied = reconcile(ReconcileInput {
+            spec: &prod_restricted().spec,
+            observed_generation: 3,
+            secret_key: &RFC8032_SK,
+            library: None,
+            clusters: &[],
+        });
+        let live = plan_apply("prod-restricted", DEFAULT_NAMESPACE, &applied, &pk());
+        assert!(live.secret.is_some());
+        assert!(attach_target(&live).is_some());
+        let ok = ControllerHealth::new();
+        ok.note_success(Requested::of(persist_class(&live)));
+        ok.note_success(Requested::of(FailureClass::ExceptionPublish));
+        assert!(ok.ever_succeeded(FailureClass::Reconcile));
+        assert!(ok.ever_succeeded(FailureClass::ExceptionPublish));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Status PATCH and signed bundle Secret. Failed compile never writes a Secret.
 
 use crate::bundle::{encode_fsig_envelope, verify_signed_bundle, SignedBundle};
+use crate::health::{FailureClass, Requested};
 use crate::{compile_status_err, ReconcileOutcome};
 use ferrum_api::{PolicyExceptionSpec, PolicyStatus};
 use ferrum_common::{FerrumError, Result};
@@ -134,23 +135,40 @@ pub fn exceptions_secret_patch(
     }))
 }
 
-/// Push the current live exception list into every bundle Secret we own —
-/// selected by owner label, never by name prefix — scoping each Secret's
-/// `exceptions.fsig` to the exceptions that target its policy.
-pub async fn persist_exceptions(
-    client: &Client,
-    namespace: &str,
-    secret_key: &[u8],
-    specs: &[PolicyExceptionSpec],
-) -> Result<()> {
-    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let selector = format!("{MANAGED_BY_KEY}={MANAGED_BY_VALUE}");
-    let list = api
-        .list(&ListParams::default().labels(&selector))
-        .await
-        .map_err(|e| FerrumError::Degraded(format!("secret list {namespace}: {e}")))?;
-    for secret in list.items {
+/// What one pass of `persist_exceptions` did.
+///
+/// Both fields exist because the pass used to report `Ok(())` for two states
+/// that are not a publication: a list that matched no Secret at all (a fresh
+/// install has none, and the caller counted the class as having worked
+/// anyway), and a Secret it walked past.
+#[derive(Debug, Default)]
+pub struct ExceptionsPublished {
+    /// `ExceptionPublish` only if at least one Secret was actually patched.
+    pub requested: Requested,
+    /// Secrets carrying this controller's managed-by label that it cannot
+    /// scope a list to: no name, or no `ferrum.io/policy` label. This
+    /// controller writes that label on every Secret it creates, so such a
+    /// Secret is either hand-made or was stripped, and it is a Secret an agent
+    /// still reads while this pass leaves it at whatever exception list it
+    /// last had. Skipping it is right — publishing the unscoped list into it
+    /// would widen every exception it carries — and skipping it silently is
+    /// what this field ends.
+    pub unscopable: Vec<String>,
+}
+
+/// The Secrets one pass would patch, and the ones it must walk past, decided
+/// from a list the API server returned.
+///
+/// Split out of `persist_exceptions` because it is the whole of that
+/// function's judgement and the only part of it testable without a cluster: an
+/// empty list yields no target, which is exactly the state that used to be
+/// reported as a successful publish.
+fn exception_targets(secrets: &[Secret]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut unscopable = Vec::new();
+    for secret in secrets {
         let Some(name) = secret.metadata.name.as_deref() else {
+            unscopable.push("<unnamed>".to_string());
             continue;
         };
         let Some(policy) = secret
@@ -159,14 +177,56 @@ pub async fn persist_exceptions(
             .as_ref()
             .and_then(|l| l.get(POLICY_LABEL_KEY))
         else {
+            unscopable.push(name.to_string());
             continue;
         };
-        let patch = exceptions_secret_patch(&exceptions_for_policy(specs, policy), secret_key)?;
-        api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+        targets.push((name.to_string(), policy.clone()));
+    }
+    (targets, unscopable)
+}
+
+/// Push the current live exception list into every bundle Secret we own —
+/// selected by owner label, never by name prefix — scoping each Secret's
+/// `exceptions.fsig` to the exceptions that target its policy.
+pub async fn persist_exceptions(
+    client: &Client,
+    namespace: &str,
+    secret_key: &[u8],
+    specs: &[PolicyExceptionSpec],
+) -> Result<ExceptionsPublished> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let selector = format!("{MANAGED_BY_KEY}={MANAGED_BY_VALUE}");
+    let list = api
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .map_err(|e| FerrumError::Degraded(format!("secret list {namespace}: {e}")))?;
+    let (targets, unscopable) = exception_targets(&list.items);
+    let mut patched = 0usize;
+    for (name, policy) in targets {
+        let patch = exceptions_secret_patch(&exceptions_for_policy(specs, &policy), secret_key)?;
+        api.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
             .map_err(|e| FerrumError::Degraded(format!("secret patch {name}: {e}")))?;
+        // Counted after the patch, never before it.
+        patched += 1;
     }
-    Ok(())
+    Ok(ExceptionsPublished {
+        requested: publish_receipt(patched),
+        unscopable,
+    })
+}
+
+/// The receipt for a publish pass that patched `patched` Secrets.
+///
+/// Zero is the case this exists for: an installation with no bundle Secret yet
+/// lists nothing, patches nothing and used to report a success of
+/// `exception_publish` anyway.
+fn publish_receipt(patched: usize) -> Requested {
+    if patched == 0 {
+        Requested::NONE
+    } else {
+        Requested::of(FailureClass::ExceptionPublish)
+    }
 }
 
 pub(crate) async fn patch_secret_exceptions(
@@ -175,13 +235,13 @@ pub(crate) async fn patch_secret_exceptions(
     secret_name: &str,
     secret_key: &[u8],
     specs: &[PolicyExceptionSpec],
-) -> Result<()> {
+) -> Result<Requested> {
     let patch = exceptions_secret_patch(specs, secret_key)?;
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
     api.patch(secret_name, &PatchParams::default(), &Patch::Merge(&patch))
         .await
         .map_err(|e| FerrumError::Degraded(format!("secret patch {secret_name}: {e}")))?;
-    Ok(())
+    Ok(Requested::of(FailureClass::ExceptionPublish))
 }
 
 pub fn status_patch(status: &PolicyStatus) -> serde_json::Value {
@@ -339,12 +399,38 @@ pub fn plan_apply_named(
     }
 }
 
+/// The class of the one call `persist_dynamic` is, in both directions.
+///
+/// `persist_dynamic` upserts the plan's Secret and then PATCHes the object's
+/// status. When the plan carries no Secret — a failed compile, an unverifiable
+/// bundle — that call issues exactly one request and it is the status PATCH, so
+/// a failure of it belongs to `status_patch`: this is the shape a mis-edited
+/// RBAC produces on every object it touches. When the plan does carry a Secret
+/// the call is a superset of that and the failure is a reconcile that did not
+/// converge.
+///
+/// One function, read by `watch.rs` for the failure and by `persist_dynamic`
+/// for the receipt, so the class a failure is charged to and the class a
+/// success credits can never be two different answers. They were: a plan with
+/// no Secret failed as `status_patch` and succeeded as `reconcile` *and*
+/// `status_patch`, so writing «compile failed» into a status counted as a
+/// reconcile that converged.
+///
+/// Structural, not textual: it reads the plan, never the error.
+pub(crate) fn persist_class(plan: &ApplyPlan) -> FailureClass {
+    if plan.secret.is_some() {
+        FailureClass::Reconcile
+    } else {
+        FailureClass::StatusPatch
+    }
+}
+
 pub async fn persist(
     client: &Client,
     policy_name: &str,
     namespace: &str,
     plan: &ApplyPlan,
-) -> Result<()> {
+) -> Result<Requested> {
     persist_dynamic(
         client,
         &crate::watch::cluster_security_policy_resource(),
@@ -365,7 +451,7 @@ pub(crate) async fn persist_dynamic(
     object_name: &str,
     secret_namespace: &str,
     plan: &ApplyPlan,
-) -> Result<()> {
+) -> Result<Requested> {
     if let Some(secret) = &plan.secret {
         upsert_secret(client, secret_namespace, secret).await?;
     }
@@ -376,7 +462,8 @@ pub(crate) async fn persist_dynamic(
         object_name,
         &plan.status,
     )
-    .await
+    .await?;
+    Ok(Requested::of(persist_class(plan)))
 }
 
 async fn upsert_secret(client: &Client, namespace: &str, secret: &Secret) -> Result<()> {
@@ -402,13 +489,17 @@ async fn upsert_secret(client: &Client, namespace: &str, secret: &Secret) -> Res
     Ok(())
 }
 
+/// The receipt says `StatusPatch` because that is the request this issues.
+/// What a *caller* is charged for can be wider — `persist_dynamic` upserts a
+/// Secret first and answers for both through `persist_class` — but nothing
+/// that did not issue this request can produce this receipt.
 pub(crate) async fn patch_status_dynamic(
     client: &Client,
     resource: &kube::api::ApiResource,
     namespace: Option<&str>,
     name: &str,
     patch: &serde_json::Value,
-) -> Result<()> {
+) -> Result<Requested> {
     let api: Api<kube::api::DynamicObject> = match namespace {
         Some(ns) => Api::namespaced_with(client.clone(), ns, resource),
         None => Api::all_with(client.clone(), resource),
@@ -416,7 +507,7 @@ pub(crate) async fn patch_status_dynamic(
     api.patch_status(name, &PatchParams::default(), &Patch::Merge(patch.clone()))
         .await
         .map_err(|e| FerrumError::Degraded(format!("status patch {name}: {e}")))?;
-    Ok(())
+    Ok(Requested::of(FailureClass::StatusPatch))
 }
 
 #[cfg(test)]
@@ -792,5 +883,58 @@ mod tests {
         assert_eq!(for_prod, vec![scoped, global.clone()]);
         let for_other = exceptions_for_policy(&specs, "other-policy");
         assert_eq!(for_other, vec![global]);
+    }
+
+    /// A publish pass over no Secret published nothing, and a Secret it cannot
+    /// scope is named rather than walked past.
+    ///
+    /// The empty case is the one that mattered: on a fresh install no bundle
+    /// Secret exists yet, `persist_exceptions` listed nothing, patched nothing
+    /// and returned `Ok(())`, and the caller booked a success for
+    /// `exception_publish`. That flag is permanent and is the entire condition
+    /// of the terminal rule, so an installation whose very first exception
+    /// event arrived before its first policy could never afterwards report an
+    /// RBAC that 403s every exception publish.
+    #[test]
+    fn a_publish_pass_over_no_secret_requests_nothing() {
+        let (targets, unscopable) = exception_targets(&[]);
+        assert!(targets.is_empty() && unscopable.is_empty());
+        assert!(
+            publish_receipt(0).is_empty(),
+            "a pass that patched no Secret has no request to report, and a class it credits \
+             anyway can never reach the terminal rule again"
+        );
+        assert!(publish_receipt(1).contains(FailureClass::ExceptionPublish));
+        assert!(ExceptionsPublished::default().requested.is_empty());
+
+        let labelled = |name: &str, labels: Option<BTreeMap<String, String>>| Secret {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                labels,
+                ..ObjectMeta::default()
+            },
+            ..Secret::default()
+        };
+        let mut managed_only = BTreeMap::new();
+        managed_only.insert(MANAGED_BY_KEY.to_string(), MANAGED_BY_VALUE.to_string());
+        let (targets, unscopable) = exception_targets(&[
+            labelled(
+                "ferrum-bundle-cluster-prod",
+                Some(cluster_secret_labels("prod")),
+            ),
+            labelled("hand-made", Some(managed_only)),
+            labelled("no-labels-at-all", None),
+        ]);
+        assert_eq!(
+            targets,
+            vec![("ferrum-bundle-cluster-prod".to_string(), "prod".to_string())],
+            "only a Secret this controller can scope a list to is a target"
+        );
+        assert_eq!(
+            unscopable,
+            vec!["hand-made".to_string(), "no-labels-at-all".to_string()],
+            "a Secret carrying the managed-by label that cannot be scoped is reported, not \
+             walked past: an agent reads it and it keeps whatever exception list it had"
+        );
     }
 }

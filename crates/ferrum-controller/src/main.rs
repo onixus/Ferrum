@@ -324,4 +324,60 @@ mod tests {
         );
         let _ = fs::remove_file(&seed);
     }
+
+    /// The argv the shipped manifest passes is parsed into the config the
+    /// watch loop publishes from.
+    ///
+    /// Nothing joined those two before. `boundary_gate.rs` reads `--status-dir`
+    /// out of `deploy/controller/deployment.yaml` and checks the volume behind
+    /// it; the unit tests here read the parser; and the assignment between
+    /// them was covered by neither, so replacing `opts.status_dir` with `None`
+    /// on the line below left every test in this crate and every gate in
+    /// `ferrum-testkit` green while the shipped controller published its
+    /// counters nowhere. This reads the real manifest so the flag under test
+    /// is the flag that ships, not one this file made up.
+    #[test]
+    fn the_status_dir_the_manifest_passes_is_the_one_the_watch_config_carries() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/<crate> has two ancestors")
+            .join("deploy/controller/deployment.yaml");
+        let body =
+            fs::read_to_string(&manifest).unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
+        let doc: serde_yaml::Value = serde_yaml::from_str(&body).expect("deployment");
+        let container = doc["spec"]["template"]["spec"]["containers"][0].clone();
+        let mut args: Vec<String> = container["args"]
+            .as_sequence()
+            .expect("args")
+            .iter()
+            .map(|a| a.as_str().expect("string arg").to_string())
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("run"));
+        args.remove(0);
+        let at = args
+            .iter()
+            .position(|a| a == "--status-dir")
+            .expect("the manifest passes --status-dir");
+        let dir = args[at + 1].clone();
+
+        // The seed file is the only argument that must exist on this disk.
+        let seed = seed_file();
+        let seed_at = args
+            .iter()
+            .position(|a| a == "--seed-file")
+            .expect("the manifest passes --seed-file");
+        args[seed_at + 1] = seed.to_string_lossy().into_owned();
+
+        let cfg = parse_run(args.into_iter()).expect("the shipped argv parses");
+        assert_eq!(
+            cfg.status_dir,
+            Some(PathBuf::from(&dir)),
+            "the controller was given --status-dir {dir} and reconciles with none: its \
+             counters, its degraded reasons and the cause of a terminal class are published \
+             nowhere, and a pod with no status file is indistinguishable from one that was \
+             never asked for one"
+        );
+        let _ = fs::remove_file(&seed);
+    }
 }

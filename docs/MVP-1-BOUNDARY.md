@@ -308,7 +308,7 @@
 |---|---|---|---|
 | `ferrum-agent` | `status.json` и флаг `degraded` в конверте экспорта | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::a_degraded_node_that_changes_why_says_so` |
 | `ferrum-admission` | текст `message` в отказе — то, что видит человек, запустивший `kubectl` | U | U `webhook.rs::a_warm_watch_decides_and_a_cold_one_denies_with_the_cold_reason` · U `webhook.rs::unsigned_image_deny` |
-| `ferrum-controller` | `status.json` в `--status-dir` плюс код выхода: до входа в watch — `error: <причина>` и выход 1; после — счётчик и причина на класс отказа в файле, а прогон отказов одного класса без единого успеха завершает процесс | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` · U `health.rs::a_single_failed_event_is_counted_and_the_process_keeps_running` · U `health.rs::a_run_of_status_patch_failures_with_no_success_is_terminal_and_names_the_class` · U `health.rs::a_class_that_succeeded_once_does_not_go_terminal_on_a_later_burst` · U `health.rs::the_status_file_is_written_whole_and_a_failed_write_is_its_own_reason` · U `boundary_gate.rs::the_controllers_channel_names_every_post_start_failure_class` |
+| `ferrum-controller` | `status.json` в `--status-dir` плюс код выхода: до входа в watch — `error: <причина>` и выход 1; после — счётчик и причина на класс отказа в файле, а прогон отказов одного класса без единого успеха завершает процесс | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` · U `health.rs::a_single_failed_event_is_counted_and_the_process_keeps_running` · U `health.rs::a_run_of_status_patch_failures_with_no_success_is_terminal_and_names_the_class` · U `health.rs::a_class_that_succeeded_once_does_not_go_terminal_on_a_later_burst` · U `health.rs::the_status_file_is_written_whole_and_a_failed_write_is_its_own_reason` · U `ferrum-controller/src/watch.rs::a_reconcile_that_published_nothing_marks_no_class_as_having_worked` · U `apply.rs::a_publish_pass_over_no_secret_requests_nothing` · U `ferrum-controller/src/main.rs::the_status_dir_the_manifest_passes_is_the_one_the_watch_config_carries` · U `boundary_gate.rs::the_controllers_channel_names_every_post_start_failure_class` |
 
 Строка контроллера — единственная, которая до этого цикла не проходила третье
 утверждение, и не тем каналом, который в ней стоял: `deploy/controller/rbac.yaml`
@@ -340,6 +340,22 @@ model этого проекта. То же самое и той же формы 
 системе, потому что RBAC и есть место, где оператор читает, за чем контроллер
 следит. Все четыре удалены; правило держит
 `boundary_gate.rs::a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose`,
+и в этом цикле у него закрыты два обхода, каждый из которых восстанавливал
+предмет находки целиком. Первый: перепись шла от `image:` к
+`serviceAccountName` того же pod spec, поэтому биндинг на любой другой
+ServiceAccount не разрешался ни в одно правило — `ClusterRole` с теми самыми
+четырьмя ресурсами и пишущими глаголами, привязанный к
+`ServiceAccount/ferrum-controller-ops`, проходил все наборы этого crate и
+`lint-deploy`. Теперь каждый субъект биндинга обязан быть аккаунтом, под
+которым что-то запускается: грант субъекту, которого никто не запускает, — то
+же право без назначения, только ещё и невидимое для переписи. Второй: читались
+все `.rs` под `crates/<субъект>/src`, включая `#[cfg(test)]`, так что один
+юнит-тест с литералом `gvk` воскрешал читающий грант на Kind, которого в
+поставляемом бинаре нет. Читается поставляемая половина файла — до первой
+строки `#[cfg(test)]`, — и то же правило теперь применяется к
+`the_controllers_channel_names_every_post_start_failure_class`, который до
+этого цикла засчитывал `note_failure` из тестового модуля `watch.rs` за
+отчётность реконсайл-пути.
 и оно ограничено группой `ferrum.io` намеренно: ядровые ресурсы (`pods`,
 `secrets`, `nodes`) адресуются типами `k8s-openapi` без единого `gvk`, так что
 тот же вопрос объявил бы мёртвым каждый из них. Неиспользуемый ядровой грант —
@@ -389,17 +405,66 @@ watch, отказ публикации подписанных exception, — б�
 процесс, который логирует это вечно, выглядит здоровым и для Kubernetes, и для
 любой панели над ним. «Ни одного успеха в этом классе» — вся защита целиком,
 поэтому классы разделены по вызову, а не по слову: `status_patch` — это
-запрос, который **ничем, кроме PATCH статуса, не был** (статус
-PolicyException; статус политики, у плана которой нет Secret), и именно в него
-попадает мис-RBAC на каждом объекте, которого касается.
+запрос, который **ничем, кроме PATCH статуса, не был**: статус
+PolicyException и статус политики, у плана которой нет Secret.
+
+**И поэтому же успех класса теперь нельзя объявить, не сделав запроса.** Вся
+защита стоит на флаге «хоть раз прошло», флаг необратим — а ставили его три
+места, где вызов не обращался к API server ни разу. `attach_exceptions` на
+плане без Secret выходит первым же `return` (план без Secret — это любая
+политика с провалившейся компиляцией), `persist_exceptions` на свежей
+установке не находит ни одного bundle-Secret и не патчит ничего, и оба
+возвращали `Ok(())`, после которого вызыватель писал `note_success`. Одной
+такой политики хватало, чтобы `exception_publish` больше никогда не дошёл до
+терминального правила: тысяча отказов подряд после этого — тысяча `Ok`.
+Правило, которое авторы знали, в том же файле было записано ровно один раз —
+ветка «объект уже сошёлся» успеха не засчитывает, потому что запроса не было.
+
+Теперь оно записано типом, а не дисциплиной. `note_success` принимает не
+класс, а `Requested` — расписку, которую возвращает тот код, который запрос и
+делал: `persist_dynamic`, `patch_status_dynamic`, `patch_secret_exceptions`,
+`persist_exceptions` (по факту пропатченных Secret, а не по факту вызова).
+Функция, которая не обратилась ни к чему, возвращать может только
+`Requested::NONE`, а место вызова расписку выдумать не может — единственное
+исключение названо в коде и в гейте: класс `watch`, чей запрос — сам watch, и
+чей ответ — пришедшее событие. Заодно исчезла вторая половина того же дефекта:
+запись статуса «compile failed» засчитывалась в `reconcile`, потому что успех
+и отказ одного и того же вызова классифицировались по-разному. Класс у него
+один — `apply.rs::persist_class`, — и читают его теперь оба направления.
 
 Чего эта правка не делает. PATCH статуса политики, у плана которой Secret
 есть, идёт одним вызовом с upsert этого Secret и потому считается в
-`reconcile`, а не в `status_patch`: разнести эти два запроса — правка в
-`crates/ferrum-controller/src/apply.rs`. `status.json` живёт ровно столько,
-сколько под, и о том, что было между запусками, не сообщает ничего. И
-`Jenkinsfile` этот файл ни в одной стадии не читает: всё, что здесь стоит `U`,
-прогнано на этом дереве руками, как и всюду в этом документе.
+`reconcile`, а не в `status_patch` — **в обе стороны и на любом кластере, где
+политики компилируются**. Прежняя формулировка этого абзаца соседствовала с
+утверждением, что мис-RBAC попадает в `status_patch` «на каждом объекте,
+которого касается»; верно первое. На установке, где компиляция проходит, 403
+на PATCH статуса политики приходит в `reconcile`, и `status_patch` остаётся
+классом статусов PolicyException и политик с провалившейся компиляцией.
+Терминальное правило от этого не страдает — оно сработает через `reconcile`, —
+а диагностика страдает наполовину: заголовок скажет «reconcile», но причина в
+том же сообщении и в `status.json` — это дословный текст запроса, `status
+patch <имя>: 403 Forbidden`. Разносить upsert и PATCH на два независимо
+считаемых запроса ради счётчика этот цикл не стал намеренно: один вызов — один
+класс, а разнесённый upsert, у которого PATCH не прошёл, — это объект, чей
+Secret обновлён, а статус нет, то есть частично применённое состояние, которое
+пришлось бы либо откатывать, либо объявлять успехом в одном классе и отказом в
+другом. `status.json` живёт ровно столько, сколько под, и о том, что было
+между запусками, не сообщает ничего. И `Jenkinsfile` этот файл ни в одной
+стадии не читает: всё, что здесь стоит `U`, прогнано на этом дереве руками,
+как и всюду в этом документе.
+
+**Молчаливых веток в этом цикле стало на одну меньше.** `Event::Deleted`
+объекта без `namespace`/`name` не удалял исключение из набора — ни класса, ни
+строки: отозванный exception продолжал подписываться в Secret и раздаваться
+агентам, то есть fail-open в единственном направлении, где он запрещён. Набор
+ключуется `namespace/name`, применить такое удаление к нему нечем; теперь это
+отказ класса `reconcile` со строкой, называющей, что именно осталось живым, —
+та же трактовка, которую тот же файл уже давал тому же дефекту в
+`apply_exception_object`. Так же перестали быть молчаливыми Secret с нашей
+меткой `managed-by`, которым `persist_exceptions` не может отскопировать
+список (нет имени или нет метки `ferrum.io/policy`): пропустить такой Secret
+по-прежнему правильно — общий список расширил бы каждое исключение в нём, — но
+пропускается он теперь с отказом класса `exception_publish`, а не с `Ok`.
 
 Чего инвентарь не делает: он не утверждает, что канал субъекта достаточен.
 У webhook нет ни последнего-известного-хорошего, ни списка причин; у
@@ -451,6 +516,7 @@ PolicyException; статус политики, у плана которой н�
 | Манифест не может объявить `optional: true` на томе, обслуживающем путь, без которого бинарь не стартует, — FD028, находка, а не предупреждение; том, который бинарь действительно терпит, находкой не является | U | U `lint_deploy.rs::a_required_mount_declared_optional_is_a_finding` · U `lint_deploy.rs::the_webhooks_bundle_mount_is_the_same_finding` · U `lint_deploy.rs::an_optional_serving_certificate_is_a_finding_too` · U `lint_deploy.rs::a_mount_the_binary_tolerates_may_be_optional` · U `lint_deploy.rs::a_file_is_served_by_the_longest_mount_that_covers_it` |
 | Каждая цитата «Делает» разрешается в определение `fn` или в стадию, а список §D здесь — ровно `AcceptanceCase::ALL` | U | U `boundary_gate.rs::every_claim_in_the_does_section_cites_something_that_exists` · U `boundary_gate.rs::the_document_lists_exactly_the_rfc_d_cases` |
 | Каждая причина деградации, которую агент может объявить, названа здесь — по префиксу `DEG_`, по телу `degraded_reasons_at` и по аргументам `mark_terminal_fault` | U | U `boundary_gate.rs::every_degraded_reason_the_agent_can_raise_is_named_in_the_document` |
+| Классы отказа контроллера перечисляются из тела `pub enum FailureClass`, а не из списка в самом гейте: у каждого варианта обязан быть аксессор счётчика, место в `ALL`, ключ в `status_json`, выведенный из `counter()`, и хотя бы одно место маршрутизации в `watch.rs`/`apply.rs`; успех класса нельзя назвать на месте вызова | U | U `boundary_gate.rs::the_controllers_channel_names_every_post_start_failure_class` |
 | Обратное направление: каждый `#[test]` в `ferrum-testkit/tests`, `ferrum-agent/tests` и `ferrum-admission/tests` процитирован строкой или назван в списке исключений с причиной; само правило исключения проверено на входах, ответ на которых известен, а не только на пустом списке | U | U `boundary_gate.rs::every_gate_in_this_tree_is_cited_by_a_row` · U `boundary_gate.rs::a_test_is_found_under_its_attributes_and_a_plain_fn_is_not` · U `boundary_gate.rs::an_exemption_from_citation_is_named_one_at_a_time` |
 | У каждого поставляемого бинаря ровно один канал отказа, он достижим и несёт причину, а не константу; перепись грантов читает и wildcard — `resources: ["*"]` с пишущим глаголом даёт каждый `<kind>/status` группы, а не ни одного | U | U `boundary_gate.rs::every_shipped_subject_has_one_reachable_channel_that_carries_a_cause` · U `boundary_gate.rs::a_wildcard_resource_grant_is_a_status_grant` |
 | Грамматика ячейки закрыта: проза не доказательство, цитата разрешается в определение, а не в упоминание, прочерк — только у названного субъекта, а метка суммирует все цитаты строки | U | U `boundary_gate.rs::prose_is_not_evidence` · U `boundary_gate.rs::a_mention_of_a_test_is_not_a_definition_of_one` · U `boundary_gate.rs::only_a_named_subject_may_cite_nothing` · U `boundary_gate.rs::a_marker_summarises_every_citation_it_covers` |
@@ -477,7 +543,7 @@ PolicyException; статус политики, у плана которой н�
 | Граница hot path webhook держится его же `Cargo.toml`: компилятор и живой кластер туда не заезжают | U | U `webhook.rs::cargo_toml_hot_path_keeps_boundary` |
 | Серверный сертификат: просроченный не даёт стартовать, далёкий срок не шумит, ротация доходит до новых соединений, поллер подхватывает переписанный том, откат возможен, а негодный материал оставляет действующий сертификат | U | U `ferrum-admission/tests/serving_cert.rs::an_expired_certificate_refuses_to_start` · U `ferrum-admission/tests/serving_cert.rs::a_far_off_expiry_does_not_warn` · U `ferrum-admission/tests/serving_cert.rs::rotation_reaches_new_connections` · U `ferrum-admission/tests/serving_cert.rs::the_poller_picks_up_a_rotated_mount` · U `ferrum-admission/tests/serving_cert.rs::a_swap_can_be_undone` · U `ferrum-admission/tests/serving_cert.rs::unusable_material_keeps_the_current_certificate` |
 | Читатель argv манифеста видит обе законные записи Kubernetes — `command:` и `args:`, — а таблица feature-флагов держится за сами `#[cfg(feature = …)]`-места | U | U `deploy_gate.rs::a_containers_argv_is_command_then_args_and_either_alone` · U `deploy_gate.rs::every_flag_read_under_a_cfg_feature_is_in_the_table` |
-| Перепись грантов читает все глаголы, а не только пишущие: грант на `ferrum.io`-ресурс, для которого у субъекта нет литерала `GroupVersionKind::gvk`, — право без назначения, потому что ни один запрос его не достигает | U | U `boundary_gate.rs::a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose` |
+| Перепись грантов читает все глаголы, а не только пишущие: грант на `ferrum.io`-ресурс, для которого у субъекта нет литерала `GroupVersionKind::gvk` в поставляемой половине его исходников, — право без назначения; литерал внутри `#[cfg(test)]` достижимостью не считается, а биндинг на ServiceAccount, которого не запускает ни один pod spec, — субъект, о котором перепись не спрашивала ничего, и он же находка | U | U `boundary_gate.rs::a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose` |
 
 ## Не делает
 
