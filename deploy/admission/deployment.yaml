@@ -96,10 +96,17 @@ spec:
               mountPath: /etc/ferrum/tls
               readOnly: true
       volumes:
+        # Not optional. The binary refuses to start without a verified bundle
+        # and exits 2 before the poll loop that would pick one up later, so
+        # `optional: true` promised a tolerance it does not have: two replicas
+        # in CrashLoopBackOff, and — because readiness here is a TCP connect —
+        # Ready throughout, while failurePolicy: Fail denies every Pod outside
+        # ferrum/kube-system. Without it the Pod waits in ContainerCreating and
+        # `kubectl describe` names the Secret it is waiting for. The install
+        # order in README puts the bundle before this file for that reason.
         - name: bundle
           secret:
             secretName: ferrum-bundle-cluster-prod-restricted
-            optional: true
         # Serving certificate, issued offline by `ferrumctl gen-webhook-pki`,
         # which writes this Secret and the caBundle that matches it.
         - name: tls
