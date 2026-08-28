@@ -3,19 +3,23 @@
 # The agent then signals whatever holds the tgid at reaction time, which after
 # a pid wrap is not the workload that raised the record. This is the fail-open
 # a join test bypasses if it stubs `ProcCgroupCheck` out: with a stub, every
-# other assertion in this file still passes.
+# other assertion in this file still passes. The confirmation counter is left
+# moving on purpose -- the mutation must be invisible to everything except the
+# assertion that watches a real target leave a real cgroup.
 #
 # Must fail: `a_target_that_left_the_cgroup_is_refused_and_survives`.
 diff --git a/crates/ferrum-agent/src/lib.rs b/crates/ferrum-agent/src/lib.rs
-index bfb8cca..6e836b3 100644
 --- a/crates/ferrum-agent/src/lib.rs
 +++ b/crates/ferrum-agent/src/lib.rs
-@@ -1889,19 +1889,6 @@ impl Agent {
-         // The decision was made on an event that has been through a queue and
-         // a poll interval; the pid space wraps in far less. Confirm the target
-         // is still the workload that raised it before signalling anything.
+@@ -2000,22 +2000,11 @@
+                 Some(format!("{}: {why}", respond::REFUSE_TARGET_UNPROVABLE)),
+             );
+         }
 -        match self.target_check.cgroup_id(meta.tgid) {
--            Some(current) if current == meta.cgroup_id => {}
+-            Some(current) if current == meta.cgroup_id => {
+-                self.respond_target_confirmed
+-                    .fetch_add(1, Ordering::Relaxed);
+-            }
 -            Some(_) => {
 -                self.respond_stale_target.fetch_add(1, Ordering::Relaxed);
 -                self.respond_refused.fetch_add(1, Ordering::Relaxed);
@@ -27,6 +31,11 @@ index bfb8cca..6e836b3 100644
 -                return (false, Some(respond::REFUSE_TARGET_GONE.into()));
 -            }
 -        }
++        // MUTATION: the target is taken to be the workload that raised the
++        // record without asking /proc, so whatever holds the tgid now is
++        // signalled -- and the confirmation counter still moves.
++        self.respond_target_confirmed
++            .fetch_add(1, Ordering::Relaxed);
          let responder = match &self.responder {
              Some(responder) => responder,
              None => {

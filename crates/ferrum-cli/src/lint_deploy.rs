@@ -85,6 +85,14 @@ const FORBIDDEN_HOST_PATH_PREFIXES: [&str; 5] = [
 /// `crates/ferrum-ebpf/src/lib.rs`; change both together.
 const TRACEFS_ROOTS: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
 
+/// The only `hostPath.type` that makes the tracefs mount an assertion.
+///
+/// Every other value, `DirectoryOrCreate` and the empty default included, lets
+/// kubelet mount whatever is there — and `DirectoryOrCreate` has it *make* an
+/// empty directory on a node where tracefs is elsewhere or absent, which is
+/// byte for byte the state the `emptyDir` fixture exists to catch.
+const HOST_PATH_DIRECTORY: &str = "Directory";
+
 const OBSERVE_FORBIDDEN_VERBS: [&str; 3] = ["delete", "deletecollection", "*"];
 const OBSERVE_FORBIDDEN_RESOURCES: [&str; 5] =
     ["secrets", "pods/exec", "pods/attach", "pods/eviction", "*"];
@@ -509,7 +517,13 @@ fn check_pod_templates(docs: &[Doc], findings: &mut Vec<Finding>) {
 /// A finding, never a warning: this is the same unverifiable join FD005 and
 /// FD022 were each added to stop passing. The mount must also be a `hostPath`
 /// at a tracefs root — an `emptyDir` there is a directory with no `events` in
-/// it, which is exactly the state this rule exists to catch.
+/// it, which is exactly the state this rule exists to catch — and its
+/// `hostPath.type` must be `Directory`. `DirectoryOrCreate`, or no type at
+/// all, is the same blindness with a different author: on a node whose tracefs
+/// is somewhere else or absent, kubelet creates an empty directory and mounts
+/// that, and the pod starts, hooks nothing and reports the same Degraded as
+/// the `emptyDir` fixture. `Directory` is what makes the pod unschedulable and
+/// visible instead, and it is what `deploy/agent/README` says the mount does.
 fn check_tracefs(
     doc: &Doc,
     owner: &str,
@@ -530,7 +544,9 @@ fn check_tracefs(
             return false;
         };
         TRACEFS_ROOTS.contains(&path)
-            && mounted_host_path(spec, container, path).as_deref() == Some(path)
+            && mounted_host_path(spec, container, path).is_some_and(|(host, kind)| {
+                host == path && kind.as_deref() == Some(HOST_PATH_DIRECTORY)
+            })
     });
     if mounted {
         return;
@@ -539,15 +555,24 @@ fn check_tracefs(
         code: BPF_ELF_WITHOUT_TRACEFS,
         file: doc.file.clone(),
         msg: format!(
-            "{owner} container '{cname}' passes --bpf-elf but mounts no tracefs hostPath at one \
-             of {TRACEFS_ROOTS:?}; the tracepoint ids the attach reads are not in this container, \
-             so every hook fails and the datapath is Degraded on every node"
+            "{owner} container '{cname}' passes --bpf-elf but mounts no tracefs hostPath of type \
+             {HOST_PATH_DIRECTORY} at one of {TRACEFS_ROOTS:?}; the tracepoint ids the attach \
+             reads are not in this container, so every hook fails and the datapath is Degraded on \
+             every node. Any other hostPath type — DirectoryOrCreate, or none — has kubelet mount \
+             an empty directory it made itself on a node where tracefs is elsewhere, which is that \
+             same blindness with the manifest looking complete"
         ),
     });
 }
 
-/// The `hostPath.path` of the volume mounted at `mount_path` in this container.
-fn mounted_host_path(spec: &Value, container: &Value, mount_path: &str) -> Option<String> {
+/// The `hostPath` `path` and `type` of the volume mounted at `mount_path` in
+/// this container. `type` is `None` when the manifest leaves it out, which
+/// Kubernetes reads as "no check at all" and this rule reads the same way.
+fn mounted_host_path(
+    spec: &Value,
+    container: &Value,
+    mount_path: &str,
+) -> Option<(String, Option<String>)> {
     let volume_name = seq(container, "volumeMounts").iter().find_map(|m| {
         (m.get("mountPath").and_then(Value::as_str)? == mount_path)
             .then(|| m.get("name").and_then(Value::as_str))
@@ -555,13 +580,17 @@ fn mounted_host_path(spec: &Value, container: &Value, mount_path: &str) -> Optio
     })?;
     seq(spec, "volumes").iter().find_map(|v| {
         (v.get("name").and_then(Value::as_str)? == volume_name)
-            .then(|| {
-                v.get("hostPath")
-                    .and_then(|h| h.get("path"))
-                    .and_then(Value::as_str)
-            })
+            .then(|| v.get("hostPath"))
             .flatten()
-            .map(str::to_string)
+            .and_then(|h| {
+                let path = h.get("path").and_then(Value::as_str)?.to_string();
+                let kind = h
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|k| !k.is_empty());
+                Some((path, kind))
+            })
     })
 }
 
@@ -755,14 +784,33 @@ fn container_flag(argv: &[String], flag: &str) -> Option<String> {
 ///   is the repudiation case with the node still reporting healthy.
 /// - `--node` scopes the pod watch, so a second one indexes another node's pods
 ///   and every identity lookup here misses.
+/// - `--reload-ms`, `--export-max-bytes`, `--export-keep` and `--export-queue`
+///   are the rest of what `parse_flags` reads last-wins. They were left out for
+///   a cycle as "tuning", which is the wrong axis: this rule is not about how
+///   important a value is, it is about an argv where nobody chose the value
+///   that won. A doubled `--export-keep` or `--export-max-bytes` silently
+///   resizes the only record a kill leaves, and a doubled `--reload-ms` decides
+///   how stale `status.json` is allowed to be — the freshness contract the
+///   README tells an operator to read before believing any other field.
 ///
-/// Deliberately absent: the controller's flags, whose parser accumulates
-/// `--cluster` on purpose rather than overwriting, and admission's `--listen`,
-/// where a wrong port is a webhook that fails closed and says so on the first
-/// request. Inverting this into "every flag except a repeatable allowlist" was
+/// Deliberately absent, and this is the whole list:
+///
+/// - admission's `--listen`, where a wrong port is a webhook that fails closed
+///   and says so on the first request;
+/// - the controller's flags. `--cluster` accumulates on purpose rather than
+///   overwriting, so a second one is not ambiguity there. `--min-agent-abi`
+///   and `--min-admission-abi` *are* last-wins and would belong on the list on
+///   their merits — they are left off because this lint's argv reader mirrors
+///   the *agent's* `parse_flags`, which
+///   `the_argv_reader_mirrors_the_agents_parse_flags` holds it to, and the
+///   controller parses its own way. Adding them would make a claim about a
+///   parser nothing here compares against. Whoever mirrors that parser should
+///   add them in the same change.
+///
+/// Inverting this into "every flag except a repeatable allowlist" was
 /// considered and not taken: it would draw findings on flags nobody here has an
 /// argument about, and this list is meant to be exactly the arguments.
-const JOINED_FLAGS: [&str; 11] = [
+const JOINED_FLAGS: [&str; 15] = [
     "--policy-name",
     "--bundle",
     "--role",
@@ -774,6 +822,10 @@ const JOINED_FLAGS: [&str; 11] = [
     "--exceptions",
     "--export-dir",
     "--node",
+    "--reload-ms",
+    "--export-max-bytes",
+    "--export-keep",
+    "--export-queue",
 ];
 
 /// Mirroring the binary's last-wins parse is only half an answer: a flag
@@ -1610,6 +1662,28 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Every flag `parse_flags` reads last-wins is on the list, so a doubled
+    /// one is ambiguity wherever it appears.
+    ///
+    /// `--export-keep` is the case that shows why "tuning" was the wrong reason
+    /// to leave four flags off: it decides how many rotations of the only
+    /// record a kill leaves survive, and an overlay that appends instead of
+    /// replacing picks the winner with nobody choosing it.
+    #[test]
+    fn a_retention_flag_named_twice_is_a_finding() {
+        let one = "            - --export-dir\n";
+        let two = "            - --export-keep\n            - \"5\"\n            - --export-keep\n            - \"1\"\n            - --export-dir\n";
+        let dir = agent_tree_with("dup-export-keep", |raw| raw.replace(one, two));
+        assert_eq!(
+            codes_in(&dir),
+            [DUPLICATE_JOINED_FLAG]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// FD026, against the shipped DaemonSet with one mount removed. tracefs is
     /// a filesystem of its own: nothing propagates it into a container, so an
     /// agent without this mount reads no tracepoint id, fails every attach and
@@ -1645,6 +1719,34 @@ mod tests {
                 .collect::<BTreeSet<_>>()
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same blindness written by kubelet instead of by the author.
+    ///
+    /// `type: Directory` is what the rule's own doc comment and
+    /// `deploy/agent/README` say makes this mount an assertion: a node whose
+    /// tracefs is elsewhere or absent leaves the pod unschedulable and visible.
+    /// Under `DirectoryOrCreate` kubelet makes an empty directory and mounts
+    /// that, and the pod starts with no `events` under the mount — the state
+    /// `an_emptydir_where_tracefs_belongs_is_still_a_finding` exists to catch,
+    /// reached without an `emptyDir` anywhere in the manifest. Leaving the type
+    /// out entirely is the same answer for the same reason.
+    #[test]
+    fn a_tracefs_hostpath_kubelet_would_create_is_still_a_finding() {
+        for kind in ["            type: DirectoryOrCreate\n", ""] {
+            let dir = agent_tree_with("created-tracefs", |raw| {
+                raw.replace("            type: Directory\n", kind)
+            });
+            assert_eq!(
+                codes_in(&dir),
+                [BPF_ELF_WITHOUT_TRACEFS]
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<BTreeSet<_>>(),
+                "hostPath type {kind:?} left FD026 silent"
+            );
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
 
     /// The committed negative tree the Jenkins 'Validate policies' stage runs,
