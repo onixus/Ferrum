@@ -249,6 +249,16 @@ pub const RESPOND_SIGNAL_FAILING: &str =
 /// `RESPOND_TARGET_UNPROVEN_MIN` is: on a node that cannot signal at all,
 /// *every* reaction lands here, so the floor is reached by the same traffic
 /// that would have proved the node healthy.
+///
+/// What the floor is not is a window. The predicate counts failures over the
+/// whole process life, so a node that loses the `/proc`-read-then-`kill` race
+/// four times, or accumulates four over weeks, does raise the reason. That is
+/// the intent and not a slip in it: the conjunct doing the work is
+/// `respond_kill == 0`, and a node that can signal proves it on its first
+/// delivery and clears the reason for good. Four unredeemed failures and no
+/// delivery ever is the claim, not four in a row — and the reason goes false
+/// the moment one lands, so it is not the permanently-true kind this comment
+/// argues against.
 pub const RESPOND_SIGNAL_FAILING_MIN: u64 = 4;
 /// The reasons `is_degraded` can give, in the words the operator reads in
 /// `status.json` and in the transition line. Constants rather than literals:
@@ -2410,7 +2420,7 @@ pub fn poll_status(
 #[derive(Default)]
 struct PollStamps {
     bundle: Option<source::SourceStamp>,
-    exceptions: Option<source::FileStamp>,
+    exceptions: source::ExceptionsStamp,
     publisher: StatusPublisher,
 }
 
@@ -2430,19 +2440,21 @@ fn poll_once(
             }
         }
     }
-    match source::exceptions_stamp(path) {
-        None => {
-            if stamps.exceptions.take().is_some() {
-                agent.set_exceptions(Vec::new());
-            }
-        }
-        Some(next) => {
-            if Some(next) != stamps.exceptions {
-                stamps.exceptions = Some(next);
-                if let Err(err) = agent.reload_exceptions_path(path) {
-                    eprintln!("ferrum-agent: exceptions reload failed, waivers dropped: {err}");
-                }
-            }
+    // Every change of answer goes through `reload_exceptions_path`, including
+    // the change to "no file". That function is the one place that separates
+    // ENOENT from a stat or read that refused, and deciding it here instead is
+    // what let an unreadable-but-present `exceptions.fsig` clear the whole live
+    // waiver table as quietly as a Secret that carries none — the exact state
+    // `DEG_WAIVERS_DROPPED` exists to name, reached by the branch that never
+    // reads the file. The empty arm also has to run: a node whose corrupt file
+    // is later removed must stop reporting a drop, and a reason that is true
+    // for the rest of the process lifetime is the failure mode
+    // `RESPOND_SIGNAL_FAILING_MIN` is written against.
+    let next = source::exceptions_stamp(path);
+    if next != stamps.exceptions {
+        stamps.exceptions = next;
+        if let Err(err) = agent.reload_exceptions_path(path) {
+            eprintln!("ferrum-agent: exceptions reload failed, waivers dropped: {err}");
         }
     }
     agent.clock().persist();
@@ -4819,6 +4831,68 @@ mod tests {
         );
     }
 
+    /// What `RESPOND_SIGNAL_FAILING_MIN` actually counts, pinned so the
+    /// comment above it cannot drift back into claiming a window.
+    ///
+    /// The failures need not be consecutive and need not be close together:
+    /// four over the process life, with ordinary traffic between them, is the
+    /// reason. That is right because the conjunct carrying the claim is
+    /// `respond_kill == 0` — a node that can signal proves it on the first
+    /// delivery — but it means the floor is not a guard against a node that
+    /// loses the `/proc`-read-then-`kill` race a few times before its first
+    /// success, and the doc comment must say the thing this test asserts.
+    #[test]
+    fn the_signal_floor_counts_a_process_lifetime_and_not_a_run() {
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        let flaky = std::sync::Arc::new(FlakyResponder::default());
+        flaky
+            .fail_first
+            .store(RESPOND_SIGNAL_FAILING_MIN, Ordering::Relaxed);
+        agent.set_responder(Box::new(std::sync::Arc::clone(&flaky)));
+
+        for _ in 0..RESPOND_SIGNAL_FAILING_MIN {
+            agent.handle_event(
+                container_meta(4242),
+                &ev("execve", "sh", "/bin/sh", true, false),
+                &MemorySink::new(),
+            );
+            // Traffic that decides nothing, between every failure: the run is
+            // broken and the count is not.
+            agent.handle_event(
+                container_meta(4242),
+                &ev("openat", "app", "/etc/hostname", true, false),
+                &MemorySink::new(),
+            );
+        }
+        assert_eq!(agent.respond_failed_total(), RESPOND_SIGNAL_FAILING_MIN);
+        assert_eq!(agent.respond_kill_total(), 0);
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == RESPOND_SIGNAL_FAILING),
+            "four failures with no delivery ever is the claim, whatever sat between them: \
+             {reasons:?}"
+        );
+
+        // And the first delivery ends it, which is why counting a lifetime is
+        // not the same as latching one.
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &MemorySink::new(),
+        );
+        assert_eq!(agent.respond_kill_total(), 1);
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+    }
+
     /// Respond-scoped, for the same reason the two target reasons are: under
     /// observe `react` returns REFUSE_ROLE before any responder is reached, so
     /// `respond_failed` cannot move and the reason would be a claim about a
@@ -4900,6 +4974,140 @@ mod tests {
             "{:?}",
             agent.degraded_reasons_at(Instant::now())
         );
+    }
+
+    /// The poll loop's own answer to "is there an exceptions file", which is
+    /// the branch neither waiver test above reaches: one drives
+    /// `try_reload_exceptions`, the other `reload_exceptions_path`, and
+    /// `poll_once` asks `exceptions_stamp` instead of either.
+    ///
+    /// A stat that refuses is not a file that is absent. `std::fs::metadata`
+    /// fails with EACCES after a remount, EIO, ELOOP, or succeeds on a
+    /// directory where the file was — and every one of those used to reach the
+    /// same arm as ENOENT, which empties the live waiver table on the ground
+    /// that the Secret carries none. A node holding approved waivers then
+    /// enforced as if none had been signed, `waivers_dropped` stayed false,
+    /// `waivers_unjoined` cannot fire on an empty list, and the deny storm had
+    /// no cause anywhere an operator looks. That is `DEG_WAIVERS_DROPPED`'s
+    /// own defect, reached through the second of the two paths into it.
+    ///
+    /// A directory is used as the unreadable file because this suite runs as
+    /// root, where a mode-000 file is still readable: it is also the shape a
+    /// half-rotated kubelet mount actually leaves behind.
+    #[test]
+    fn an_exceptions_file_that_cannot_be_stat_ed_is_not_an_exceptions_file_that_is_gone() {
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("exceptions.fsig");
+        let signed = exceptions_fsig(&[waiver("ns", "p1", &["no-runtime-sock"])]);
+        fs::write(&file, signed).expect("write exceptions");
+
+        let mut agent = healthy_respond_agent();
+        let out = StatusOutput {
+            ctx: None,
+            sink: None,
+            status_dir: None,
+        };
+        let mut stamps = PollStamps::default();
+
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert_eq!(agent.exceptions().len(), 1, "the tick installed the table");
+        assert!(!agent.waivers_dropped());
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+
+        // The file becomes something the stat cannot read as a file. Nothing
+        // was removed: the waivers are still approved and still signed.
+        fs::remove_file(&file).expect("remove");
+        fs::create_dir(&file).expect("directory where the file was");
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert!(
+            agent.exceptions().is_empty(),
+            "an unreadable table is still dropped: fail-closed is not the defect"
+        );
+        assert!(
+            agent.waivers_dropped(),
+            "the table went and the node says nothing about it"
+        );
+        assert_eq!(agent.exceptions_reload_failed_total(), 1);
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == DEG_WAIVERS_DROPPED),
+            "a node that lost every approved waiver to an unreadable file reports: {reasons:?}"
+        );
+
+        // And the file genuinely going away clears it: the reason is about a
+        // table that was dropped, not about a table that is empty.
+        fs::remove_dir(&file).expect("remove directory");
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert!(!agent.waivers_dropped());
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half of the same three lines: the arm that empties the table
+    /// never cleared the latch, so a node whose corrupt Secret was then fixed
+    /// by deleting the file reported `DEG_WAIVERS_DROPPED` for the rest of the
+    /// process lifetime over a table nothing had dropped. A reason that cannot
+    /// go false is the failure `RESPOND_SIGNAL_FAILING_MIN` argues against
+    /// three hundred lines above it.
+    #[test]
+    fn removing_a_corrupt_exceptions_file_stops_the_node_reporting_a_drop() {
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("temp dir");
+        let file = dir.join("exceptions.fsig");
+        let signed = exceptions_fsig(&[waiver("ns", "p1", &["no-runtime-sock"])]);
+        let mut tampered = signed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        fs::write(&file, &tampered).expect("write exceptions");
+
+        let mut agent = healthy_respond_agent();
+        let out = StatusOutput {
+            ctx: None,
+            sink: None,
+            status_dir: None,
+        };
+        let mut stamps = PollStamps::default();
+
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert!(agent.waivers_dropped(), "a tampered envelope is a drop");
+        assert_eq!(agent.exceptions_reload_failed_total(), 1);
+
+        fs::remove_file(&file).expect("remove");
+        poll_once(&mut agent, &dir, &mut stamps, &out);
+        assert!(
+            !agent.waivers_dropped(),
+            "the Secret now carries no waivers, and this node lost none"
+        );
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            !reasons.iter().any(|r| r == DEG_WAIVERS_DROPPED),
+            "{reasons:?}"
+        );
+        // Still counted: the drop happened, and the count is what says so
+        // after the reason has correctly gone.
+        assert_eq!(agent.exceptions_reload_failed_total(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent with every other reason answered, so a waiver test asserts on
+    /// waivers rather than on whatever else a fresh agent is missing.
+    fn healthy_respond_agent() -> Agent {
+        let mut agent = Agent::new(cfg_respond_named("p1"));
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
+        agent
     }
 
     /// A Secret that carries no `exceptions.fsig` at all is a node that
@@ -4984,21 +5192,48 @@ mod tests {
 
     /// The claim the test above cannot make on its own: that the shipped
     /// carrier has no second, private way back to the constant. `main.rs` is a
-    /// binary and this branch of it is behind a `cfg` and a thread, so the
-    /// only mechanical statement available is that the fallback is not written
-    /// there any more — which is exactly what was written there.
+    /// binary and this branch of it is behind a `cfg` and a thread, so what is
+    /// available is a source scan — but a source scan has to read the shape of
+    /// the code and not the presence of a name.
+    ///
+    /// Reading two substrings did not. "`main.rs` mentions `cgroup_scan_root`
+    /// and does not mention `DEFAULT_CGROUP_ROOT`" is satisfied by
+    /// `let _ = cgroup_scan_root(..); let root = PathBuf::from("/sys/fs/cgroup");`
+    /// — the fallback restored in the one form a constant-shaped grep cannot
+    /// see, with the boundary row it backs still claiming a property of the
+    /// running carrier. So the scan reads the binding instead: the derivation
+    /// is called exactly once, its refusal returns, the value it produced is
+    /// the one the scan is driven from, and no cgroup path is spelled out
+    /// anywhere in the file.
     #[test]
     fn the_carrier_has_no_fallback_to_the_hardcoded_cgroup_root() {
         const MAIN: &str = include_str!("main.rs");
+        assert_eq!(
+            MAIN.matches("cgroup_scan_root").count(),
+            1,
+            "the carrier derives its scan root somewhere other than the one place this gate \
+             reads, so what the other place does is unexamined"
+        );
         assert!(
-            MAIN.contains("cgroup_scan_root"),
-            "the carrier no longer derives its scan root through the library, so this gate reads \
-             nothing"
+            MAIN.contains("let Some(root) = ferrum_agent::cgroup_scan_root("),
+            "the carrier no longer binds the derivation's answer in a form whose failure arm \
+             returns: a call whose result is discarded satisfies a scan for the name and still \
+             leaves the fallback below it"
+        );
+        assert!(
+            MAIN.contains("resolver.refresh(&fs, &root, &source)"),
+            "the index is no longer scanned against the root that binding produced, so the \
+             derivation can succeed and be ignored"
         );
         assert!(
             !MAIN.contains("DEFAULT_CGROUP_ROOT"),
             "`main.rs` names DEFAULT_CGROUP_ROOT again: a hierarchy nobody chose is not a \
              substitute for a derivation that refused"
+        );
+        assert!(
+            !MAIN.contains("/sys/fs/cgroup"),
+            "`main.rs` spells a cgroup hierarchy out as a literal, which is the same fallback \
+             written so that a scan for the constant's name cannot see it"
         );
     }
 
@@ -6572,14 +6807,28 @@ mod tests {
     /// reports it" — substituting the first for the second is precisely what
     /// the boundary document exists to refuse.
     ///
-    /// What it is, mechanically: read this file's own source, take every
-    /// `AtomicU64` / `AtomicBool` / `Mutex<Option<_>>` field of `Agent`, and
-    /// compute which of them the body of `degraded_reasons_at` reads — through
-    /// its own `self.field` accesses and, transitively, through the `self.m()`
-    /// predicates it calls, because reasons are routinely raised by a
-    /// `*_recent_at` helper rather than by touching the field in the arm. A
+    /// What it is, mechanically: read this file's own source, take every field
+    /// of `Agent` whose type holds state that outlives the call that wrote it,
+    /// and compute which of them the body of `degraded_reasons_at` *reads* —
+    /// through its own `self.field` accesses and, transitively, through the
+    /// `self.m()` predicates it calls, because reasons are routinely raised by
+    /// a `*_recent_at` helper rather than by touching the field in the arm. A
     /// field not in that set must appear in `COUNTERS_WITHOUT_A_REASON` with
     /// its defence on the line.
+    ///
+    /// Both halves of that sentence were bypasses in the shape the census
+    /// shipped in, and both are closed here. "Every field" was a list of three
+    /// type names, so a counter declared `AtomicUsize` or held in
+    /// `RwLock<Option<_>>` was not a field at all as far as the gate was
+    /// concerned — the whole census defeated by a type annotation, in the
+    /// direction it exists to close. It now recognises the shape of state
+    /// rather than a list of types, `NOT_ACCUMULATED_STATE` names what is
+    /// exempt, and a declaration in neither stops the gate. "Reads" counted
+    /// every `self.field` occurrence, write or read, code or prose: `now_from`
+    /// is on the walk only because `waivers_unjoined` calls `self.now()`, and
+    /// it *writes* `datapath_degraded` and reads nothing, so that field was
+    /// covered twice and deleting its genuine arm would have left the census
+    /// calling it covered.
     ///
     /// What it cannot do, and the table is where that shows: it reads calls,
     /// not meanings. It cannot tell that an arm reading a field raises the
@@ -6601,12 +6850,34 @@ mod tests {
         /// agent decided a kill, could not send it, and that is fine" and "the
         /// node lost every approved waiver, and that is fine" — sentences
         /// nobody would sign.
-        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 17] = [
+        ///
+        /// It is still extensible: the bars are the array length, eight words,
+        /// and — now — a citation. That last one is the whole of what a
+        /// mechanism can add here, and it is worth saying why nothing stronger
+        /// is attempted. Unlike the `DEG_*` family, this table cannot be tied
+        /// to `docs/MVP-1-BOUNDARY.md`: the document states what an operator
+        /// can observe about a node, and a counter with no reason is by
+        /// definition not observable there, so a row would have to assert its
+        /// own irrelevance in the one file that exists to list what matters.
+        /// The bar this gate can raise instead is that a defence point at
+        /// something checkable: every row must name, in backticks, a reason, a
+        /// field or a method this file declares, so "where the state does
+        /// reach a reason" is a claim the gate re-checks on every build rather
+        /// than a sentence read once by its author. A row that names a reason
+        /// which is later deleted fails here; a row that names nothing fails
+        /// immediately. What remains uncloseable is an author who writes a
+        /// true-looking sentence citing a real symbol, and that is a review
+        /// problem, not a gate problem — which is why the rows are written to
+        /// be read, and why each says where the state goes instead of that it
+        /// is fine.
+        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 19] = [
             (
                 "respond_refused",
                 "the aggregate of every guard that said no. A refusal is the guards working, and \
                  each one already names itself on its own exported envelope; the reasons that do \
-                 degrade are about refusals of a particular shape, not about their number.",
+                 degrade — `TARGET_CHECK_UNPROVABLE`, `TARGET_NEVER_PROVEN`, \
+                 `RESPOND_SIGNAL_FAILING` — are about refusals of a particular shape, not about \
+                 their number.",
             ),
             (
                 "respond_role_skipped",
@@ -6688,7 +6959,8 @@ mod tests {
                  container. Every pod start opens this window one refresh wide, so a node that \
                  degraded on it would degrade on ordinary healthy behaviour; what outlives the \
                  window is the disagreement above. The counter exists so the skipped record does \
-                 not leave silently.",
+                 not leave silently; the window it is counted from is `container_unproven_window`, \
+                 which `evict_unproven` bounds.",
             ),
             (
                 "export_lost_seen",
@@ -6699,21 +6971,56 @@ mod tests {
             ),
             (
                 "degraded_reported",
-                "not a fault: the reasons as last handed to a caller that logs transitions. It is \
-                 the memory of this list, so it cannot be an entry in it.",
+                "not a fault: the reasons `degraded_state_at` last handed to a caller that logs \
+                 transitions. It is the memory of this list, so it cannot be an entry in it.",
+            ),
+            (
+                "container_flag_window",
+                "when each cgroup's publish window opened, which \
+                 `note_container_flag_disagreement` reads to decide whether one disagreement is a \
+                 fault. An open window is a pod that has just started; what outlives it is \
+                 `container_flag_fault_at`, and that stamp is what `DEG_CONTAINER_FLAG` reads. \
+                 Bounded by `CONTAINER_FLAG_TRACKED_MAX`, so it is a clock and not a number that \
+                 climbs.",
+            ),
+            (
+                "container_unproven_window",
+                "the same shape for a cgroup the index does not resolve: `container_unproven` \
+                 opens one window per caller and `evict_unproven` bounds the map at \
+                 `CONTAINER_FLAG_TRACKED_MAX`. An entry is a question asked and later answered by \
+                 the next accepted sync, and the answer that matters is counted in \
+                 `container_unproven` above.",
             ),
         ];
 
         #[test]
         fn every_agent_counter_is_either_a_reason_or_defended() {
-            let fields = state_fields();
+            let scan = state_fields(SOURCE);
             assert!(
-                fields.len() >= 32,
+                scan.unrecognised.is_empty(),
+                "the field scan cannot place these declarations on `Agent`: {:?}\n\
+                 A type it does not recognise is a counter it would not have enumerated, which \
+                 is how a census over `AtomicU64` misses an `AtomicUsize`. Either the type holds \
+                 state that outlives a call — give it an arm or a row — or add its exact type to \
+                 NOT_ACCUMULATED_STATE with the sentence that says why it holds none.",
+                scan.unrecognised
+            );
+            for (ty, _) in NOT_ACCUMULATED_STATE {
+                assert!(
+                    scan.types.contains(ty),
+                    "NOT_ACCUMULATED_STATE exempts `{ty}`, which no field of `Agent` is declared \
+                     as any more. Remove the row: an exemption for a type nobody uses is how the \
+                     list stops describing the agent."
+                );
+            }
+            let fields = scan.state;
+            assert!(
+                fields.len() >= 41,
                 "the field scan found {} pieces of state on `Agent`; the scan is broken rather \
                  than the agent, and a broken scan is a gate that passes having read nothing",
                 fields.len()
             );
-            let methods = agent_methods();
+            let methods = agent_methods(SOURCE);
             assert!(
                 methods.len() >= 60,
                 "the method scan found {} methods on `Agent`; same objection",
@@ -6726,6 +7033,7 @@ mod tests {
                  more than twelve when this floor was written, so the walk is broken: {read:?}",
                 read.len()
             );
+            let declared = declared_names(SOURCE);
 
             let defended: BTreeMap<&str, &str> =
                 COUNTERS_WITHOUT_A_REASON.iter().copied().collect();
@@ -6752,6 +7060,18 @@ mod tests {
                     "`{field}` is now read by `degraded_reasons_at` and is still listed in \
                      COUNTERS_WITHOUT_A_REASON as needing no reason. One of the two is wrong."
                 );
+                let cites: Vec<String> = citations(defence)
+                    .into_iter()
+                    .filter(|word| word != field && declared.contains(word))
+                    .collect();
+                assert!(
+                    !cites.is_empty(),
+                    "`{field}` is excused by a sentence that points nowhere: {defence:?}\n\
+                     A row here must name, in backticks, something this file declares — the \
+                     reason the state does reach, the field or the method that decides it — so \
+                     the defence can be checked against the code rather than read as an \
+                     assertion about it."
+                );
             }
 
             let undefended: Vec<&String> = fields
@@ -6765,6 +7085,131 @@ mod tests {
                  Each of these is a number that can climb on a node reporting healthy. Either \
                  give it an arm in `degraded_reasons_at`, or add it to COUNTERS_WITHOUT_A_REASON \
                  with the sentence that says why it needs none."
+            );
+        }
+
+        /// An `Agent` the gate has never seen, for the bypasses a gate over
+        /// the real file cannot demonstrate: it can only show the state that
+        /// file is in, never that a way past the scan is closed.
+        ///
+        /// `small` is the F2 bypass verbatim — a counter of a type the shipped
+        /// scan did not list. `wrapped` is a declaration rustfmt broke over two
+        /// lines, which used to fail `split_once(": ")` and be dropped in
+        /// silence. `plain` is a type the scan cannot place at all. Both fields
+        /// the helper touches, it only writes, and both are named in prose the
+        /// arm carries — a trailing comment and a string.
+        const FIXTURE_FIELDS: &str = r#"
+    /// A counter of a type the census as shipped never enumerated.
+    small: AtomicUsize,
+    behind_lock: RwLock<Option<String>>,
+    wrapped:
+        Mutex<Option<Instant>>,
+    role: AgentRole,
+    plain: Newtype,
+}
+"#;
+
+        const FIXTURE_METHODS: &str = r#"
+    fn degraded_reasons_at(&self, now: Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.small.load(Ordering::Relaxed) > 0 {
+            out.push(DEG_SMALL.to_string()); // see self.behind_lock
+        }
+        self.helper(now);
+        out.push(format!("{}", "self.wrapped"));
+        out
+    }
+
+    fn helper(&self, now: Instant) {
+        self.behind_lock.store(true, Ordering::Relaxed);
+        *self.wrapped.lock().unwrap() = Some(now);
+    }
+}
+"#;
+
+        /// The fixture, assembled rather than written out: a literal
+        /// `pub struct Agent {` at a line start in this file is a second
+        /// `Agent` for the gate's own scan of SOURCE, and a literal
+        /// `impl Agent {` would put this fixture's `degraded_reasons_at` over
+        /// the real one in the method map.
+        fn fixture() -> String {
+            format!(
+                "{}{}{}{}",
+                concat!("\npub ", "struct Agent {"),
+                FIXTURE_FIELDS,
+                concat!("\nimpl ", "Agent {"),
+                FIXTURE_METHODS,
+            )
+        }
+
+        /// A counter is state whatever integer it is spelled with. The scan
+        /// that shipped enumerated `AtomicU64`, `AtomicBool` and
+        /// `Mutex<Option<`, so `AtomicUsize`, `AtomicI64`, `AtomicU32`,
+        /// `RwLock<Option<_>>` and `OnceLock<_>` were not fields of `Agent` as
+        /// far as the census was concerned: no arm wanted, no row wanted, gate
+        /// green, and the whole census defeated by a type annotation.
+        #[test]
+        fn a_counter_of_an_unlisted_type_is_enumerated_by_the_census() {
+            let scan = state_fields(&fixture());
+            assert!(
+                scan.state.contains("small"),
+                "an `AtomicUsize` counter is invisible to the field scan: {:?}",
+                scan.state
+            );
+            assert!(
+                scan.state.contains("behind_lock"),
+                "an `RwLock<Option<_>>` is invisible to the field scan: {:?}",
+                scan.state
+            );
+            assert!(
+                scan.state.contains("wrapped"),
+                "a declaration rustfmt wrapped over two lines is skipped rather than read: {:?}",
+                scan.state
+            );
+            assert!(
+                !scan.state.contains("role"),
+                "configuration is being counted as state the agent accumulates"
+            );
+        }
+
+        /// And a type in neither the shapes nor `NOT_ACCUMULATED_STATE` stops
+        /// the gate instead of slipping through it. This is the half that
+        /// makes the list above safe to keep: it decides only what is out, and
+        /// what it does not name has to be decided rather than assumed.
+        #[test]
+        fn a_declaration_the_scan_cannot_place_fails_closed() {
+            let scan = state_fields(&fixture());
+            assert_eq!(
+                scan.unrecognised,
+                vec!["plain: Newtype".to_string()],
+                "a type the scan cannot place must be reported, not dropped"
+            );
+        }
+
+        /// A write is not a read. `now_from` writes `datapath_degraded` and
+        /// reads nothing, and it is on the walk only because `waivers_unjoined`
+        /// calls `self.now()`: any counter a later slice increments inside a
+        /// walked helper was reported as reaching a reason on the strength of
+        /// a `fetch_add`. Prose is not a read either — this file names its own
+        /// fields in nearly every doc comment and error message.
+        #[test]
+        fn state_a_walked_helper_only_writes_or_only_names_is_not_covered() {
+            let scan = state_fields(&fixture());
+            let methods = agent_methods(&fixture());
+            let read = read_by_degraded_reasons(&scan.state, &methods);
+            assert!(
+                read.contains("small"),
+                "the walk lost the field the arm actually loads: {read:?}"
+            );
+            assert!(
+                !read.contains("behind_lock"),
+                "a `store` inside a walked helper is being counted as the reason reading it, and \
+                 a trailing comment naming the field is being counted as code"
+            );
+            assert!(
+                !read.contains("wrapped"),
+                "an assignment through a lock inside a walked helper is being counted as a read, \
+                 and `self.wrapped` inside a string literal as another"
             );
         }
 
@@ -6788,35 +7233,194 @@ mod tests {
             out
         }
 
-        /// The `AtomicU64` / `AtomicBool` / `Mutex<Option<_>>` fields of
-        /// `Agent`: the state that survives a call and can therefore be a
-        /// number climbing on a node nobody looks at. Plain values, the
-        /// loader, the responder and the index are not in scope — they are not
-        /// observations the agent accumulates about itself.
-        fn state_fields() -> BTreeSet<String> {
+        /// Every declared field of `Agent`, sorted into state the agent
+        /// accumulates about itself and state it does not, with anything the
+        /// scan cannot place reported rather than dropped.
+        #[derive(Default)]
+        struct Fields {
+            /// Names that must reach a reason or be defended.
+            state: BTreeSet<String>,
+            /// `name: Type` for every declaration in neither category. Not a
+            /// silent skip and not a guess: see `classify`.
+            unrecognised: Vec<String>,
+            /// Every type seen, so a row of `NOT_ACCUMULATED_STATE` that no
+            /// longer describes a field can be found and removed.
+            types: BTreeSet<String>,
+        }
+
+        /// Types on `Agent` that carry no observation the agent accumulates
+        /// about itself, each with the reason it is out of scope.
+        ///
+        /// This list decides only what is OUT. The scan that shipped named the
+        /// types that were IN — `AtomicU64`, `AtomicBool`, `Mutex<Option<` —
+        /// and so a counter declared `AtomicUsize`, `AtomicI64`, `AtomicU32`,
+        /// `RwLock<Option<_>>` or `OnceLock<_>` was never enumerated at all:
+        /// no arm wanted, no row wanted, gate green. A list of recognised
+        /// types was the whole defence and a type annotation was the bypass,
+        /// in exactly the direction the census exists to close. Widening that
+        /// list would have been the same shape of defence a second time, so
+        /// the direction is inverted instead: `classify` recognises the
+        /// *shape* of state that outlives a call — an atomic, or a value
+        /// behind an interior-mutability cell — this list names the concrete
+        /// types that are exempt, and a declaration in neither fails the gate.
+        /// The scan can still be wrong; it can no longer be wrong quietly.
+        const NOT_ACCUMULATED_STATE: [(&str, &str); 11] = [
+            (
+                "AgentRole",
+                "the shipped configuration, not an observation: which of the two service accounts \
+                 this node runs as. `degraded_reasons_at` reads it all over as the scope of other \
+                 reasons, never as one.",
+            ),
+            (
+                "Loader",
+                "the bundle machinery, which keeps its own counters and its own degraded state \
+                 behind `policy_degraded` and `events_dropped_total`. A census of this struct \
+                 cannot see inside it and must not pretend to.",
+            ),
+            (
+                "SharedCgroupIndex",
+                "the cgroup→pod index, shared with the refresher thread. Its emptiness is a \
+                 reason already — `degraded_reasons_at` reads it through `cgroup_index` — and \
+                 what it holds is metadata about pods, not a number about this agent.",
+            ),
+            (
+                "bool",
+                "a plain flag set once by the caller that constructed the agent: `cp_down` is \
+                 told to the agent, not observed by it, and it reaches `DEG_CONTROL_PLANE_DOWN` \
+                 directly.",
+            ),
+            (
+                "Option<PathBuf>",
+                "where the bundle and the last-known-good snapshot live. Configuration: \
+                 `bundle_path` records nothing that happened.",
+            ),
+            (
+                "Vec<u8>",
+                "the pinned trust root. A key, not a count; a wrong one is refused at \
+                 `load_exceptions_source` and at every bundle load rather than accumulated.",
+            ),
+            (
+                "Vec<PolicyExceptionSpec>",
+                "the live waiver table itself. Its emptiness after a failed reload is precisely \
+                 what `exceptions_dropped` and `DEG_WAIVERS_DROPPED` report, so the table is the \
+                 subject of a reason rather than a counter needing one.",
+            ),
+            (
+                "String",
+                "`policy_name`, the name this node joins waivers against. Configuration, and its \
+                 failure to join anything is `WAIVERS_UNJOINED`.",
+            ),
+            (
+                "Option<Box<dyn Responder>>",
+                "the installed signal path. Whether one exists is configuration; that it never \
+                 delivers is `respond_failed` and `RESPOND_SIGNAL_FAILING`.",
+            ),
+            (
+                "Box<dyn TargetCheck>",
+                "the pre-signal guard. That it cannot be evaluated is `TARGET_CHECK_UNPROVABLE`, \
+                 raised from the guard's own construction rather than from a count.",
+            ),
+            (
+                "MonotonicFloor",
+                "the clock, which owns its own state and its own rollback counter; the agent \
+                 reads that counter in `now_from` and marks `datapath_degraded` from it, so the \
+                 rollback does reach a reason and it is not read here.",
+            ),
+        ];
+
+        enum Kind {
+            State,
+            NotState,
+            Unrecognised,
+        }
+
+        /// State that outlives the call that wrote it, by shape rather than by
+        /// name: any atomic, or any value behind an interior-mutability cell.
+        /// Everything else must be named in `NOT_ACCUMULATED_STATE`.
+        fn classify(ty: &str) -> Kind {
+            let cells = [
+                "Mutex<",
+                "RwLock<",
+                "OnceLock<",
+                "OnceCell<",
+                "RefCell<",
+                "Cell<",
+            ];
+            if ty.starts_with("Atomic") || cells.iter().any(|cell| ty.contains(cell)) {
+                Kind::State
+            } else if NOT_ACCUMULATED_STATE.iter().any(|(known, _)| *known == ty) {
+                Kind::NotState
+            } else {
+                Kind::Unrecognised
+            }
+        }
+
+        /// Split a joined field list at the commas that end a declaration,
+        /// ignoring those inside a generic argument list.
+        fn split_declarations(decls: &str) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut depth = 0i32;
+            let mut current = String::new();
+            for ch in decls.chars() {
+                match ch {
+                    '<' | '(' | '[' | '{' => depth += 1,
+                    '>' | ')' | ']' | '}' => depth -= 1,
+                    ',' if depth == 0 => {
+                        out.push(std::mem::take(&mut current));
+                        continue;
+                    }
+                    _ => {}
+                }
+                current.push(ch);
+            }
+            out.push(current);
+            out
+        }
+
+        /// The field list of `pub struct Agent`, comments and attributes out,
+        /// joined before it is split: a declaration rustfmt wrapped over two
+        /// lines used to fail `split_once(": ")` and be skipped without a
+        /// word, which is the same hole as an unrecognised type with a longer
+        /// fuse.
+        fn agent_declarations(src: &str) -> Vec<String> {
             // Anchored at a line start: this gate's own source is part of
             // SOURCE, so an unanchored needle matches the needle.
-            let block = top_level_items("\npub struct Agent {", SOURCE);
+            let block = top_level_items("\npub struct Agent {", src);
             assert_eq!(block.len(), 1, "`pub struct Agent` is not declared once");
-            let mut out = BTreeSet::new();
-            for line in block[0].lines() {
-                let Some(rest) = line.strip_prefix("    ") else {
-                    continue;
-                };
-                if rest.starts_with(' ') || rest.starts_with("//") || rest.starts_with('#') {
+            let (_, body) = block[0]
+                .split_once('{')
+                .expect("`pub struct Agent` has no field list");
+            let mut decls = String::new();
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
                     continue;
                 }
-                let Some((name, ty)) = rest.split_once(": ") else {
+                decls.push_str(line);
+                decls.push(' ');
+            }
+            split_declarations(&decls)
+                .into_iter()
+                .map(|decl| decl.trim().to_string())
+                .filter(|decl| !decl.is_empty())
+                .collect()
+        }
+
+        fn state_fields(src: &str) -> Fields {
+            let mut out = Fields::default();
+            for decl in agent_declarations(src) {
+                let Some((name, ty)) = decl.split_once(": ") else {
+                    out.unrecognised.push(decl);
                     continue;
                 };
-                let Some(ty) = ty.strip_suffix(',') else {
-                    continue;
-                };
-                if ty.starts_with("AtomicU64")
-                    || ty.starts_with("AtomicBool")
-                    || ty.starts_with("Mutex<Option<")
-                {
-                    out.insert(name.to_string());
+                let (name, ty) = (name.trim(), ty.trim());
+                out.types.insert(ty.to_string());
+                match classify(ty) {
+                    Kind::State => {
+                        out.state.insert(name.to_string());
+                    }
+                    Kind::NotState => {}
+                    Kind::Unrecognised => out.unrecognised.push(format!("{name}: {ty}")),
                 }
             }
             out
@@ -6825,9 +7429,9 @@ mod tests {
         /// Every inherent method of `Agent`, by name, with its body. Both
         /// `impl Agent` blocks: one of them is behind a `cfg` and a walk that
         /// reads only the first would silently lose whatever moves there.
-        fn agent_methods() -> BTreeMap<String, String> {
+        fn agent_methods(src: &str) -> BTreeMap<String, String> {
             let mut out = BTreeMap::new();
-            for block in top_level_items("\nimpl Agent {", SOURCE) {
+            for block in top_level_items("\nimpl Agent {", src) {
                 let mut current: Option<String> = None;
                 let mut body = String::new();
                 for line in block.lines() {
@@ -6880,29 +7484,184 @@ mod tests {
             (!name.is_empty()).then_some(name)
         }
 
-        /// `self.<ident>` in a body, with whether it is a call. Comment lines
-        /// are dropped first: a doc comment naming a field is prose about it,
-        /// not a read of it, and this whole file is written in prose that names
-        /// its fields.
-        fn self_refs(body: &str) -> Vec<(String, bool)> {
-            let mut out = Vec::new();
-            for line in body.lines() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
+        /// A body with every comment removed and the contents of every string
+        /// and character literal blanked out.
+        ///
+        /// Dropping lines whose trimmed start is `//` was not enough: a
+        /// trailing `// see self.respond_failed` sits on a code line, and
+        /// `self.foo` inside a `format!` message is prose too. This whole file
+        /// argues in sentences that name its own fields, so a scanner that
+        /// reads prose as code reads coverage that is not there.
+        fn strip_noncode(body: &str) -> String {
+            let src: Vec<char> = body.chars().collect();
+            let mut out = String::with_capacity(body.len());
+            let mut i = 0usize;
+            while i < src.len() {
+                let c = src[i];
+                let next = src.get(i + 1).copied();
+                if c == '/' && next == Some('/') {
+                    while i < src.len() && src[i] != '\n' {
+                        i += 1;
+                    }
                     continue;
                 }
-                let mut rest = code;
-                while let Some(at) = rest.find("self.") {
-                    let after = &rest[at + "self.".len()..];
+                if c == '/' && next == Some('*') {
+                    i += 2;
+                    while i < src.len() && !(src[i] == '*' && src.get(i + 1) == Some(&'/')) {
+                        if src[i] == '\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                    i = (i + 2).min(src.len());
+                    continue;
+                }
+                if c == 'r' && (next == Some('"') || next == Some('#')) {
+                    let mut hashes = 0usize;
+                    let mut j = i + 1;
+                    while src.get(j) == Some(&'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if src.get(j) == Some(&'"') {
+                        let mut end = j + 1;
+                        loop {
+                            if end >= src.len() {
+                                break;
+                            }
+                            if src[end] == '"'
+                                && (0..hashes).all(|k| src.get(end + 1 + k) == Some(&'#'))
+                            {
+                                end += 1 + hashes;
+                                break;
+                            }
+                            if src[end] == '\n' {
+                                out.push('\n');
+                            }
+                            end += 1;
+                        }
+                        out.push_str("\"\"");
+                        i = end;
+                        continue;
+                    }
+                }
+                if c == '"' {
+                    i += 1;
+                    while i < src.len() && src[i] != '"' {
+                        if src[i] == '\\' {
+                            i += 1;
+                        }
+                        if src.get(i) == Some(&'\n') {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                    out.push_str("\"\"");
+                    i += 1;
+                    continue;
+                }
+                // A `'` opens a character literal only in the two shapes that
+                // close on one; anything else is a lifetime, `<'_>` included.
+                if c == '\'' {
+                    let escaped = src.get(i + 1) == Some(&'\\') && src.get(i + 3) == Some(&'\'');
+                    let plain = src.get(i + 1).is_some() && src.get(i + 2) == Some(&'\'');
+                    if escaped || plain {
+                        out.push_str("''");
+                        i += if escaped { 4 } else { 3 };
+                        continue;
+                    }
+                }
+                out.push(c);
+                i += 1;
+            }
+            out
+        }
+
+        /// One `self.<ident>` occurrence.
+        struct SelfRef {
+            name: String,
+            /// `self.name(` — a method call, which the walk follows. Never a
+            /// read of a field: `container_unproven` is both a counter and the
+            /// predicate that counts it, and calling the second is not
+            /// evidence that anything reads the first.
+            is_call: bool,
+            /// The occurrence reads the field's value.
+            is_read: bool,
+        }
+
+        /// Methods that only write the state they are called on. A census that
+        /// counts these as reads reports a field as reaching a reason on the
+        /// strength of a `fetch_add`: `now_from` writes `datapath_degraded`
+        /// and reads nothing, and is on the walk at all only because
+        /// `waivers_unjoined` calls `self.now()`.
+        const WRITE_ONLY: [&str; 12] = [
+            "store",
+            "fetch_add",
+            "fetch_sub",
+            "fetch_and",
+            "fetch_or",
+            "fetch_xor",
+            "clear",
+            "push",
+            "insert",
+            "remove",
+            "retain",
+            "truncate",
+        ];
+
+        /// Whether the line assigns: an `=` that is not part of a comparison
+        /// or a match arm.
+        fn assigns(line: &str) -> bool {
+            let bytes = line.as_bytes();
+            for (at, ch) in bytes.iter().enumerate() {
+                if *ch != b'=' {
+                    continue;
+                }
+                let before = at.checked_sub(1).map(|i| bytes[i]);
+                let after = bytes.get(at + 1).copied();
+                if matches!(before, Some(b'=' | b'!' | b'<' | b'>')) || after == Some(b'=') {
+                    continue;
+                }
+                return true;
+            }
+            false
+        }
+
+        fn self_refs(body: &str) -> Vec<SelfRef> {
+            let code = strip_noncode(body);
+            let mut out = Vec::new();
+            for line in code.lines() {
+                let line = line.trim();
+                let mut from = 0usize;
+                while let Some(rel) = line[from..].find("self.") {
+                    let at = from + rel;
+                    let after = &line[at + "self.".len()..];
                     let name: String = after
                         .chars()
                         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                         .collect();
-                    let tail = after[name.len()..].trim_start();
-                    if !name.is_empty() {
-                        out.push((name.clone(), tail.starts_with('(')));
+                    from = at + "self.".len() + name.len();
+                    if name.is_empty() {
+                        continue;
                     }
-                    rest = &after[name.len()..];
+                    let tail = &line[from..];
+                    let is_call = tail.trim_start().starts_with('(');
+                    // The head of the statement, with an assignment further
+                    // along: `self.x = v`, `*self.x.lock().unwrap() = v`.
+                    let head = at == 0 || (at == 1 && line.starts_with('*'));
+                    let written = (head && assigns(line))
+                        || tail.strip_prefix('.').is_some_and(|m| {
+                            let called: String = m
+                                .chars()
+                                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                .collect();
+                            WRITE_ONLY.contains(&called.as_str())
+                        });
+                    out.push(SelfRef {
+                        name,
+                        is_call,
+                        is_read: !is_call && !written,
+                    });
                 }
             }
             out
@@ -6916,6 +7675,12 @@ mod tests {
         /// `waivers_unjoined`. A one-level walk would report every one of
         /// those fields undefended and the table would fill up with rows that
         /// are not true.
+        ///
+        /// Reads only. A write inside a walked helper is the reason path
+        /// causing the state, not consulting it, and counting it as coverage
+        /// is how `datapath_degraded` came to be covered twice — once by its
+        /// own arm and once by `now_from` storing into it, so that deleting
+        /// the arm would have left the census still calling it covered.
         fn read_by_degraded_reasons(
             fields: &BTreeSet<String>,
             methods: &BTreeMap<String, String>,
@@ -6927,19 +7692,58 @@ mod tests {
             let mut visited: BTreeSet<String> = BTreeSet::new();
             let mut queue = vec![seed.clone()];
             while let Some(body) = queue.pop() {
-                for (name, is_call) in self_refs(&body) {
-                    if fields.contains(&name) {
-                        covered.insert(name.clone());
+                for reference in self_refs(&body) {
+                    if reference.is_read && fields.contains(&reference.name) {
+                        covered.insert(reference.name.clone());
                     }
-                    if is_call && !visited.contains(&name) {
-                        if let Some(next) = methods.get(&name) {
-                            visited.insert(name);
+                    if reference.is_call && !visited.contains(&reference.name) {
+                        if let Some(next) = methods.get(&reference.name) {
+                            visited.insert(reference.name);
                             queue.push(next.clone());
                         }
                     }
                 }
             }
             covered
+        }
+
+        /// Every name this file declares that a defence may point at: a field
+        /// of `Agent`, one of its methods, or a top-level constant.
+        fn declared_names(src: &str) -> BTreeSet<String> {
+            let mut out: BTreeSet<String> = agent_methods(src).into_keys().collect();
+            for decl in agent_declarations(src) {
+                if let Some((name, _)) = decl.split_once(": ") {
+                    out.insert(name.trim().to_string());
+                }
+            }
+            for marker in ["\nconst ", "\npub const ", "\npub(crate) const "] {
+                let mut from = 0usize;
+                while let Some(rel) = src[from..].find(marker) {
+                    let at = from + rel + marker.len();
+                    let name: String = src[at..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    from = at + name.len().max(1);
+                    if !name.is_empty() {
+                        out.insert(name);
+                    }
+                }
+            }
+            out
+        }
+
+        /// The backticked words of a defence that could be citations.
+        fn citations(defence: &str) -> Vec<String> {
+            defence
+                .split('`')
+                .skip(1)
+                .step_by(2)
+                .map(|word| word.trim().to_string())
+                .filter(|word| {
+                    !word.is_empty() && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+                .collect()
         }
     }
 }

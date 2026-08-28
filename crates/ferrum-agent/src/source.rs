@@ -460,9 +460,39 @@ fn stamp_one(path: &Path) -> Option<FileStamp> {
     })
 }
 
-/// `None` = exceptions file absent (poll loop clears waivers, not an error).
-pub(crate) fn exceptions_stamp(path: &Path) -> Option<FileStamp> {
-    stamp_one(&exceptions_file_path(path))
+/// What a stat of `exceptions.fsig` established.
+///
+/// Three answers, not two. `std::fs::metadata(..).ok()` collapses "no such
+/// file" and "there, but the stat refused" into the same `None`, and the poll
+/// loop's answer to those two is opposite: the first empties the waiver table
+/// because the Secret carries no waivers, the second must drop them and say
+/// so. Collapsing them is how a node that lost every approved waiver went back
+/// to reporting healthy through the one branch that never reaches
+/// `read_exceptions_path`, which has separated them all along.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExceptionsStamp {
+    /// ENOENT: a Secret that carries no waivers.
+    #[default]
+    Absent,
+    Present(FileStamp),
+    /// The stat failed for a reason that is not ENOENT — EACCES after a
+    /// remount, EIO, ELOOP, a symlink loop caught mid-rotation — or it
+    /// succeeded on something that is not a regular file, e.g. a directory
+    /// where the file was. Never equal to `Absent`.
+    Unreadable,
+}
+
+pub(crate) fn exceptions_stamp(path: &Path) -> ExceptionsStamp {
+    let file = exceptions_file_path(path);
+    match std::fs::metadata(file) {
+        Ok(meta) if meta.is_file() => ExceptionsStamp::Present(FileStamp {
+            mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            len: meta.len(),
+        }),
+        Ok(_) => ExceptionsStamp::Unreadable,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ExceptionsStamp::Absent,
+        Err(_) => ExceptionsStamp::Unreadable,
+    }
 }
 
 /// Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
