@@ -294,276 +294,6 @@ pipeline {
                 }
             }
 
-            // The only stage that puts the datapath in a kernel. Everything before
-            // it reads the ELF; four of the RFC section D acceptance cases run through
-            // Bpf::load, and nothing else in this pipeline executes a single one of
-            // its instructions.
-            //
-            // Requires of the agent: CAP_BPF (or root) and tracefs mounted at
-            // /sys/kernel/tracing. CONFIG_MODULES=y is not required: a kernel
-            // without loadable modules has no init_module/finit_module tracepoint,
-            // and KernelHandle::attach_for_arch narrows the enforceable set and
-            // names what it dropped instead of refusing, which this stage checks
-            // against tracefs. FERRUM_BPF_ELF_REQUIRED turns every remaining skip
-            // into a stage failure: a green no-op here is exactly the fail-open
-            // the stage exists to close.
-            //
-            // The one no-op FERRUM_BPF_ELF_REQUIRED cannot catch by itself is this
-            // line losing `--features attach`: attach_live.rs is `cfg`-gated on it,
-            // so the binary would run zero tests and exit 0 with the env var never
-            // read. `the_gate_must_not_be_compiled_out` lives outside that cfg and
-            // fails when the feature is off and FERRUM_BPF_ELF_REQUIRED is on.
-            //
-            // A passed count cannot stand in for that, and until now this stage
-            // believed it could. Every skip path in the test file is an early
-            // `return` from a `#[test]`, so a run that attached nothing reports
-            // `test result: ok. 7 passed` character for character like a run that
-            // attached everything — and dropping FERRUM_BPF_ELF_REQUIRED alone,
-            // with the feature still on, took this stage green having loaded no
-            // program into any kernel. What the count cannot see, a positive
-            // control can: `--show-output` surfaces the line the test prints only
-            // after `KernelHandle::attach_for_arch` has returned a loaded handle,
-            // and that line is required below. It is emitted from inside the
-            // attached path, so no skip can produce it.
-            stage('BPF attach') {
-                steps {
-                    sh '''
-                        set -eu
-                        elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
-                        test -f "$elf"
-                        out=/tmp/ferrum-attach-live.out
-                        # Not a pipeline: /bin/sh here is dash, which has no
-                        # pipefail, and `| tee` would hand `set -e` tee's status
-                        # and swallow a failing cargo test.
-                        if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
-                            cargo test -p ferrum-ebpf --features attach --test attach_live \
-                            -- --show-output > "$out" 2>&1
-                        then
-                            cat "$out"
-                            exit 1
-                        fi
-                        cat "$out"
-                        passed="$(sed -n 's/^test result: ok\\. \\([0-9][0-9]*\\) passed.*/\\1/p' "$out" | head -1)"
-                        # Every test in the gate, not "at least one". The number is
-                        # derived from the source rather than written down here, so
-                        # a test added to attach_live.rs is required by this stage
-                        # the moment it exists — and #[ignore] on any of the ones
-                        # already there drops `passed` below it and fails, which is
-                        # what "at least one" could not do. `mod gate` starts the
-                        # cfg(attach) half; the single test outside it is compiled
-                        # out under the feature this line builds with, so counting
-                        # from there is counting what actually runs.
-                        src=crates/ferrum-ebpf/tests/attach_live.rs
-                        expected="$(sed -n '/^mod gate {/,$p' "$src" \
-                            | grep -cE '^[[:space:]]*#\\[test\\][[:space:]]*$')"
-                        if [ "${expected:-0}" -lt 1 ]; then
-                            echo "counted no #[test] under mod gate in $src. This stage's own" >&2
-                            echo "idea of what it must run is broken, so it can no longer tell a" >&2
-                            echo "full run from an empty one." >&2
-                            exit 1
-                        fi
-                        if [ "${passed:-0}" -ne "$expected" ]; then
-                            echo "BPF attach ran ${passed:-no} of the $expected kernel tests in" >&2
-                            echo "$src. A test that does not run proves nothing: #[ignore] on one" >&2
-                            echo "of them leaves the datapath rows it covers asserted by no code" >&2
-                            echo "that executed. Check --features attach is still on the cargo" >&2
-                            echo "test line, and that no test was ignored or filtered out." >&2
-                            exit 1
-                        fi
-                        # The positive controls. Each is printed from the far side
-                        # of a successful attach, so no skip can emit one however
-                        # many tests it reports as passed. All of them, not the
-                        # first: this stage used to require only the KernelHandle
-                        # line, which is printed by exactly one of the tests above,
-                        # so gutting the other seven left it green.
-                        for evidence in \
-                            "attached through KernelHandle on " \
-                            "long path: " \
-                            "foreign records from tgid "
-                        do
-                            if ! grep -q "$evidence" "$out"; then
-                                echo "BPF attach reported $passed passed tests without printing" >&2
-                                echo "\\"$evidence\\". Every skip in attach_live.rs is an early return" >&2
-                                echo "from a #[test], so the count alone cannot tell a skipped run" >&2
-                                echo "from a real one; that line is emitted only from inside the" >&2
-                                echo "attached path. Check FERRUM_BPF_ELF_REQUIRED, --features" >&2
-                                echo "attach and -- --show-output are all still on the cargo line." >&2
-                                exit 1
-                            fi
-                        done
-                        echo "ok: all $passed attach_live tests executed against this kernel"
-                        # The lib tests behind the same feature. `cargo test
-                        # --workspace` runs default features, so until this line
-                        # nothing ever executed the RLIMIT_MEMLOCK raise that every
-                        # production attach now goes through — and it is the raise
-                        # living outside the code under test that this cycle was
-                        # about.
-                        cargo test -p ferrum-ebpf --features attach --lib
-                    '''
-                }
-            }
-
-            // The join: a record this kernel wrote, through a signed bundle, to a
-            // real SIGKILL. `BPF attach` proves the datapath writes the record the
-            // decoder reads and links no agent; `cargo test --workspace` proves the
-            // decision path on recorded bytes. Only this stage runs both halves in
-            // one process, and it is the only place `SignalResponder::kill` — the
-            // only unsafe call in the agent — ever returns Ok.
-            //
-            // Requires root (CAP_BPF plus CAP_KILL over its own forked probe),
-            // tracefs, and a writable cgroup2 hierarchy: the probe is put in a
-            // cgroup of the test's own so the reaction is checked against the real
-            // /proc by ProcCgroupCheck, not a stub.
-            //
-            // The same three protections as `BPF attach`, for the same reason, and
-            // the middle one is why that stage's comment used to say two.
-            // FERRUM_BPF_ELF_REQUIRED turns every skip (no ELF, no tracepoint, no
-            // cgroup2) into a failure. It cannot catch this line losing
-            // `--features attach`, because attach_join.rs is cfg-gated on it and
-            // would run zero tests and exit 0 — so `the_gate_must_not_be_compiled_out`
-            // lives outside that cfg and fails when the var is set and the feature
-            // is not. And the passed count is not a third protection: every skip in
-            // `live()` is an early `return` from a `#[test]`, so a run that
-            // attached nothing, decided nothing and killed nothing reports
-            // `test result: ok. 4 passed` exactly like a real one, and dropping the
-            // env var alone used to print this stage's own success line over it.
-            // The positive control the count cannot supply is the evidence line the
-            // shell test prints after `waitpid` has confirmed the SIGKILL: it is
-            // reachable only from the far end of record → verdict → signal, so it
-            // is required below, and `--show-output` is what makes a passing test's
-            // stdout visible to that check.
-            stage('BPF join') {
-                steps {
-                    sh '''
-                        set -eu
-                        elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
-                        test -f "$elf"
-                        out=/tmp/ferrum-attach-join.out
-                        # Not a pipeline: /bin/sh is dash, which has no pipefail,
-                        # and `| tee` would hand `set -e` tee's status.
-                        if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
-                            cargo test -p ferrum-agent --features attach,apiserver \
-                            --test attach_join -- --show-output > "$out" 2>&1
-                        then
-                            cat "$out"
-                            exit 1
-                        fi
-                        cat "$out"
-                        passed="$(sed -n 's/^test result: ok\\. \\([0-9][0-9]*\\) passed.*/\\1/p' "$out" | head -1)"
-                        src=crates/ferrum-agent/tests/attach_join.rs
-                        # Every test in the join, derived from the source for the
-                        # reason the same line in 'BPF attach' is: "at least one"
-                        # goes green with the other four ignored, and the boundary
-                        # rows for docker.sock, the truncated path, the flag-stripped
-                        # record and REFUSE_STALE_TARGET would then be proved by
-                        # nothing that ran. `mod gate` starts the cfg(attach) half.
-                        expected="$(sed -n '/^mod gate {/,$p' "$src" \
-                            | grep -cE '^[[:space:]]*#\\[test\\][[:space:]]*$')"
-                        if [ "${expected:-0}" -lt 1 ]; then
-                            echo "counted no #[test] under mod gate in $src. This stage's own" >&2
-                            echo "idea of what it must run is broken, so it can no longer tell a" >&2
-                            echo "full run from an empty one." >&2
-                            exit 1
-                        fi
-                        if [ "${passed:-0}" -ne "$expected" ]; then
-                            echo "BPF join ran ${passed:-no} of the $expected tests in $src. The" >&2
-                            echo "only stage that carries a kernel record to a real SIGKILL must" >&2
-                            echo "run all of them: an ignored or filtered test leaves the section D" >&2
-                            echo "row it covers asserted by no code that executed. Check that" >&2
-                            echo "--features attach is still on the cargo test line." >&2
-                            exit 1
-                        fi
-                        # Per-test evidence, named. Each test that reaches a
-                        # confirmed SIGKILL prints one line through one helper. The
-                        # line is printed after waitpid has confirmed the signal, so
-                        # it is reachable only from the far end of record -> verdict
-                        # -> signal, and no skip can emit it.
-                        #
-                        # The set is read out of join_evidence.rs and NOT out of
-                        # $src, which is where it came from until cycle 11.
-                        # Deriving it from the file under test is self-lowering one
-                        # level finer than the count, and cheaper to hit: gut the
-                        # kill half of one test — keep its record and decode
-                        # assertions, drop the responder call and its
-                        # signalled(...) — and the test passes, passed still equals
-                        # expected, the required set silently shrinks from four
-                        # labels to three, this stage goes green, and the section D
-                        # row that test covers keeps a K witness that no longer
-                        # carries a record to a signal. join_evidence.rs holds the
-                        # set to the rows the boundary document names and asserts
-                        # against $src in both directions under a plain cargo test.
-                        #
-                        # The one join test with no line here is the stale-target
-                        # refusal, which deliberately kills nothing; the count check
-                        # above is what covers it.
-                        names=/tmp/ferrum-join-evidence.txt
-                        anchor=crates/ferrum-agent/tests/join_evidence.rs
-                        sed -n 's/^ *evidence: "\\(.*\\)",$/\\1/p' "$anchor" \
-                            | sort -u > "$names"
-                        if [ ! -s "$names" ]; then
-                            echo "no evidence labels found in $anchor: this stage can no longer" >&2
-                            echo "name the evidence it requires, so requiring it proves nothing." >&2
-                            echo "Check the shape of REQUIRED_KILLS." >&2
-                            exit 1
-                        fi
-                        while read -r what; do
-                            if ! grep -q "$what: kernel record" "$out"; then
-                                echo "BPF join reported $passed passed tests without the evidence" >&2
-                                echo "line for '$what'. Every skip in live() is an early return" >&2
-                                echo "from a #[test], so the count alone cannot tell a skipped run" >&2
-                                echo "from a real one; the waitpid line can, and this one is" >&2
-                                echo "absent. Check FERRUM_BPF_ELF_REQUIRED, --features attach and" >&2
-                                echo "-- --show-output are all still on the cargo test line." >&2
-                                exit 1
-                            fi
-                        done < "$names"
-                        evidence="$(wc -l < "$names")"
-                        echo "ok: all $passed join tests ran and $evidence of them took a kernel"
-                        echo "ok: record through a signed bundle to a confirmed SIGKILL"
-                        # The lib tests under the pair of features the DaemonSet
-                        # ships with, for the same reason the ebpf stage above runs
-                        # its own: `--test attach_join` compiles and runs exactly
-                        # one integration target. `cargo test --workspace` is
-                        # default features and both of these are off, so until this
-                        # line the agent's 150 unit tests had never been *run*
-                        # under `attach,apiserver` — only compiled, by the clippy
-                        # line, which links nothing and executes nothing.
-                        cargo test -p ferrum-agent --features attach,apiserver --lib
-                    '''
-                }
-            }
-
-            // Measures the gate above rather than the code: each patch must make
-            // the join fail. Cycle 8's most valuable finding came from patching the
-            // datapath by hand and watching six of seven tests still pass, and that
-            // measurement survived only as prose in a merge body.
-            //
-            // No patch here survives. This comment said one did until the harness
-            // was run: on Linux 6.18.44 all six are killed, each naming the gate::
-            // test that caught it. It then said four for a cycle after two more
-            // were added — the patch headers and the boundary document were
-            // refreshed and this line was not, which is why the count it names is
-            // now derived and not written down. A `cargo test` exit status is not
-            // on its own a kill — it is also what a compile error returns — so
-            // run.sh requires per patch that the join built, ran, and named a
-            // failing test.
-            //
-            // And how many patches: run.sh iterated whatever *.patch it found and
-            // asserted nothing about the number, so deleting five of six left one
-            // measured mutation, no survivors, and this stage green. The set is
-            // named in crates/ferrum-agent/tests/mutation_manifest.rs, which
-            // run.sh checks this directory against before it applies anything and
-            // which `cargo test --workspace` holds to the directory on every
-            // commit, kernel or no kernel.
-            stage('BPF join mutations') {
-                steps {
-                    sh '''
-                        set -eu
-                        FERRUM_BPF_ELF="$PWD/dist/ferrum-ebpf-progs.bpf.o" \
-                            crates/ferrum-agent/tests/mutations/run.sh
-                    '''
-                }
-            }
             }
         }
 
@@ -571,8 +301,8 @@ pipeline {
         // Три стадии, которые линкуют, — в x86_64-контейнере под эмуляцией.
         // Отдельная группа, а не общий с 'Build' контейнер: под QEMU идёт только
         // то, что обязано быть x86_64, а fmt, clippy и 884 теста остаются на
-        // родной архитектуре ноды. Ниже 'BPF join mutations', а не выше, потому
-        // что ни одна стадия датапейса эти бинари не читает — они архивируются
+        // родной архитектуре ноды. Стоит выше 'Datapath', потому что ядра ей не
+        // нужно: ни одна стадия датапейса эти бинари не читает — они архивируются,
         // и на этом их путь заканчивается; образы линкуют свои заново из
         // застэшенных исходников.
         stage('Link') {
@@ -1134,5 +864,301 @@ pipeline {
         failure {
             echo 'Ferrum CI failed'
         }
+
+        // Стадии, которым нужно настоящее ядро, — последними, и это не косметика.
+        // Пока они стояли посреди пайплайна, их падение уносило шесть стадий,
+        // которым ядро не нужно вовсе: 'Link', три образа и всю группу 'Checks',
+        // а в ней cargo-deny и cargo-audit. Терять supply chain из-за отсутствия
+        // tracefs — худший из возможных обменов.
+        //
+        // Пропускать их по условию было бы вторым способом это починить и худшим:
+        // гейт, умеющий себя пропустить, — ровно тот дефект, от которого написан
+        // MVP-1-BOUNDARY.md. Они падают честно и красят билд красным на ноде без
+        // ядра; всё, что здесь исполнимо, к этому моменту уже исполнено.
+        stage('Datapath') {
+            agent {
+                docker {
+                    image RUST_IMAGE
+                    args RUST_DOCKER_ARGS
+                    reuseNode true
+                }
+            }
+            stages {
+            // The only stage that puts the datapath in a kernel. Everything before
+            // it reads the ELF; four of the RFC section D acceptance cases run through
+            // Bpf::load, and nothing else in this pipeline executes a single one of
+            // its instructions.
+            //
+            // Requires of the agent: CAP_BPF (or root) and tracefs mounted at
+            // /sys/kernel/tracing. CONFIG_MODULES=y is not required: a kernel
+            // without loadable modules has no init_module/finit_module tracepoint,
+            // and KernelHandle::attach_for_arch narrows the enforceable set and
+            // names what it dropped instead of refusing, which this stage checks
+            // against tracefs. FERRUM_BPF_ELF_REQUIRED turns every remaining skip
+            // into a stage failure: a green no-op here is exactly the fail-open
+            // the stage exists to close.
+            //
+            // The one no-op FERRUM_BPF_ELF_REQUIRED cannot catch by itself is this
+            // line losing `--features attach`: attach_live.rs is `cfg`-gated on it,
+            // so the binary would run zero tests and exit 0 with the env var never
+            // read. `the_gate_must_not_be_compiled_out` lives outside that cfg and
+            // fails when the feature is off and FERRUM_BPF_ELF_REQUIRED is on.
+            //
+            // A passed count cannot stand in for that, and until now this stage
+            // believed it could. Every skip path in the test file is an early
+            // `return` from a `#[test]`, so a run that attached nothing reports
+            // `test result: ok. 7 passed` character for character like a run that
+            // attached everything — and dropping FERRUM_BPF_ELF_REQUIRED alone,
+            // with the feature still on, took this stage green having loaded no
+            // program into any kernel. What the count cannot see, a positive
+            // control can: `--show-output` surfaces the line the test prints only
+            // after `KernelHandle::attach_for_arch` has returned a loaded handle,
+            // and that line is required below. It is emitted from inside the
+            // attached path, so no skip can produce it.
+            stage('BPF attach') {
+                steps {
+                    // dist/ приезжает стэшем: 'BPF ELF' теперь в другой
+                    // группе, и её воркспейс этой стадии не наследуется.
+                    unstash 'image-context'
+                    sh '''
+                        set -eu
+                        elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
+                        test -f "$elf"
+                        out=/tmp/ferrum-attach-live.out
+                        # Not a pipeline: /bin/sh here is dash, which has no
+                        # pipefail, and `| tee` would hand `set -e` tee's status
+                        # and swallow a failing cargo test.
+                        if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
+                            cargo test -p ferrum-ebpf --features attach --test attach_live \
+                            -- --show-output > "$out" 2>&1
+                        then
+                            cat "$out"
+                            exit 1
+                        fi
+                        cat "$out"
+                        passed="$(sed -n 's/^test result: ok\\. \\([0-9][0-9]*\\) passed.*/\\1/p' "$out" | head -1)"
+                        # Every test in the gate, not "at least one". The number is
+                        # derived from the source rather than written down here, so
+                        # a test added to attach_live.rs is required by this stage
+                        # the moment it exists — and #[ignore] on any of the ones
+                        # already there drops `passed` below it and fails, which is
+                        # what "at least one" could not do. `mod gate` starts the
+                        # cfg(attach) half; the single test outside it is compiled
+                        # out under the feature this line builds with, so counting
+                        # from there is counting what actually runs.
+                        src=crates/ferrum-ebpf/tests/attach_live.rs
+                        expected="$(sed -n '/^mod gate {/,$p' "$src" \
+                            | grep -cE '^[[:space:]]*#\\[test\\][[:space:]]*$')"
+                        if [ "${expected:-0}" -lt 1 ]; then
+                            echo "counted no #[test] under mod gate in $src. This stage's own" >&2
+                            echo "idea of what it must run is broken, so it can no longer tell a" >&2
+                            echo "full run from an empty one." >&2
+                            exit 1
+                        fi
+                        if [ "${passed:-0}" -ne "$expected" ]; then
+                            echo "BPF attach ran ${passed:-no} of the $expected kernel tests in" >&2
+                            echo "$src. A test that does not run proves nothing: #[ignore] on one" >&2
+                            echo "of them leaves the datapath rows it covers asserted by no code" >&2
+                            echo "that executed. Check --features attach is still on the cargo" >&2
+                            echo "test line, and that no test was ignored or filtered out." >&2
+                            exit 1
+                        fi
+                        # The positive controls. Each is printed from the far side
+                        # of a successful attach, so no skip can emit one however
+                        # many tests it reports as passed. All of them, not the
+                        # first: this stage used to require only the KernelHandle
+                        # line, which is printed by exactly one of the tests above,
+                        # so gutting the other seven left it green.
+                        for evidence in \
+                            "attached through KernelHandle on " \
+                            "long path: " \
+                            "foreign records from tgid "
+                        do
+                            if ! grep -q "$evidence" "$out"; then
+                                echo "BPF attach reported $passed passed tests without printing" >&2
+                                echo "\\"$evidence\\". Every skip in attach_live.rs is an early return" >&2
+                                echo "from a #[test], so the count alone cannot tell a skipped run" >&2
+                                echo "from a real one; that line is emitted only from inside the" >&2
+                                echo "attached path. Check FERRUM_BPF_ELF_REQUIRED, --features" >&2
+                                echo "attach and -- --show-output are all still on the cargo line." >&2
+                                exit 1
+                            fi
+                        done
+                        echo "ok: all $passed attach_live tests executed against this kernel"
+                        # The lib tests behind the same feature. `cargo test
+                        # --workspace` runs default features, so until this line
+                        # nothing ever executed the RLIMIT_MEMLOCK raise that every
+                        # production attach now goes through — and it is the raise
+                        # living outside the code under test that this cycle was
+                        # about.
+                        cargo test -p ferrum-ebpf --features attach --lib
+                    '''
+                }
+            }
+
+            // The join: a record this kernel wrote, through a signed bundle, to a
+            // real SIGKILL. `BPF attach` proves the datapath writes the record the
+            // decoder reads and links no agent; `cargo test --workspace` proves the
+            // decision path on recorded bytes. Only this stage runs both halves in
+            // one process, and it is the only place `SignalResponder::kill` — the
+            // only unsafe call in the agent — ever returns Ok.
+            //
+            // Requires root (CAP_BPF plus CAP_KILL over its own forked probe),
+            // tracefs, and a writable cgroup2 hierarchy: the probe is put in a
+            // cgroup of the test's own so the reaction is checked against the real
+            // /proc by ProcCgroupCheck, not a stub.
+            //
+            // The same three protections as `BPF attach`, for the same reason, and
+            // the middle one is why that stage's comment used to say two.
+            // FERRUM_BPF_ELF_REQUIRED turns every skip (no ELF, no tracepoint, no
+            // cgroup2) into a failure. It cannot catch this line losing
+            // `--features attach`, because attach_join.rs is cfg-gated on it and
+            // would run zero tests and exit 0 — so `the_gate_must_not_be_compiled_out`
+            // lives outside that cfg and fails when the var is set and the feature
+            // is not. And the passed count is not a third protection: every skip in
+            // `live()` is an early `return` from a `#[test]`, so a run that
+            // attached nothing, decided nothing and killed nothing reports
+            // `test result: ok. 4 passed` exactly like a real one, and dropping the
+            // env var alone used to print this stage's own success line over it.
+            // The positive control the count cannot supply is the evidence line the
+            // shell test prints after `waitpid` has confirmed the SIGKILL: it is
+            // reachable only from the far end of record → verdict → signal, so it
+            // is required below, and `--show-output` is what makes a passing test's
+            // stdout visible to that check.
+            stage('BPF join') {
+                steps {
+                    sh '''
+                        set -eu
+                        elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
+                        test -f "$elf"
+                        out=/tmp/ferrum-attach-join.out
+                        # Not a pipeline: /bin/sh is dash, which has no pipefail,
+                        # and `| tee` would hand `set -e` tee's status.
+                        if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
+                            cargo test -p ferrum-agent --features attach,apiserver \
+                            --test attach_join -- --show-output > "$out" 2>&1
+                        then
+                            cat "$out"
+                            exit 1
+                        fi
+                        cat "$out"
+                        passed="$(sed -n 's/^test result: ok\\. \\([0-9][0-9]*\\) passed.*/\\1/p' "$out" | head -1)"
+                        src=crates/ferrum-agent/tests/attach_join.rs
+                        # Every test in the join, derived from the source for the
+                        # reason the same line in 'BPF attach' is: "at least one"
+                        # goes green with the other four ignored, and the boundary
+                        # rows for docker.sock, the truncated path, the flag-stripped
+                        # record and REFUSE_STALE_TARGET would then be proved by
+                        # nothing that ran. `mod gate` starts the cfg(attach) half.
+                        expected="$(sed -n '/^mod gate {/,$p' "$src" \
+                            | grep -cE '^[[:space:]]*#\\[test\\][[:space:]]*$')"
+                        if [ "${expected:-0}" -lt 1 ]; then
+                            echo "counted no #[test] under mod gate in $src. This stage's own" >&2
+                            echo "idea of what it must run is broken, so it can no longer tell a" >&2
+                            echo "full run from an empty one." >&2
+                            exit 1
+                        fi
+                        if [ "${passed:-0}" -ne "$expected" ]; then
+                            echo "BPF join ran ${passed:-no} of the $expected tests in $src. The" >&2
+                            echo "only stage that carries a kernel record to a real SIGKILL must" >&2
+                            echo "run all of them: an ignored or filtered test leaves the section D" >&2
+                            echo "row it covers asserted by no code that executed. Check that" >&2
+                            echo "--features attach is still on the cargo test line." >&2
+                            exit 1
+                        fi
+                        # Per-test evidence, named. Each test that reaches a
+                        # confirmed SIGKILL prints one line through one helper. The
+                        # line is printed after waitpid has confirmed the signal, so
+                        # it is reachable only from the far end of record -> verdict
+                        # -> signal, and no skip can emit it.
+                        #
+                        # The set is read out of join_evidence.rs and NOT out of
+                        # $src, which is where it came from until cycle 11.
+                        # Deriving it from the file under test is self-lowering one
+                        # level finer than the count, and cheaper to hit: gut the
+                        # kill half of one test — keep its record and decode
+                        # assertions, drop the responder call and its
+                        # signalled(...) — and the test passes, passed still equals
+                        # expected, the required set silently shrinks from four
+                        # labels to three, this stage goes green, and the section D
+                        # row that test covers keeps a K witness that no longer
+                        # carries a record to a signal. join_evidence.rs holds the
+                        # set to the rows the boundary document names and asserts
+                        # against $src in both directions under a plain cargo test.
+                        #
+                        # The one join test with no line here is the stale-target
+                        # refusal, which deliberately kills nothing; the count check
+                        # above is what covers it.
+                        names=/tmp/ferrum-join-evidence.txt
+                        anchor=crates/ferrum-agent/tests/join_evidence.rs
+                        sed -n 's/^ *evidence: "\\(.*\\)",$/\\1/p' "$anchor" \
+                            | sort -u > "$names"
+                        if [ ! -s "$names" ]; then
+                            echo "no evidence labels found in $anchor: this stage can no longer" >&2
+                            echo "name the evidence it requires, so requiring it proves nothing." >&2
+                            echo "Check the shape of REQUIRED_KILLS." >&2
+                            exit 1
+                        fi
+                        while read -r what; do
+                            if ! grep -q "$what: kernel record" "$out"; then
+                                echo "BPF join reported $passed passed tests without the evidence" >&2
+                                echo "line for '$what'. Every skip in live() is an early return" >&2
+                                echo "from a #[test], so the count alone cannot tell a skipped run" >&2
+                                echo "from a real one; the waitpid line can, and this one is" >&2
+                                echo "absent. Check FERRUM_BPF_ELF_REQUIRED, --features attach and" >&2
+                                echo "-- --show-output are all still on the cargo test line." >&2
+                                exit 1
+                            fi
+                        done < "$names"
+                        evidence="$(wc -l < "$names")"
+                        echo "ok: all $passed join tests ran and $evidence of them took a kernel"
+                        echo "ok: record through a signed bundle to a confirmed SIGKILL"
+                        # The lib tests under the pair of features the DaemonSet
+                        # ships with, for the same reason the ebpf stage above runs
+                        # its own: `--test attach_join` compiles and runs exactly
+                        # one integration target. `cargo test --workspace` is
+                        # default features and both of these are off, so until this
+                        # line the agent's 150 unit tests had never been *run*
+                        # under `attach,apiserver` — only compiled, by the clippy
+                        # line, which links nothing and executes nothing.
+                        cargo test -p ferrum-agent --features attach,apiserver --lib
+                    '''
+                }
+            }
+
+            // Measures the gate above rather than the code: each patch must make
+            // the join fail. Cycle 8's most valuable finding came from patching the
+            // datapath by hand and watching six of seven tests still pass, and that
+            // measurement survived only as prose in a merge body.
+            //
+            // No patch here survives. This comment said one did until the harness
+            // was run: on Linux 6.18.44 all six are killed, each naming the gate::
+            // test that caught it. It then said four for a cycle after two more
+            // were added — the patch headers and the boundary document were
+            // refreshed and this line was not, which is why the count it names is
+            // now derived and not written down. A `cargo test` exit status is not
+            // on its own a kill — it is also what a compile error returns — so
+            // run.sh requires per patch that the join built, ran, and named a
+            // failing test.
+            //
+            // And how many patches: run.sh iterated whatever *.patch it found and
+            // asserted nothing about the number, so deleting five of six left one
+            // measured mutation, no survivors, and this stage green. The set is
+            // named in crates/ferrum-agent/tests/mutation_manifest.rs, which
+            // run.sh checks this directory against before it applies anything and
+            // which `cargo test --workspace` holds to the directory on every
+            // commit, kernel or no kernel.
+            stage('BPF join mutations') {
+                steps {
+                    sh '''
+                        set -eu
+                        FERRUM_BPF_ELF="$PWD/dist/ferrum-ebpf-progs.bpf.o" \
+                            crates/ferrum-agent/tests/mutations/run.sh
+                    '''
+                }
+            }
+            }
+        }
+
     }
 }

@@ -76,9 +76,12 @@ cargo run -p ferrum-cli -- lint-deploy deploy
   проброшенный в контейнер, был бы тем самым hostPath, который правила рантайма
   убивают;
 - в rust-контейнере родной архитектуры — группа `Build` (`Format`, `Clippy`,
-  `Test`, `BPF ELF`, `BPF attach`, `BPF join`, `BPF join mutations`) и группа
-  `Checks` (`Crate boundary`, `Validate policies`, `Security: policy invariants`,
-  `Security: MVP acceptance`, `Security: supply chain`);
+  `Test`, `BPF ELF`), группа `Checks` (`Crate boundary`, `Validate policies`,
+  `Security: policy invariants`, `Security: MVP acceptance`,
+  `Security: supply chain`) и группа `Datapath` (`BPF attach`, `BPF join`,
+  `BPF join mutations`) — последняя стоит в конце пайплайна: ей нужно настоящее
+  ядро с tracefs, и её падение на ноде без него больше не уносит с собой
+  supply chain и всё остальное, чему ядро не нужно;
 - в x86_64-контейнере под эмуляцией — группа `Link` (`Agent binary`,
   `Admission binary`, `Controller binary`). Цель `x86_64-unknown-linux-musl` не
   выводится из архитектуры ноды намеренно: стенд ядра — x86_64, и бинарь,
