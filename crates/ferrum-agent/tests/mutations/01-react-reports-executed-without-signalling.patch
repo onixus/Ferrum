@@ -1,0 +1,35 @@
+# Mutation: `react` reports the reaction as executed without ever calling the
+# responder.
+#
+# The counter is still incremented, so `respond_kill_total()` and the export's
+# `executed=true` both agree with a healthy node. Nothing inside the agent can
+# tell the difference: this is precisely the shape of every §D `-> kill` proof
+# that stopped at a `Responder` trait object backed by a fake.
+#
+# Must fail: the three killing tests in `tests/attach_join.rs`, at
+# `Probe::wait_for_death` - the export says the process was killed and the
+# process is still running.
+diff --git a/crates/ferrum-agent/src/lib.rs b/crates/ferrum-agent/src/lib.rs
+index bfb8cca..e17fcd7 100644
+--- a/crates/ferrum-agent/src/lib.rs
++++ b/crates/ferrum-agent/src/lib.rs
+@@ -1909,16 +1909,9 @@ impl Agent {
+                 return (false, Some(respond::REFUSE_NO_RESPONDER.into()));
+             }
+         };
+-        match responder.kill(meta.tgid) {
+-            Ok(()) => {
+-                self.respond_kill.fetch_add(1, Ordering::Relaxed);
+-                (true, None)
+-            }
+-            Err(err) => {
+-                self.respond_failed.fetch_add(1, Ordering::Relaxed);
+-                (false, Some(err.to_string()))
+-            }
+-        }
++        let _ = responder;
++        self.respond_kill.fetch_add(1, Ordering::Relaxed);
++        (true, None)
+     }
+ 
+     /// A live in-scope exception demotes only enforcing actions on a named

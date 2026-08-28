@@ -1,0 +1,32 @@
+# Mutation: the stale-target guard is removed from `react`.
+#
+# The agent then signals whatever holds the tgid at reaction time, which after
+# a pid wrap is not the workload that raised the record. This is the fail-open
+# a join test bypasses if it stubs `ProcCgroupCheck` out: with a stub, every
+# other assertion in this file still passes.
+#
+# Must fail: `a_target_that_left_the_cgroup_is_refused_and_survives`.
+diff --git a/crates/ferrum-agent/src/lib.rs b/crates/ferrum-agent/src/lib.rs
+index bfb8cca..6e836b3 100644
+--- a/crates/ferrum-agent/src/lib.rs
++++ b/crates/ferrum-agent/src/lib.rs
+@@ -1889,19 +1889,6 @@ impl Agent {
+         // The decision was made on an event that has been through a queue and
+         // a poll interval; the pid space wraps in far less. Confirm the target
+         // is still the workload that raised it before signalling anything.
+-        match self.target_check.cgroup_id(meta.tgid) {
+-            Some(current) if current == meta.cgroup_id => {}
+-            Some(_) => {
+-                self.respond_stale_target.fetch_add(1, Ordering::Relaxed);
+-                self.respond_refused.fetch_add(1, Ordering::Relaxed);
+-                return (false, Some(respond::REFUSE_STALE_TARGET.into()));
+-            }
+-            None => {
+-                self.respond_stale_target.fetch_add(1, Ordering::Relaxed);
+-                self.respond_refused.fetch_add(1, Ordering::Relaxed);
+-                return (false, Some(respond::REFUSE_TARGET_GONE.into()));
+-            }
+-        }
+         let responder = match &self.responder {
+             Some(responder) => responder,
+             None => {

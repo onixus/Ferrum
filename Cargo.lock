@@ -555,6 +555,7 @@ dependencies = [
  "ferrum-k8smeta",
  "ferrum-policy",
  "ferrum-proto",
+ "ferrum-testkit",
  "ferrum-wasm-host",
  "libc",
  "serde_json",
