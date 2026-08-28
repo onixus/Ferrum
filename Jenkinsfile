@@ -1,82 +1,176 @@
-// Локальный CI Ferrum на http://localhost:8081.
+// Локальный CI Ferrum на http://localhost:8081. Гонять тесты только здесь.
 // Сборка в docker.image().inside(): CARGO_TARGET_DIR обязан быть named volume.
 // Bind-mount macOS/VirtioFS ломает cargo недетерминированно (E0463 can't find crate).
 // clippy — check-only (.rmeta); cargo test после него пересоберёт .rlib — это ожидаемо.
+// Стадии разведены на функциональные и security намеренно: падение security-стадии
+// означает нарушенный инвариант из AGENTS.md, а не сломанную фичу.
+// SAST стоит первым: находка роняет билд за минуту, а не после полной сборки Rust.
 
 def RUST_IMAGE = 'rust:1.75-bookworm'
-def RUST_DOCKER_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry -v ferrum-cargo-target:/build-target'
+def RUST_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
+                ' -v ferrum-cargo-target:/build-target' +
+                ' -v ferrum-cargo-tools:/cargo-tools'
 
-pipeline {
-    agent {
-        docker {
-            image RUST_IMAGE
-            args RUST_DOCKER_ARGS
-            reuseNode true
+// cargo-deny/cargo-audit ставятся в отдельный том: /usr/local/cargo/bin трогать нельзя,
+// там лежит сам cargo и монтирование его затрёт.
+def rust(String script) {
+    docker.image(RUST_IMAGE).inside(RUST_ARGS) {
+        withEnv([
+            'CARGO_TARGET_DIR=/build-target',
+            'CARGO_TERM_COLOR=never',
+            'CARGO_INSTALL_ROOT=/cargo-tools',
+            'PATH+FERRUM_TOOLS=/cargo-tools/bin',
+        ]) {
+            sh script
         }
     }
+}
+
+pipeline {
+    agent any
 
     options {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '20'))
-        timeout(time: 30, unit: 'MINUTES')
-    }
-
-    environment {
-        CARGO_TARGET_DIR = '/build-target'
-        CARGO_TERM_COLOR = 'never'
+        timeout(time: 45, unit: 'MINUTES')
     }
 
     stages {
-        stage('Format') {
+        stage('SAST (semgrep)') {
             steps {
                 sh '''
                     set -eu
-                    rustup component add rustfmt
-                    cargo fmt --all -- --check
+                    docker run --rm -v "$WORKSPACE":/src -w /src semgrep/semgrep:latest \
+                        semgrep scan --config p/rust --config p/secrets \
+                            --metrics=off --no-error --json --output semgrep.json
+                    docker run --rm -v "$WORKSPACE":/src -w /src semgrep/semgrep:latest \
+                        semgrep scan --config p/rust --config p/secrets \
+                            --metrics=off --severity ERROR --error
                 '''
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'semgrep.json', allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Format') {
+            steps {
+                script {
+                    rust '''
+                        set -eu
+                        rustup component add rustfmt
+                        cargo fmt --all -- --check
+                    '''
+                }
             }
         }
 
         stage('Clippy') {
             steps {
-                sh '''
-                    set -eu
-                    rustup component add clippy
-                    cargo clippy --workspace --all-targets -- -D warnings
-                '''
+                script {
+                    rust '''
+                        set -eu
+                        rustup component add clippy
+                        cargo clippy --workspace --all-targets -- -D warnings
+                    '''
+                }
             }
         }
 
-        stage('Test') {
+        stage('Functional tests') {
             steps {
-                sh '''
-                    set -eu
-                    cargo test --workspace
-                '''
+                script {
+                    rust '''
+                        set -eu
+                        cargo test --workspace \
+                            --exclude ferrum-admission \
+                            --exclude ferrum-policy \
+                            --exclude ferrum-crypto
+                        cargo test -p ferrum-admission --lib --test webhook
+                    '''
+                }
             }
         }
 
-        stage('Validate policies') {
+        stage('Functional: policy validation') {
             steps {
-                sh '''
-                    set -eu
-                    cargo run -p ferrum-cli --quiet -- validate policies/examples/prod-restricted.yaml
-                    cargo run -p ferrum-cli --quiet -- validate policies/examples/exception-ok.yaml
-                    cargo run -p ferrum-cli --quiet -- validate policies/examples/policy-library.yaml
-                    cargo run -p ferrum-cli --quiet -- validate policies/examples/runtime-profile.yaml
-                    cargo run -p ferrum-cli --quiet -- validate policies/examples/ferrum-cluster.yaml
-                    cargo run -p ferrum-cli --quiet -- validate policies/examples/compliance-snapshot.yaml
-                    set +e
-                    cargo run -p ferrum-cli --quiet -- validate policies/examples/exception-bad-no-ticket.yaml >/tmp/ferrum-bad-exception.out 2>/tmp/ferrum-bad-exception.err
-                    status=$?
-                    set -e
-                    if [ "$status" -eq 0 ]; then
-                        echo "exception-bad-no-ticket.yaml must fail validation" >&2
-                        exit 1
-                    fi
-                    echo "ok: exception-bad-no-ticket.yaml rejected"
-                '''
+                script {
+                    rust '''
+                        set -eu
+                        for p in prod-restricted exception-ok policy-library \
+                                 runtime-profile ferrum-cluster compliance-snapshot; do
+                            cargo run -p ferrum-cli --quiet -- validate "policies/examples/$p.yaml"
+                        done
+                    '''
+                }
+            }
+        }
+
+        stage('Security: policy invariants') {
+            steps {
+                script {
+                    rust '''
+                        set -eu
+                        cargo test -p ferrum-policy
+                        cargo test -p ferrum-crypto
+                    '''
+                }
+            }
+        }
+
+        stage('Security: MVP acceptance') {
+            // Приёмка из AGENTS.md: unsigned/privileged/cluster-admin → deny,
+            // exception без TTL → reject, CP down → LKG, не fail-open.
+            steps {
+                script {
+                    rust '''
+                        set -eu
+                        cargo test -p ferrum-admission --test mvp
+                    '''
+                }
+            }
+        }
+
+        stage('Security: negative validation') {
+            steps {
+                script {
+                    rust '''
+                        set -eu
+                        for bad in exception-bad-no-ticket; do
+                            if cargo run -p ferrum-cli --quiet -- validate \
+                                "policies/examples/$bad.yaml" >/dev/null 2>&1; then
+                                echo "$bad.yaml must fail validation" >&2
+                                exit 1
+                            fi
+                            echo "ok: $bad.yaml rejected"
+                        done
+                    '''
+                }
+            }
+        }
+
+        stage('Security: supply chain') {
+            steps {
+                script {
+                    rust '''
+                        set -eu
+                        command -v cargo-deny  >/dev/null || cargo install --locked cargo-deny
+                        command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
+                        cargo deny check licenses bans sources advisories
+                        cargo audit --json > "$WORKSPACE/cargo-audit.json" || {
+                            cat "$WORKSPACE/cargo-audit.json" >&2
+                            exit 1
+                        }
+                    '''
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'cargo-audit.json', allowEmptyArchive: true
+                }
             }
         }
     }

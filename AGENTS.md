@@ -18,6 +18,24 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 - Тесты точечно: `cargo test -p <crate>`. Не гонять весь workspace без нужды.
 - Политики без кластера: `cargo run -p ferrum-cli -- validate policies/examples/<file>.yaml`.
 
+## Тесты гоняются в локальном Jenkins
+
+Полный прогон — только на локальном Jenkins `http://localhost:8081`, джоба `ferrum`
+(собирает `main` из `/Users/onixus/Git/Ferrum`, скрипт — `Jenkinsfile` в репозитории).
+Локально у себя гоняйте максимум `cargo test -p <crate>` по затронутому crate;
+вердикт по изменению даёт Jenkins, а не ваша машина.
+
+- Запуск без коммита: `curl -s --get --data-urlencode "url=/Users/onixus/Git/Ferrum" http://localhost:8081/git/notifyCommit`.
+  После коммита в `main` джоба стартует сама (post-commit hook + поллинг раз в 2 минуты).
+- API-токена нет, UI недоступен: лог билда читать из
+  `/Users/onixus/jenkins_home/jobs/ferrum/builds/<N>/log`, артефакты — в `.../archive/`.
+- Стадии функциональные: `Functional tests`, `Functional: policy validation`.
+- Стадии security: `SAST (semgrep)`, `Security: policy invariants`,
+  `Security: MVP acceptance` (приёмка из раздела MVP-1), `Security: negative validation`,
+  `Security: supply chain` (cargo-deny + cargo-audit).
+- Новый инвариант или новый пункт приёмки — добавлять тест в security-стадию,
+  а не в общий `cargo test`. Красная security-стадия не «флейк»: это нарушенный инвариант.
+
 ## Границы crate
 
 Что исполняется на hot path, не тащит kube client, serde_yaml и сеть.
