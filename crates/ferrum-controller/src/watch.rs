@@ -6,6 +6,7 @@ use crate::apply::{
     patch_status_dynamic, persist, persist_dynamic, persist_exceptions, plan_apply,
     plan_apply_namespaced, secret_name, ApplyPlan,
 };
+use crate::health::{ControllerHealth, FailureClass};
 use crate::{
     compile_status_err, exception_status_patch, reconcile, reconcile_exception,
     reconcile_namespaced, NamespacedReconcileInput, ObservedException, ObservedNamespacedPolicy,
@@ -23,6 +24,7 @@ use kube::runtime::{watcher, WatchStreamExt};
 use kube::Client;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub fn cluster_security_policy_gvk() -> GroupVersionKind {
     GroupVersionKind::gvk(
@@ -185,15 +187,55 @@ fn snapshot_exceptions(set: &ExceptionSet) -> Vec<PolicyExceptionSpec> {
         .collect()
 }
 
+/// How often `status.json` is rewritten when nothing has happened.
+///
+/// The file is also published whenever a counter moves, so this interval is
+/// only what keeps `ts` from going stale on a healthy controller: a reader
+/// that finds an old timestamp is looking at a process that stopped.
+const STATUS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A failure together with the class of API call it came from.
+///
+/// The class is decided at the call site and never by reading the message: a
+/// classifier that switches on error text is exactly the shape this tree keeps
+/// having to delete.
+struct Classified {
+    class: FailureClass,
+    err: FerrumError,
+}
+
+/// `Ok` or one classified failure. Distinct from `Result<()>`, which in the
+/// loops below means «terminal, leave».
+type Classed = std::result::Result<(), Classified>;
+
+fn as_class(class: FailureClass) -> impl Fn(FerrumError) -> Classified {
+    move |err| Classified { class, err }
+}
+
 pub async fn run_watch(cfg: WatchConfig) -> Result<()> {
     let client = Client::try_default()
         .await
         .map_err(|e| FerrumError::Degraded(format!("kube client: {e}")))?;
     let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+    let health = ControllerHealth::new();
+    // Published before the first event, so an operator who finds no file at
+    // all knows the process never reached its watches rather than that it is
+    // idle.
+    health.publish(cfg.status_dir.as_deref());
     tokio::select! {
-        r = run_cluster_policy_watch(&client, &cfg, &exceptions) => r,
-        r = run_namespaced_policy_watch(&client, &cfg, &exceptions) => r,
-        r = run_exception_watch(&client, &cfg, &exceptions) => r,
+        r = run_cluster_policy_watch(&client, &cfg, &exceptions, &health) => r,
+        r = run_namespaced_policy_watch(&client, &cfg, &exceptions, &health) => r,
+        r = run_exception_watch(&client, &cfg, &exceptions, &health) => r,
+        r = publish_status(&cfg, &health) => r,
+    }
+}
+
+/// Keeps the published file fresh. Never returns and never fails: a status
+/// surface that can end the process is a probe, and this one is not.
+async fn publish_status(cfg: &WatchConfig, health: &ControllerHealth) -> Result<()> {
+    loop {
+        tokio::time::sleep(STATUS_INTERVAL).await;
+        health.publish(cfg.status_dir.as_deref());
     }
 }
 
@@ -201,6 +243,7 @@ async fn run_cluster_policy_watch(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
 ) -> Result<()> {
     let api: Api<DynamicObject> =
         Api::all_with(client.clone(), &cluster_security_policy_resource());
@@ -208,12 +251,18 @@ async fn run_cluster_policy_watch(
     while let Some(event) = stream.next().await {
         match event {
             Ok(obj) => {
-                if let Err(err) = reconcile_object(client, cfg, exceptions, obj).await {
-                    eprintln!("ferrum-controller: {err}");
+                health.note_success(FailureClass::Watch);
+                if let Err(failure) = reconcile_object(client, cfg, exceptions, health, obj).await {
+                    eprintln!("ferrum-controller: {}", failure.err);
+                    health.note_failure(failure.class, &failure.err)?;
                 }
             }
-            Err(err) => eprintln!("ferrum-controller watch: {err}"),
+            Err(err) => {
+                eprintln!("ferrum-controller watch: {err}");
+                health.note_failure(FailureClass::Watch, &err)?;
+            }
         }
+        health.publish_if_changed(cfg.status_dir.as_deref());
     }
     Err(FerrumError::Degraded(
         "ClusterSecurityPolicy watch ended".into(),
@@ -224,18 +273,27 @@ async fn run_namespaced_policy_watch(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
 ) -> Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &security_policy_resource());
     let mut stream = std::pin::pin!(watcher(api, watcher::Config::default()).applied_objects());
     while let Some(event) = stream.next().await {
         match event {
             Ok(obj) => {
-                if let Err(err) = reconcile_namespaced_object(client, cfg, exceptions, obj).await {
-                    eprintln!("ferrum-controller: {err}");
+                health.note_success(FailureClass::Watch);
+                if let Err(failure) =
+                    reconcile_namespaced_object(client, cfg, exceptions, health, obj).await
+                {
+                    eprintln!("ferrum-controller: {}", failure.err);
+                    health.note_failure(failure.class, &failure.err)?;
                 }
             }
-            Err(err) => eprintln!("ferrum-controller watch: {err}"),
+            Err(err) => {
+                eprintln!("ferrum-controller watch: {err}");
+                health.note_failure(FailureClass::Watch, &err)?;
+            }
         }
+        health.publish_if_changed(cfg.status_dir.as_deref());
     }
     Err(FerrumError::Degraded("SecurityPolicy watch ended".into()))
 }
@@ -244,6 +302,7 @@ async fn run_exception_watch(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
 ) -> Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &policy_exception_resource());
     // Raw watcher events: Deleted must revoke, applied_objects would hide it.
@@ -251,12 +310,17 @@ async fn run_exception_watch(
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => {
-                if let Err(err) = handle_exception_event(client, cfg, exceptions, ev).await {
-                    eprintln!("ferrum-controller: {err}");
-                }
+                health.note_success(FailureClass::Watch);
+                // Reports and counts each object's own failure itself; what
+                // comes back here is the terminal case and nothing else.
+                handle_exception_event(client, cfg, exceptions, health, ev).await?;
             }
-            Err(err) => eprintln!("ferrum-controller watch: {err}"),
+            Err(err) => {
+                eprintln!("ferrum-controller watch: {err}");
+                health.note_failure(FailureClass::Watch, &err)?;
+            }
         }
+        health.publish_if_changed(cfg.status_dir.as_deref());
     }
     Err(FerrumError::Degraded("PolicyException watch ended".into()))
 }
@@ -265,18 +329,20 @@ async fn handle_exception_event(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
     event: watcher::Event<DynamicObject>,
 ) -> Result<()> {
     // Status patches must never block publication: the in-memory set is
     // updated first, and a failed status write on one object cannot leave a
     // revoked/narrowed exception live in the Secrets (that is fail-open).
-    let mut status_errors: Vec<String> = Vec::new();
-    match event {
-        watcher::Event::Applied(obj) => {
-            if let Err(err) = apply_exception_object(client, exceptions, &obj).await {
-                status_errors.push(err.to_string());
-            }
-        }
+    //
+    // Each object's own failure is reported and counted here rather than
+    // returned, because one `Restarted` carries many objects and one bad one
+    // must not stop the rest. What this function returns is the terminal case:
+    // a class in which nothing has ever succeeded.
+    let mut objects: Vec<&DynamicObject> = Vec::new();
+    match &event {
+        watcher::Event::Applied(obj) => objects.push(obj),
         watcher::Event::Deleted(obj) => {
             if let (Some(ns), Some(name)) = (
                 obj.metadata.namespace.as_deref(),
@@ -290,27 +356,35 @@ async fn handle_exception_event(
         }
         watcher::Event::Restarted(objs) => {
             exceptions.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            for obj in &objs {
-                if let Err(err) = apply_exception_object(client, exceptions, obj).await {
-                    status_errors.push(err.to_string());
-                }
+            objects.extend(objs.iter());
+        }
+    }
+    for obj in objects {
+        match apply_exception_object(client, exceptions, obj).await {
+            Ok(()) => health.note_success(FailureClass::StatusPatch),
+            Err(failure) => {
+                eprintln!("ferrum-controller: exception status: {}", failure.err);
+                health.note_failure(failure.class, &failure.err)?;
             }
         }
     }
-    persist_exceptions(
+    match persist_exceptions(
         client,
         &cfg.namespace,
         &cfg.secret_key,
         &snapshot_exceptions(exceptions),
     )
-    .await?;
-    if status_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(FerrumError::Degraded(format!(
-            "exception status patch: {}",
-            status_errors.join("; ")
-        )))
+    .await
+    {
+        Ok(()) => {
+            health.note_success(FailureClass::ExceptionPublish);
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("ferrum-controller: exception publish: {err}");
+            health.note_failure(FailureClass::ExceptionPublish, &err)?;
+            Ok(())
+        }
     }
 }
 
@@ -338,9 +412,13 @@ async fn apply_exception_object(
     client: &Client,
     exceptions: &ExceptionSet,
     obj: &DynamicObject,
-) -> Result<()> {
-    let name = require_name(obj, "PolicyException")?;
-    let namespace = require_namespace(obj, "PolicyException")?;
+) -> Classed {
+    // A missing name is a broken object, not a broken API call: it is counted
+    // against the reconcile class so that a status subresource nobody can
+    // patch stays the only thing `status_patch` reports.
+    let name = require_name(obj, "PolicyException").map_err(as_class(FailureClass::Reconcile))?;
+    let namespace =
+        require_namespace(obj, "PolicyException").map_err(as_class(FailureClass::Reconcile))?;
     let key = format!("{namespace}/{name}");
     let (status, live) = exception_disposition(obj);
     {
@@ -354,6 +432,8 @@ async fn apply_exception_object(
             }
         }
     }
+    // The one request this function makes, and it is nothing but a status
+    // PATCH.
     patch_status_dynamic(
         client,
         &policy_exception_resource(),
@@ -362,19 +442,45 @@ async fn apply_exception_object(
         &exception_status_patch(&status),
     )
     .await
+    .map_err(as_class(FailureClass::StatusPatch))
+}
+
+/// The class a `persist` of `plan` fails in.
+///
+/// `persist_dynamic` upserts the plan's Secret and then PATCHes the object's
+/// status. When the plan carries no Secret — a failed compile, an
+/// unverifiable bundle — that call issues exactly one request and it is the
+/// status PATCH, so a failure of it belongs to `status_patch`: this is the
+/// shape a mis-edited RBAC produces on every object it touches. When the plan
+/// does carry a Secret the call is a superset of that and the failure is a
+/// reconcile that did not converge.
+///
+/// Structural, not textual: it reads the plan, never the error. Splitting the
+/// two requests apart so that a Secret-carrying plan can report them
+/// separately is a change in `apply.rs`.
+fn persist_class(plan: &ApplyPlan) -> FailureClass {
+    if plan.secret.is_some() {
+        FailureClass::Reconcile
+    } else {
+        FailureClass::StatusPatch
+    }
 }
 
 async fn reconcile_object(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
     obj: DynamicObject,
-) -> Result<()> {
-    let name = require_name(&obj, "ClusterSecurityPolicy")?;
+) -> Classed {
+    let reconcile_class = as_class(FailureClass::Reconcile);
+    let name = require_name(&obj, "ClusterSecurityPolicy").map_err(&reconcile_class)?;
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
-        let secret = load_bundle_secret(client, &cfg.namespace, &secret_name(&name)).await?;
+        let secret = load_bundle_secret(client, &cfg.namespace, &secret_name(&name))
+            .await
+            .map_err(&reconcile_class)?;
         if should_skip_applied(
             generation,
             og,
@@ -383,6 +489,10 @@ async fn reconcile_object(
             secret.as_ref(),
             &cfg.trust_root,
         ) {
+            // Nothing was requested, so nothing succeeded: an object that is
+            // already converged must not mark a class as having worked, or a
+            // controller that can PATCH nothing would be protected from the
+            // terminal rule by the objects it never touched.
             return Ok(());
         }
     }
@@ -394,7 +504,6 @@ async fn reconcile_object(
                 secret_key: &cfg.secret_key,
                 library: cfg.library.as_ref(),
                 clusters: &cfg.clusters,
-                runtime_profile: None,
             });
             plan_apply(&observed.name, &cfg.namespace, &outcome, &cfg.trust_root)
         }
@@ -408,18 +517,29 @@ async fn reconcile_object(
     if failed_status_already_recorded(&obj, generation, &plan) {
         return Ok(());
     }
-    persist(client, &name, &cfg.namespace, &plan).await?;
-    attach_exceptions(client, cfg, exceptions, &plan).await
+    persist(client, &name, &cfg.namespace, &plan)
+        .await
+        .map_err(as_class(persist_class(&plan)))?;
+    // The call above ends in a status PATCH whatever else it did.
+    health.note_success(FailureClass::Reconcile);
+    health.note_success(FailureClass::StatusPatch);
+    attach_exceptions(client, cfg, exceptions, &plan)
+        .await
+        .map_err(as_class(FailureClass::ExceptionPublish))?;
+    health.note_success(FailureClass::ExceptionPublish);
+    Ok(())
 }
 
 async fn reconcile_namespaced_object(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
     obj: DynamicObject,
-) -> Result<()> {
-    let name = require_name(&obj, "SecurityPolicy")?;
-    let policy_namespace = require_namespace(&obj, "SecurityPolicy")?;
+) -> Classed {
+    let reconcile_class = as_class(FailureClass::Reconcile);
+    let name = require_name(&obj, "SecurityPolicy").map_err(&reconcile_class)?;
+    let policy_namespace = require_namespace(&obj, "SecurityPolicy").map_err(&reconcile_class)?;
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
@@ -428,7 +548,8 @@ async fn reconcile_namespaced_object(
             &cfg.namespace,
             &namespaced_secret_name(&name, &policy_namespace),
         )
-        .await?;
+        .await
+        .map_err(&reconcile_class)?;
         if should_skip_applied(
             generation,
             og,
@@ -476,8 +597,15 @@ async fn reconcile_namespaced_object(
         &cfg.namespace,
         &plan,
     )
-    .await?;
-    attach_exceptions(client, cfg, exceptions, &plan).await
+    .await
+    .map_err(as_class(persist_class(&plan)))?;
+    health.note_success(FailureClass::Reconcile);
+    health.note_success(FailureClass::StatusPatch);
+    attach_exceptions(client, cfg, exceptions, &plan)
+        .await
+        .map_err(as_class(FailureClass::ExceptionPublish))?;
+    health.note_success(FailureClass::ExceptionPublish);
+    Ok(())
 }
 
 /// A freshly created bundle Secret must carry the current exception list too;
@@ -593,7 +721,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         let applied = match &outcome {
             ReconcileOutcome::Applied(a) => a,
@@ -630,7 +757,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         match outcome {
             ReconcileOutcome::Applied(a) => {
@@ -688,7 +814,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         assert!(matches!(outcome, ReconcileOutcome::Failed(_)));
         let plan = plan_apply(&observed.name, DEFAULT_NAMESPACE, &outcome, &pk());
@@ -722,7 +847,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: Some(&lib),
             clusters: &clusters,
-            runtime_profile: None,
         });
         match outcome {
             ReconcileOutcome::Applied(a) => {
@@ -746,7 +870,6 @@ mod tests {
             secret_key: &[0u8; ED25519_SECRET_KEY_LEN],
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         match &outcome {
             ReconcileOutcome::Failed(s) => {
@@ -818,7 +941,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         let applied = match &outcome {
             ReconcileOutcome::Applied(a) => a,
