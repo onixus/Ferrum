@@ -18,8 +18,8 @@ pub use cgroupfs::{
 };
 pub use index::SharedCgroupIndex;
 pub use labels::{
-    apply_labels_event, apply_labels_stream, label_key, try_apply_labels_event, LabelCache,
-    LabelObject, LabelWatchEvent, DEFAULT_MAX_AGE, MAX_LABEL_ENTRIES, MAX_OBJECT_LABEL_BYTES,
+    apply_labels_stream, apply_labels_stream_at, label_key, LabelCache, LabelObject,
+    LabelWatchEvent, DEFAULT_MAX_AGE, MAX_LABEL_ENTRIES, MAX_OBJECT_LABEL_BYTES,
     MAX_TOTAL_LABEL_BYTES, RELIST_DEBT_HOLDDOWN,
 };
 pub use resolver::{CgroupResolver, RefreshStats};

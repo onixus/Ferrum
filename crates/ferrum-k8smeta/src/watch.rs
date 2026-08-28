@@ -93,9 +93,16 @@ pub fn parse_watch_event(line: &[u8]) -> Result<PodWatchEvent> {
     }
 }
 
-/// Fold one event into the cache. DELETE removes by UID, so every cgroup of
-/// that pod disappears from the next resolver refresh.
-pub fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOutcome {
+/// Fold one already-parsed event into the cache. DELETE removes by UID, so
+/// every cgroup of that pod disappears from the next resolver refresh.
+///
+/// Crate-private on purpose: it is the second half of [`apply_watch_line_at`]
+/// and knows nothing about the relist debt, so a caller reaching it directly
+/// gets a fold that never checks the debt and never raises one. That is what
+/// `apply_watch_stream` used to do, and it is why the property "the debt is
+/// checked on every frame" was asserted nowhere in `tests/resolve.rs` — the
+/// only file that replays streams.
+pub(crate) fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOutcome {
     // Every frame the apiserver produced is proof the watch is alive, so a
     // bookmark on a quiet cluster and a 410 both count. An ERROR frame does
     // not: a stream that only rejects us delivers no pod state. Liveness is
@@ -128,23 +135,36 @@ pub fn apply_watch_event(cache: &mut PodCache, event: PodWatchEvent) -> WatchOut
 }
 
 /// Feed a whole recorded stream (one JSON object per line). Stops at the first
-/// event demanding a relist and reports it.
-pub fn apply_watch_stream(cache: &mut PodCache, body: &[u8]) -> Result<WatchOutcome> {
+/// frame demanding a relist and reports it.
+///
+/// Every line goes through [`apply_watch_line_at`], the same fold the network
+/// loop runs, so a replayed stream meets the relist debt exactly where a live
+/// one does. It used to parse and fold the lines itself, which made it a
+/// second answer to the two facts the fold exists for: an unreadable frame was
+/// an `Err` that ended the replay instead of a debt the stream reads past, and
+/// a standing debt was never looked at. `tests/resolve.rs` reaches the crate
+/// through here, so that file asserted nothing about either.
+///
+/// No longer `Result`: the fold answers an unreadable frame with a debt, not an
+/// error, and there is nothing left here that can fail.
+pub fn apply_watch_stream(cache: &mut PodCache, body: &[u8]) -> WatchOutcome {
+    apply_watch_stream_at(cache, body, Instant::now())
+}
+
+/// Same, at an explicit instant, so a replayed stream can be aged past
+/// [`crate::labels::RELIST_DEBT_HOLDDOWN`] without sleeping through it.
+pub fn apply_watch_stream_at(cache: &mut PodCache, body: &[u8], now: Instant) -> WatchOutcome {
     let mut outcome = WatchOutcome::Ignored;
     for line in body.split(|b| *b == b'\n') {
         if line.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
-        let event = parse_watch_event(line)?;
-        if let Some(rv) = event_resource_version(&event) {
-            cache.set_resource_version(rv);
-        }
-        outcome = apply_watch_event(cache, event);
+        outcome = apply_watch_line_at(cache, line, now);
         if outcome == WatchOutcome::MustRelist {
-            return Ok(outcome);
+            return outcome;
         }
     }
-    Ok(outcome)
+    outcome
 }
 
 /// The relist obligation, raised and discharged the same way on either cache.
@@ -840,7 +860,7 @@ mod freshness_tests {
             return;
         };
         assert_eq!(
-            apply_watch_stream(&mut cache, GONE).expect("apply"),
+            apply_watch_stream(&mut cache, GONE),
             WatchOutcome::MustRelist
         );
         assert!(cache.snapshot().is_err());
@@ -890,7 +910,7 @@ mod freshness_tests {
         };
         let stream = br#"{"type":"MODIFIED","object":{"metadata":{"uid":"u1","name":"web-0","namespace":"prod","resourceVersion":"77"},"spec":{"nodeName":"node-a"}}}"#;
         assert_eq!(
-            apply_watch_stream(&mut cache, stream).expect("apply"),
+            apply_watch_stream(&mut cache, stream),
             WatchOutcome::Applied
         );
         assert_eq!(cache.snapshot().expect("fresh").len(), 1);
@@ -900,7 +920,7 @@ mod freshness_tests {
 #[cfg(test)]
 mod label_parse_tests {
     use super::*;
-    use crate::labels::{apply_labels_event, apply_labels_stream, LabelCache};
+    use crate::labels::{apply_labels_stream, try_apply_labels_event, LabelCache};
 
     const NS_LIST: &[u8] = br#"{
         "kind": "NamespaceList",
@@ -950,11 +970,15 @@ mod label_parse_tests {
         let mut cache = LabelCache::new();
         cache.try_replace_all(objects).expect("list fits");
         assert_eq!(
-            cache.labels_or_empty("prod", "default").get("tier"),
+            cache
+                .labels_of("prod", "default")
+                .and_then(|l| l.get("tier")),
             Some(&"front".to_string())
         );
         assert_eq!(
-            cache.labels_or_empty("dev", "default").get("tier"),
+            cache
+                .labels_of("dev", "default")
+                .and_then(|l| l.get("tier")),
             Some(&"sandbox".to_string())
         );
     }
@@ -968,9 +992,14 @@ mod label_parse_tests {
                  "labels":{"ferrum.io/zone":"pci"}}}}"#,
         )
         .expect("added");
-        assert_eq!(apply_labels_event(&mut cache, added), WatchOutcome::Applied);
         assert_eq!(
-            cache.labels_or_empty("", "prod").get("ferrum.io/zone"),
+            try_apply_labels_event(&mut cache, added).expect("fits"),
+            WatchOutcome::Applied
+        );
+        assert_eq!(
+            cache
+                .labels_of("", "prod")
+                .and_then(|l| l.get("ferrum.io/zone")),
             Some(&"pci".to_string())
         );
 
@@ -979,9 +1008,11 @@ mod label_parse_tests {
                  "labels":{"ferrum.io/zone":"public"}}}}"#,
         )
         .expect("modified");
-        apply_labels_event(&mut cache, modified);
+        try_apply_labels_event(&mut cache, modified).expect("fits");
         assert_eq!(
-            cache.labels_or_empty("", "prod").get("ferrum.io/zone"),
+            cache
+                .labels_of("", "prod")
+                .and_then(|l| l.get("ferrum.io/zone")),
             Some(&"public".to_string())
         );
 
@@ -989,7 +1020,7 @@ mod label_parse_tests {
             br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"7"}}}"#,
         )
         .expect("bookmark");
-        apply_labels_event(&mut cache, bookmark);
+        try_apply_labels_event(&mut cache, bookmark).expect("fits");
         assert_eq!(cache.resource_version(), "7");
 
         let deleted = parse_labels_watch_event(
@@ -997,7 +1028,7 @@ mod label_parse_tests {
         )
         .expect("deleted");
         assert_eq!(
-            apply_labels_event(&mut cache, deleted),
+            try_apply_labels_event(&mut cache, deleted).expect("fits"),
             WatchOutcome::Removed
         );
         assert!(cache.labels_of("", "prod").is_none());
@@ -1017,7 +1048,7 @@ mod label_parse_tests {
             .try_replace_all(parse_labels_list("NamespaceList", NS_LIST).expect("list").1)
             .expect("list fits");
         assert!(cache.is_warm());
-        let outcome = apply_labels_stream(&mut cache, line).expect("apply");
+        let outcome = apply_labels_stream(&mut cache, "namespaces", line).expect("apply");
         assert_eq!(outcome, WatchOutcome::MustRelist);
         // A relist demand must not empty the cache we already have.
         assert_eq!(cache.len(), 2);
@@ -1033,10 +1064,11 @@ mod label_parse_tests {
     }
 
     /// The same fact on the label caches, where it is a fail-open: the
-    /// namespace whose ADDED frame was eaten has labels, the cache does not
-    /// have them, and `labels_or_empty` cannot tell that apart from a namespace
-    /// that carries none. An unobserved label is not a non-match, so the cache
-    /// must stop calling itself warm the moment it misses a frame.
+    /// namespace whose ADDED frame was eaten has labels and the cache does not
+    /// have them, so a reader that folds the miss into an empty map cannot tell
+    /// it apart from a namespace that carries none. An unobserved label is not
+    /// a non-match, so the cache must stop calling itself warm the moment it
+    /// misses a frame.
     #[test]
     fn an_eaten_namespace_frame_is_not_a_namespace_without_labels() {
         let mut cache = LabelCache::new();
@@ -1066,8 +1098,8 @@ mod label_parse_tests {
             WatchOutcome::Applied
         );
         assert_eq!(cache.resource_version(), "5");
-        // The hole is real: prod answers as unlabelled.
-        assert!(cache.labels_or_empty("", "prod").is_empty());
+        // The hole is real: prod is not in the cache at all.
+        assert!(cache.labels_of("", "prod").is_none());
         // So the cache must not be warm, which is the gate every consumer of
         // these labels fails closed on.
         assert!(cache.relist_pending());

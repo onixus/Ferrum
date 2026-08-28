@@ -46,6 +46,7 @@ fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
     reject_unobservable_syscalls(&fx)?;
     reject_unobservable_predicates(&fx)?;
     reject_unexecutable_actions(&fx)?;
+    reject_cluster_selector(&fx)?;
     let admission_program = encode::encode_admission(&fx)?;
     let ebpf_spec = encode::encode_ebpf(&fx)?;
     let wasm = ferrum_wasm_abi::placeholder_module().to_vec();
@@ -175,6 +176,27 @@ fn reject_unobservable_predicates(fx: &Effects<'_>) -> Result<()> {
 /// current caller runs it first. That is exactly why this exists: the
 /// validator is advisory, and a bundle reaching the encoder by another route
 /// must not lose the invariant on the way.
+/// Second gate on the `clusterSelector` invariant, for the same reason as the
+/// three above: `emit_bundle` is what produces the bytes both planes execute,
+/// and it must refuse independently of the advisory validator a caller may
+/// have skipped. A bundle carrying a cluster selector is a policy that
+/// admission denies every Pod for and the agent applies to every workload on
+/// every node, with `DEG_LABELS_UNKNOWN` true for as long as it is loaded —
+/// see `ferrum_policy::validate_selector` for why delivering the labels to the
+/// node was the worse of the two repairs.
+fn reject_cluster_selector(fx: &Effects<'_>) -> Result<()> {
+    let cluster = &fx.selector.cluster_selector;
+    if !cluster.match_labels.is_empty() || !cluster.match_expressions.is_empty() {
+        return Err(FerrumError::Compile(
+            "selector.clusterSelector is outside MVP-1: nothing on either plane observes cluster \
+             labels, so the bundle would deny every Pod at admission and apply to every workload \
+             at runtime while holding the node Degraded"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn reject_unexecutable_actions(fx: &Effects<'_>) -> Result<()> {
     if fx.runtime.default_action == RuntimeAction::Deny {
         return Err(FerrumError::Compile(
@@ -419,6 +441,36 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// No bundle this compiler emits can carry a cluster selector.
+    ///
+    /// That is what makes `DEG_LABELS_UNKNOWN` stop being eternally true on
+    /// the cluster branch: the agent's `cluster_labels_observed: false` is
+    /// still the honest answer, and now nothing can ask the question. The
+    /// validator refuses first; this gate has to hold on its own, because the
+    /// bytes both planes execute come out of `emit_bundle` and a caller that
+    /// skipped the validator must not get a bundle out of it.
+    #[test]
+    fn a_cluster_selector_does_not_compile() {
+        let mut spec = prod_restricted();
+        spec.selector.cluster_selector.match_labels = [("env".to_string(), "prod".to_string())]
+            .into_iter()
+            .collect();
+        assert_validation_no_bundle(compile_cluster_policy(&spec));
+
+        let fx = Effects::from(&spec);
+        match reject_cluster_selector(&fx) {
+            Err(FerrumError::Compile(msg)) => {
+                assert!(msg.contains("clusterSelector"), "{msg}");
+                assert!(msg.contains("Degraded"), "{msg}");
+            }
+            other => panic!("expected Compile, got {other:?}"),
+        }
+
+        // The shipped example, which carries a namespace selector and no
+        // cluster selector, still compiles: this gate is about one field.
+        compile_cluster_policy(&prod_restricted()).expect("prod-restricted still compiles");
     }
 
     #[test]

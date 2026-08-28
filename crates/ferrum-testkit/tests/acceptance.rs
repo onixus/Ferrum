@@ -716,3 +716,290 @@ fn both_planes_answer_an_unlabelled_namespace_the_same_way() {
         "the runtime plane must fail closed on the same namespace admission fails closed on"
     );
 }
+
+/// All three joined label groups, both planes, and a positive match.
+///
+/// The gate above runs both planes on one input and requires one answer, and
+/// three mutations showed how much of the claim it still left open. Each was
+/// applied to a copy of this tree and measured:
+///
+///   * M1 — `ferrum_ebpf::selector_match` stops consulting
+///     `cluster_labels_observed` and `service_account_labels_observed`, so the
+///     runtime plane fails *open* on two of the three groups: the gate above
+///     passed, and so did `cargo test --workspace`. Nothing in the tree caught
+///     it.
+///   * M2 — `ferrum_admission::program_applies` drops
+///     `require_labels_if_selected` for cluster and serviceAccount: the gate
+///     above passed; only `webhook.rs` caught it.
+///   * M3 — `selector_match` always answers `NoMatch`, i.e. the label matcher
+///     is dead: the gate above passed, because both of its runtime assertions
+///     expect a *negative* answer (`NoMatch` and `LabelsUnknown`) and it never
+///     asserts a positive one.
+///
+/// So this one asserts, for the same compiled `prod-restricted` with its
+/// selector extended identically on both decoded halves: a positive match on
+/// both planes; a plain miss on both planes; and, per group, that "never
+/// observed" is fail-closed on both.
+///
+/// The cluster group is asserted only in its unobserved state, and that is not
+/// a gap in the gate but the fact it is measuring: no path in this tree gives
+/// a node an observed cluster label — `PodRecord::identity` hard-codes
+/// `cluster_labels_observed: false` because there is nothing to read — which
+/// is why authoring a `clusterSelector` is now a compile error. The last
+/// assertion here is that refusal, so the two facts stay one.
+#[test]
+fn both_planes_agree_on_every_label_group_and_on_a_match() {
+    use ferrum_admission::AdmissionSubject;
+    use ferrum_ebpf::{parse_febp, selector_match, SelectorMatch};
+    use ferrum_k8smeta::source::{ContainerRecord, PodCache, PodMetadataSource};
+    use ferrum_k8smeta::{LabelObject, PodRecord, WorkloadIdentity};
+    use std::collections::BTreeMap;
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The runtime plane's identity for a pod, with each group either listed
+    /// (`Some`) or never named by any list (`None`). Built through `PodCache`,
+    /// not by hand, so the observedness flags come from the join the node
+    /// actually runs.
+    fn identity(
+        namespace_labels: Option<BTreeMap<String, String>>,
+        service_account_labels: Option<BTreeMap<String, String>>,
+    ) -> WorkloadIdentity {
+        let mut cache = PodCache::new("node-a");
+        cache.upsert(PodRecord {
+            uid: "uid-1".into(),
+            namespace: "prod".into(),
+            name: "web-1".into(),
+            node_name: "node-a".into(),
+            service_account: "web".into(),
+            resource_version: "1".into(),
+            labels: BTreeMap::new(),
+            namespace_labels: BTreeMap::new(),
+            service_account_labels: BTreeMap::new(),
+            namespace_labels_observed: false,
+            service_account_labels_observed: false,
+            containers: vec![ContainerRecord {
+                name: "app".into(),
+                id: "a".repeat(64),
+                image: "registry.internal.example/app@sha256:abc".into(),
+                image_digest: "sha256:abc".into(),
+            }],
+        });
+        cache.mark_applied_at(std::time::Instant::now());
+        cache
+            .namespaces_mut()
+            .try_replace_all(
+                namespace_labels
+                    .into_iter()
+                    .map(|labels| LabelObject {
+                        namespace: String::new(),
+                        name: "prod".into(),
+                        labels,
+                        resource_version: "1".into(),
+                    })
+                    .collect(),
+            )
+            .expect("namespace list fits");
+        cache
+            .service_accounts_mut()
+            .try_replace_all(
+                service_account_labels
+                    .into_iter()
+                    .map(|labels| LabelObject {
+                        namespace: "prod".into(),
+                        name: "web".into(),
+                        labels,
+                        resource_version: "1".into(),
+                    })
+                    .collect(),
+            )
+            .expect("serviceaccount list fits");
+        let pod = cache.snapshot().expect("snapshot").remove(0);
+        pod.identity(&pod.containers[0])
+    }
+
+    /// The admission plane's subject for the same pod. Privileged, so
+    /// "allowed" can only mean the policy did not apply: a compliant Pod would
+    /// be allowed either way and would prove nothing.
+    fn subject(
+        cluster: Option<BTreeMap<String, String>>,
+        namespace: Option<BTreeMap<String, String>>,
+        service_account: Option<BTreeMap<String, String>>,
+    ) -> AdmissionSubject {
+        let mut subject = compliant_subject();
+        subject.namespace = "prod".into();
+        subject.service_account = "web".into();
+        subject.privileged = true;
+        subject.cluster_labels = cluster;
+        subject.namespace_labels = namespace;
+        subject.service_account_labels = service_account;
+        subject
+    }
+
+    let mut spec = prod_restricted().spec;
+    spec.mode = PolicyMode::Enforce;
+    let bundle = compile_cluster_policy(&spec).expect("compile prod-restricted");
+    let mut ebpf = parse_febp(&bundle.ebpf_spec).expect("parse FEBP");
+    let mut admission = program();
+    let pci = labels(&[("ferrum.io/zone", "pci")]);
+    let front = labels(&[("tier", "front")]);
+    let prod = labels(&[("env", "prod")]);
+
+    // The one selector both planes are asked about, written into each decoded
+    // half of the same compilation. `prod-restricted` already carries the
+    // namespace half; the other two are added here because no policy this
+    // compiler will emit can carry a cluster selector, and the shipped example
+    // carries no ServiceAccount one. The two crates have their own decoded
+    // `PolicySelector` types, so the maps rather than the write are what is
+    // shared, and the assertions below read them back off both.
+    ebpf.selector.cluster_selector.match_labels = prod.clone();
+    ebpf.selector.service_account_selector.match_labels = front.clone();
+    admission.selector.cluster_selector.match_labels = prod.clone();
+    admission.selector.service_account_selector.match_labels = front.clone();
+    assert_eq!(ebpf.selector.cluster_selector.match_labels, prod);
+    assert_eq!(admission.selector.cluster_selector.match_labels, prod);
+    assert_eq!(ebpf.selector.service_account_selector.match_labels, front);
+    assert_eq!(
+        admission.selector.service_account_selector.match_labels,
+        front
+    );
+    assert_eq!(
+        ebpf.selector.namespace_selector.match_expressions.len(),
+        admission
+            .selector
+            .namespace_selector
+            .match_expressions
+            .len(),
+        "the namespace half comes from the compilation itself and must reach both planes"
+    );
+    assert!(
+        !ebpf
+            .selector
+            .namespace_selector
+            .match_expressions
+            .is_empty(),
+        "the fixture must carry a namespace selector, or this gate asserts nothing about it"
+    );
+
+    // 1. Everything observed and matching. The positive answer M3 showed
+    //    nothing here asserted: a matcher that has stopped matching anything
+    //    passes every negative assertion in this file.
+    let mut matching = identity(Some(pci.clone()), Some(front.clone()));
+    matching.cluster_labels = prod.clone();
+    matching.cluster_labels_observed = true;
+    assert_eq!(
+        selector_match(&ebpf.selector, &matching),
+        SelectorMatch::Match,
+        "three observed, matching label groups are a match, not an unknown"
+    );
+    let decision = admit(
+        &admission,
+        &subject(Some(prod.clone()), Some(pci.clone()), Some(front.clone())),
+        &[],
+        now(),
+    );
+    assert!(
+        !decision.allowed && !decision.fail_closed,
+        "the same three groups must make the policy apply on the other plane: {:?}",
+        decision.reasons
+    );
+
+    // 2. Observed and not matching, one group at a time: a decision, on both
+    //    planes, and never an integrity failure.
+    for (what, wrong) in [
+        ("cluster", (Some(labels(&[("env", "dev")])), None, None)),
+        (
+            "namespace",
+            (None, Some(labels(&[("ferrum.io/zone", "public")])), None),
+        ),
+        (
+            "serviceAccount",
+            (None, None, Some(labels(&[("tier", "back")]))),
+        ),
+    ] {
+        let (cluster, namespace, service_account) = wrong;
+        let mut identity = identity(
+            Some(namespace.clone().unwrap_or_else(|| pci.clone())),
+            Some(service_account.clone().unwrap_or_else(|| front.clone())),
+        );
+        identity.cluster_labels = cluster.clone().unwrap_or_else(|| prod.clone());
+        identity.cluster_labels_observed = true;
+        assert_eq!(
+            selector_match(&ebpf.selector, &identity),
+            SelectorMatch::NoMatch,
+            "{what}: an observed group that does not match is a miss"
+        );
+        let decision = admit(
+            &admission,
+            &subject(
+                Some(cluster.unwrap_or_else(|| prod.clone())),
+                Some(namespace.unwrap_or_else(|| pci.clone())),
+                Some(service_account.unwrap_or_else(|| front.clone())),
+            ),
+            &[],
+            now(),
+        );
+        assert!(
+            decision.allowed && !decision.fail_closed,
+            "{what}: the other plane must answer the same miss the same way: {:?}",
+            decision.reasons
+        );
+    }
+
+    // 3. Never observed, one group at a time. Fail closed on both planes —
+    //    the half M1 and M2 each opened, on the two groups the gate above
+    //    never asked about.
+    for what in ["cluster", "namespace", "serviceAccount"] {
+        let mut identity = identity(
+            (what != "namespace").then(|| pci.clone()),
+            (what != "serviceAccount").then(|| front.clone()),
+        );
+        identity.cluster_labels_observed = what != "cluster";
+        identity.cluster_labels = if what == "cluster" {
+            BTreeMap::new()
+        } else {
+            prod.clone()
+        };
+        assert_eq!(
+            selector_match(&ebpf.selector, &identity),
+            SelectorMatch::LabelsUnknown,
+            "{what}: a group nothing ever observed cannot answer its selector"
+        );
+        let decision = admit(
+            &admission,
+            &subject(
+                (what != "cluster").then(|| prod.clone()),
+                (what != "namespace").then(|| pci.clone()),
+                (what != "serviceAccount").then(|| front.clone()),
+            ),
+            &[],
+            now(),
+        );
+        assert!(
+            !decision.allowed && decision.fail_closed,
+            "{what}: the other plane must fail closed on the same unknown: {:?}",
+            decision.reasons
+        );
+        assert!(
+            decision.reasons.iter().any(|r| r.contains(what)),
+            "{what}: the deny must name which group was not known: {:?}",
+            decision.reasons
+        );
+    }
+
+    // 4. And the reason the cluster group is only ever asserted unobserved
+    //    above: nothing this compiler emits can ask the question.
+    let mut with_cluster = prod_restricted().spec;
+    with_cluster.selector.cluster_selector.match_labels = prod.clone();
+    assert!(
+        compile_cluster_policy(&with_cluster).is_err(),
+        "a policy carrying a clusterSelector must not compile: no node observes cluster labels, \
+         so on the runtime plane it applies to every workload and holds DEG_LABELS_UNKNOWN true \
+         for as long as it is loaded"
+    );
+}
