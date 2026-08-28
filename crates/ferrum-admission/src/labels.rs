@@ -501,7 +501,7 @@ mod tests {
             WatchedLabels::new(
                 Arc::new(RwLock::new(namespaces)),
                 Arc::new(RwLock::new(service_accounts)),
-                BTreeMap::new(),
+                ClusterLabels::stated(BTreeMap::new()),
             )
         }
 
