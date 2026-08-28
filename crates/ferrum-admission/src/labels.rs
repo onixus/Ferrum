@@ -150,28 +150,16 @@ impl ClusterLabels {
     }
 
     /// No `--cluster-label`: a cluster selector cannot be answered, and a
-    /// policy carrying one fails closed.
+    /// policy carrying one fails closed. There is deliberately no
+    /// `From<BTreeMap>` beside these two: a caller holding only the parsed map
+    /// would have to guess from emptiness, which is the defect this type
+    /// exists to remove. Every caller knows whether the flag was there.
     pub fn unstated() -> Self {
         Self(None)
     }
 
     pub fn observed(&self) -> Option<&BTreeMap<String, String>> {
         self.0.as_ref()
-    }
-}
-
-/// For a caller that kept only the parsed map and no longer knows whether the
-/// flag was there. It has to guess, and it guesses fail-closed: an empty map
-/// becomes `unstated`, so a cluster selector denies rather than being answered
-/// from labels nobody stated. A caller that *does* know — the flag parser —
-/// should call [`ClusterLabels::stated`] and not come through here.
-impl From<BTreeMap<String, String>> for ClusterLabels {
-    fn from(labels: BTreeMap<String, String>) -> Self {
-        if labels.is_empty() {
-            Self::unstated()
-        } else {
-            Self::stated(labels)
-        }
     }
 }
 
@@ -387,18 +375,14 @@ mod tests {
         );
         let unstated = StaticLabels::cluster(ClusterLabels::unstated());
         assert_eq!(unstated.cluster_labels(), None);
-        // The lossy path a caller holding only the parsed map has to take
-        // guesses fail-closed.
-        assert_eq!(
-            ClusterLabels::from(BTreeMap::new()),
-            ClusterLabels::unstated()
-        );
     }
 
     #[test]
     fn cluster_labels_do_not_make_a_source_warm() {
-        let labels =
-            StaticLabels::cluster(BTreeMap::from([("env".to_string(), "prod".to_string())]));
+        let labels = StaticLabels::cluster(ClusterLabels::stated(BTreeMap::from([(
+            "env".to_string(),
+            "prod".to_string(),
+        )])));
         assert_eq!(labels.cluster_labels().expect("stated").len(), 1);
         assert!(
             !labels.is_warm(),

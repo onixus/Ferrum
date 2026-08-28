@@ -1263,7 +1263,9 @@ fn cluster_labels_come_from_the_flag_and_need_no_warm_cache() {
             .match_labels
             .insert("env".into(), "prod".into());
     });
-    let cfg = cfg_with(StaticLabels::cluster(labels(&[("env", "prod")])));
+    let cfg = cfg_with(StaticLabels::cluster(ClusterLabels::stated(labels(&[(
+        "env", "prod",
+    )]))));
     let reply = decide(
         &cfg,
         &program,
@@ -1273,7 +1275,9 @@ fn cluster_labels_come_from_the_flag_and_need_no_warm_cache() {
     assert_eq!(reply["response"]["allowed"], false);
     assert!(!deny_msg(&reply).contains("labels unavailable"));
 
-    let elsewhere = cfg_with(StaticLabels::cluster(labels(&[("env", "staging")])));
+    let elsewhere = cfg_with(StaticLabels::cluster(ClusterLabels::stated(labels(&[(
+        "env", "staging",
+    )]))));
     let reply = decide(
         &elsewhere,
         &program,
@@ -1605,7 +1609,7 @@ mod watched_labels {
         Arc::new(WatchedLabels::new(
             Arc::new(RwLock::new(namespaces)),
             Arc::new(RwLock::new(service_accounts)),
-            std::collections::BTreeMap::new(),
+            ClusterLabels::stated(std::collections::BTreeMap::new()),
         ))
     }
 
@@ -1867,7 +1871,9 @@ fn a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map() {
     );
 
     // And the flag that does match still applies the policy.
-    let stated = cfg_with(StaticLabels::cluster(labels(&[("env", "prod")])));
+    let stated = cfg_with(StaticLabels::cluster(ClusterLabels::stated(labels(&[(
+        "env", "prod",
+    )]))));
     let reply = decide(
         &stated,
         &program,

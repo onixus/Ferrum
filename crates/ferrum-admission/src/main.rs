@@ -4,8 +4,8 @@
 
 use ferrum_admission::{
     admit_bytes, load_path, parse_trust_root, poll_bundle_file, poll_exceptions_file,
-    poll_serving_cert, serve_listener, verify_exceptions_fsig, AdmissionSubject, LabelSource,
-    ReviewConfig, StaticLabels, TlsSource, WebhookState,
+    poll_serving_cert, serve_listener, verify_exceptions_fsig, AdmissionSubject, ClusterLabels,
+    LabelSource, ReviewConfig, StaticLabels, TlsSource, WebhookState,
 };
 use ferrum_api::PolicyExceptionSpec;
 use std::collections::BTreeMap;
@@ -257,10 +257,16 @@ fn review_config(flags: &Flags) -> ReviewConfig {
 
 /// `--cluster-label k=v`, repeatable as `k=v,k2=v2`. MVP-1 has no cluster
 /// object to read these from; they are operator-stated, not discovered.
-fn cluster_labels(flags: &Flags) -> BTreeMap<String, String> {
+///
+/// This is the one caller that knows whether the flag was *passed*, so it is
+/// the one that must say so. `--cluster-label ""` states a cluster with no
+/// labels: the operator was heard, and a cluster selector answers with a miss
+/// rather than failing closed. No flag at all is `unstated`, and a policy
+/// carrying a cluster selector still denies.
+fn cluster_labels(flags: &Flags) -> ClusterLabels {
     let mut out = BTreeMap::new();
     let Some(raw) = flags.map.get("cluster-label") else {
-        return out;
+        return ClusterLabels::unstated();
     };
     for pair in raw.split(',').filter(|s| !s.trim().is_empty()) {
         match pair.split_once('=') {
@@ -270,7 +276,7 @@ fn cluster_labels(flags: &Flags) -> BTreeMap<String, String> {
             _ => die(&format!("--cluster-label expects k=v, got {pair:?}")),
         }
     }
-    out
+    ClusterLabels::stated(out)
 }
 
 /// Live namespace/ServiceAccount labels, or a cold source that denies every
