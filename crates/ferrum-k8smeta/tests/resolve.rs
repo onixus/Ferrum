@@ -4,7 +4,7 @@ use ferrum_common::FerrumError;
 use ferrum_k8smeta::cgroupfs::{scan, CgroupFs, StdCgroupFs};
 use ferrum_k8smeta::source::{PodCache, PodMetadataSource, POD_WATCH_BUDGET};
 use ferrum_k8smeta::watch::{
-    apply_watch_event, apply_watch_stream, parse_labels_list, parse_pod_list, parse_watch_event,
+    apply_watch_line, apply_watch_stream, parse_labels_list, parse_pod_list, parse_watch_event,
     PodWatchEvent, WatchOutcome,
 };
 use ferrum_k8smeta::{apply_labels_stream, PodRecord};
@@ -210,7 +210,7 @@ fn deleted_pod_clears_every_cgroup_of_that_pod() {
     );
 
     let stream = std::fs::read(fixture("pod-watch.jsonl")).expect("watch fixture");
-    apply_watch_stream(&mut cache, &stream).expect("apply stream");
+    apply_watch_stream(&mut cache, &stream);
     assert_eq!(cache.resource_version(), "1006");
     // api-0 added, web-0 deleted, both node-b pods refused.
     assert_eq!(cache.len(), 1);
@@ -256,6 +256,87 @@ fn vanished_cgroup_directory_drops_the_entry() {
     assert!(resolver.index().lookup_cgroup(side_inode).is_err());
 }
 
+/// A replayed stream meets the relist debt where a live one does.
+///
+/// `apply_watch_stream` and `apply_labels_stream` used to parse and fold the
+/// lines themselves, so neither `relist_if_due` nor `note_unreadable_frame`
+/// ran on a replay: an unreadable frame was an `Err` that ended the replay
+/// where the shipped fold raises a debt and reads on, and a standing debt was
+/// never looked at. Every stream in this file goes through those two
+/// functions, so "the debt is checked on every frame" — the property the
+/// hold-down exists to bound — was asserted here exactly nowhere.
+///
+/// Both halves, on both streams: the unreadable frame does not end the replay
+/// and does leave the cache owing a relist, and the next frame after the
+/// hold-down ends the stream so the relist can run.
+#[test]
+fn a_replayed_stream_answers_an_unreadable_frame_the_way_the_node_does() {
+    let healthy = std::fs::read(fixture("pod-watch.jsonl")).expect("watch fixture");
+    let first = healthy
+        .split(|b| *b == b'\n')
+        .next()
+        .expect("line")
+        .to_vec();
+    let mut stream = br#"{"type":"WHAT-IS-THIS","object":{}}"#.to_vec();
+    stream.push(b'\n');
+    stream.extend_from_slice(&first);
+
+    let mut cache = list_into_cache();
+    let now = Instant::now();
+    let outcome = ferrum_k8smeta::watch::apply_watch_stream_at(&mut cache, &stream, now);
+    assert_ne!(
+        outcome,
+        WatchOutcome::MustRelist,
+        "one unreadable frame must not end the stream: a `type:` a newer apiserver invented \
+         would cost one reconnect per frame"
+    );
+    assert!(
+        cache.relist_pending(),
+        "and it must not be read past for free either: the frame was a change that happened \
+         and was not applied"
+    );
+    match cache.snapshot() {
+        Err(FerrumError::Degraded(msg)) => assert!(msg.contains("relist"), "{msg}"),
+        other => panic!("a cache owing a relist must be Degraded, got {other:?}"),
+    }
+
+    // The next frame of any kind, once the debt has stood past the hold-down,
+    // ends the stream. Nothing here sleeps: the instant is supplied.
+    let later = now + ferrum_k8smeta::RELIST_DEBT_HOLDDOWN + Duration::from_secs(1);
+    assert_eq!(
+        ferrum_k8smeta::watch::apply_watch_stream_at(&mut cache, &first, later),
+        WatchOutcome::MustRelist
+    );
+
+    // The label stream answers the same two facts the same way.
+    let mut labels = PodCache::new(NODE);
+    let ns = std::fs::read(fixture("namespace-watch.jsonl")).expect("namespace fixture");
+    let ns_first = ns.split(|b| *b == b'\n').next().expect("line").to_vec();
+    let mut ns_stream = br#"{"type":"WHAT-IS-THIS","object":{}}"#.to_vec();
+    ns_stream.push(b'\n');
+    ns_stream.extend_from_slice(&ns_first);
+    let outcome = ferrum_k8smeta::apply_labels_stream_at(
+        labels.namespaces_mut(),
+        "namespaces",
+        &ns_stream,
+        now,
+    )
+    .expect("an unreadable frame is a debt, not an error");
+    assert_ne!(outcome, WatchOutcome::MustRelist);
+    assert!(labels.namespaces().relist_pending());
+    assert!(!labels.namespaces().is_warm());
+    assert_eq!(
+        ferrum_k8smeta::apply_labels_stream_at(
+            labels.namespaces_mut(),
+            "namespaces",
+            &ns_first,
+            later
+        )
+        .expect("still not an error"),
+        WatchOutcome::MustRelist
+    );
+}
+
 #[test]
 fn expired_resource_version_demands_a_relist() {
     let bytes = std::fs::read(fixture("pod-watch-expired.jsonl")).expect("fixture");
@@ -266,7 +347,7 @@ fn expired_resource_version_demands_a_relist() {
     }
     let mut cache = list_into_cache();
     let before = cache.snapshot().expect("snapshot").len();
-    let outcome = apply_watch_stream(&mut cache, &bytes).expect("apply");
+    let outcome = apply_watch_stream(&mut cache, &bytes);
     assert_eq!(outcome, WatchOutcome::MustRelist);
     // A relist demand must not silently empty the cache...
     assert_eq!(cache.len(), before);
@@ -324,10 +405,12 @@ fn modified_updates_metadata_and_foreign_added_is_ignored() {
         .collect();
     let mut cache = list_into_cache();
 
-    let modified = parse_watch_event(lines[1]).expect("parse MODIFIED");
-    assert!(matches!(modified, PodWatchEvent::Modified(_)));
+    assert!(matches!(
+        parse_watch_event(lines[1]).expect("parse MODIFIED"),
+        PodWatchEvent::Modified(_)
+    ));
     assert_eq!(
-        apply_watch_event(&mut cache, modified),
+        apply_watch_line(&mut cache, lines[1]),
         WatchOutcome::Applied
     );
     let web = cache.get(WEB_UID).expect("web-0");
@@ -337,9 +420,9 @@ fn modified_updates_metadata_and_foreign_added_is_ignored() {
         "registry.example.com/app:1.5"
     );
 
-    let foreign = parse_watch_event(lines[3]).expect("parse foreign ADDED");
+    assert!(parse_watch_event(lines[3]).is_ok(), "foreign ADDED parses");
     assert_eq!(
-        apply_watch_event(&mut cache, foreign),
+        apply_watch_line(&mut cache, lines[3]),
         WatchOutcome::Ignored,
         "a pod scheduled elsewhere must never enter this node's cache"
     );
@@ -386,7 +469,7 @@ fn deleted_namespace_drops_its_labels_from_every_pod() {
         .is_empty());
 
     let stream = std::fs::read(fixture("namespace-watch.jsonl")).expect("ns watch fixture");
-    apply_labels_stream(cache.namespaces_mut(), &stream).expect("apply ns stream");
+    apply_labels_stream(cache.namespaces_mut(), "namespaces", &stream).expect("apply ns stream");
     assert_eq!(cache.namespaces().resource_version(), "2004");
 
     let pods = cache.snapshot().expect("snapshot");
@@ -456,14 +539,18 @@ fn pod_in_an_unknown_namespace_gets_empty_labels_and_is_counted() {
 fn expired_namespace_watch_demands_a_relist_and_keeps_labels() {
     let mut cache = labelled_cache();
     let stream = std::fs::read(fixture("namespace-watch-expired.jsonl")).expect("fixture");
-    let outcome = apply_labels_stream(cache.namespaces_mut(), &stream).expect("apply");
+    let outcome =
+        apply_labels_stream(cache.namespaces_mut(), "namespaces", &stream).expect("apply");
     assert_eq!(outcome, WatchOutcome::MustRelist);
     assert_eq!(cache.namespaces().len(), 2);
     // The labels survive the 410, but stop counting as warm until a list
     // lands: the namespace may have been relabelled inside the gap.
     assert!(cache.namespaces().relist_pending());
     assert!(!cache.namespaces().is_warm());
-    assert!(!cache.namespaces().labels_or_empty("", "prod").is_empty());
+    assert!(cache
+        .namespaces()
+        .labels_of("", "prod")
+        .is_some_and(|labels| !labels.is_empty()));
 }
 
 #[test]
@@ -523,13 +610,11 @@ fn a_bookmark_alone_keeps_a_quiet_cluster_resolvable() {
         return;
     };
     cache.mark_applied_at(nearly_stale);
-    let bookmark = parse_watch_event(
-        br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"1099"}}}"#,
-    )
-    .expect("bookmark");
+    let bookmark = br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"1099"}}}"#;
+    assert!(parse_watch_event(bookmark).is_ok());
     // No pod changed: the bookmark is the only proof the stream is alive.
     assert_eq!(
-        apply_watch_event(&mut cache, bookmark),
+        apply_watch_line(&mut cache, bookmark),
         WatchOutcome::Ignored
     );
     assert_eq!(cache.resource_version(), "1099");
@@ -574,7 +659,7 @@ fn a_namespace_bookmark_keeps_the_label_cache_warm() {
     assert!(cache.namespaces().is_warm());
     let bookmark = br#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"2222"}}}"#;
     assert_eq!(
-        apply_labels_stream(cache.namespaces_mut(), bookmark).expect("apply"),
+        apply_labels_stream(cache.namespaces_mut(), "namespaces", bookmark).expect("apply"),
         WatchOutcome::Ignored
     );
     assert_eq!(cache.namespaces().resource_version(), "2222");
@@ -583,4 +668,58 @@ fn a_namespace_bookmark_keeps_the_label_cache_warm() {
         "a bookmark is the only liveness a quiet cluster produces"
     );
     assert!(cache.namespaces().is_warm());
+}
+
+/// `labels_of` already answers "was this object listed"; `PodCache::snapshot`
+/// counted the miss and then dropped the answer, leaving an empty map in both
+/// branches. Every consumer had to re-derive it from emptiness, and got the
+/// unlabelled namespace wrong. The record carries it now.
+#[test]
+fn an_unlabelled_namespace_resolves_as_observed_and_empty_not_as_unknown() {
+    let mut cache = labelled_cache();
+    // The list completed and named `prod`; `prod` carries no labels. That is
+    // not the fact "no list ever mentioned prod".
+    cache
+        .namespaces_mut()
+        .try_replace_all(vec![ferrum_k8smeta::LabelObject {
+            namespace: String::new(),
+            name: "prod".into(),
+            labels: std::collections::BTreeMap::new(),
+            resource_version: "2002".into(),
+        }])
+        .expect("list fits");
+
+    let pods = cache.snapshot().expect("snapshot");
+    let web = pod_named(&pods, "web-0");
+    assert!(web.namespace_labels.is_empty());
+    assert!(
+        web.namespace_labels_observed,
+        "a namespace the list named is observed even when it has no labels"
+    );
+    assert!(web.service_account_labels_observed);
+    assert_eq!(
+        cache.labels_unknown_total(),
+        0,
+        "nothing here is unknown, so nothing may be counted as such"
+    );
+    let identity = web.identity(&web.containers[0]);
+    assert!(identity.namespace_labels_observed);
+    assert!(identity.service_account_labels_observed);
+    assert!(
+        !identity.cluster_labels_observed,
+        "the node has no source of cluster labels at all, and says so"
+    );
+
+    // The other half, unchanged: a namespace no list ever named is unknown,
+    // counted, and carries the fact out on the record.
+    let mut moved = cache.get(WEB_UID).expect("web-0").clone();
+    moved.namespace = "never-listed".into();
+    cache.upsert(moved);
+    let pods = cache.snapshot().expect("snapshot");
+    let web = pod_named(&pods, "web-0");
+    assert!(!web.namespace_labels_observed);
+    assert!(!web.service_account_labels_observed);
+    assert_eq!(cache.labels_unknown_total(), 2);
+    let identity = web.identity(&web.containers[0]);
+    assert!(!identity.namespace_labels_observed);
 }

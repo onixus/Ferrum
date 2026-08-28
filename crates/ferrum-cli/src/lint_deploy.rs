@@ -44,6 +44,7 @@ const DUPLICATE_JOINED_FLAG: &str = "FD025";
 const BPF_ELF_WITHOUT_TRACEFS: &str = "FD026";
 const LABEL_SOURCE_UNJOINED: &str = "FD027";
 const OPTIONAL_REQUIRED_MOUNT: &str = "FD028";
+const UNREADABLE_VOLUME_MODE: &str = "FD029";
 
 /// Bundle Secrets the controller writes: `ferrum-bundle-cluster-<policy>` for a
 /// cluster-scoped policy, `ferrum-bundle-ns-<namespace>-<policy>` for a
@@ -524,6 +525,7 @@ fn check_pod_templates(docs: &[Doc], findings: &mut Vec<Finding>) {
                 check_policy_join(doc, &owner, spec, container, findings);
                 check_tracefs(doc, &owner, spec, container, findings);
                 check_optional_required_mount(doc, &owner, spec, container, findings);
+                check_volume_readability(doc, &owner, spec, container, findings);
             }
         }
     }
@@ -623,6 +625,184 @@ fn normalised_path(path: &str) -> &str {
 /// container may mount `/etc/ferrum` and `/etc/ferrum/tls`, and a file under
 /// the second is served by the second. Length is compared on the normalised
 /// form, so a trailing slash cannot make one mount win over a longer one.
+/// A file the process cannot open, promised by the manifest that mounts it.
+///
+/// kubelet writes a Secret or ConfigMap volume as root:root and applies
+/// `defaultMode` verbatim; the group is changed to `fsGroup` only when the Pod
+/// declares one. So a mode with no world bits, under a `runAsUser` that is not
+/// 0 and with no `fsGroup`, is a file the container cannot read — and the
+/// tighter the mode looks, the more certainly it is broken. The controller
+/// shipped exactly that: `defaultMode: 0400` on the bundle signing key under
+/// `runAsUser: 65532`, so `/etc/ferrum/signing/seed` was root-only and the
+/// process that has to read it is not root. Nothing in the tree could catch
+/// it: the flags are right, the mount is right, the file is there, and the
+/// open fails at runtime on a cluster.
+///
+/// The rule is the whole class rather than that one file, and it is checked
+/// against *both* readings of the literal, because the two readers of this
+/// tree disagree about it. `defaultMode: 0400` is 256 to a YAML 1.1 parser
+/// (kubectl, client-go — leading zero means octal) and 400 to a YAML 1.2 one
+/// (`serde_yaml`, this lint — leading zeros are decimal). A manifest whose
+/// meaning depends on which parser applies it is already a finding, so a mode
+/// that is unreadable under either reading is reported under the same code:
+/// writing it in plain decimal (`288` for `0440`) is the one form both agree
+/// on.
+fn check_volume_readability(
+    doc: &Doc,
+    owner: &str,
+    spec: &Value,
+    container: &Value,
+    findings: &mut Vec<Finding>,
+) {
+    let Some(uid) = effective_run_as_user(spec, container).filter(|uid| *uid != 0) else {
+        // Running as root, or as whatever uid the image declares: this rule
+        // has nothing it can prove.
+        return;
+    };
+    let fs_group = pod_security_context(spec)
+        .and_then(|c| c.get("fsGroup"))
+        .and_then(Value::as_i64);
+    let cname = container
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>");
+    for mount in seq(container, "volumeMounts") {
+        let Some(vname) = mount.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(volume) = seq(spec, "volumes")
+            .iter()
+            .find(|v| v.get("name").and_then(Value::as_str) == Some(vname))
+        else {
+            continue;
+        };
+        let at = mount
+            .get("mountPath")
+            .and_then(Value::as_str)
+            .unwrap_or("<no mountPath>");
+        for (source, written, readings) in declared_modes(volume) {
+            let unreadable: Vec<String> = readings
+                .iter()
+                .filter(|mode| !readable_by(**mode, fs_group.is_some()))
+                .map(|mode| format!("0o{mode:o}"))
+                .collect();
+            if unreadable.is_empty() {
+                continue;
+            }
+            findings.push(Finding {
+                code: UNREADABLE_VOLUME_MODE,
+                file: doc.file.clone(),
+                msg: format!(
+                    "{owner} container '{cname}' mounts volume '{vname}' at {at} whose {source} \
+                     is {written} — {} to this parser and to the one that applies the file — and \
+                     the Pod runs as uid {uid}{}. kubelet writes those files root:root and moves \
+                     the group only for an fsGroup, so this uid is left with the `other` bits, \
+                     which are empty: the process cannot open the file it is mounted for. Give \
+                     the Pod `fsGroup: {uid}` and a group-readable mode, and write that mode in \
+                     plain decimal — 0440 is 288 — because a leading zero is octal to the YAML \
+                     1.1 parser that applies this manifest and not an integer at all to a 1.2 \
+                     one",
+                    unreadable.join(" or "),
+                    match fs_group {
+                        Some(g) => format!(" with fsGroup {g}"),
+                        None => " with no fsGroup".to_string(),
+                    }
+                ),
+            });
+        }
+    }
+}
+
+fn pod_security_context(spec: &Value) -> Option<&Value> {
+    spec.get("securityContext")
+}
+
+/// The uid the container actually runs as: its own `runAsUser` if it sets one,
+/// otherwise the Pod's.
+fn effective_run_as_user(spec: &Value, container: &Value) -> Option<i64> {
+    container
+        .get("securityContext")
+        .and_then(|c| c.get("runAsUser"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            pod_security_context(spec)
+                .and_then(|c| c.get("runAsUser"))
+                .and_then(Value::as_i64)
+        })
+}
+
+/// Every file mode this volume declares: the source, the literal as written,
+/// and every mode that literal can mean.
+fn declared_modes(volume: &Value) -> Vec<(String, String, Vec<u32>)> {
+    let mut out = Vec::new();
+    let mut from = |label: &str, source: &Value| {
+        if let Some(mode) = source.get("defaultMode").and_then(mode_readings) {
+            out.push((format!("{label} defaultMode"), mode.0, mode.1));
+        }
+        for item in seq(source, "items") {
+            if let Some(mode) = item.get("mode").and_then(mode_readings) {
+                let key = item.get("key").and_then(Value::as_str).unwrap_or("<item>");
+                out.push((format!("{label} item '{key}' mode"), mode.0, mode.1));
+            }
+        }
+    };
+    for (key, label) in [("secret", "Secret"), ("configMap", "ConfigMap")] {
+        if let Some(source) = volume.get(key) {
+            from(label, source);
+        }
+    }
+    if let Some(projected) = volume.get("projected") {
+        from("projected", projected);
+        for source in seq(projected, "sources") {
+            for (key, label) in [
+                ("secret", "projected Secret"),
+                ("configMap", "projected ConfigMap"),
+            ] {
+                if let Some(source) = source.get(key) {
+                    from(label, source);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The literal as written, and every mode it can mean.
+///
+/// `0400` is not one value in this file, it is two and a half. To the YAML 1.1
+/// parser that applies the manifest (kubectl, client-go) it is octal 256. To
+/// the YAML 1.2 parser reading it here it is not an integer at all — leading
+/// zeros are not decimal ints in the core schema — so it arrives as the string
+/// `"0400"`, which is a type the API server rejects outright from any client
+/// that sends it on. Both readings are returned and both have to be readable:
+/// a mode whose value depends on who parses the file is a finding under either
+/// answer. A mode written in plain decimal (288 for 0440) has exactly one
+/// reading, which is why the message asks for that form.
+fn mode_readings(value: &Value) -> Option<(String, Vec<u32>)> {
+    let (written, mut readings) = match value {
+        Value::Number(n) => {
+            let as_written = u32::try_from(n.as_i64()?).ok()?;
+            (as_written.to_string(), vec![as_written])
+        }
+        Value::String(s) => (s.clone(), s.trim().parse::<u32>().into_iter().collect()),
+        _ => return None,
+    };
+    // The same digits read as octal: what a YAML 1.1 parser does with the
+    // leading zero this one could not read as a number.
+    if let Ok(as_octal) = u32::from_str_radix(written.trim().trim_start_matches('0'), 8) {
+        if !readings.contains(&as_octal) {
+            readings.push(as_octal);
+        }
+    }
+    (!readings.is_empty()).then_some((written, readings))
+}
+
+/// kubelet gives the container's uid the `other` bits, and the `group` bits
+/// only when the Pod declares an `fsGroup`.
+fn readable_by(mode: u32, has_fs_group: bool) -> bool {
+    mode & 0o004 != 0 || (has_fs_group && mode & 0o040 != 0)
+}
+
 fn volume_serving<'a>(
     spec: &'a Value,
     container: &'a Value,
@@ -2120,6 +2300,42 @@ mod tests {
                 .map(|c| c.to_string())
                 .collect::<BTreeSet<_>>()
         );
+    }
+
+    /// A mounted file the container's uid cannot open is a broken install,
+    /// and nothing else in this tree can see it: the flags are right, the
+    /// mount is right, the file is there, and `open()` fails on a cluster.
+    #[test]
+    fn a_volume_mode_the_run_as_user_cannot_read_is_a_finding() {
+        let codes = codes_for("crates/ferrum-testkit/fixtures/deploy-bad-volume-mode");
+        assert_eq!(
+            codes,
+            [UNREADABLE_VOLUME_MODE]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// The arithmetic behind that rule, including the two answers one literal
+    /// can have. `0400` is octal 256 to the YAML 1.1 parser that applies a
+    /// manifest and a string to the 1.2 parser reading it here; `288` is the
+    /// same mode to both, which is why the finding asks for decimal.
+    #[test]
+    fn a_mode_is_readable_only_through_bits_the_uid_actually_gets() {
+        // No fsGroup: the container's uid gets `other` and nothing else.
+        assert!(!readable_by(0o400, false));
+        assert!(!readable_by(0o440, false));
+        assert!(readable_by(0o444, false));
+        // With one, the group bits are the container's too.
+        assert!(readable_by(0o440, true));
+        assert!(!readable_by(0o400, true));
+
+        let ambiguous = mode_readings(&Value::String("0400".into())).expect("readings");
+        assert_eq!(ambiguous.0, "0400");
+        assert_eq!(ambiguous.1, vec![0o620, 0o400], "decimal 400, then octal");
+        let plain = mode_readings(&Value::Number(288.into())).expect("readings");
+        assert_eq!(plain.1, vec![0o440], "288 decimal is one mode and only one");
     }
 
     #[test]

@@ -646,8 +646,21 @@ const WRITE_VERBS: [&str; 5] = ["create", "update", "patch", "delete", "*"];
 /// a signature — and closing it needs dataflow this file has no business
 /// carrying.
 fn writes_status(sources: &str, kind: &str) -> bool {
+    reaches_kind(sources, kind) && sources.contains("patch_status")
+}
+
+/// Whether `sources` can address `kind` against the API server at all: the
+/// `GroupVersionKind::gvk(GROUP, VERSION, "<Kind>")` literal every `ApiResource`
+/// in this workspace is built from, and therefore every `Api<DynamicObject>`,
+/// every watch and every PATCH of a CRD.
+///
+/// This is the read half of `writes_status`, split out because a *read* grant
+/// needs exactly this handle and nothing more: a controller that never
+/// constructs it cannot `get`, `list` or `watch` the kind either, so the grant
+/// is a permission with no purpose in precisely the same sense.
+fn reaches_kind(sources: &str, kind: &str) -> bool {
     let quoted = format!("\"{kind}\"");
-    let has_handle = sources
+    sources
         .match_indices("GroupVersionKind::gvk(")
         .any(|(at, _)| {
             let rest = &sources[at..];
@@ -655,8 +668,77 @@ fn writes_status(sources: &str, kind: &str) -> bool {
             // rustfmt did to the line breaks inside the argument list.
             let end = rest.find(';').unwrap_or(rest.len());
             rest[..end].contains(&quoted)
-        });
-    has_handle && sources.contains("patch_status")
+        })
+}
+
+/// `<resource>` -> `<Kind>` for every `ferrum.io` kind this file knows, derived
+/// from `STATUS_TYPES` so the two cannot drift apart.
+fn ferrum_kinds() -> BTreeMap<String, String> {
+    STATUS_TYPES
+        .iter()
+        .map(|(status, kind, _)| {
+            (
+                status
+                    .strip_suffix("/status")
+                    .expect("STATUS_TYPES names a status subresource")
+                    .to_string(),
+                kind.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Every `ferrum.io` resource a subject is granted **any** verb on, by the same
+/// pod-spec -> ServiceAccount -> binding -> rule walk as
+/// `granted_status_writes`, reduced to the bare resource: a subresource grant
+/// implies the resource, and a wildcard names them all.
+///
+/// Verbs are not filtered here on purpose. `granted_status_writes` asks a
+/// question only a write can answer; this one asks whether the subject can
+/// reach the kind at all, and `get`/`list`/`watch` need the same handle a PATCH
+/// does.
+///
+/// Restricted to `ferrum.io` because the handle it looks for is the one a CRD
+/// needs. Core-group kinds — `pods`, `secrets`, `nodes` — are reached through
+/// `k8s-openapi` types with no `gvk` literal anywhere, so asking the same
+/// question of them would report every one of them dead. An unused core-group
+/// grant is a real finding and this is not the instrument for it.
+fn granted_ferrum_resources(
+    accounts: &BTreeSet<String>,
+    roles: &BTreeMap<(String, String), Vec<Value>>,
+    bindings: &[Binding],
+) -> (BTreeSet<String>, usize) {
+    let known = ferrum_kinds();
+    let mut granted = BTreeSet::new();
+    let mut reached = 0usize;
+    for binding in bindings {
+        if !binding.accounts.iter().any(|a| accounts.contains(a)) {
+            continue;
+        }
+        let key = (binding.role_kind.clone(), binding.role_name.clone());
+        let Some(rules) = roles.get(&key) else {
+            continue;
+        };
+        for rule in rules {
+            reached += 1;
+            let ferrum_group = sequence(rule, "apiGroups")
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|group| group == "*" || group == FERRUM_GROUP);
+            if !ferrum_group {
+                continue;
+            }
+            for resource in sequence(rule, "resources").iter().filter_map(Value::as_str) {
+                let base = resource.split('/').next().unwrap_or(resource);
+                if base == "*" {
+                    granted.extend(known.keys().cloned());
+                } else {
+                    granted.insert(base.to_string());
+                }
+            }
+        }
+    }
+    (granted, reached)
 }
 
 /// `text` with its comments removed, so a sentence describing a write is not
@@ -1056,18 +1138,7 @@ fn every_shipped_subject_has_one_reachable_channel_that_carries_a_cause() {
             "no pod spec under deploy/ that runs {subject} names a serviceAccountName, so no \
              binding can be followed to it and this census asked nothing about it"
         );
-        let sources_dir = root.join("crates").join(subject).join("src");
-        assert!(
-            sources_dir.is_dir(),
-            "{} does not exist, so what {subject} writes cannot be read",
-            sources_dir.display()
-        );
-        let mut files = Vec::new();
-        rs_files(&sources_dir, &mut files);
-        let sources: String = files
-            .iter()
-            .map(|path| strip_rust_comments(&fs::read_to_string(path).expect("source file")))
-            .collect();
+        let sources = crate_sources(&root, subject);
         for resource in &granted {
             let Some((_, kind, status_type)) = STATUS_TYPES.iter().find(|(r, _, _)| r == resource)
             else {
@@ -1121,15 +1192,7 @@ fn every_shipped_subject_has_one_reachable_channel_that_carries_a_cause() {
          follow a ServiceAccount through a binding to a rule, so every subject above came \
          back with nothing granted and the loop proved nothing. Found: {granted:?}"
     );
-    let mut controller_sources = Vec::new();
-    rs_files(
-        &root.join("crates/ferrum-controller/src"),
-        &mut controller_sources,
-    );
-    let controller_body: String = controller_sources
-        .iter()
-        .map(|path| strip_rust_comments(&fs::read_to_string(path).expect("source file")))
-        .collect();
+    let controller_body = crate_sources(&root, "ferrum-controller");
     assert!(
         writes_status(&controller_body, "PolicyException"),
         "the writer this census is calibrated on is gone: it can no longer tell a granted \
@@ -1232,50 +1295,528 @@ fn a_wildcard_resource_grant_is_a_status_grant() {
     );
 }
 
-/// The controller's channel is stderr, and the exit code is reachable only
-/// before the watch starts.
+/// `text` up to its first test module.
 ///
-/// The inventory row for `ferrum-controller` said «код выхода и строка
-/// `error: <причина>` в stderr» and cited an argv test, and that is true of
-/// exactly one class of fault: the ones `run()` can return before `run_watch`
-/// is entered. After that the process is three `tokio::select!`ed watch loops.
-/// `kube::runtime::watcher` retries internally and does not terminate, so every
-/// fault an operator actually needs a channel for — a reconcile that fails, a
-/// status PATCH that 403s, which is precisely what a botched RBAC edit
-/// produces, a watch error — is one `eprintln!` and the loop continues. The
-/// exit code is never reached and the line does not carry the `error:` prefix
-/// the row named. So the row's second assertion, «the channel is reachable»,
-/// was satisfied by the one class of fault an operator never needs a channel
-/// for.
+/// Every reachability question in this file is about the binary that ships,
+/// and a `#[cfg(test)]` module is not in it. Without this cut a single unit
+/// test building `GroupVersionKind::gvk("ferrum.io", "v1", "PolicyLibrary")`
+/// makes `reaches_kind` say the controller can address PolicyLibrary, and the
+/// read grant deleted in cycle 12 can be restored with a gate that stays
+/// green — a handle that exists only in a test binary resurrecting a
+/// permission in the shipped ClusterRole.
 ///
-/// This is what makes the rewritten row true rather than the claim true: the
-/// channel *is* stderr, both halves of it, and the difference between them is
-/// whether the process is still running afterwards. The repair the row cannot
-/// make is in `crates/ferrum-controller/src`, which this slice does not own —
-/// a 403 on a status PATCH is a log line and nothing else: no exit, no
-/// counter, no status, nothing an operator polls.
-#[test]
-fn the_controllers_channel_is_stderr_and_a_failed_event_never_reaches_the_exit_code() {
-    let root = repo_root();
-    let main = strip_rust_comments(
-        &fs::read_to_string(root.join("crates/ferrum-controller/src/main.rs")).expect("main.rs"),
+/// The cut is the first line that is exactly `#[cfg(test)]`, and everything
+/// after it goes. That is the convention in every crate here: the test module
+/// is last in the file and nothing shipped follows it. It fails toward
+/// reporting a grant dead — cutting too much can only remove handles — which
+/// is the direction that produces a finding to look at rather than a silence.
+fn strip_test_modules(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if line.trim() == "#[cfg(test)]" {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Every source file of one shipped crate, comments and test modules stripped,
+/// as one string.
+fn crate_sources(root: &Path, subject: &str) -> String {
+    let dir = root.join("crates").join(subject).join("src");
+    assert!(
+        dir.is_dir(),
+        "{} does not exist, so what {subject} can reach cannot be read",
+        dir.display()
     );
-    let watch = strip_rust_comments(
-        &fs::read_to_string(root.join("crates/ferrum-controller/src/watch.rs")).expect("watch.rs"),
+    let mut files = Vec::new();
+    rs_files(&dir, &mut files);
+    files.sort();
+    files
+        .iter()
+        .map(|path| {
+            strip_test_modules(&strip_rust_comments(
+                &fs::read_to_string(path).expect("source file"),
+            ))
+        })
+        .collect()
+}
+
+/// Assertion 3 of the inventory, on every verb rather than the writing ones.
+///
+/// The census above asks its question of `<kind>/status` and write verbs only,
+/// so a `get`/`list`/`watch` grant on a `ferrum.io` kind was decided by nothing
+/// at all, in either direction — the same «green because there is nothing to
+/// check» the other half of that test was rewritten to escape. Four of them
+/// were live in `deploy/controller/rbac.yaml` when this was written:
+/// `runtimeprofiles`, `ferrumclusters`, `compliancesnapshots` and
+/// `policylibraries`. `crates/ferrum-controller/src` contains no
+/// `GroupVersionKind::gvk` literal for any of those Kinds, so no
+/// `ApiResource`, so no `Api<DynamicObject>`, so no `get`, no `list` and no
+/// `watch`. A read grant nothing can exercise is the same finding as a write
+/// grant nothing exercises, and this project's threat model names it: a
+/// permission with no purpose is a lateral-movement target. It lies twice
+/// over, because the RBAC is also where an operator reads what the controller
+/// watches.
+///
+/// The repair is the same pair as before — reach the kind, or delete the grant
+/// — and, as before, it was the grant that went: the reader is not a function
+/// but a watch loop against an API server for kinds this workspace has never
+/// modelled.
+#[test]
+fn a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose() {
+    let root = repo_root();
+    let subjects = shipped_subjects(&root);
+    assert!(
+        subjects.len() >= 3,
+        "found {} image: references under deploy/; this census would run over nothing",
+        subjects.len()
+    );
+    let (roles, bindings) = rbac(&root);
+    let known = ferrum_kinds();
+
+    let mut dead = Vec::new();
+    let mut unknown = Vec::new();
+    let mut rules_reached = 0usize;
+    let mut grants_seen = 0usize;
+    for (subject, accounts) in &subjects {
+        let (granted, reached) = granted_ferrum_resources(accounts, &roles, &bindings);
+        rules_reached += reached;
+        grants_seen += granted.len();
+        let sources = crate_sources(&root, subject);
+        for resource in &granted {
+            let Some(kind) = known.get(resource) else {
+                unknown.push(format!("  {subject}: {resource}"));
+                continue;
+            };
+            if !reaches_kind(&sources, kind) {
+                dead.push(format!(
+                    "  {subject}: {resource} (no GroupVersionKind::gvk(…, \"{kind}\") in \
+                     crates/{subject}/src, so no ApiResource and no request of any verb)"
+                ));
+            }
+        }
+    }
+    assert!(
+        unknown.is_empty(),
+        "these subjects are granted a ferrum.io resource this file cannot name a Kind \
+         for:\n{}\nSTATUS_TYPES is what the census decides against; a grant outside it is \
+         checked by nothing.",
+        unknown.join("\n")
+    );
+    assert!(
+        dead.is_empty(),
+        "these subjects hold a grant on a ferrum.io resource nothing in them can \
+         address:\n{}\nA read grant is not free: it is a permission with no purpose, which \
+         the threat model calls a lateral-movement target, and it tells anyone reading the \
+         RBAC to learn what this controller does that the kind is watched when nothing \
+         watches it. Either reach the kind, or delete the grant.",
+        dead.join("\n")
     );
 
-    // The startup half, which is the one the row used to claim was the whole
-    // channel: a returned error is printed with the `error:` prefix and the
-    // process leaves with 1.
+    // The positive controls. Every assertion above is an absence, and an
+    // unresolved RBAC graph produces the same absence as a clean tree.
+    assert!(
+        rules_reached > 0,
+        "no binding under deploy/ resolved to a rule for any shipped subject, so this census \
+         ran over an empty rule set for all {} of them",
+        subjects.len()
+    );
+    assert!(
+        grants_seen > 0,
+        "no shipped subject came back holding a single ferrum.io grant, so the loop above \
+         asked nothing"
+    );
+    let controller = subjects
+        .get("ferrum-controller")
+        .expect("ferrum-controller is a shipped subject");
+    let (granted, _) = granted_ferrum_resources(controller, &roles, &bindings);
+    assert!(
+        granted.contains("policyexceptions"),
+        "the grant this census is calibrated on is gone from the graph: {granted:?}"
+    );
+
+    // And the reader on inputs whose answer is known, because with the tree
+    // clean a rule that decided nothing would look exactly like this one.
+    let sources = crate_sources(&root, "ferrum-controller");
+    assert!(
+        reaches_kind(&sources, "PolicyException"),
+        "the controller no longer builds a gvk for PolicyException, which it watches: this \
+         scan has stopped seeing handles and would report every grant dead"
+    );
+    let synthetic_roles = {
+        let body = "rules:\n  - apiGroups: [\"ferrum.io\"]\n    resources: \
+                    [\"runtimeprofiles\"]\n    verbs: [\"get\", \"list\", \"watch\"]\n";
+        let doc: Value = serde_yaml::from_str(body).expect("role");
+        let mut roles = BTreeMap::new();
+        roles.insert(
+            ("ClusterRole".to_string(), "synthetic".to_string()),
+            sequence(&doc, "rules").to_vec(),
+        );
+        roles
+    };
+    let synthetic_bindings = vec![Binding {
+        role_kind: "ClusterRole".to_string(),
+        role_name: "synthetic".to_string(),
+        accounts: controller.iter().cloned().collect(),
+    }];
+    let (resurrected, reached) =
+        granted_ferrum_resources(controller, &synthetic_roles, &synthetic_bindings);
+    assert_eq!(reached, 1, "the synthetic binding resolved to no rule");
+    assert!(
+        resurrected.contains("runtimeprofiles"),
+        "a read-only grant must come back as granted: verbs are not filtered here, and a \
+         census that dropped read grants would be the one this test replaces: {resurrected:?}"
+    );
+    assert!(
+        !reaches_kind(&sources, known["runtimeprofiles"].as_str()),
+        "the controller now names RuntimeProfile in a gvk call. If it genuinely watches \
+         RuntimeProfile, restore the runtimeprofiles grant in deploy/controller/rbac.yaml in \
+         the same change and delete this control; if it does not, this scan has stopped \
+         telling a handle from a mention and the finding above can never be made"
+    );
+
+    // A handle that exists only in a test binary is not a handle. Read on
+    // inputs whose answer is known, because with the tree clean a cut that
+    // removed nothing would look exactly like this one.
+    let shipped_and_tested = "fn watch() {\n    GroupVersionKind::gvk(GROUP, VERSION, \"SecurityPolicy\");\n}\n\
+                              #[cfg(test)]\nmod tests {\n    fn t() {\n        \
+                              GroupVersionKind::gvk(GROUP, VERSION, \"PolicyLibrary\");\n    }\n}\n";
+    let shipped = strip_test_modules(shipped_and_tested);
+    assert!(
+        reaches_kind(&shipped, "SecurityPolicy"),
+        "the cut took the shipped half of the file with it"
+    );
+    assert!(
+        reaches_kind(shipped_and_tested, "PolicyLibrary"),
+        "this control asserts nothing unless the uncut text does reach the Kind"
+    );
+    assert!(
+        !reaches_kind(&shipped, "PolicyLibrary"),
+        "a gvk literal inside #[cfg(test)] still reads as reachability, so a unit test can \
+         restore any read grant in the shipped RBAC and this census will not see it"
+    );
+
+    // ------------------------------------------------------------------
+    // Every subject a binding points at is a subject something runs.
+    //
+    // The walk above starts at `image:` and reaches rules through the
+    // ServiceAccounts of the pod specs that carry it, so a binding whose only
+    // subject is an account no pod spec names resolves to no crate, is asked
+    // no question, and is refused by nothing. A ClusterRole carrying the four
+    // resources this cycle deleted, with every writing verb, bound to
+    // `ServiceAccount/ferrum-controller-ops`, passed every set in this crate
+    // and `lint-deploy` too: the entire subject of the finding, restored and
+    // invisible. Whatever such an account is for, it is a grant this tree
+    // ships and nothing in this tree exercises — the definition of the
+    // permission with no purpose the two censuses above exist to refuse.
+    let mut running: BTreeSet<String> = BTreeSet::new();
+    for accounts in subjects.values() {
+        running.extend(accounts.iter().cloned());
+    }
+    let mut unreachable: Vec<String> = Vec::new();
+    for binding in &bindings {
+        for account in &binding.accounts {
+            if !running.contains(account) {
+                unreachable.push(format!(
+                    "  ServiceAccount/{account} <- {}/{}",
+                    binding.role_kind, binding.role_name
+                ));
+            }
+        }
+    }
+    unreachable.sort();
+    unreachable.dedup();
+    assert!(
+        unreachable.is_empty(),
+        "these bindings grant a role to a ServiceAccount no pod spec under deploy/ runs:\n{}\n\
+         No image is bound to that subject, so no crate answers for it and every census in \
+         this file walks past the grant entirely. Delete the binding, or run something as \
+         that account.",
+        unreachable.join("\n")
+    );
+    assert!(
+        !running.is_empty(),
+        "no pod spec under deploy/ names a serviceAccountName, so the check above compared \
+         every binding against an empty set and passed nothing"
+    );
+}
+
+/// Whether any mapping anywhere under `node` carries `key`.
+fn contains_key(node: &Value, key: &str) -> bool {
+    match node {
+        Value::Mapping(map) => {
+            map.contains_key(Value::from(key))
+                || map.iter().any(|(_, value)| contains_key(value, key))
+        }
+        Value::Sequence(items) => items.iter().any(|item| contains_key(item, key)),
+        _ => false,
+    }
+}
+
+/// The controller's container spec, from the manifest that ships it.
+fn controller_container(root: &Path) -> (Value, Value) {
+    let body = fs::read_to_string(root.join("deploy/controller/deployment.yaml"))
+        .expect("deploy/controller/deployment.yaml");
+    for doc in serde_yaml::Deserializer::from_str(&body) {
+        let Ok(value) = Value::deserialize(doc) else {
+            continue;
+        };
+        if scalar(&value, "kind") != "Deployment" {
+            continue;
+        }
+        let pod = value
+            .get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("spec"))
+            .cloned()
+            .expect("pod spec");
+        let container = sequence(&pod, "containers")
+            .first()
+            .cloned()
+            .expect("a container");
+        return (pod, container);
+    }
+    panic!("no Deployment in deploy/controller/deployment.yaml");
+}
+
+/// The variants of `pub enum FailureClass` in `health.rs`, in source order.
+///
+/// Read out of the enum rather than listed here, which is the difference
+/// between this gate and the one it replaces. That one held its own copy of
+/// the four classes and a docstring claiming they were «taken from the code»;
+/// a fifth variant with no accessor, no key and no mention anywhere in
+/// `watch.rs` passed it green, because the list it checked against was the
+/// list it shipped with. A gate that decides against its own hardcoded answer
+/// asks the tree nothing.
+fn failure_class_variants(health: &str) -> Vec<String> {
+    let at = health.find("pub enum FailureClass {").expect(
+        "health.rs no longer declares `pub enum FailureClass`, so this gate has no \
+                 list of classes to check and would pass over any number of them",
+    );
+    let body = &health[at..];
+    let end = body.find("\n}").expect("the enum is closed");
+    let mut out = Vec::new();
+    for line in body[..end].lines().skip(1) {
+        let line = line.trim();
+        let Some(name) = line.strip_suffix(',') else {
+            continue;
+        };
+        if !name.is_empty()
+            && name.chars().next().is_some_and(char::is_uppercase)
+            && name.chars().all(|c| c.is_alphanumeric())
+        {
+            out.push(name.to_string());
+        }
+    }
+    assert!(
+        !out.is_empty(),
+        "no variant was read out of `pub enum FailureClass`, so every assertion below runs \
+         over an empty list and proves nothing"
+    );
+    out
+}
+
+/// `<variant>` -> the counter name its `counter()` arm returns.
+fn failure_class_counters(health: &str, variants: &[String]) -> BTreeMap<String, String> {
+    let at = health
+        .find("pub fn counter(self) -> &'static str {")
+        .expect("health.rs no longer maps a class to its counter name");
+    let body = &health[at..];
+    let end = body.find("\n    }").expect("the fn is closed");
+    let mut out = BTreeMap::new();
+    for variant in variants {
+        let arm = format!("FailureClass::{variant} => \"");
+        let Some(from) = body[..end].find(&arm) else {
+            continue;
+        };
+        let rest = &body[from + arm.len()..];
+        let quote = rest.find('"').expect("the counter name is closed");
+        out.insert(variant.clone(), rest[..quote].to_string());
+    }
+    out
+}
+
+/// How `watch.rs` and `apply.rs` route a failure or a receipt to a class. A
+/// class named in none of these forms is a class nothing in the reconcile path
+/// can ever record.
+const CLASS_ROUTES: [&str; 3] = ["note_failure(", "as_class(", "Requested::of("];
+
+fn routes_class(sources: &str, variant: &str) -> bool {
+    CLASS_ROUTES
+        .iter()
+        .any(|route| sources.contains(&format!("{route}FailureClass::{variant}")))
+}
+
+/// Every class of failure that can happen after `run_watch` is entered reaches
+/// a counter and a file, and a class in which nothing has ever worked reaches
+/// the exit code.
+///
+/// This replaces `the_controllers_channel_is_stderr_and_a_failed_event_never_
+/// reaches_the_exit_code`, whose closing assertions — no `process::exit` and no
+/// `error:` line anywhere downstream of the watch — were true of a controller
+/// that had no state at all. That test was right about what it measured: after
+/// `run_watch` the process is three `tokio::select!`ed loops,
+/// `kube::runtime::watcher` retries internally and never terminates, so every
+/// fault an operator needs a channel for — a reconcile that does not converge,
+/// a 403 on a status PATCH, which is exactly what a mis-edited RBAC produces,
+/// a watch error — was one `eprintln!` and the next turn of the loop. Nothing
+/// counted it, nothing published it, and the process stayed `1/1 Ready` while
+/// reconciling nothing at all. Its own docstring said the repair was in
+/// `crates/ferrum-controller/src`; this is the gate for that repair.
+///
+/// What is asserted here, and each of them is a thing the old shape could not
+/// have satisfied: every class is named in `health.rs` and noted at the call
+/// site in `watch.rs`; every class is a key of the published object; a run of
+/// one class with no success in it returns `Err` rather than printing; and the
+/// file it publishes is wired to a writable volume and to no probe. The last
+/// is not decoration — a liveness probe on a degradation signal turns a
+/// recoverable fault into a crash loop and a permanent one into an infinite
+/// one, which is why `ferrum-agent`'s status surface refuses the same wiring.
+///
+/// What it still cannot do: it reads the sources for the calls, not the
+/// running process. That a 403 lands in `status_patch` rather than `reconcile`
+/// is decided by the call site, and the unit tests in `health.rs` are what
+/// hold the arithmetic behind it.
+#[test]
+fn the_controllers_channel_names_every_post_start_failure_class() {
+    let root = repo_root();
+    let src = root.join("crates/ferrum-controller/src");
+    // The shipped half of each file: `#[cfg(test)]` and everything after it
+    // is not in the binary an operator runs. Without the cut the unit tests in
+    // `watch.rs` answered for it — `watch.contains("FailureClass::Watch")` was
+    // satisfied by a test, and a `note_failure` written inside one counted as
+    // the reconcile path noting a failure.
+    let read = |name: &str| {
+        strip_test_modules(&strip_rust_comments(
+            &fs::read_to_string(src.join(name)).unwrap_or_else(|e| {
+                panic!("crates/ferrum-controller/src/{name}: {e}");
+            }),
+        ))
+    };
+    let main = read("main.rs");
+    let watch = read("watch.rs");
+    let health = read("health.rs");
+    let apply = read("apply.rs");
+    // The class of a failure is decided at the call site, and one of those
+    // sites moved into `apply.rs` when the receipt did: `persist_class` is
+    // read by both files and is what keeps the class a failure is charged to
+    // and the class a success credits from being two answers.
+    let routed = format!("{watch}{apply}");
+
+    // The startup half, unchanged: a returned error is printed with the
+    // `error:` prefix and the process leaves with 1. It is now also the half
+    // the terminal rule below arrives through, which is the whole point of
+    // returning `Err` from the loops rather than exiting inside them.
     assert!(
         main.contains("eprintln!(\"error: {err}\")") && main.contains("process::exit(1)"),
         "crates/ferrum-controller/src/main.rs no longer prints `error: <cause>` and exits 1, \
-         so the startup half of the inventory row names a channel that is gone"
+         so neither half of the inventory row has a channel"
+    );
+    for exit in ["process::exit(", "std::process::exit(", "exit(1)"] {
+        assert!(
+            !watch.contains(exit),
+            "watch.rs calls {exit}. A terminal class must leave by returning `Err` from \
+             `run_watch` so that `main` prints it with the same prefix every other fatal \
+             cause gets; a loop that exits by itself is a second exit path with its own \
+             message"
+        );
+    }
+
+    // Every class this controller can fail in, read out of the enum that
+    // declares them. The list this replaces was written out in this file under
+    // a docstring that said it was not: five classes passed it with the fifth
+    // having no accessor, no key and no call site anywhere.
+    let variants = failure_class_variants(&health);
+    let counters = failure_class_counters(&health, &variants);
+    for variant in &variants {
+        let counter = counters.get(variant).unwrap_or_else(|| {
+            panic!(
+                "FailureClass::{variant} has no arm in `counter()`, so it has no name in \
+                 status.json and a reader of the file cannot find it"
+            )
+        });
+        assert!(
+            health.contains(&format!("pub fn {counter}(")),
+            "health.rs has no `{counter}` accessor for FailureClass::{variant}: nothing in \
+             or out of this process can read that counter by name"
+        );
+        assert!(
+            routes_class(&routed, variant),
+            "no call site in watch.rs or apply.rs names FailureClass::{variant} in any of \
+             {CLASS_ROUTES:?}, so that class of failure happens and nothing counts it — the \
+             defect this gate replaces, one class in. A class the reconcile path never \
+             records is a counter that is zero forever and a terminal rule that can never \
+             fire."
+        );
+    }
+
+    // The list `ALL` is what `status_json` and `degraded_reasons` iterate, so
+    // a variant missing from it is a class with a counter nothing publishes.
+    let all_at = health
+        .find("pub const ALL:")
+        .expect("health.rs no longer lists the classes it iterates");
+    let all_end = health[all_at..].find("];").expect("the list is closed") + all_at;
+    let all = &health[all_at..all_end];
+    for variant in &variants {
+        assert!(
+            all.contains(&format!("FailureClass::{variant}")),
+            "FailureClass::{variant} is not in `ALL`, so degraded_reasons() and status_json() \
+             walk past it: it can fail, be counted, end the process, and appear in nothing an \
+             operator reads"
+        );
+    }
+    assert!(
+        all.contains(&format!("[FailureClass; {}]", variants.len())),
+        "`ALL` is not declared over all {} variants of FailureClass: {all}",
+        variants.len()
     );
 
-    // The post-startup half. Each watch loop handles a per-event failure by
-    // printing it and going round again, so the count is one per arm and the
-    // prefix is the process name rather than `error:`.
+    // And every counter is a key of the published object by construction,
+    // rather than by a literal this file could be told to look for.
+    let status_at = health
+        .find("pub fn status_json(")
+        .expect("health.rs no longer publishes an object");
+    let status_body = &health[status_at..];
+    let status_end = status_body.find("\n    }").expect("the fn is closed");
+    let status_body = &status_body[..status_end];
+    assert!(
+        status_body.contains("for class in FailureClass::ALL") && status_body.contains("counter"),
+        "status_json no longer derives its keys from FailureClass::ALL and counter(), so the \
+         set of classes and the set of keys in the file can drift: {status_body}"
+    );
+
+    // A success may not be named at a call site: it travels back from the code
+    // that made the request. Three sites in watch.rs used to credit a class
+    // for a call that had issued nothing — a plan with no Secret, a publish
+    // pass over no Secret — and `ever_ok` is permanent, so each of them
+    // disarmed the terminal rule for that class for the life of the process.
+    assert!(
+        !routed.contains("note_success(FailureClass::"),
+        "a call site names the class it succeeded in. A success is a `Requested` returned by \
+         the function that issued the request; a class named at the call site is a success \
+         claimed by code that cannot know whether a request was made"
+    );
+    let invented: Vec<&str> = watch
+        .match_indices("Requested::of(")
+        .map(|(at, _)| {
+            let rest = &watch[at..];
+            &rest[..rest.find(')').map(|i| i + 1).unwrap_or(rest.len())]
+        })
+        .filter(|call| !call.contains("FailureClass::Watch"))
+        .collect();
+    assert!(
+        invented.is_empty(),
+        "watch.rs builds a receipt for a class whose request it did not make: {invented:?}. \
+         `Watch` is the one class whose request is the watch itself, so an event delivered is \
+         its answer; every other receipt must come back from apply.rs, which is where the \
+         request is issued"
+    );
+
+    // Each loop still reports, and now also counts. Three loops, two kinds of
+    // failure each: the event's own and the watch's.
     let loops = watch
         .matches("while let Some(event) = stream.next().await")
         .count();
@@ -1287,23 +1828,92 @@ fn the_controllers_channel_is_stderr_and_a_failed_event_never_reaches_the_exit_c
     let printed = watch.matches("eprintln!(\"ferrum-controller").count();
     assert!(
         printed >= loops * 2,
-        "watch.rs has {loops} event loops and only {printed} `ferrum-controller:` lines. Each \
-         loop reports two kinds of failure — the event's own and the watch's — and a loop \
-         that reports neither swallows it entirely"
+        "watch.rs has {loops} event loops and only {printed} `ferrum-controller:` lines. A \
+         loop that reports neither kind of failure swallows it entirely"
+    );
+    let noted = watch.matches("note_failure(").count();
+    assert!(
+        noted >= loops * 2,
+        "watch.rs prints {printed} failure lines and notes only {noted} of them. A failure \
+         that is printed and not counted is the one an operator cannot poll for, which is \
+         the whole finding this gate carries"
+    );
+    let dropped: Vec<&str> = watch
+        .match_indices("note_failure(")
+        .map(|(at, _)| {
+            let rest = &watch[at..];
+            let end = rest.find(';').map(|i| i + 1).unwrap_or(rest.len());
+            &rest[..end]
+        })
+        .filter(|statement| !statement.contains('?'))
+        .collect();
+    assert!(
+        dropped.is_empty(),
+        "watch.rs calls note_failure without propagating its result: {dropped:?}. That \
+         result is the terminal case — a class in which nothing has ever succeeded — and \
+         dropping it puts the process back where it was: logging a broken deployment \
+         forever while Kubernetes reports the pod ready"
+    );
+
+    // The terminal rule itself: named, bounded, and gated on the class never
+    // having worked. Without that second half a single bad object ends the
+    // process, which is the crash loop `ferrum-agent`'s status surface refuses.
+    assert!(
+        health.contains("pub const TERMINAL_RUN"),
+        "health.rs no longer bounds the run that ends the process"
     );
     assert!(
-        !watch.contains("eprintln!(\"error:"),
-        "watch.rs prints an `error:` line. That prefix belongs to `main`, which exits after \
-         it; a line with the same prefix from a loop that continues tells an operator the \
-         process is gone when it is not, and the inventory row would then be naming two \
-         channels under one name"
+        health.contains("ever_ok.load(Ordering::Relaxed)"),
+        "health.rs no longer reads whether the class ever succeeded, so the terminal rule is \
+         a plain failure count and one 403 on one object can end the process"
     );
-    for exit in ["process::exit(", "std::process::exit(", "exit(1)"] {
+
+    // The surface it publishes to, and the probe it must never be.
+    let (pod, container) = controller_container(&root);
+    let args: Vec<String> = sequence(&container, "args")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    let at = args.iter().position(|a| a == "--status-dir").expect(
+        "the controller manifest passes no --status-dir, so the counters this gate \
+                 checked above are published nowhere in the shipped configuration",
+    );
+    let dir = args
+        .get(at + 1)
+        .expect("--status-dir is the last argument and has no value");
+    let mount = sequence(&container, "volumeMounts")
+        .iter()
+        .find(|m| scalar(m, "mountPath") == *dir)
+        .unwrap_or_else(|| panic!("no volumeMount serves {dir}"));
+    let name = scalar(mount, "name");
+    let volume = sequence(&pod, "volumes")
+        .iter()
+        .find(|v| scalar(v, "name") == name)
+        .unwrap_or_else(|| panic!("no volume named {name}"));
+    assert!(
+        volume.get("emptyDir").is_some(),
+        "the volume behind --status-dir is not an emptyDir. The root filesystem is read-only \
+         and a status file that cannot be written is a controller with no readable state, \
+         reported by nothing but the line it prints once"
+    );
+    assert_eq!(
+        container
+            .get("securityContext")
+            .and_then(|c| c.get("readOnlyRootFilesystem"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "readOnlyRootFilesystem was dropped to make the status file writable. The emptyDir \
+         above is what makes it writable; the read-only root stays"
+    );
+    for probe in ["livenessProbe", "readinessProbe", "startupProbe"] {
         assert!(
-            !watch.contains(exit),
-            "watch.rs calls {exit}. The inventory row says the exit code is the startup \
-             channel; if a failed event can now reach it, the row is understating what an \
-             operator sees and the two halves are no longer distinguishable"
+            !contains_key(&container, probe),
+            "the controller container declares a {probe}. Nothing in this tree may wire a \
+             probe to a degradation signal: a restart on a recoverable fault is a crash \
+             loop, and a restart on a permanent one is an infinite loop that never lives \
+             long enough to log why. The terminal rule in health.rs is the only thing that \
+             may end this process, and it ends it once"
         );
     }
 }

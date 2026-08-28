@@ -3,9 +3,10 @@
 
 use crate::apply::{
     live_secret_matches, load_bundle_secret, namespaced_secret_name, patch_secret_exceptions,
-    patch_status_dynamic, persist, persist_dynamic, persist_exceptions, plan_apply,
+    patch_status_dynamic, persist, persist_class, persist_dynamic, persist_exceptions, plan_apply,
     plan_apply_namespaced, secret_name, ApplyPlan,
 };
+use crate::health::{ControllerHealth, FailureClass, Requested};
 use crate::{
     compile_status_err, exception_status_patch, reconcile, reconcile_exception,
     reconcile_namespaced, NamespacedReconcileInput, ObservedException, ObservedNamespacedPolicy,
@@ -23,6 +24,7 @@ use kube::runtime::{watcher, WatchStreamExt};
 use kube::Client;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub fn cluster_security_policy_gvk() -> GroupVersionKind {
     GroupVersionKind::gvk(
@@ -185,15 +187,73 @@ fn snapshot_exceptions(set: &ExceptionSet) -> Vec<PolicyExceptionSpec> {
         .collect()
 }
 
+/// How often `status.json` is rewritten when nothing has happened.
+///
+/// The file is also published whenever a counter moves, so this interval is
+/// only what keeps `ts` from going stale on a healthy controller: a reader
+/// that finds an old timestamp is looking at a process that stopped.
+const STATUS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// A failure together with the class of API call it came from.
+///
+/// The class is decided at the call site and never by reading the message: a
+/// classifier that switches on error text is exactly the shape this tree keeps
+/// having to delete.
+struct Classified {
+    class: FailureClass,
+    err: FerrumError,
+}
+
+/// `Ok` or one classified failure. Distinct from `Result<()>`, which in the
+/// loops below means «terminal, leave».
+type Classed = std::result::Result<(), Classified>;
+
+fn as_class(class: FailureClass) -> impl Fn(FerrumError) -> Classified {
+    move |err| Classified { class, err }
+}
+
+/// Install the process-wide rustls provider before the first `kube::Client`.
+///
+/// `kube` builds its TLS stack through `rustls::ClientConfig::builder()`, which
+/// reads a process-wide `CryptoProvider` and panics when none is installed. It
+/// installs one itself only under its `aws-lc-rs` feature, which this tree does
+/// not carry (ring everywhere, and the release binaries are static musl). So
+/// the provider is installed here, before any client exists: without it the
+/// controller panics inside rustls on the first line of `run_watch` — before a
+/// watch, before a counter, before any status file could say why.
+pub(crate) fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Err means another thread installed one first, which is the outcome
+        // this asks for.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 pub async fn run_watch(cfg: WatchConfig) -> Result<()> {
+    install_crypto_provider();
     let client = Client::try_default()
         .await
         .map_err(|e| FerrumError::Degraded(format!("kube client: {e}")))?;
     let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+    let health = ControllerHealth::new();
+    // Published before the first event, so an operator who finds no file at
+    // all knows the process never reached its watches rather than that it is
+    // idle.
+    health.publish(cfg.status_dir.as_deref());
     tokio::select! {
-        r = run_cluster_policy_watch(&client, &cfg, &exceptions) => r,
-        r = run_namespaced_policy_watch(&client, &cfg, &exceptions) => r,
-        r = run_exception_watch(&client, &cfg, &exceptions) => r,
+        r = run_cluster_policy_watch(&client, &cfg, &exceptions, &health) => r,
+        r = run_namespaced_policy_watch(&client, &cfg, &exceptions, &health) => r,
+        r = run_exception_watch(&client, &cfg, &exceptions, &health) => r,
+        r = publish_status(&cfg, &health) => r,
+    }
+}
+
+/// Keeps the published file fresh. Never returns and never fails: a status
+/// surface that can end the process is a probe, and this one is not.
+async fn publish_status(cfg: &WatchConfig, health: &ControllerHealth) -> Result<()> {
+    loop {
+        tokio::time::sleep(STATUS_INTERVAL).await;
+        health.publish(cfg.status_dir.as_deref());
     }
 }
 
@@ -201,6 +261,7 @@ async fn run_cluster_policy_watch(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
 ) -> Result<()> {
     let api: Api<DynamicObject> =
         Api::all_with(client.clone(), &cluster_security_policy_resource());
@@ -208,12 +269,21 @@ async fn run_cluster_policy_watch(
     while let Some(event) = stream.next().await {
         match event {
             Ok(obj) => {
-                if let Err(err) = reconcile_object(client, cfg, exceptions, obj).await {
-                    eprintln!("ferrum-controller: {err}");
+                // The one class whose receipt is not returned by a call this
+                // file made: the request is the watch itself, and an event
+                // delivered is its answer.
+                health.note_success(Requested::of(FailureClass::Watch));
+                if let Err(failure) = reconcile_object(client, cfg, exceptions, health, obj).await {
+                    eprintln!("ferrum-controller: {}", failure.err);
+                    health.note_failure(failure.class, &failure.err)?;
                 }
             }
-            Err(err) => eprintln!("ferrum-controller watch: {err}"),
+            Err(err) => {
+                eprintln!("ferrum-controller watch: {err}");
+                health.note_failure(FailureClass::Watch, &err)?;
+            }
         }
+        health.publish_if_changed(cfg.status_dir.as_deref());
     }
     Err(FerrumError::Degraded(
         "ClusterSecurityPolicy watch ended".into(),
@@ -224,18 +294,27 @@ async fn run_namespaced_policy_watch(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
 ) -> Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &security_policy_resource());
     let mut stream = std::pin::pin!(watcher(api, watcher::Config::default()).applied_objects());
     while let Some(event) = stream.next().await {
         match event {
             Ok(obj) => {
-                if let Err(err) = reconcile_namespaced_object(client, cfg, exceptions, obj).await {
-                    eprintln!("ferrum-controller: {err}");
+                health.note_success(Requested::of(FailureClass::Watch));
+                if let Err(failure) =
+                    reconcile_namespaced_object(client, cfg, exceptions, health, obj).await
+                {
+                    eprintln!("ferrum-controller: {}", failure.err);
+                    health.note_failure(failure.class, &failure.err)?;
                 }
             }
-            Err(err) => eprintln!("ferrum-controller watch: {err}"),
+            Err(err) => {
+                eprintln!("ferrum-controller watch: {err}");
+                health.note_failure(FailureClass::Watch, &err)?;
+            }
         }
+        health.publish_if_changed(cfg.status_dir.as_deref());
     }
     Err(FerrumError::Degraded("SecurityPolicy watch ended".into()))
 }
@@ -244,6 +323,7 @@ async fn run_exception_watch(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
 ) -> Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &policy_exception_resource());
     // Raw watcher events: Delete must revoke, applied_objects would hide it.
@@ -256,14 +336,17 @@ async fn run_exception_watch(
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => {
-                if let Err(err) =
-                    handle_exception_event(client, cfg, exceptions, &staging, ev).await
-                {
-                    eprintln!("ferrum-controller: {err}");
-                }
+                health.note_success(Requested::of(FailureClass::Watch));
+                // Reports and counts each object's own failure itself; what
+                // comes back here is the terminal case and nothing else.
+                handle_exception_event(client, cfg, exceptions, &staging, health, ev).await?;
             }
-            Err(err) => eprintln!("ferrum-controller watch: {err}"),
+            Err(err) => {
+                eprintln!("ferrum-controller watch: {err}");
+                health.note_failure(FailureClass::Watch, &err)?;
+            }
         }
+        health.publish_if_changed(cfg.status_dir.as_deref());
     }
     Err(FerrumError::Degraded("PolicyException watch ended".into()))
 }
@@ -273,56 +356,122 @@ async fn handle_exception_event(
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
     staging: &ExceptionSet,
+    health: &ControllerHealth,
     event: watcher::Event<DynamicObject>,
 ) -> Result<()> {
     // Status patches must never block publication: the in-memory set is
     // updated first, and a failed status write on one object cannot leave a
     // revoked/narrowed exception live in the Secrets (that is fail-open).
-    let mut status_errors: Vec<String> = Vec::new();
-    match event {
-        watcher::Event::Apply(obj) => {
-            if let Err(err) = apply_exception_object(client, exceptions, &obj).await {
-                status_errors.push(err.to_string());
-            }
-        }
+    //
+    // Each object's own failure is reported and counted here rather than
+    // returned, because one relist carries many objects and one bad one must
+    // not stop the rest. What this function returns is the terminal case: a
+    // class in which nothing has ever succeeded.
+    //
+    // Each object is paired with the set it belongs in: a live `Apply` goes
+    // straight to the published set, while a relist is accumulated in
+    // `staging` and swapped in whole at `InitDone`, so a relist in progress
+    // never publishes a partial set — that would be a mass revocation of
+    // exceptions that are still in force.
+    let mut objects: Vec<(&DynamicObject, &ExceptionSet)> = Vec::new();
+    match &event {
+        watcher::Event::Apply(obj) => objects.push((obj, exceptions)),
         watcher::Event::Delete(obj) => {
-            if let (Some(ns), Some(name)) = (
+            match (
                 obj.metadata.namespace.as_deref(),
                 obj.metadata.name.as_deref(),
             ) {
-                exceptions
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&format!("{ns}/{name}"));
+                (Some(ns), Some(name)) => {
+                    exceptions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&format!("{ns}/{name}"));
+                }
+                // The set is keyed by `namespace/name`, so a deletion that
+                // carries neither cannot be applied to it — and dropping it
+                // silently is fail-open in the one direction this controller
+                // may never fail open: the exception stays in the published
+                // Secrets, keeps being signed into every bundle, and goes on
+                // overriding a deny on agents that have no way to know it was
+                // revoked. It is the same broken object `apply_exception_object`
+                // charges to `reconcile`, and it is charged there too; what
+                // changes is that it is now charged at all.
+                _ => {
+                    let err = FerrumError::Validation(
+                        "PolicyException deleted with no metadata.namespace/name: the \
+                         revoked exception cannot be removed from the published set and \
+                         stays live until the next relist"
+                            .to_string(),
+                    );
+                    eprintln!("ferrum-controller: exception delete: {err}");
+                    health.note_failure(FailureClass::Reconcile, &err)?;
+                }
             }
         }
         watcher::Event::Init => {
             staging.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
-        watcher::Event::InitApply(obj) => {
-            if let Err(err) = apply_exception_object(client, staging, &obj).await {
-                status_errors.push(err.to_string());
-            }
-        }
+        watcher::Event::InitApply(obj) => objects.push((obj, staging)),
         watcher::Event::InitDone => {
             let relisted = staging.lock().unwrap_or_else(|e| e.into_inner()).clone();
             *exceptions.lock().unwrap_or_else(|e| e.into_inner()) = relisted;
         }
     }
-    persist_exceptions(
+    for (obj, target) in objects {
+        match apply_exception_object(client, target, obj).await {
+            Ok(requested) => health.note_success(requested),
+            Err(failure) => {
+                eprintln!("ferrum-controller: exception status: {}", failure.err);
+                health.note_failure(failure.class, &failure.err)?;
+            }
+        }
+    }
+    match persist_exceptions(
         client,
         &cfg.namespace,
         &cfg.secret_key,
         &snapshot_exceptions(exceptions),
     )
-    .await?;
-    if status_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(FerrumError::Degraded(format!(
-            "exception status patch: {}",
-            status_errors.join("; ")
-        )))
+    .await
+    {
+        Ok(published) => {
+            // `Requested::NONE` when the list matched no Secret: a fresh
+            // install has none, nothing was published, and counting that as a
+            // success of this class would disarm the terminal rule for it for
+            // the life of the process.
+            health.note_success(published.requested);
+            // A Secret this controller cannot scope a list to is that Secret
+            // being wrong, and it is wrong on every event until a human fixes
+            // its labels. Charged as a failure it was an unbounded run by
+            // construction and the process exited on the tenth event; it is a
+            // reason, in the file and in `is_degraded()`, and never a run.
+            let unscopable = published.unscopable.clone();
+            if health.note_unactionable(FailureClass::ExceptionPublish, unscopable)
+                && !published.unscopable.is_empty()
+            {
+                eprintln!(
+                    "ferrum-controller: exception publish: secret(s) {} carry {}={} and no {} \
+                     label: this controller cannot scope an exception list to them, so the list \
+                     each already holds is what the agents reading it still get",
+                    published.unscopable.join(", "),
+                    crate::apply::MANAGED_BY_KEY,
+                    crate::apply::MANAGED_BY_VALUE,
+                    crate::apply::POLICY_LABEL_KEY,
+                );
+            }
+            // A Secret the API server refused is an ordinary failure of this
+            // class, counted after the receipt for the ones that went through.
+            for cause in &published.refused {
+                eprintln!("ferrum-controller: exception publish: {cause}");
+                health.note_failure(FailureClass::ExceptionPublish, cause)?;
+            }
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("ferrum-controller: exception publish: {err}");
+            health.note_failure(FailureClass::ExceptionPublish, &err)?;
+            Ok(())
+        }
     }
 }
 
@@ -346,13 +495,21 @@ pub(crate) fn exception_disposition(
     }
 }
 
+/// `Classed`, plus the receipt for the one request this makes when it makes
+/// it.
+type ClassedRequest = std::result::Result<Requested, Classified>;
+
 async fn apply_exception_object(
     client: &Client,
     exceptions: &ExceptionSet,
     obj: &DynamicObject,
-) -> Result<()> {
-    let name = require_name(obj, "PolicyException")?;
-    let namespace = require_namespace(obj, "PolicyException")?;
+) -> ClassedRequest {
+    // A missing name is a broken object, not a broken API call: it is counted
+    // against the reconcile class so that a status subresource nobody can
+    // patch stays the only thing `status_patch` reports.
+    let name = require_name(obj, "PolicyException").map_err(as_class(FailureClass::Reconcile))?;
+    let namespace =
+        require_namespace(obj, "PolicyException").map_err(as_class(FailureClass::Reconcile))?;
     let key = format!("{namespace}/{name}");
     let (status, live) = exception_disposition(obj);
     {
@@ -366,6 +523,8 @@ async fn apply_exception_object(
             }
         }
     }
+    // The one request this function makes, and it is nothing but a status
+    // PATCH.
     patch_status_dynamic(
         client,
         &policy_exception_resource(),
@@ -374,25 +533,36 @@ async fn apply_exception_object(
         &exception_status_patch(&status),
     )
     .await
+    .map_err(as_class(FailureClass::StatusPatch))
 }
 
 async fn reconcile_object(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
     obj: DynamicObject,
-) -> Result<()> {
-    let name = require_name(&obj, "ClusterSecurityPolicy")?;
+) -> Classed {
+    let reconcile_class = as_class(FailureClass::Reconcile);
+    let name = require_name(&obj, "ClusterSecurityPolicy").map_err(&reconcile_class)?;
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
-        let secret = load_bundle_secret(client, &cfg.namespace, &secret_name(&name)).await?;
+        let loaded = load_bundle_secret(client, &cfg.namespace, &secret_name(&name))
+            .await
+            .map_err(&reconcile_class)?;
+        // The GET was issued and answered, whatever it answered. It is the
+        // only request a converged object makes, and crediting nothing for it
+        // left `reconcile` never-having-worked on a cluster where every object
+        // is converged — which is a cluster in its steady state, not a broken
+        // one.
+        health.note_success(loaded.requested);
         if should_skip_applied(
             generation,
             og,
             ready,
             &digest,
-            secret.as_ref(),
+            loaded.secret.as_ref(),
             &cfg.trust_root,
         ) {
             return Ok(());
@@ -406,7 +576,6 @@ async fn reconcile_object(
                 secret_key: &cfg.secret_key,
                 library: cfg.library.as_ref(),
                 clusters: &cfg.clusters,
-                runtime_profile: None,
             });
             plan_apply(&observed.name, &cfg.namespace, &outcome, &cfg.trust_root)
         }
@@ -420,33 +589,46 @@ async fn reconcile_object(
     if failed_status_already_recorded(&obj, generation, &plan) {
         return Ok(());
     }
-    persist(client, &name, &cfg.namespace, &plan).await?;
-    attach_exceptions(client, cfg, exceptions, &plan).await
+    let persisted = persist(client, &name, &cfg.namespace, &plan)
+        .await
+        .map_err(as_class(persist_class(&plan)))?;
+    // One receipt for one call, from `persist_class`, which is also what a
+    // failure of it is charged to.
+    health.note_success(persisted);
+    let attached = attach_exceptions(client, cfg, exceptions, &plan)
+        .await
+        .map_err(as_class(FailureClass::ExceptionPublish))?;
+    health.note_success(attached);
+    Ok(())
 }
 
 async fn reconcile_namespaced_object(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    health: &ControllerHealth,
     obj: DynamicObject,
-) -> Result<()> {
-    let name = require_name(&obj, "SecurityPolicy")?;
-    let policy_namespace = require_namespace(&obj, "SecurityPolicy")?;
+) -> Classed {
+    let reconcile_class = as_class(FailureClass::Reconcile);
+    let name = require_name(&obj, "SecurityPolicy").map_err(&reconcile_class)?;
+    let policy_namespace = require_namespace(&obj, "SecurityPolicy").map_err(&reconcile_class)?;
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
-        let secret = load_bundle_secret(
+        let loaded = load_bundle_secret(
             client,
             &cfg.namespace,
             &namespaced_secret_name(&name, &policy_namespace),
         )
-        .await?;
+        .await
+        .map_err(&reconcile_class)?;
+        health.note_success(loaded.requested);
         if should_skip_applied(
             generation,
             og,
             ready,
             &digest,
-            secret.as_ref(),
+            loaded.secret.as_ref(),
             &cfg.trust_root,
         ) {
             return Ok(());
@@ -480,7 +662,7 @@ async fn reconcile_namespaced_object(
     if failed_status_already_recorded(&obj, generation, &plan) {
         return Ok(());
     }
-    persist_dynamic(
+    let persisted = persist_dynamic(
         client,
         &security_policy_resource(),
         Some(&policy_namespace),
@@ -488,8 +670,27 @@ async fn reconcile_namespaced_object(
         &cfg.namespace,
         &plan,
     )
-    .await?;
-    attach_exceptions(client, cfg, exceptions, &plan).await
+    .await
+    .map_err(as_class(persist_class(&plan)))?;
+    health.note_success(persisted);
+    let attached = attach_exceptions(client, cfg, exceptions, &plan)
+        .await
+        .map_err(as_class(FailureClass::ExceptionPublish))?;
+    health.note_success(attached);
+    Ok(())
+}
+
+/// The Secret `attach_exceptions` would patch, if there is one.
+///
+/// Both `None` arms are ordinary: a plan whose compile failed carries no
+/// Secret, and there is nothing to attach an exception list to. What was not
+/// ordinary is what the caller did with the `Ok(())` that came back from them
+/// — it credited `exception_publish` with a success, for a call that had made
+/// no request, which is permanent and is the whole of the terminal rule for
+/// that class. The decision is a function of the plan alone, so it is one, and
+/// it is what the unit test below reads.
+fn attach_target(plan: &ApplyPlan) -> Option<&str> {
+    plan.secret.as_ref()?.metadata.name.as_deref()
 }
 
 /// A freshly created bundle Secret must carry the current exception list too;
@@ -499,24 +700,32 @@ async fn attach_exceptions(
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
     plan: &ApplyPlan,
-) -> Result<()> {
-    let Some(secret) = &plan.secret else {
-        return Ok(());
+) -> Result<Requested> {
+    let Some(secret_name) = attach_target(plan) else {
+        return Ok(Requested::NONE);
     };
-    let Some(secret_name) = secret.metadata.name.as_deref() else {
-        return Ok(());
-    };
-    let scoped = match secret
+    let secret = plan.secret.as_ref().expect("attach_target read the Secret");
+    // The same refusal `exception_targets` makes on the publish path, and for
+    // the same reason: a Secret whose policy this controller cannot name is a
+    // Secret it cannot scope a list to, and publishing the unscoped list into
+    // it widens every exception the list carries to a policy nobody targeted
+    // them at. This arm published it. Nothing reaches it today — every plan
+    // this controller builds labels its Secret — and two paths that answer one
+    // question two ways is the state in which the next change picks the wrong
+    // one.
+    let Some(policy) = secret
         .metadata
         .labels
         .as_ref()
         .and_then(|l| l.get(crate::apply::POLICY_LABEL_KEY))
-    {
-        Some(policy) => {
-            crate::apply::exceptions_for_policy(&snapshot_exceptions(exceptions), policy)
-        }
-        None => snapshot_exceptions(exceptions),
+    else {
+        return Err(FerrumError::Integrity(format!(
+            "secret {secret_name} carries no {} label: refusing to attach an exception list \
+             this controller cannot scope to a policy",
+            crate::apply::POLICY_LABEL_KEY,
+        )));
     };
+    let scoped = crate::apply::exceptions_for_policy(&snapshot_exceptions(exceptions), policy);
     patch_secret_exceptions(
         client,
         &cfg.namespace,
@@ -539,6 +748,7 @@ fn failed_outcome(generation: i64, err: &FerrumError) -> crate::ReconcileOutcome
 mod tests {
     use super::*;
     use crate::apply::{bundle_secret, plan_apply, DEFAULT_NAMESPACE};
+    use crate::health::TERMINAL_RUN;
     use crate::{reconcile, ClusterAbi, ReconcileInput, ReconcileOutcome};
     use ferrum_api::{
         ClusterSecurityPolicy, ClusterSecurityPolicySpec, PolicyLibrarySpec, RuntimeAction,
@@ -605,7 +815,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         let applied = match &outcome {
             ReconcileOutcome::Applied(a) => a,
@@ -642,7 +851,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         match outcome {
             ReconcileOutcome::Applied(a) => {
@@ -650,6 +858,85 @@ mod tests {
             }
             ReconcileOutcome::Failed(s) => panic!("{}", s.compile.message),
         }
+    }
+
+    /// A reconcile that published nothing does not mark publishing as
+    /// working.
+    ///
+    /// The plan of a policy whose compile failed carries no Secret — the
+    /// assertion `missing_spec_is_validation_no_secret` below already holds —
+    /// so `attach_exceptions` has nothing to patch and issues no request.
+    /// Before the receipt, the call site marked `exception_publish` as having
+    /// succeeded on exactly that path, and `ever_ok` is permanent: from the
+    /// first policy in the cluster that failed to compile, an RBAC that 403s
+    /// every exception publish could never reach the terminal rule again. The
+    /// same three lines held for `reconcile`, which was credited for writing
+    /// «compile failed» into a status.
+    #[test]
+    fn a_reconcile_that_published_nothing_marks_no_class_as_having_worked() {
+        let failed = ReconcileOutcome::Failed(PolicyStatus {
+            observed_generation: 1,
+            compile: compile_status_err(&FerrumError::Validation(
+                "ClusterSecurityPolicy spec is missing".into(),
+            )),
+            rollout: RolloutStatus::default(),
+        });
+        let plan = plan_apply("bare", DEFAULT_NAMESPACE, &failed, &pk());
+        assert!(plan.secret.is_none(), "a failed compile writes no Secret");
+        assert!(
+            attach_target(&plan).is_none(),
+            "there is no Secret to attach an exception list to, so no request is made"
+        );
+
+        let health = ControllerHealth::new();
+        // The receipts `reconcile_object` gets for this plan, from the two
+        // functions that would have made the requests.
+        health.note_success(Requested::of(persist_class(&plan)));
+        health.note_success(Requested::NONE);
+        assert!(
+            !health.ever_succeeded(FailureClass::ExceptionPublish),
+            "a call that made no request marked the class as having worked"
+        );
+        assert!(
+            !health.ever_succeeded(FailureClass::Reconcile),
+            "writing a failed compile into a status is a status patch, not a reconcile that \
+             converged"
+        );
+        assert!(
+            health.ever_succeeded(FailureClass::StatusPatch),
+            "the one request this plan does make is a status PATCH, and it went through"
+        );
+
+        // And that is the terminal rule, not bookkeeping: publishes that all
+        // fail must still reach it.
+        let mut last = Ok(());
+        for _ in 0..TERMINAL_RUN {
+            last = health.note_failure(FailureClass::ExceptionPublish, "secret patch: 403");
+        }
+        let err = last.expect_err("a class in which nothing ever worked must end the process");
+        assert!(
+            err.to_string().contains("exception_publish"),
+            "the terminal error must name the class: {err}"
+        );
+
+        // The other direction, so this is not an assertion that nothing ever
+        // counts: a plan that does carry a Secret makes both requests, and
+        // both receipts say so.
+        let applied = reconcile(ReconcileInput {
+            spec: &prod_restricted().spec,
+            observed_generation: 3,
+            secret_key: &RFC8032_SK,
+            library: None,
+            clusters: &[],
+        });
+        let live = plan_apply("prod-restricted", DEFAULT_NAMESPACE, &applied, &pk());
+        assert!(live.secret.is_some());
+        assert!(attach_target(&live).is_some());
+        let ok = ControllerHealth::new();
+        ok.note_success(Requested::of(persist_class(&live)));
+        ok.note_success(Requested::of(FailureClass::ExceptionPublish));
+        assert!(ok.ever_succeeded(FailureClass::Reconcile));
+        assert!(ok.ever_succeeded(FailureClass::ExceptionPublish));
     }
 
     #[test]
@@ -700,7 +987,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         assert!(matches!(outcome, ReconcileOutcome::Failed(_)));
         let plan = plan_apply(&observed.name, DEFAULT_NAMESPACE, &outcome, &pk());
@@ -734,7 +1020,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: Some(&lib),
             clusters: &clusters,
-            runtime_profile: None,
         });
         match outcome {
             ReconcileOutcome::Applied(a) => {
@@ -758,7 +1043,6 @@ mod tests {
             secret_key: &[0u8; ED25519_SECRET_KEY_LEN],
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         match &outcome {
             ReconcileOutcome::Failed(s) => {
@@ -830,7 +1114,6 @@ mod tests {
             secret_key: &RFC8032_SK,
             library: None,
             clusters: &[],
-            runtime_profile: None,
         });
         let applied = match &outcome {
             ReconcileOutcome::Applied(a) => a,
@@ -1091,5 +1374,325 @@ mod tests {
         assert!(!status.active);
         assert!(live.is_none());
         assert!(!status.message.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // The receipts, measured against a stub API server rather than modelled.
+    //
+    // Everything above this line reads a pure function; the defects below
+    // live in what the reconcile path does with an answer the API server
+    // gave it, and none of them is visible without one.
+    // ---------------------------------------------------------------------
+
+    use crate::testapi::{status_error, Req, StubApi};
+    use std::sync::Arc as StdArc;
+
+    fn stub_cfg() -> WatchConfig {
+        WatchConfig {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            secret_key: RFC8032_SK.to_vec(),
+            trust_root: pk(),
+            library: None,
+            clusters: Vec::new(),
+            status_dir: None,
+        }
+    }
+
+    /// A Secret as the API server lists it: owned by this controller, and
+    /// scopable when `policy` is `Some`.
+    fn listed_secret(name: &str, policy: Option<&str>) -> serde_json::Value {
+        let mut labels = serde_json::Map::new();
+        labels.insert(
+            crate::apply::MANAGED_BY_KEY.to_string(),
+            serde_json::json!(crate::apply::MANAGED_BY_VALUE),
+        );
+        if let Some(policy) = policy {
+            labels.insert(
+                crate::apply::POLICY_LABEL_KEY.to_string(),
+                serde_json::json!(policy),
+            );
+        }
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": name, "namespace": DEFAULT_NAMESPACE, "labels": labels },
+            "type": "Opaque",
+        })
+    }
+
+    fn secret_list(items: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "SecretList",
+            "metadata": { "resourceVersion": "1" },
+            "items": items,
+        })
+    }
+
+    /// The first `kube::Client` this process builds must not be a panic.
+    ///
+    /// `kube` builds its TLS stack through `rustls::ClientConfig::builder()`,
+    /// which panics when no process-wide `CryptoProvider` is installed, and it
+    /// installs one itself only under its `aws-lc-rs` feature — which this
+    /// tree does not carry. So `Client::try_default()` on the first line of
+    /// `run_watch` panicked before a watch, before a counter and before any
+    /// status file could say why: the whole surface this module publishes was
+    /// unreachable on a real cluster. The tests below are the other half of
+    /// this one — every one of them builds a client and gets an answer.
+    #[test]
+    fn the_process_has_a_crypto_provider_before_its_first_client() {
+        install_crypto_provider();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "no rustls provider is installed, so the first kube::Client this process builds \
+             panics inside rustls"
+        );
+    }
+
+    /// One publish pass, driven through the same function the exception watch
+    /// drives: `InitDone` carries no object, so the only requests it makes are
+    /// the ones `persist_exceptions` makes.
+    async fn publish_pass(
+        client: &Client,
+        cfg: &WatchConfig,
+        health: &ControllerHealth,
+    ) -> Result<()> {
+        let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+        let staging: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+        handle_exception_event(
+            client,
+            cfg,
+            &exceptions,
+            &staging,
+            health,
+            watcher::Event::InitDone,
+        )
+        .await
+    }
+
+    /// One Secret that refuses every PATCH must not make the ones that
+    /// succeeded invisible.
+    ///
+    /// `persist_exceptions` walked its targets with `?` inside the loop, so
+    /// the first refusal returned before the receipt for the Secrets already
+    /// patched was built. `ever_ok` for `exception_publish` therefore stayed
+    /// false for the life of the process, and the tenth event ended it —
+    /// naming a class in which publishing had in fact worked on every event,
+    /// on every other Secret. The terminal rule exists to report a deployment
+    /// that never worked; this is it firing on one 413.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_secret_that_refuses_every_patch_does_not_end_a_controller_that_publishes() {
+        let stub = StubApi::start(StdArc::new(|req: &Req| {
+            match (req.method.as_str(), req.path()) {
+                ("GET", _) => (
+                    200,
+                    secret_list(vec![
+                        listed_secret("ferrum-bundle-cluster-a", Some("a")),
+                        listed_secret("ferrum-bundle-cluster-b", Some("b")),
+                    ]),
+                ),
+                ("PATCH", p) if p.ends_with("ferrum-bundle-cluster-b") => (
+                    413,
+                    status_error(413, "Request entity too large: limit is 3145728"),
+                ),
+                ("PATCH", _) => (200, listed_secret("ferrum-bundle-cluster-a", Some("a"))),
+                _ => (404, status_error(404, "not found")),
+            }
+        }));
+        let client = stub.client();
+        let cfg = stub_cfg();
+        let health = ControllerHealth::new();
+
+        for event in 1..=TERMINAL_RUN {
+            publish_pass(&client, &cfg, &health)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "event {event} of {TERMINAL_RUN} ended the process: {e}. Every one of \
+                         them published the exception list to ferrum-bundle-cluster-a"
+                    )
+                });
+        }
+        assert!(
+            health.ever_succeeded(FailureClass::ExceptionPublish),
+            "a pass that patched one Secret and was refused by another reported no publish at all"
+        );
+        assert_eq!(
+            stub.seen_matching("PATCH", "ferrum-bundle-cluster-a").len() as u64,
+            TERMINAL_RUN,
+            "one publish per event, including the events after the first refusal"
+        );
+        assert!(
+            health.is_degraded(),
+            "the Secret that refuses every patch must still be a reason"
+        );
+    }
+
+    /// A Secret this controller cannot scope a list to is one object being
+    /// wrong, and one object may not end the process.
+    ///
+    /// The `unscopable` list is charged to `exception_publish` once per event,
+    /// while the pass that found it patched nothing and so returned
+    /// `Requested::NONE`. Ten events — ten watch relists, or ten exceptions
+    /// being edited — and the controller exits, calling a hand-made Secret a
+    /// deployment fault of the class that publishes exceptions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_secret_that_cannot_be_scoped_is_a_reason_and_never_a_terminal_run() {
+        let stub = StubApi::start(StdArc::new(|req: &Req| match req.method.as_str() {
+            "GET" => (200, secret_list(vec![listed_secret("hand-made", None)])),
+            _ => (404, status_error(404, "not found")),
+        }));
+        let client = stub.client();
+        let cfg = stub_cfg();
+        let health = ControllerHealth::new();
+
+        for event in 1..=TERMINAL_RUN * 2 {
+            publish_pass(&client, &cfg, &health)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "event {event} ended the process: {e}. One Secret with no {} label is \
+                         that Secret being wrong; the process publishes to every other one and \
+                         must keep running",
+                        crate::apply::POLICY_LABEL_KEY
+                    )
+                });
+        }
+        assert!(
+            stub.seen_matching("PATCH", "hand-made").is_empty(),
+            "the unscoped list was published into a Secret this controller cannot scope"
+        );
+        let reasons = health.degraded_reasons();
+        assert!(
+            reasons.iter().any(|r| r.contains("hand-made")),
+            "the Secret nobody can scope is not in any reason an operator reads: {reasons:?}"
+        );
+    }
+
+    /// An object that is already converged asked the API server for its Secret
+    /// and got an answer, and that is a request of `reconcile` that worked.
+    ///
+    /// The skip returned `Ok(())` and credited nothing, so on a cluster in its
+    /// steady state — every object converged — `reconcile.ever_ok` stayed
+    /// false for the life of the process, and ten failures with no success
+    /// between them end it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_converged_object_credits_the_get_it_made() {
+        let outcome = reconcile(ReconcileInput {
+            spec: &prod_restricted().spec,
+            observed_generation: 3,
+            secret_key: &RFC8032_SK,
+            library: None,
+            clusters: &[],
+        });
+        let applied = match outcome {
+            ReconcileOutcome::Applied(applied) => applied,
+            ReconcileOutcome::Failed(s) => panic!("{}", s.compile.message),
+        };
+        let secret = bundle_secret("prod-restricted", DEFAULT_NAMESPACE, &applied.bundle, &pk())
+            .expect("secret");
+        let secret_json = serde_json::to_value(&secret).expect("secret json");
+        let digest = applied.bundle.digest.as_str().to_string();
+
+        let stub = StubApi::start(StdArc::new(move |req: &Req| match req.method.as_str() {
+            "GET" => (200, secret_json.clone()),
+            _ => (404, status_error(404, "not found")),
+        }));
+        let client = stub.client();
+        let cfg = stub_cfg();
+        let health = ControllerHealth::new();
+        let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let obj = converged_object("prod-restricted", 3, &digest);
+        assert!(
+            reconcile_object(&client, &cfg, &exceptions, &health, obj)
+                .await
+                .is_ok(),
+            "a converged object is not a failure"
+        );
+        assert_eq!(
+            stub.seen_matching("GET", "secrets").len(),
+            1,
+            "the skip is decided from a Secret the API server was asked for"
+        );
+        assert!(
+            stub.seen_matching("PATCH", "").is_empty(),
+            "a converged object writes nothing, which is the point of the skip"
+        );
+        assert!(
+            health.ever_succeeded(FailureClass::Reconcile),
+            "the GET that decided the skip was issued and answered, and nothing recorded it: a \
+             controller in its steady state can never mark `reconcile` as having worked"
+        );
+    }
+
+    /// The object the API server holds for a policy that is already applied.
+    fn converged_object(name: &str, generation: i64, digest: &str) -> DynamicObject {
+        let spec = prod_restricted().spec;
+        let v = serde_json::json!({
+            "apiVersion": "ferrum.io/v1",
+            "kind": "ClusterSecurityPolicy",
+            "metadata": { "name": name, "generation": generation, "resourceVersion": "42" },
+            "spec": spec,
+            "status": {
+                "observedGeneration": generation,
+                "compile": { "ready": true, "bundleDigest": digest, "message": "" },
+                "rollout": {},
+            },
+        });
+        serde_json::from_value(v).expect("DynamicObject")
+    }
+
+    /// A Secret with no policy label gets no exception list, on both paths
+    /// that can publish one.
+    ///
+    /// `persist_exceptions` refuses it — that is what `exception_targets` is
+    /// for — and `attach_exceptions` published the whole unscoped list into it
+    /// instead, which is the widening the scoping exists to prevent. The plan
+    /// this controller builds always carries the label, so nothing reaches
+    /// this today; two paths that answer one question differently is the state
+    /// in which the next change picks the wrong one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attaching_to_an_unlabelled_secret_publishes_nothing() {
+        let stub = StubApi::start(StdArc::new(|_req: &Req| {
+            (
+                200,
+                serde_json::json!({ "kind": "Secret", "apiVersion": "v1" }),
+            )
+        }));
+        let client = stub.client();
+        let cfg = stub_cfg();
+        let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let outcome = reconcile(ReconcileInput {
+            spec: &prod_restricted().spec,
+            observed_generation: 1,
+            secret_key: &RFC8032_SK,
+            library: None,
+            clusters: &[],
+        });
+        let mut plan = plan_apply("prod-restricted", DEFAULT_NAMESPACE, &outcome, &pk());
+        let secret = plan.secret.as_mut().expect("the plan carries a Secret");
+        secret
+            .metadata
+            .labels
+            .as_mut()
+            .expect("labels")
+            .remove(crate::apply::POLICY_LABEL_KEY);
+
+        let err = attach_exceptions(&client, &cfg, &exceptions, &plan)
+            .await
+            .expect_err(
+                "an exception list scoped to no policy was published into a Secret whose policy \
+                 this controller cannot name",
+            );
+        assert!(
+            matches!(err, FerrumError::Integrity(_)),
+            "refusing to widen an exception list is an integrity refusal: {err:?}"
+        );
+        assert!(
+            stub.seen_matching("PATCH", "").is_empty(),
+            "the unscoped list reached the API server"
+        );
     }
 }

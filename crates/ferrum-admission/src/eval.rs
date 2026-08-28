@@ -57,11 +57,17 @@ pub struct AdmissionSubject {
     /// Empty = ClusterSecurityPolicy. Non-empty = namespaced SecurityPolicy.
     pub policy_namespace: String,
     pub namespace: String,
-    pub cluster_labels: BTreeMap<String, String>,
-    pub namespace_labels: BTreeMap<String, String>,
+    /// `None` is "the webhook never observed this group of labels", `Some` is
+    /// "it did" — `Some` of an empty map included, for an object that carries
+    /// no labels. Only `None` fails closed. These three are not on the admitted
+    /// object: cluster labels are operator-stated and the other two are joined
+    /// in from watches, so each has a state where it is simply not known.
+    /// `workload_labels` below has no such state — it rides on the object.
+    pub cluster_labels: Option<BTreeMap<String, String>>,
+    pub namespace_labels: Option<BTreeMap<String, String>>,
     pub workload_labels: BTreeMap<String, String>,
     pub service_account: String,
-    pub service_account_labels: BTreeMap<String, String>,
+    pub service_account_labels: Option<BTreeMap<String, String>>,
     pub image: String,
     /// Proven out of band with bundle trust roots. Default false (fail closed).
     pub image_signed: bool,
@@ -223,52 +229,59 @@ fn program_applies(
     if !subject.policy_namespace.is_empty() && subject.namespace != subject.policy_namespace {
         return Ok(false);
     }
-    // Cluster/namespace/SA labels are not on the admitted object. An empty
-    // map means the webhook never saw them — fail closed, do not skip policy.
+    // Cluster/namespace/SA labels are not on the admitted object, so each has a
+    // "never observed" state — fail closed there, do not skip policy. An
+    // observed group holding no labels is not that state: it answers the
+    // selector with a non-match, which is a decision.
     require_labels_if_selected(
         &program.selector.cluster_selector,
-        &subject.cluster_labels,
+        subject.cluster_labels.as_ref(),
         "cluster",
     )?;
     require_labels_if_selected(
         &program.selector.namespace_selector,
-        &subject.namespace_labels,
+        subject.namespace_labels.as_ref(),
         "namespace",
     )?;
     require_labels_if_selected(
         &program.selector.service_account_selector,
-        &subject.service_account_labels,
+        subject.service_account_labels.as_ref(),
         "serviceAccount",
     )?;
-    Ok(
-        label_selector_matches(&program.selector.cluster_selector, &subject.cluster_labels)?
-            && label_selector_matches(
-                &program.selector.namespace_selector,
-                &subject.namespace_labels,
-            )?
-            && label_selector_matches(
-                &program.selector.workload_selector,
-                &subject.workload_labels,
-            )?
-            && label_selector_matches(
-                &program.selector.service_account_selector,
-                &subject.service_account_labels,
-            )?,
-    )
+    // Past the check above, every selected group is `Some`. An unselected one
+    // is matched against an empty map, which its empty selector accepts.
+    let none = BTreeMap::new();
+    Ok(label_selector_matches(
+        &program.selector.cluster_selector,
+        subject.cluster_labels.as_ref().unwrap_or(&none),
+    )? && label_selector_matches(
+        &program.selector.namespace_selector,
+        subject.namespace_labels.as_ref().unwrap_or(&none),
+    )? && label_selector_matches(
+        &program.selector.workload_selector,
+        &subject.workload_labels,
+    )? && label_selector_matches(
+        &program.selector.service_account_selector,
+        subject.service_account_labels.as_ref().unwrap_or(&none),
+    )?)
 }
 
 fn selector_nonempty(selector: &LabelSelector) -> bool {
     !selector.match_labels.is_empty() || !selector.match_expressions.is_empty()
 }
 
+/// Refuses on "never observed", never on "observed and empty". The two used to
+/// be the same condition here, so a warm cache that had listed an unlabelled
+/// namespace produced an integrity failure where the honest answer was "the
+/// selector did not match".
 fn require_labels_if_selected(
     selector: &LabelSelector,
-    labels: &BTreeMap<String, String>,
+    labels: Option<&BTreeMap<String, String>>,
     what: &str,
 ) -> Result<(), FerrumError> {
-    if selector_nonempty(selector) && labels.is_empty() {
+    if selector_nonempty(selector) && labels.is_none() {
         return Err(FerrumError::Integrity(format!(
-            "{what} selector is set but {what} labels are missing; fail closed"
+            "{what} selector is set but {what} labels were never observed; fail closed"
         )));
     }
     Ok(())
@@ -726,9 +739,11 @@ mod tests {
             .match_labels
             .insert("ferrum.io/zone".into(), "pci".into());
         let mut subject = signed_subject();
-        subject
-            .namespace_labels
-            .insert("ferrum.io/zone".into(), "public".into());
+        subject.namespace_labels = Some(
+            [("ferrum.io/zone".to_string(), "public".to_string())]
+                .into_iter()
+                .collect(),
+        );
         subject.privileged = true;
         let decision = admit(&program, &subject, &[], now());
         assert!(decision.allowed);

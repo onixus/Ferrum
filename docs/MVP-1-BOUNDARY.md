@@ -204,6 +204,7 @@
 | FD027 читает токен по пути, а не по факту automount: явная `projected` проекция, смонтированная туда, откуда её читает код, — не находка, а смонтированная в другое место — находка | U | U `lint_deploy.rs::a_projected_token_where_the_code_reads_it_is_not_a_finding` · U `lint_deploy.rs::a_projected_token_mounted_somewhere_else_is_still_a_finding` · U `lint_deploy.rs::a_projected_token_no_container_mounts_is_still_a_finding` |
 | Под, чьему ServiceAccount это дерево выдало RBAC, обязан нести токен, даже если не называет ни одного флага watch — иначе он аутентифицируется как `system:anonymous`, а выданный грант описывает личность, которую никто не предъявляет | U | U `lint_deploy.rs::a_granted_service_account_with_no_projected_token_is_a_finding` · U `lint_deploy.rs::a_service_account_this_tree_grants_nothing_needs_no_token` · U `lint_deploy.rs::a_binding_to_a_ruleless_role_is_not_a_grant` |
 | `ApiserverConfig` без спроецированного токена — ошибка старта, называющая файл, а не бесконечный backoff | U | U `ferrum-k8smeta/src/watch.rs::a_config_without_a_projected_token_is_an_error_that_names_the_file` |
+| Долг relist, поднятый нечитаемым кадром, гасится истечением hold-down на любом следующем кадре, а не приходом второго нечитаемого: одиночный плохой кадр на здоровом потоке не оставляет кэш нетёплым на всё время соединения, и при этом всплеск нечитаемых кадров не стоит переподключения на кадр | U | U `ferrum-k8smeta/src/watch.rs::one_unreadable_frame_on_an_otherwise_healthy_stream_still_relists` · U `ferrum-k8smeta/src/watch.rs::an_unreadable_pod_frame_ends_the_stream_once_its_debt_stands` · U `ferrum-k8smeta/src/watch.rs::a_rolling_stream_of_unknown_frames_is_not_a_reconnect_per_frame` |
 | `status.json` пишется целиком, переживает сбой записи и не держит замок на агенте | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::the_status_write_holds_no_lock_on_the_shared_agent` |
 
 ### Сигналы деградации
@@ -224,7 +225,7 @@
 | `DEG_EXPORT_DEAD` — writer мёртв: enforcement идёт и не записывается | U | U `ferrum-agent/src/lib.rs::a_dead_export_writer_degrades_the_agent` |
 | `DEG_EXPORT_LOSSY` — экспорт терял события: kill мог не оставить записи | U | U `ferrum-agent/src/lib.rs::a_lossy_export_degrades_and_then_recovers` |
 | `DEG_DECODE_FAILURES` — записи не декодировались: их не видело ни одно правило | U | U `ferrum-agent/src/lib.rs::a_run_of_records_that_all_fail_to_decode_is_degraded_without_more_traffic` |
-| `DEG_LABELS_UNKNOWN` — неразрешённые label: правила применены fail-closed | U | U `ferrum-agent/src/lib.rs::unobserved_namespace_labels_do_not_skip_a_rule` |
+| `DEG_LABELS_UNKNOWN` — неразрешённые label: правила применены fail-closed; вечно-истинной эта причина быть больше не может — ветку кластера снял запрет `clusterSelector` при компиляции, ветку namespace/ServiceAccount гасит список, который доехал | U | U `ferrum-agent/src/lib.rs::unobserved_namespace_labels_do_not_skip_a_rule` · U `ferrum-policy/src/lib.rs::a_cluster_selector_is_refused_on_both_kinds` · U `ferrum-compiler/src/lib.rs::a_cluster_selector_does_not_compile` |
 | `DEG_RING_DROPS` — дропы в ядре: записи, которых не видело ни одно правило | U | U `ferrum-agent/src/lib.rs::ring_drops_degrade_and_then_recover` |
 | `DEG_PATH_TRUNCATED` — путь не поместился: suffix-правило решено без байтов, которые называет | U | U `ferrum-agent/src/lib.rs::path_truncation_degrades_and_then_recovers` · U `replay.rs::a_truncated_docker_sock_path_still_kills_and_degrades` |
 | `DEG_IDENTITY_UNKNOWN` — cgroup, которую индекс не может назвать | U | U `replay.rs::a_cgroup_missing_from_the_index_is_counted_and_degrades` |
@@ -307,10 +308,10 @@
 |---|---|---|---|
 | `ferrum-agent` | `status.json` и флаг `degraded` в конверте экспорта | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::a_degraded_node_that_changes_why_says_so` |
 | `ferrum-admission` | текст `message` в отказе — то, что видит человек, запустивший `kubectl` | U | U `webhook.rs::a_warm_watch_decides_and_a_cold_one_denies_with_the_cold_reason` · U `webhook.rs::unsigned_image_deny` |
-| `ferrum-controller` | stderr, и обе его половины: до входа в watch — `error: <причина>` и выход 1; после — строка `ferrum-controller: <причина>` на каждый отказавший event, процесс продолжает | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` · U `boundary_gate.rs::the_controllers_channel_is_stderr_and_a_failed_event_never_reaches_the_exit_code` |
+| `ferrum-controller` | `status.json` в `--status-dir` плюс код выхода: до входа в watch — `error: <причина>` и выход 1; после — счётчик и причина на класс отказа в файле, а всплеск отказов одного класса без единого успеха завершает процесс | U | U `ferrum-controller/src/main.rs::a_flag_is_never_taken_as_the_value_of_the_flag_before_it` · U `health.rs::a_failure_run_is_a_burst_and_not_a_lifetime` · U `health.rs::the_file_written_after_a_failed_publish_says_the_publish_failed` · U `health.rs::a_single_failed_event_is_counted_and_the_process_keeps_running` · U `health.rs::a_run_of_status_patch_failures_with_no_success_is_terminal_and_names_the_class` · U `health.rs::a_class_that_succeeded_once_does_not_go_terminal_on_a_later_burst` · U `health.rs::the_status_file_is_written_whole_and_a_failed_write_is_its_own_reason` · U `ferrum-controller/src/watch.rs::a_reconcile_that_published_nothing_marks_no_class_as_having_worked` · U `apply.rs::a_publish_pass_over_no_secret_requests_nothing` · U `ferrum-controller/src/main.rs::the_status_dir_the_manifest_passes_is_the_one_the_watch_config_carries` · U `boundary_gate.rs::the_controllers_channel_names_every_post_start_failure_class` |
 
 Строка контроллера — единственная, которая до этого цикла не проходила третье
-утверждение, и не тем каналом, который в ней стоит: `deploy/controller/rbac.yaml`
+утверждение, и не тем каналом, который в ней стоял: `deploy/controller/rbac.yaml`
 выдавал право записи в `ferrumclusters/status`, а `FerrumCluster` не назван ни
 в одном файле контроллера. Починок было две — дать `.degraded` первого писателя
 или удалить грант. Удалён грант, и вместе с ним ещё два той же формы
@@ -321,29 +322,191 @@
 model этого проекта. То же самое и той же формы — `runtimeprofiles/status`:
 он пережил ту прополку, потому что правило спрашивало, назван ли *тип статуса*
 где-нибудь в crate, а `pub fn runtime_profile_status(…) -> RuntimeProfileStatus`
-его называет. Результат этой функции — поле, которое читают два юнит-теста;
-`ApiResource` для `runtimeprofiles` нет, watch нет, PATCH нет. Правило теперь
-спрашивает про ручку, которая нужна записи (`GroupVersionKind::gvk(…, "Kind")`
-плюс `patch_status`), и грант удалён — та же починка по той же причине.
+его называл. Правило стало спрашивать про ручку, которая нужна записи
+(`GroupVersionKind::gvk(…, "Kind")` плюс `patch_status`), и грант удалён — та же
+починка по той же причине.
 
-Строка контроллера переписана в том же цикле, и не потому, что канал сменился,
-а потому, что она называла одну его половину целым. `код выхода и error:
-<причина>` верно ровно для отказов **до** входа в watch: их возвращает `run()`,
-`main` печатает и выходит с 1, и цитируемый argv-тест — про этот путь. После
-старта процесс — три `tokio::select!`-нутых цикла watch; `kube::runtime::watcher`
-переспрашивает сам и не завершается, поэтому каждый отказ, ради которого канал
-и нужен — не сошедшийся reconcile, 403 на PATCH статуса (ровно то, что даёт
-криво отредактированный RBAC), ошибка watch, — это один `eprintln!` с префиксом
-`ferrum-controller:` и следующий виток. Код выхода туда не доходит. Так что
-второе утверждение инвентаря — «канал достижим» — держалось на единственном
-классе отказов, ради которого канал оператору не нужен.
+**Перепись грантов теперь читает все глаголы, а не только пишущие.** Пока она
+спрашивала про `<kind>/status` и `create/update/patch/delete`, грант
+`get/list/watch` на `ferrum.io`-ресурс не решался ничем и ни в какую сторону —
+то же самое «зелёное, потому что проверять нечего», от которого этот тест
+уходил в прошлом цикле, только этажом ниже. Таких грантов у контроллера было
+четыре: `runtimeprofiles`, `ferrumclusters`, `compliancesnapshots`,
+`policylibraries`. Ни для одного из этих Kind в `crates/ferrum-controller/src`
+нет литерала `GroupVersionKind::gvk`, значит нет `ApiResource`, значит нет
+`Api<DynamicObject>`, значит ни `get`, ни `list`, ни `watch` этот бинарь по ним
+никогда не выполнял и выполнить не мог. Читающий грант не бесплатен дважды: это
+право без назначения — цель бокового движения, — и это ложное утверждение о
+системе, потому что RBAC и есть место, где оператор читает, за чем контроллер
+следит. Все четыре удалены; правило держит
+`boundary_gate.rs::a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose`,
+и в этом цикле у него закрыты два обхода, каждый из которых восстанавливал
+предмет находки целиком. Первый: перепись шла от `image:` к
+`serviceAccountName` того же pod spec, поэтому биндинг на любой другой
+ServiceAccount не разрешался ни в одно правило — `ClusterRole` с теми самыми
+четырьмя ресурсами и пишущими глаголами, привязанный к
+`ServiceAccount/ferrum-controller-ops`, проходил все наборы этого crate и
+`lint-deploy`. Теперь каждый субъект биндинга обязан быть аккаунтом, под
+которым что-то запускается: грант субъекту, которого никто не запускает, — то
+же право без назначения, только ещё и невидимое для переписи. Второй: читались
+все `.rs` под `crates/<субъект>/src`, включая `#[cfg(test)]`, так что один
+юнит-тест с литералом `gvk` воскрешал читающий грант на Kind, которого в
+поставляемом бинаре нет. Читается поставляемая половина файла — до первой
+строки `#[cfg(test)]`, — и то же правило теперь применяется к
+`the_controllers_channel_names_every_post_start_failure_class`, который до
+этого цикла засчитывал `note_failure` из тестового модуля `watch.rs` за
+отчётность реконсайл-пути.
+и оно ограничено группой `ferrum.io` намеренно: ядровые ресурсы (`pods`,
+`secrets`, `nodes`) адресуются типами `k8s-openapi` без единого `gvk`, так что
+тот же вопрос объявил бы мёртвым каждый из них. Неиспользуемый ядровой грант —
+настоящая находка, но не этим инструментом.
 
-Канал у контроллера один и это stderr; обе половины держит
-`boundary_gate.rs::the_controllers_channel_is_stderr_and_a_failed_event_never_reaches_the_exit_code`.
-Чего эта починка не делает и сделать не может из этого слайса: после старта
-403 на PATCH статуса — строка в логе и больше ничего. Ни выхода, ни счётчика,
-ни статуса, ни чего-либо, что оператор опрашивает. Это правка в
-`crates/ferrum-controller/src`, а не в этом документе.
+Той же правкой удалены `retain_policy_mode` и `runtime_profile_status`: обе
+принимали спеку RuntimeProfile, игнорировали её и возвращали константу, обе
+вызывались из `reconcile` на каждом проходе, и единственный читатель результата
+второй — поле, которое смотрели два юнит-теста. Вместе с ними ушли вход
+`runtime_profile` и выход `profile_status`, так что «RuntimeProfile не поднимает
+режим политики» — теперь свойство типа, который контроллер согласует, а не
+функции, которую можно отредактировать до обратного.
+
+Строка контроллера в прошлом цикле называла одну половину канала целым.
+`код выхода и error: <причина>` было верно ровно для отказов **до** входа в
+watch: их возвращает `run()`, `main` печатает и выходит с 1, и цитируемый
+argv-тест — про этот путь. После старта процесс — три `tokio::select!`-нутых
+цикла watch; `kube::runtime::watcher` переспрашивает сам и не завершается,
+поэтому каждый отказ, ради которого канал и нужен — не сошедшийся reconcile,
+403 на PATCH статуса (ровно то, что даёт криво отредактированный RBAC), ошибка
+watch, отказ публикации подписанных exception, — был одним `eprintln!` и
+следующим витком. Ни счётчика, ни файла, ни кода выхода: субъект, у которого
+нет ни `is_degraded()`, ни списка причин, а значит, ни одна перепись этого
+дерева по нему не шла и вакуумно проходила.
+
+**Это и есть то, что закрыто здесь.** `crates/ferrum-controller/src/health.rs`
+— форма агентовская намеренно: счётчик на класс отказа
+(`reconcile_failures`, `status_patch_failures`, `watch_errors`,
+`exception_publish_failures`), прогон подряд и «был ли хоть один успех» на
+каждый, `degraded_reasons()`, пустота которого и есть `is_degraded()`, и
+`status.json`, публикуемый в `--status-dir` атомарной заменой через временный
+файл. Класс отказа определяется местом вызова, а не текстом ошибки: разбор
+сообщений — ровно тот дефект, который это дерево удаляет цикл за циклом.
+Манифест даёт под это `emptyDir` на `/run/ferrum` и сохраняет
+`readOnlyRootFilesystem: true`; ни одного probe на этот файл нет и быть не
+может — restart на восстановимой деградации есть crash-loop, а на
+невосстановимой — бесконечный цикл, который не живёт достаточно долго, чтобы
+сказать почему.
+
+Терминальное правило одно и узкое: прогон в `TERMINAL_RUN` отказов **одного
+класса**, пришедших не реже чем раз в `TERMINAL_WINDOW`, в котором ни один
+запрос этого класса **ни разу** не прошёл, возвращает `Err` из `run_watch` — дальше это обычный путь `main`: `error:
+<причина>` и выход 1. Оба условия обязательны. Один 403 на одном объекте —
+плохой объект, и процесс, который на нём уходит, и есть тот crash-loop, от
+которого отказался статус агента; класс, в котором не работало **ничего**, —
+это не объект, а деплой (криво отредактированный RBAC, неприменённая CRD), и
+процесс, который логирует это вечно, выглядит здоровым и для Kubernetes, и для
+любой панели над ним. «Ни одного успеха в этом классе» — вся защита целиком,
+поэтому классы разделены по вызову, а не по слову: `status_patch` — это
+запрос, который **ничем, кроме PATCH статуса, не был**: статус
+PolicyException и статус политики, у плана которой нет Secret.
+
+**И поэтому же успех класса теперь нельзя объявить, не сделав запроса.** Вся
+защита стоит на флаге «хоть раз прошло», флаг необратим — а ставили его три
+места, где вызов не обращался к API server ни разу. `attach_exceptions` на
+плане без Secret выходит первым же `return` (план без Secret — это любая
+политика с провалившейся компиляцией), `persist_exceptions` на свежей
+установке не находит ни одного bundle-Secret и не патчит ничего, и оба
+возвращали `Ok(())`, после которого вызыватель писал `note_success`. Одной
+такой политики хватало, чтобы `exception_publish` больше никогда не дошёл до
+терминального правила: тысяча отказов подряд после этого — тысяча `Ok`.
+Правило, которое авторы знали, в том же файле было записано ровно один раз —
+ветка «объект уже сошёлся» успеха не засчитывает, потому что запроса не было.
+
+Теперь оно записано типом, а не дисциплиной. `note_success` принимает не
+класс, а `Requested` — расписку, которую возвращает тот код, который запрос и
+делал: `persist_dynamic`, `patch_status_dynamic`, `patch_secret_exceptions`,
+`persist_exceptions` (по факту пропатченных Secret, а не по факту вызова).
+Функция, которая не обратилась ни к чему, возвращать может только
+`Requested::NONE`, а место вызова расписку выдумать не может — единственное
+исключение названо в коде и в гейте: класс `watch`, чей запрос — сам watch, и
+чей ответ — пришедшее событие. Заодно исчезла вторая половина того же дефекта:
+запись статуса «compile failed» засчитывалась в `reconcile`, потому что успех
+и отказ одного и того же вызова классифицировались по-разному. Класс у него
+один — `apply.rs::persist_class`, — и читают его теперь оба направления.
+
+Чего эта правка не делает. PATCH статуса политики, у плана которой Secret
+есть, идёт одним вызовом с upsert этого Secret и потому считается в
+`reconcile`, а не в `status_patch` — **в обе стороны и на любом кластере, где
+политики компилируются**. Прежняя формулировка этого абзаца соседствовала с
+утверждением, что мис-RBAC попадает в `status_patch` «на каждом объекте,
+которого касается»; верно первое. На установке, где компиляция проходит, 403
+на PATCH статуса политики приходит в `reconcile`, и `status_patch` остаётся
+классом статусов PolicyException и политик с провалившейся компиляцией.
+Терминальное правило от этого не страдает — оно сработает через `reconcile`, —
+а диагностика страдает наполовину: заголовок скажет «reconcile», но причина в
+том же сообщении и в `status.json` — это дословный текст запроса, `status
+patch <имя>: 403 Forbidden`. Разносить upsert и PATCH на два независимо
+считаемых запроса ради счётчика этот цикл не стал намеренно: один вызов — один
+класс, а разнесённый upsert, у которого PATCH не прошёл, — это объект, чей
+Secret обновлён, а статус нет, то есть частично применённое состояние, которое
+пришлось бы либо откатывать, либо объявлять успехом в одном классе и отказом в
+другом. `status.json` живёт ровно столько, сколько под, и о том, что было
+между запусками, не сообщает ничего. И `Jenkinsfile` этот файл ни в одной
+стадии не читает: всё, что здесь стоит `U`, прогнано на этом дереве руками,
+как и всюду в этом документе.
+
+**У той же расписки есть обратная сторона, и она стреляла по здоровому
+процессу.** Требование «успех — только там, где был запрос» верно, а места, где
+запрос *был*, оказались не размечены, и терминальное правило стало вероятнее
+убить работающий контроллер, чем поймать сломанный RBAC. Три штуки, все
+измерены против stub-apiserver, а не рассуждением:
+
+- `persist_exceptions` выходила из цикла патчей первым же `?`, выбрасывая
+  расписку по Secret'ам, которые уже пропатчила. Один Secret, отказывающий
+  постоянно (413 на разросшемся списке, повторяющийся конфликт), — и класс, в
+  котором публикация работает на всех остальных Secret, выглядит классом, где
+  не работало ничего. Теперь пасс идёт до конца, отказ каждого Secret
+  считается отдельно, а исключения доезжают до всех Secret, кроме сломанного.
+- Сошедшийся объект возвращал `Ok(())`, не засчитав GET, которым он и решил,
+  что сошёлся. На кластере в установившемся режиме — где сошлись все объекты —
+  `reconcile.ever_ok` был ложен всю жизнь процесса. Расписку теперь отдаёт
+  `load_bundle_secret`, то есть тот код, который запрос и сделал. Цена названа:
+  этот GET — полноценный запрос класса `reconcile` (его отказ туда же и
+  считается), поэтому установка, где `get secrets` разрешён, а PATCH статуса
+  политики — нет, до терминального правила по `reconcile` больше не доходит.
+  Симметрия здесь обязательна: класс, в котором отказ считают, а успех нет, —
+  это ровно тот перекос, из-за которого правило и стреляло не туда.
+- Secret с меткой владельца и без метки политики считался отказом
+  `exception_publish` на **каждом** событии, а пасс, который его нашёл, ничего
+  не патчил и расписки не давал. Прогон такого рода неограничен по построению:
+  объект неисправен, пока его не починит человек, и десятое событие завершало
+  процесс. Это причина (`note_unactionable`: список в `status.json`, строка в
+  `degraded_reasons()`, самозатухающая на первом пассе, который его больше не
+  видит) и никогда не прогон.
+
+И сам прогон получил окно. «Десять подряд, и между ними ничего не прошло» без
+часов означает «десятый из них, когда бы он ни пришёл»: у класса, которому
+нечем поставить `ever_ok` — `exception_publish` на установке без единого
+bundle-Secret ровно таков, — десять транзиентных ошибок за день завершали
+процесс. `TERMINAL_WINDOW` = 580 с и выбран не за круглость: watch этого
+бинаря уходит с `timeoutSeconds=290` (`kube-core`, `WatchParams`), после чего
+watcher релистит и передаёт **каждый** объект заново, — значит деплойный (а не
+объектный) отказ перезаваливается не реже чем раз в 290 с даже на кластере,
+где ничего не редактируют и политика одна. Удвоение — запас на сам релист:
+список идёт не мгновенно и может быть повторён, а один медленный релист не
+должен рвать прогон. Десять отказов по-прежнему обязаны уложиться примерно в
+десять минут, а не в сутки.
+
+**Молчаливых веток в этом цикле стало на одну меньше.** `Event::Deleted`
+объекта без `namespace`/`name` не удалял исключение из набора — ни класса, ни
+строки: отозванный exception продолжал подписываться в Secret и раздаваться
+агентам, то есть fail-open в единственном направлении, где он запрещён. Набор
+ключуется `namespace/name`, применить такое удаление к нему нечем; теперь это
+отказ класса `reconcile` со строкой, называющей, что именно осталось живым, —
+та же трактовка, которую тот же файл уже давал тому же дефекту в
+`apply_exception_object`. Так же перестали быть молчаливыми Secret с нашей
+меткой `managed-by`, которым `persist_exceptions` не может отскопировать
+список (нет имени или нет метки `ferrum.io/policy`): пропустить такой Secret
+по-прежнему правильно — общий список расширил бы каждое исключение в нём, — но
+пропускается он теперь с отказом класса `exception_publish`, а не с `Ok`.
 
 Чего инвентарь не делает: он не утверждает, что канал субъекта достаточен.
 У webhook нет ни последнего-известного-хорошего, ни списка причин; у
@@ -392,9 +555,19 @@ model этого проекта. То же самое и той же формы 
 | Тег-половина замыкания образов открыта, и обе посылки, делающие её незакрываемой здесь, держатся тестом, а не doc-комментарием | U | U `deploy_gate.rs::the_tag_half_of_the_closure_is_open_and_says_why` |
 | Флаг, который даёт только cargo feature, вкомпилирован в образ, которому манифест его передаёт | U | U `deploy_gate.rs::a_flag_only_a_feature_provides_is_built_into_the_image_that_is_passed_it` |
 | Каждый non-default feature, который выбирает argv поставляемого манифеста, компилируется и как lint-таргет (`clippy --all-targets`), и как test-таргет: `cargo build` этого не засчитывает, потому что не компилирует ни одного тестового таргета, а `cargo tree` не компилирует вообще ничего | U | U `deploy_gate.rs::every_feature_a_manifest_selects_is_a_lint_and_test_target` · U `deploy_gate.rs::a_build_is_not_a_test_and_a_tree_is_not_a_compile` · U `Jenkinsfile::Clippy` · U `Jenkinsfile::Test` |
+| То же утверждение, исполненное, а не прочитанное: гейт сам запускает `cargo clippy --features … --all-targets -- -D warnings` и `cargo test --features …` для каждой пары (crate, feature), которую выбирает поставляемый манифест, и требует успеха. Строка в Jenkinsfile присутствовала и была верна ровно в тот цикл, когда её таргеты не собирались | U | U `deploy_gate.rs::every_feature_a_manifest_selects_actually_compiles_and_passes` |
 | Манифест не может объявить `optional: true` на томе, обслуживающем путь, без которого бинарь не стартует, — FD028, находка, а не предупреждение; том, который бинарь действительно терпит, находкой не является | U | U `lint_deploy.rs::a_required_mount_declared_optional_is_a_finding` · U `lint_deploy.rs::the_webhooks_bundle_mount_is_the_same_finding` · U `lint_deploy.rs::an_optional_serving_certificate_is_a_finding_too` · U `lint_deploy.rs::a_mount_the_binary_tolerates_may_be_optional` · U `lint_deploy.rs::a_file_is_served_by_the_longest_mount_that_covers_it` |
+| Том, чей `defaultMode` недоступен `runAsUser` этого пода, — FD029, находка, а не предупреждение: kubelet пишет Secret-том root:root и меняет группу только под `fsGroup`, поэтому «аккуратный» 0400 под non-root — это ключ, который процесс не откроет; правило читает оба смысла литерала, потому что `0400` — это 256 для YAML 1.1, применяющего манифест, и вообще не число для 1.2, читающего его здесь | U | U `lint_deploy.rs::a_volume_mode_the_run_as_user_cannot_read_is_a_finding` · U `lint_deploy.rs::a_mode_is_readable_only_through_bits_the_uid_actually_gets` · U `lint_deploy.rs::deploy_tree_is_clean` |
+| Первый `kube::Client` контроллера строится, а не паникует: провайдер rustls ставится до него, потому что `kube` ставит свой только под фичей `aws-lc-rs`, которой в этом дереве нет | U | U `ferrum-controller/src/watch.rs::the_process_has_a_crypto_provider_before_its_first_client` · U `ferrum-controller/src/watch.rs::a_converged_object_credits_the_get_it_made` |
+| Прогон отказов, завершающий процесс, — всплеск, а не итог жизни процесса: отказ, пришедший позже `TERMINAL_WINDOW` после предыдущего, начинает прогон заново, а сломанный деплой, который перезаваливается раз в relist (290 с, `timeoutSeconds` каждого watch), правило по-прежнему завершает | U | U `health.rs::a_failure_run_is_a_burst_and_not_a_lifetime` |
+| Объект, который нечем починить ни одним запросом, — причина в `status.json` и в `is_degraded()`, но никогда не прогон: Secret без метки политики виден на каждом событии, поэтому его прогон неограничен по построению | U | U `health.rs::an_unactionable_object_degrades_without_ending_the_process` · U `ferrum-controller/src/watch.rs::a_secret_that_cannot_be_scoped_is_a_reason_and_never_a_terminal_run` |
+| Расписка переживает отказ соседнего Secret, а сошедшийся объект засчитывает GET, которым он и сошёлся: и то и другое измерено против stub-apiserver, а не смоделировано | U | U `ferrum-controller/src/watch.rs::one_secret_that_refuses_every_patch_does_not_end_a_controller_that_publishes` · U `ferrum-controller/src/watch.rs::a_converged_object_credits_the_get_it_made` |
+| Неотскоупленный список исключений не публикуется ни одним из двух путей: `attach_exceptions` отказывает Secret без метки политики так же, как `exception_targets` его пропускает | U | U `ferrum-controller/src/watch.rs::attaching_to_an_unlabelled_secret_publishes_nothing` |
+| Файл, записанный после неудавшейся публикации, несёт `statusWriteFailed: true` и `REASON_STATUS_UNWRITABLE`, а следующий за ним — уже нет | U | U `health.rs::the_file_written_after_a_failed_publish_says_the_publish_failed` |
+| Неразрешённый селектор решает запись и не посылает сигнала: правило применено, совпадение экспортировано с `labels_unknown`, отказ назван `REFUSE_LABELS_UNKNOWN` и посчитан, `SIGKILL` не отправлен — а та же запись против наблюдённых меток убивает | U | U `ferrum-agent/src/lib.rs::an_unresolved_selector_decides_the_record_and_signals_nothing` |
 | Каждая цитата «Делает» разрешается в определение `fn` или в стадию, а список §D здесь — ровно `AcceptanceCase::ALL` | U | U `boundary_gate.rs::every_claim_in_the_does_section_cites_something_that_exists` · U `boundary_gate.rs::the_document_lists_exactly_the_rfc_d_cases` |
 | Каждая причина деградации, которую агент может объявить, названа здесь — по префиксу `DEG_`, по телу `degraded_reasons_at` и по аргументам `mark_terminal_fault` | U | U `boundary_gate.rs::every_degraded_reason_the_agent_can_raise_is_named_in_the_document` |
+| Классы отказа контроллера перечисляются из тела `pub enum FailureClass`, а не из списка в самом гейте: у каждого варианта обязан быть аксессор счётчика, место в `ALL`, ключ в `status_json`, выведенный из `counter()`, и хотя бы одно место маршрутизации в `watch.rs`/`apply.rs`; успех класса нельзя назвать на месте вызова | U | U `boundary_gate.rs::the_controllers_channel_names_every_post_start_failure_class` |
 | Обратное направление: каждый `#[test]` в `ferrum-testkit/tests`, `ferrum-agent/tests` и `ferrum-admission/tests` процитирован строкой или назван в списке исключений с причиной; само правило исключения проверено на входах, ответ на которых известен, а не только на пустом списке | U | U `boundary_gate.rs::every_gate_in_this_tree_is_cited_by_a_row` · U `boundary_gate.rs::a_test_is_found_under_its_attributes_and_a_plain_fn_is_not` · U `boundary_gate.rs::an_exemption_from_citation_is_named_one_at_a_time` |
 | У каждого поставляемого бинаря ровно один канал отказа, он достижим и несёт причину, а не константу; перепись грантов читает и wildcard — `resources: ["*"]` с пишущим глаголом даёт каждый `<kind>/status` группы, а не ни одного | U | U `boundary_gate.rs::every_shipped_subject_has_one_reachable_channel_that_carries_a_cause` · U `boundary_gate.rs::a_wildcard_resource_grant_is_a_status_grant` |
 | Грамматика ячейки закрыта: проза не доказательство, цитата разрешается в определение, а не в упоминание, прочерк — только у названного субъекта, а метка суммирует все цитаты строки | U | U `boundary_gate.rs::prose_is_not_evidence` · U `boundary_gate.rs::a_mention_of_a_test_is_not_a_definition_of_one` · U `boundary_gate.rs::only_a_named_subject_may_cite_nothing` · U `boundary_gate.rs::a_marker_summarises_every_citation_it_covers` |
@@ -414,12 +587,18 @@ model этого проекта. То же самое и той же формы 
 | Без bundle webhook не поднимается, а не поднимается пустым: `serve` выходит с 2 | U | U `webhook.rs::serve_missing_bundle_exits_2` |
 | Монтирование исключений перечитывается и продолжает проверять scope и TTL; пропавший файл — пустой список, непроверяемый — сброс | U | U `webhook.rs::exceptions_mount_rotation_gates_scope_and_ttl` · U `webhook.rs::exceptions_reload_missing_file_is_empty_and_unverifiable_resets` |
 | Кеш меток решает только по тому, что перечислил: тёплый применяет namespace-селектор в своём namespace и держит метки ServiceAccount внутри его namespace, холодный отказывает выбранной политике и не трогает невыбранную, а метки кластера приходят из флага и тёплого кеша не требуют | U | U `webhook.rs::warm_cache_applies_a_namespace_selector_to_its_own_namespace_only` · U `webhook.rs::warm_cache_keeps_service_account_labels_inside_their_namespace` · U `webhook.rs::cold_cache_denies_a_selected_policy_but_not_an_unselected_one` · U `webhook.rs::cluster_labels_come_from_the_flag_and_need_no_warm_cache` · U `webhook.rs::prod_restricted_namespace_selector_without_labels_fail_closed` · U `webhook.rs::cold_stale_and_relist_pending_deny_with_different_causes` · U `webhook.rs::a_stale_watch_says_stale_and_a_gone_watch_says_relist` |
+| Кеш меток решает только по тому, что перечислил, и «перечислен без меток» — не «не перечислен»: тёплый кеш, назвавший непомеченный namespace, не отказывает выбранной политике, а namespace, которого он не называл, отказывает по-прежнему; обе плоскости отвечают на это одинаково | U | U `webhook.rs::a_warm_cache_that_listed_an_unlabelled_namespace_does_not_deny_a_selected_policy` · U `webhook.rs::a_namespace_a_warm_cache_never_listed_is_still_a_fail_closed_deny` · U `webhook.rs::a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map` · U `resolve.rs::an_unlabelled_namespace_resolves_as_observed_and_empty_not_as_unknown` · U `ferrum-ebpf/src/eval.rs::an_observed_namespace_without_labels_is_a_non_match_not_labels_unknown` · U `acceptance.rs::both_planes_answer_an_unlabelled_namespace_the_same_way` · U `acceptance.rs::both_planes_agree_on_every_label_group_and_on_a_match` |
 | Нечитаемое монтирование считается отдельно от удалённого — по bundle, по исключениям и по серверному сертификату: пустой том и пропавший том разной природы, и `MountStat` их не смешивает | U | U `webhook.rs::unreadable_bundle_mount_is_counted_and_a_deleted_one_is_not` · U `webhook.rs::absent_and_unreadable_exceptions_mounts_are_counted_apart` · U `ferrum-admission/tests/serving_cert.rs::an_unreadable_serving_mount_is_counted_and_a_deleted_one_is_not` |
 | Том bundle у webhook не может быть `optional`, и это проверяется из самого манифеста, а не только линтом | U | U `webhook.rs::bundle_secret_mount_is_not_optional` |
 | Пропавший ключ в смонтированном томе не молчит: webhook продолжает охранять по last-known-good и продолжает служить сертификатом, но говорит, что источника у них больше нет — счётчиком и строкой на переход, а не на каждый тик | U | U `webhook.rs::a_bundle_key_that_vanished_is_counted_not_silent` · U `ferrum-admission/tests/serving_cert.rs::a_serving_key_that_vanished_is_counted_not_silent` |
 | Граница hot path webhook держится его же `Cargo.toml`: компилятор и живой кластер туда не заезжают | U | U `webhook.rs::cargo_toml_hot_path_keeps_boundary` |
 | Серверный сертификат: просроченный не даёт стартовать, далёкий срок не шумит, ротация доходит до новых соединений, поллер подхватывает переписанный том, откат возможен, а негодный материал оставляет действующий сертификат | U | U `ferrum-admission/tests/serving_cert.rs::an_expired_certificate_refuses_to_start` · U `ferrum-admission/tests/serving_cert.rs::a_far_off_expiry_does_not_warn` · U `ferrum-admission/tests/serving_cert.rs::rotation_reaches_new_connections` · U `ferrum-admission/tests/serving_cert.rs::the_poller_picks_up_a_rotated_mount` · U `ferrum-admission/tests/serving_cert.rs::a_swap_can_be_undone` · U `ferrum-admission/tests/serving_cert.rs::unusable_material_keeps_the_current_certificate` |
 | Читатель argv манифеста видит обе законные записи Kubernetes — `command:` и `args:`, — а таблица feature-флагов держится за сами `#[cfg(feature = …)]`-места | U | U `deploy_gate.rs::a_containers_argv_is_command_then_args_and_either_alone` · U `deploy_gate.rs::every_flag_read_under_a_cfg_feature_is_in_the_table` |
+| Перепись грантов читает все глаголы, а не только пишущие: грант на `ferrum.io`-ресурс, для которого у субъекта нет литерала `GroupVersionKind::gvk` в поставляемой половине его исходников, — право без назначения; литерал внутри `#[cfg(test)]` достижимостью не считается, а биндинг на ServiceAccount, которого не запускает ни один pod spec, — субъект, о котором перепись не спрашивала ничего, и он же находка | U | U `boundary_gate.rs::a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose` |
+| Тепло кеша меток — часть join'а узла, а не украшение над ним: кеш, который протух или должен relist, отдаёт метки как ненаблюдённые, поэтому рантайм отвечает `LabelsUnknown` там, где admission отказывает, а не `Match`; каждая группа отвечает за себя | U | U `ferrum-k8smeta/src/source.rs::a_stale_label_cache_does_not_report_its_labels_as_observed` · U `ferrum-k8smeta/src/source.rs::a_label_cache_owing_a_relist_does_not_report_its_labels_as_observed` · U `ferrum-k8smeta/src/source.rs::one_cold_group_does_not_unobserve_the_other` |
+| `clusterSelector` вне MVP-1 и отвергается при авторстве обеими копиями гейта — валидатором и вторым гейтом компилятора, — а остальные три группы селектора остаются авторуемыми; разбор и fail-closed обеих плоскостей остаются для байтов, которых этот компилятор не производил | U | U `ferrum-policy/src/lib.rs::a_cluster_selector_is_refused_on_both_kinds` · U `ferrum-policy/src/lib.rs::the_other_selector_groups_are_still_authorable` · U `ferrum-compiler/src/lib.rs::a_cluster_selector_does_not_compile` · U `webhook.rs::a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map` |
+| `--cluster-label`, съеденный соседним флагом, — отказ, а не заявленный кластер без меток; повторы накапливаются, а не побеждают последним; `--cluster-label ''` по-прежнему заявляет кластер без меток, а отсутствие флага по-прежнему fail-closed | U | U `ferrum-admission/src/main.rs::a_cluster_label_whose_value_was_eaten_is_refused_not_stated` · U `ferrum-admission/src/main.rs::an_explicitly_empty_cluster_label_is_still_a_stated_cluster` · U `ferrum-admission/src/main.rs::repeated_cluster_labels_accumulate_and_disagreements_are_refused` · U `ferrum-admission/src/main.rs::other_flags_keep_the_semantics_the_deploy_lint_models` |
+| Переигранный поток встречает долг relist там же, где живой: нечитаемый кадр поднимает долг и поток читается дальше, а первый кадр после hold-down заканчивает поток — обе половины на обоих потоках | U | U `resolve.rs::a_replayed_stream_answers_an_unreadable_frame_the_way_the_node_does` |
 
 ## Не делает
 
@@ -516,6 +695,61 @@ model этого проекта. То же самое и той же формы 
   Firecracker microVM без `CONFIG_MODULES`: `init_module` и `finit_module`
   там сообщаются незацепленными, потому что tracepoint для них не существует,
   а не потому, что attach проверен и отказал. Второго ядра здесь не было.
+- **Всплеск нечитаемых кадров всё ещё запрещает каждый выбранный Pod — до
+  одного hold-down.** `RELIST_DEBT_HOLDDOWN` — 5 секунд
+  (`crates/ferrum-k8smeta/src/labels.rs:40`). Пока долг стоит,
+  `LabelCache::is_warm` ложен, `review.rs` отказывает каждому Pod под
+  namespaceSelector, а `PodCache::snapshot()` возвращает `Err`, и
+  `containerOnly` не матчится. С этого цикла холодность кеша меток стоит и на
+  рантайме: `snapshot()` спрашивает `is_warm_at` у обоих вложенных кешей и
+  отдаёт группу как ненаблюдённую, пока она не тёплая, — то есть узел на этот
+  же долг отвечает `LabelsUnknown` и Degraded, а не совпадением селектора по
+  меткам, про которые уже известно, что они отстали. Раньше видна была только
+  холодность: протухший и должный relist кеш держал записи от прежнего листа,
+  `labels_of` отвечал `Some`, и одно состояние кеша давало admission отказ, а
+  агенту — `Match`. Ограниченно, не навсегда, но не ноль. На
+  молчащем потоке hold-down не срабатывает вовсе — гасит долг не он, а
+  read-дедлайн сокета: `IO_TIMEOUT` = `POD_WATCH_BUDGET / 2` = 150 секунд
+  (`crates/ferrum-k8smeta/src/watch.rs:996`), после которых `read` возвращает
+  ошибку, `watch_once` — `Err`, и `watch_loop` переподключается и делает
+  relist. Отдельного таймаута «долг просрочен, кадров нет» этот слайс не
+  добавлял: он был бы вторым дедлайном на том же сокете. Значит окно отказов
+  на молчащем потоке — до 150 секунд, а не до 5.
+
+  **Но на рантайме это окно больше не окно убийств.** Радиус тут другой, чем в
+  admission, и это не деталь: тепло кеша — свойство узла и группы, а не пода,
+  поэтому один 410 на watch namespace помечает ненаблюдённым **каждый** pod
+  узла разом. `decide_with` программу применяет — пропуск правил был бы
+  молчаливым fail-open, и обе плоскости обязаны отвечать на это состояние
+  одинаково, — но *применить* и *исполнить* здесь не одно и то же.
+  Fail-closed в admission отказывает Pod, и следующая попытка это отменяет;
+  fail-closed на рантайме — это `SIGKILL`, которого не отменяет ничто, и
+  выдавался бы он workload'ам, про которых никто не установил, что политика их
+  выбирает. Поэтому `react` отказывается сигналить, пока scope не разрешён:
+  `REFUSE_LABELS_UNKNOWN`, `executed=false`, запись с `labels_unknown` и
+  сработавшим правилом, `respond_refused_total`, `DEG_LABELS_UNKNOWN`. Ровно
+  та же форма, что и у отказа по неизвестной identity, шагом раньше: «какой
+  это workload» и «покрывает ли его эта политика» — два вопроса, и сигналу
+  нужны оба ответа. Цена названа и принята: на время холодного кеша (до 5 с
+  hold-down на живом потоке, до 150 с на молчащем) `Kill`/`Isolate` под
+  `namespaceSelector` не исполняются — совпадение экспортируется, узел
+  Degraded, а `Deny` и `Audit` не затронуты, потому что ни один из них процесс
+  не завершает.
+
+- **Меток кластера у узла нет и не заведено.** `PodRecord::identity` зашивает
+  `cluster_labels_observed: false`, и это честно: объекта «кластер» Kubernetes
+  не отдаёт, а `--cluster-label` — заявление оператора, которое доезжает
+  только до admission. Разошлось это в разные стороны на обеих плоскостях
+  сразу: `selector_match` возвращал `LabelsUnknown` на любой `clusterSelector`
+  — и на подходящий, и на заведомо чужой, — `decide_with` на `LabelsUnknown`
+  программу применяет, поэтому политика матчилась на каждый workload каждого
+  узла и держала `DEG_LABELS_UNKNOWN` истинной, пока лежала в bundle; в
+  admission та же политика отказывала каждому Pod, потому что отгружаемая
+  установка флага не передаёт. Закрыто отказом при авторстве, а не доставкой:
+  метка кластера, заявляемая каждым узлом отдельно, — новое непроверяемое
+  утверждение, которому понадобился бы собственный гейт. Разбор и fail-closed
+  обеих плоскостей остались для байтов, которых этот компилятор не
+  производил.
 - **Ничто и никогда не обращалось к API server.** Ни webhook под нагрузкой
   admission, ни watch, ни запись status.
 

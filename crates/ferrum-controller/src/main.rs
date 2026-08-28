@@ -71,6 +71,7 @@ fn run() -> Result<(), String> {
 
 struct RunOpts {
     seed_file: Option<PathBuf>,
+    status_dir: Option<PathBuf>,
     namespace: String,
     clusters: Vec<ClusterAbi>,
     min_agent_abi: u32,
@@ -81,6 +82,7 @@ struct RunOpts {
 fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> {
     let mut opts = RunOpts {
         seed_file: None,
+        status_dir: None,
         namespace: DEFAULT_NAMESPACE.to_string(),
         clusters: Vec::new(),
         min_agent_abi: 0,
@@ -96,6 +98,9 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
             }
             "--namespace" => {
                 opts.namespace = require_val("--namespace", it.next())?;
+            }
+            "--status-dir" => {
+                opts.status_dir = Some(PathBuf::from(require_val("--status-dir", it.next())?));
             }
             "--cluster" => {
                 opts.clusters
@@ -143,6 +148,7 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
         trust_root,
         library,
         clusters: opts.clusters,
+        status_dir: opts.status_dir,
     })
 }
 
@@ -227,7 +233,7 @@ fn yaml_kind(raw: &str) -> Result<String, String> {
 }
 
 fn usage() -> String {
-    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--cluster name:agentAbi:admissionAbi]...".into()
+    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--status-dir /run/ferrum] [--cluster name:agentAbi:admissionAbi]...".into()
 }
 
 #[cfg(test)]
@@ -277,6 +283,7 @@ mod tests {
         for flag in [
             "--seed-file",
             "--namespace",
+            "--status-dir",
             "--cluster",
             "--min-agent-abi",
             "--min-admission-abi",
@@ -314,6 +321,62 @@ mod tests {
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["east", "west"]
+        );
+        let _ = fs::remove_file(&seed);
+    }
+
+    /// The argv the shipped manifest passes is parsed into the config the
+    /// watch loop publishes from.
+    ///
+    /// Nothing joined those two before. `boundary_gate.rs` reads `--status-dir`
+    /// out of `deploy/controller/deployment.yaml` and checks the volume behind
+    /// it; the unit tests here read the parser; and the assignment between
+    /// them was covered by neither, so replacing `opts.status_dir` with `None`
+    /// on the line below left every test in this crate and every gate in
+    /// `ferrum-testkit` green while the shipped controller published its
+    /// counters nowhere. This reads the real manifest so the flag under test
+    /// is the flag that ships, not one this file made up.
+    #[test]
+    fn the_status_dir_the_manifest_passes_is_the_one_the_watch_config_carries() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("crates/<crate> has two ancestors")
+            .join("deploy/controller/deployment.yaml");
+        let body =
+            fs::read_to_string(&manifest).unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
+        let doc: serde_yaml::Value = serde_yaml::from_str(&body).expect("deployment");
+        let container = doc["spec"]["template"]["spec"]["containers"][0].clone();
+        let mut args: Vec<String> = container["args"]
+            .as_sequence()
+            .expect("args")
+            .iter()
+            .map(|a| a.as_str().expect("string arg").to_string())
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("run"));
+        args.remove(0);
+        let at = args
+            .iter()
+            .position(|a| a == "--status-dir")
+            .expect("the manifest passes --status-dir");
+        let dir = args[at + 1].clone();
+
+        // The seed file is the only argument that must exist on this disk.
+        let seed = seed_file();
+        let seed_at = args
+            .iter()
+            .position(|a| a == "--seed-file")
+            .expect("the manifest passes --seed-file");
+        args[seed_at + 1] = seed.to_string_lossy().into_owned();
+
+        let cfg = parse_run(args.into_iter()).expect("the shipped argv parses");
+        assert_eq!(
+            cfg.status_dir,
+            Some(PathBuf::from(&dir)),
+            "the controller was given --status-dir {dir} and reconciles with none: its \
+             counters, its degraded reasons and the cause of a terminal class are published \
+             nowhere, and a pod with no status file is indistinguishable from one that was \
+             never asked for one"
         );
         let _ = fs::remove_file(&seed);
     }

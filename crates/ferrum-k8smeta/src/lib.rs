@@ -18,8 +18,8 @@ pub use cgroupfs::{
 };
 pub use index::SharedCgroupIndex;
 pub use labels::{
-    apply_labels_event, apply_labels_stream, label_key, try_apply_labels_event, LabelCache,
-    LabelObject, LabelWatchEvent, DEFAULT_MAX_AGE, MAX_LABEL_ENTRIES, MAX_OBJECT_LABEL_BYTES,
+    apply_labels_stream, apply_labels_stream_at, label_key, LabelCache, LabelObject,
+    LabelWatchEvent, DEFAULT_MAX_AGE, MAX_LABEL_ENTRIES, MAX_OBJECT_LABEL_BYTES,
     MAX_TOTAL_LABEL_BYTES, RELIST_DEBT_HOLDDOWN,
 };
 pub use resolver::{CgroupResolver, RefreshStats};
@@ -35,6 +35,19 @@ pub struct WorkloadIdentity {
     pub namespace_labels: BTreeMap<String, String>,
     pub workload_labels: BTreeMap<String, String>,
     pub service_account_labels: BTreeMap<String, String>,
+    /// Whether the join actually read each of the three label groups off a
+    /// cache that had listed the object, as opposed to never seeing it.
+    ///
+    /// The maps above cannot carry this: an object that carries no labels and
+    /// an object nothing ever listed both arrive as an empty map, and the two
+    /// are different decisions. `false` is "never observed" and is what the
+    /// selector planes fail closed on; an observed group with an empty map is
+    /// a plain non-match. Default `false`, so an identity assembled without
+    /// stating the fact fails closed rather than answering a selector from a
+    /// map nobody filled.
+    pub cluster_labels_observed: bool,
+    pub namespace_labels_observed: bool,
+    pub service_account_labels_observed: bool,
     pub image: String,
     pub image_digest: String,
 }

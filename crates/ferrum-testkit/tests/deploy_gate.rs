@@ -901,7 +901,7 @@ mod deploy_tree {
 mod build_closure {
     use serde::Deserialize;
     use serde_yaml::Value;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     fn repo_root() -> PathBuf {
@@ -2109,6 +2109,110 @@ mod build_closure {
         );
     }
 
+    /// The same claim, executed instead of read.
+    ///
+    /// The gate above proves a *line exists* in the Jenkinsfile. That is all
+    /// it can prove, and cycle 12 measured exactly what the gap costs: a
+    /// commit deleted `impl From<BTreeMap> for ClusterLabels` and left its
+    /// caller in the `#[cfg(feature = "apiserver")]` half of
+    /// `ferrum-admission`'s test module. The tree built, `cargo test
+    /// --workspace` reported zero failures because `apiserver` is `default =
+    /// []`, and the two lines the gate above requires — the ones cycle 12
+    /// added so this could not happen — were the only red in the pipeline.
+    /// Seven tests on `WatchedLabels`, the single shipped `LabelSource`, plus
+    /// two on a cold and a stale watch, silently did not run. A gate that
+    /// reads text cannot see that, by construction: the text was correct.
+    ///
+    /// So this one runs the commands. For every crate a shipped manifest
+    /// selects features for, with the union of those features in one
+    /// invocation:
+    ///
+    ///   * `cargo clippy -p K --features F --all-targets -- -D warnings`
+    ///   * `cargo test -p K --features F`
+    ///
+    /// Deliberately not `--no-run`: "a test target is compiled" and "the tests
+    /// pass" are different claims, the Jenkinsfile line makes the second, so
+    /// this makes the second. Cost is bounded by sharing the ambient
+    /// `target/` — every dependency the outer build already compiled is
+    /// reused, and the marginal work is the feature-enabled rebuild of the
+    /// named crate.
+    ///
+    /// What it still cannot do, said here rather than left to be read into it:
+    /// prove a *Jenkins* ran anything. Nothing in this tree can. It proves the
+    /// commands succeed on the tree that ships, which is the half a reader of
+    /// `Jenkinsfile::Test` was taking for free and did not have.
+    #[test]
+    fn every_feature_a_manifest_selects_actually_compiles_and_passes() {
+        let root = repo_root();
+        let containers = deploy_containers(&root);
+        assert!(
+            !containers.is_empty(),
+            "no container with an image: was found under deploy/, so this gate cannot see \
+             which features the install asks for and proves nothing"
+        );
+
+        // Union per crate: two flags selecting `apiserver` and `attach` on the
+        // same image are one build of that crate with both, not two.
+        let mut wanted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (flag, feature) in FEATURE_FLAGS {
+            for container in &containers {
+                if container.argv.iter().any(|a| a == flag) {
+                    wanted
+                        .entry(crate_of(&container.image))
+                        .or_default()
+                        .insert(feature.to_string());
+                }
+            }
+        }
+        assert!(
+            !wanted.is_empty(),
+            "no container under deploy/ passes a feature-gated flag, so this gate compiles \
+             nothing and proves nothing"
+        );
+
+        for (krate, features) in &wanted {
+            let features = features.iter().cloned().collect::<Vec<_>>().join(",");
+            for argv in [
+                vec![
+                    "clippy",
+                    "-p",
+                    krate,
+                    "--features",
+                    features.as_str(),
+                    "--all-targets",
+                    "--",
+                    "-D",
+                    "warnings",
+                ],
+                vec!["test", "-p", krate, "--features", features.as_str()],
+            ] {
+                let printed = format!("cargo {}", argv.join(" "));
+                let out = std::process::Command::new(env!("CARGO"))
+                    .args(&argv)
+                    .current_dir(&root)
+                    .output()
+                    .unwrap_or_else(|err| panic!("{printed}: {err}"));
+                assert!(
+                    out.status.success(),
+                    "`{printed}` failed ({}). This is a configuration the install runs; a \
+                     green `cargo test --workspace` says nothing about it, because every \
+                     production feature in this tree is off by default.\n--- stdout ---\n{}\n\
+                     --- stderr ---\n{}",
+                    out.status,
+                    tail(&String::from_utf8_lossy(&out.stdout)),
+                    tail(&String::from_utf8_lossy(&out.stderr)),
+                );
+            }
+        }
+    }
+
+    /// Last lines of a subprocess stream, so a failing feature build reports
+    /// the compiler's verdict instead of its whole log.
+    fn tail(text: &str) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        lines[lines.len().saturating_sub(40)..].join("\n")
+    }
+
     /// The reader under the gate above, on inputs whose answer is known.
     ///
     /// "Nothing is missing" is also what a `cargo_runs` that has stopped
@@ -2396,7 +2500,14 @@ mod build_closure {
                 (k + 1).min(lines.len())
             };
             for line in &lines[i + 1..end] {
-                for call in ["map.get(\"", "map.contains_key(\""] {
+                // Every spelling a binary here uses to ask its argv parser
+                // for a flag. `ferrum-admission` moved from a bare `BTreeMap`
+                // to a `Flags` that keeps every occurrence — so that a
+                // `--cluster-label` swallowed by the next flag is a refusal
+                // rather than a stated cluster — and its reads became
+                // `flags.get`. A scan that knew only the map spelling found
+                // nothing to calibrate against and said so.
+                for call in ["map.get(\"", "map.contains_key(\"", "flags.get(\""] {
                     for hit in line.split(call).skip(1) {
                         if let Some(flag) = hit.split('"').next() {
                             derived.insert((

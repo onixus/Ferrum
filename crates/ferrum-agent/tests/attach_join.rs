@@ -472,6 +472,11 @@ mod gate {
         };
         id.namespace_labels
             .insert("ferrum.io/zone".into(), "pci".into());
+        // The labels above were listed, not guessed. Without this the record
+        // decides fail-closed on the K stand — the kills still fire, so no
+        // assertion here would break, but the node would report
+        // `DEG_LABELS_UNKNOWN` for a namespace it did observe.
+        id.namespace_labels_observed = true;
         id.image = "registry.internal.example/app@sha256:abc".into();
         id.image_digest = "sha256:abc".into();
         id

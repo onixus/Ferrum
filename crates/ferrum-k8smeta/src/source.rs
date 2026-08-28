@@ -46,6 +46,12 @@ pub struct PodRecord {
     /// object: neither set of labels exists on a Pod.
     pub namespace_labels: BTreeMap<String, String>,
     pub service_account_labels: BTreeMap<String, String>,
+    /// Whether that join found the object at all. The maps above answer "which
+    /// labels", never "were there any to read": a namespace the list named
+    /// without labels and a namespace no list ever named both leave an empty
+    /// map behind, and only the second is a reason to fail closed.
+    pub namespace_labels_observed: bool,
+    pub service_account_labels_observed: bool,
     pub containers: Vec<ContainerRecord>,
 }
 
@@ -68,6 +74,14 @@ impl PodRecord {
             namespace_labels: self.namespace_labels.clone(),
             workload_labels: self.labels.clone(),
             service_account_labels: self.service_account_labels.clone(),
+            // MVP-1 gives the node no source of cluster labels at all — they
+            // are operator-stated to admission and never reach the agent — so
+            // this is honestly unobserved rather than empty. A runtime policy
+            // with a clusterSelector therefore fails closed here, which is the
+            // fact, not a placeholder.
+            cluster_labels_observed: false,
+            namespace_labels_observed: self.namespace_labels_observed,
+            service_account_labels_observed: self.service_account_labels_observed,
             image: container.image.clone(),
             image_digest: container.image_digest.clone(),
         }
@@ -297,23 +311,65 @@ impl PodMetadataSource for PodCache {
     /// `PodRecord` gets namespace/ServiceAccount labels without knowing they
     /// come from two other watches.
     fn snapshot(&self) -> Result<Vec<PodRecord>> {
-        self.freshness(Instant::now())?;
+        let now = Instant::now();
+        self.freshness(now)?;
+        // Warmth of the two label watches, asked once for the whole snapshot
+        // so every pod in it describes the same moment.
+        //
+        // Cold was already visible here, because a cache that never listed
+        // misses every lookup. Stale and relist-pending were not: the entries
+        // from before the gap are still in the map, so `labels_of` answered
+        // `Some` and the record left with `*_observed = true` for labels that
+        // are known to be behind. Admission refuses to decide on exactly that
+        // state — `LabelWarmth::Stale` and `RelistPending` both deny — so a
+        // runtime plane that answered `Match` off it made the two planes
+        // disagree on one cache state, which is the defect class this project
+        // keeps finding. Not warm means the group is unobserved, which
+        // `selector_match` reads as `LabelsUnknown`: the program still
+        // applies and the decision is flagged, never silently skipped.
+        let namespaces_warm = self.namespaces.is_warm_at(now);
+        let service_accounts_warm = self.service_accounts.is_warm_at(now);
         Ok(self
             .pods
             .values()
             .map(|pod| {
                 let mut pod = pod.clone();
                 let mut unknown = 0u64;
-                match self.namespaces.labels_of("", &pod.namespace) {
-                    Some(labels) => pod.namespace_labels = labels.clone(),
-                    None => unknown += 1,
-                }
-                match self
-                    .service_accounts
-                    .labels_of(&pod.namespace, &pod.service_account)
+                // `labels_of` answers both questions at once, and the answer to
+                // the second used to be counted and dropped: the record left
+                // here with an empty map either way, so every consumer had to
+                // re-derive "unknown" from "empty" and got the unlabelled case
+                // wrong. It travels with the labels now.
+                match namespaces_warm
+                    .then(|| self.namespaces.labels_of("", &pod.namespace))
+                    .flatten()
                 {
-                    Some(labels) => pod.service_account_labels = labels.clone(),
-                    None => unknown += 1,
+                    Some(labels) => {
+                        pod.namespace_labels = labels.clone();
+                        pod.namespace_labels_observed = true;
+                    }
+                    None => {
+                        pod.namespace_labels.clear();
+                        pod.namespace_labels_observed = false;
+                        unknown += 1;
+                    }
+                }
+                match service_accounts_warm
+                    .then(|| {
+                        self.service_accounts
+                            .labels_of(&pod.namespace, &pod.service_account)
+                    })
+                    .flatten()
+                {
+                    Some(labels) => {
+                        pod.service_account_labels = labels.clone();
+                        pod.service_account_labels_observed = true;
+                    }
+                    None => {
+                        pod.service_account_labels.clear();
+                        pod.service_account_labels_observed = false;
+                        unknown += 1;
+                    }
                 }
                 if unknown > 0 {
                     self.labels_unknown.fetch_add(unknown, Ordering::Relaxed);
@@ -405,6 +461,128 @@ mod tests {
         cache.replace_all(vec![pod("u1", "node-a")]);
         cache.mark_applied_at(Instant::now());
         assert_eq!(cache.clone().snapshot().expect("clone is fresh").len(), 1);
+    }
+
+    /// A namespace this cache listed, so `labels_of` answers `Some`.
+    fn listed_namespace(cache: &mut PodCache, name: &str, zone: &str) {
+        cache
+            .namespaces_mut()
+            .try_replace_all(vec![crate::labels::LabelObject {
+                namespace: String::new(),
+                name: name.into(),
+                labels: [("ferrum.io/zone".to_string(), zone.to_string())]
+                    .into_iter()
+                    .collect(),
+                resource_version: "1".into(),
+            }])
+            .expect("namespace list fits");
+        cache
+            .service_accounts_mut()
+            .try_replace_all(Vec::new())
+            .expect("serviceaccount list fits");
+    }
+
+    fn one_pod(cache: &mut PodCache) {
+        let mut pod = pod("u1", "node-a");
+        pod.service_account = "web".into();
+        cache.replace_all(vec![pod]);
+        cache.mark_applied_at(Instant::now());
+    }
+
+    /// Warmth of the label caches is part of the join, not decoration on it.
+    ///
+    /// A cache that listed and then stopped being refreshed still holds the
+    /// entries from before the gap, so `labels_of` kept answering `Some` and
+    /// the record left this join with `namespace_labels_observed = true` for
+    /// labels of unknown age. Admission denies on exactly that cache state
+    /// ("past its freshness budget"); the runtime plane answered `Match`. One
+    /// state, two verdicts, and `is_degraded()` false on the side that decided.
+    #[test]
+    fn a_stale_label_cache_does_not_report_its_labels_as_observed() {
+        let mut cache = PodCache::new("node-a");
+        one_pod(&mut cache);
+        listed_namespace(&mut cache, "prod", "pci");
+
+        // Warm first: this is the same cache, and the difference below is the
+        // age alone.
+        let warm = cache.snapshot().expect("fresh pod watch").remove(0);
+        assert!(warm.namespace_labels_observed);
+        assert_eq!(
+            warm.namespace_labels
+                .get("ferrum.io/zone")
+                .map(String::as_str),
+            Some("pci")
+        );
+
+        let Some(old) = Instant::now().checked_sub(crate::labels::DEFAULT_MAX_AGE * 2) else {
+            return;
+        };
+        cache.namespaces_mut().mark_fresh_at(old);
+        assert!(!cache.namespaces().is_warm());
+        let before = cache.labels_unknown_total();
+        let stale = cache
+            .snapshot()
+            .expect("the pod watch itself is fresh")
+            .remove(0);
+        assert!(
+            !stale.namespace_labels_observed,
+            "labels from a cache past its budget are not observed labels"
+        );
+        assert!(stale.namespace_labels.is_empty());
+        assert!(
+            cache.labels_unknown_total() > before,
+            "the counter behind DEG_LABELS_UNKNOWN is how this reaches the node's status"
+        );
+    }
+
+    /// The other cause, which `is_warm` folds in and nothing here may unfold:
+    /// `410 Gone` (or a frame this build could not read) means objects changed
+    /// unseen, so the labels held may already answer a selector wrongly.
+    #[test]
+    fn a_label_cache_owing_a_relist_does_not_report_its_labels_as_observed() {
+        let mut cache = PodCache::new("node-a");
+        one_pod(&mut cache);
+        listed_namespace(&mut cache, "prod", "pci");
+        cache.namespaces_mut().raise_relist_pending();
+        assert!(!cache.namespaces().is_warm());
+        assert!(cache.namespaces().relist_pending());
+
+        let pod = cache
+            .snapshot()
+            .expect("the pod watch itself owes nothing")
+            .remove(0);
+        assert!(!pod.namespace_labels_observed);
+        assert!(pod.namespace_labels.is_empty());
+
+        // And the discharge restores it: this is a hole in the cache, not an
+        // eviction of the node.
+        listed_namespace(&mut cache, "prod", "pci");
+        let pod = cache.snapshot().expect("relisted").remove(0);
+        assert!(pod.namespace_labels_observed);
+    }
+
+    /// Each group answers for itself. A ServiceAccount watch that went stale
+    /// must not take the namespace labels down with it, and vice versa: the
+    /// two are separate watches and `selector_match` asks them separately.
+    #[test]
+    fn one_cold_group_does_not_unobserve_the_other() {
+        let mut cache = PodCache::new("node-a");
+        one_pod(&mut cache);
+        listed_namespace(&mut cache, "prod", "pci");
+        cache
+            .service_accounts_mut()
+            .try_replace_all(vec![crate::labels::LabelObject {
+                namespace: "prod".into(),
+                name: "web".into(),
+                labels: BTreeMap::new(),
+                resource_version: "1".into(),
+            }])
+            .expect("serviceaccount list fits");
+        cache.service_accounts_mut().raise_relist_pending();
+
+        let pod = cache.snapshot().expect("fresh pod watch").remove(0);
+        assert!(pod.namespace_labels_observed);
+        assert!(!pod.service_account_labels_observed);
     }
 
     #[test]

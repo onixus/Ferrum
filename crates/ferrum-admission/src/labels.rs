@@ -85,14 +85,25 @@ impl LabelWarmth {
 
 /// Injected into [`crate::ReviewConfig`]. Implementations must be cheap: this
 /// is called on the admit hot path, once per request.
+///
+/// Every getter answers `Option`, and the distinction it carries is the whole
+/// point: `None` is "this source never observed that object", `Some(map)` is
+/// "it did, and these are the labels" — including `Some` of an empty map for
+/// an object that carries none. Returning a bare map forced every caller to
+/// re-derive the first from the second, and the only available derivation —
+/// "empty means unobserved" — turned a namespace with no labels into an
+/// integrity failure.
 pub trait LabelSource: std::fmt::Debug + Send + Sync {
-    fn namespace_labels(&self, namespace: &str) -> BTreeMap<String, String>;
+    fn namespace_labels(&self, namespace: &str) -> Option<BTreeMap<String, String>>;
     fn service_account_labels(
         &self,
         namespace: &str,
         service_account: &str,
-    ) -> BTreeMap<String, String>;
-    fn cluster_labels(&self) -> BTreeMap<String, String>;
+    ) -> Option<BTreeMap<String, String>>;
+    /// `None` until the operator states them. They come from `--cluster-label`,
+    /// not from any watch, so there is no cache whose warmth could stand in for
+    /// this: see [`ClusterLabels`].
+    fn cluster_labels(&self) -> Option<BTreeMap<String, String>>;
     /// Warmth and its cause, sampled once. The only state question an
     /// implementor answers: `is_warm` is derived from it and is not a member of
     /// this trait, so the decision and the message it produces cannot disagree
@@ -119,12 +130,50 @@ impl<T: LabelSource + ?Sized> LabelWarmthCheck for T {
     }
 }
 
+/// Whether the operator stated cluster labels, and which.
+///
+/// This is the one label group with no cache behind it: MVP-1 has no cluster
+/// object to read, so the labels are whatever `--cluster-label` carried and
+/// their observedness is "the flag was passed". Nothing about the map itself
+/// can say that — an operator who passes no flag and an operator who states a
+/// cluster with no labels both leave an empty map — so it is a separate fact
+/// here rather than a reading of `is_empty()`. Without it the cluster branch of
+/// `require_labels_if_selected` keeps deciding by emptiness, which is exactly
+/// the defect the namespace branch was fixed for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterLabels(Option<BTreeMap<String, String>>);
+
+impl ClusterLabels {
+    /// The flag was passed, and this is what it said — an empty map included.
+    pub fn stated(labels: BTreeMap<String, String>) -> Self {
+        Self(Some(labels))
+    }
+
+    /// No `--cluster-label`: a cluster selector cannot be answered, and a
+    /// policy carrying one fails closed. There is deliberately no
+    /// `From<BTreeMap>` beside these two: a caller holding only the parsed map
+    /// would have to guess from emptiness, which is the defect this type
+    /// exists to remove. Every caller knows whether the flag was there.
+    pub fn unstated() -> Self {
+        Self(None)
+    }
+
+    pub fn observed(&self) -> Option<&BTreeMap<String, String>> {
+        self.0.as_ref()
+    }
+}
+
 /// Labels a caller states up front: the `--cluster-label` flags, and whatever
 /// a test wants to pretend the apiserver said. Anything but `warm()` models a
 /// webhook whose watch is not answering for labels.
+///
+/// A namespace or ServiceAccount this was never given is `None`, not an empty
+/// map: it models a cache that did not list the object, which is the fail-closed
+/// case. `with_namespace(ns, BTreeMap::new())` is the other one — listed, and it
+/// has no labels.
 #[derive(Debug, Clone, Default)]
 pub struct StaticLabels {
-    cluster: BTreeMap<String, String>,
+    cluster: ClusterLabels,
     namespaces: BTreeMap<String, BTreeMap<String, String>>,
     service_accounts: BTreeMap<(String, String), BTreeMap<String, String>>,
     warmth: LabelWarmth,
@@ -133,9 +182,9 @@ pub struct StaticLabels {
 impl StaticLabels {
     /// Cluster labels only. Never warm: a cluster label says nothing about
     /// whether namespace labels are known.
-    pub fn cluster(cluster: BTreeMap<String, String>) -> Self {
+    pub fn cluster(cluster: impl Into<ClusterLabels>) -> Self {
         Self {
-            cluster,
+            cluster: cluster.into(),
             ..Default::default()
         }
     }
@@ -179,23 +228,22 @@ impl StaticLabels {
 }
 
 impl LabelSource for StaticLabels {
-    fn namespace_labels(&self, namespace: &str) -> BTreeMap<String, String> {
-        self.namespaces.get(namespace).cloned().unwrap_or_default()
+    fn namespace_labels(&self, namespace: &str) -> Option<BTreeMap<String, String>> {
+        self.namespaces.get(namespace).cloned()
     }
 
     fn service_account_labels(
         &self,
         namespace: &str,
         service_account: &str,
-    ) -> BTreeMap<String, String> {
+    ) -> Option<BTreeMap<String, String>> {
         self.service_accounts
             .get(&(namespace.to_string(), service_account.to_string()))
             .cloned()
-            .unwrap_or_default()
     }
 
-    fn cluster_labels(&self) -> BTreeMap<String, String> {
-        self.cluster.clone()
+    fn cluster_labels(&self) -> Option<BTreeMap<String, String>> {
+        self.cluster.observed().cloned()
     }
 
     fn warmth(&self) -> LabelWarmth {
@@ -214,7 +262,7 @@ pub type ColdLabels = StaticLabels;
 pub struct WatchedLabels {
     namespaces: std::sync::Arc<std::sync::RwLock<ferrum_k8smeta::LabelCache>>,
     service_accounts: std::sync::Arc<std::sync::RwLock<ferrum_k8smeta::LabelCache>>,
-    cluster: BTreeMap<String, String>,
+    cluster: ClusterLabels,
 }
 
 /// Restate one cache's state as a cause. `is_warm_at`, `is_stale_at`,
@@ -243,38 +291,42 @@ impl WatchedLabels {
     pub fn new(
         namespaces: std::sync::Arc<std::sync::RwLock<ferrum_k8smeta::LabelCache>>,
         service_accounts: std::sync::Arc<std::sync::RwLock<ferrum_k8smeta::LabelCache>>,
-        cluster: BTreeMap<String, String>,
+        cluster: impl Into<ClusterLabels>,
     ) -> Self {
         Self {
             namespaces,
             service_accounts,
-            cluster,
+            cluster: cluster.into(),
         }
     }
 }
 
 #[cfg(feature = "apiserver")]
 impl LabelSource for WatchedLabels {
-    fn namespace_labels(&self, namespace: &str) -> BTreeMap<String, String> {
+    /// `labels_of`, not `labels_or_empty`: the miss is the answer, and folding
+    /// it into an empty map here is where it used to be lost.
+    fn namespace_labels(&self, namespace: &str) -> Option<BTreeMap<String, String>> {
         self.namespaces
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .labels_or_empty("", namespace)
+            .labels_of("", namespace)
+            .cloned()
     }
 
     fn service_account_labels(
         &self,
         namespace: &str,
         service_account: &str,
-    ) -> BTreeMap<String, String> {
+    ) -> Option<BTreeMap<String, String>> {
         self.service_accounts
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .labels_or_empty(namespace, service_account)
+            .labels_of(namespace, service_account)
+            .cloned()
     }
 
-    fn cluster_labels(&self) -> BTreeMap<String, String> {
-        self.cluster.clone()
+    fn cluster_labels(&self) -> Option<BTreeMap<String, String>> {
+        self.cluster.observed().cloned()
     }
 
     fn warmth(&self) -> LabelWarmth {
@@ -303,14 +355,35 @@ mod tests {
         let cold = ColdLabels::default();
         assert!(!cold.is_warm());
         assert_eq!(cold.warmth(), LabelWarmth::Cold);
-        assert!(cold.namespace_labels("prod").is_empty());
-        assert!(cold.service_account_labels("prod", "web-sa").is_empty());
+        // `None`, not an empty map: this source never observed either object,
+        // and a caller that cannot tell the two apart fails closed on both.
+        assert_eq!(cold.namespace_labels("prod"), None);
+        assert_eq!(cold.service_account_labels("prod", "web-sa"), None);
+        assert_eq!(cold.cluster_labels(), None);
+    }
+
+    /// The one group with no cache behind it. Its observedness is the flag
+    /// having been passed, which no map can carry, so it is stated separately —
+    /// otherwise the cluster branch keeps deciding by emptiness.
+    #[test]
+    fn stated_cluster_labels_are_observed_even_when_there_are_none() {
+        let stated = StaticLabels::cluster(ClusterLabels::stated(BTreeMap::new()));
+        assert_eq!(
+            stated.cluster_labels(),
+            Some(BTreeMap::new()),
+            "an operator who states a cluster with no labels has been heard"
+        );
+        let unstated = StaticLabels::cluster(ClusterLabels::unstated());
+        assert_eq!(unstated.cluster_labels(), None);
     }
 
     #[test]
     fn cluster_labels_do_not_make_a_source_warm() {
-        let labels = StaticLabels::cluster([("env".to_string(), "prod".to_string())].into());
-        assert_eq!(labels.cluster_labels().len(), 1);
+        let labels = StaticLabels::cluster(ClusterLabels::stated(BTreeMap::from([(
+            "env".to_string(),
+            "prod".to_string(),
+        )])));
+        assert_eq!(labels.cluster_labels().expect("stated").len(), 1);
         assert!(
             !labels.is_warm(),
             "cluster flags say nothing about namespaces"
@@ -364,14 +437,14 @@ mod tests {
         struct Lying;
         // The whole trait: there is no `is_warm` here to override.
         impl LabelSource for Lying {
-            fn namespace_labels(&self, _: &str) -> BTreeMap<String, String> {
-                BTreeMap::new()
+            fn namespace_labels(&self, _: &str) -> Option<BTreeMap<String, String>> {
+                None
             }
-            fn service_account_labels(&self, _: &str, _: &str) -> BTreeMap<String, String> {
-                BTreeMap::new()
+            fn service_account_labels(&self, _: &str, _: &str) -> Option<BTreeMap<String, String>> {
+                None
             }
-            fn cluster_labels(&self) -> BTreeMap<String, String> {
-                BTreeMap::new()
+            fn cluster_labels(&self) -> Option<BTreeMap<String, String>> {
+                None
             }
             fn warmth(&self) -> LabelWarmth {
                 LabelWarmth::Cold
@@ -428,7 +501,7 @@ mod tests {
             WatchedLabels::new(
                 Arc::new(RwLock::new(namespaces)),
                 Arc::new(RwLock::new(service_accounts)),
-                BTreeMap::new(),
+                ClusterLabels::stated(BTreeMap::new()),
             )
         }
 
@@ -497,16 +570,41 @@ mod tests {
                 .expect("list");
             let source = source(listed(), service_accounts);
             assert_eq!(
-                source.namespace_labels("prod").get("ferrum.io/zone"),
+                source
+                    .namespace_labels("prod")
+                    .expect("listed")
+                    .get("ferrum.io/zone"),
                 Some(&"pci".to_string())
             );
-            assert!(source.namespace_labels("dev").is_empty());
+            // `dev` is not in this namespace cache at all, which is a different
+            // answer from a `dev` that was listed and carries no labels.
+            assert_eq!(source.namespace_labels("dev"), None);
             assert_eq!(
                 source
                     .service_account_labels("dev", "web-sa")
+                    .expect("listed")
                     .get("ferrum.io/tier"),
                 Some(&"sandbox".to_string())
             );
+        }
+
+        /// The reading that was lost: a namespace the list named without labels
+        /// comes back as `Some` of an empty map, and only a namespace the list
+        /// never named comes back as `None`.
+        #[test]
+        fn a_listed_namespace_without_labels_is_not_a_miss() {
+            let mut namespaces = LabelCache::new();
+            namespaces
+                .try_replace_all(vec![LabelObject {
+                    namespace: String::new(),
+                    name: "plain".into(),
+                    labels: BTreeMap::new(),
+                    resource_version: "1".into(),
+                }])
+                .expect("list");
+            let source = source(namespaces, listed());
+            assert_eq!(source.namespace_labels("plain"), Some(BTreeMap::new()));
+            assert_eq!(source.namespace_labels("never-listed"), None);
         }
     }
 }

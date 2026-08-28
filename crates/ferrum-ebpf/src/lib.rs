@@ -370,6 +370,10 @@ mod tests {
         };
         id.namespace_labels
             .insert("ferrum.io/zone".into(), "pci".into());
+        // The labels and the fact that a listed namespace produced them travel
+        // together; an identity holding one holds both.
+        id.namespace_labels_observed = true;
+        id.service_account_labels_observed = true;
         id
     }
 
@@ -1109,6 +1113,7 @@ mod tests {
         let shell = ev("execve", "sh", "/bin/sh", true, false);
         let mut cold = pci_identity();
         cold.namespace_labels.clear();
+        cold.namespace_labels_observed = false;
 
         assert_eq!(
             selector_match(&spec.selector, &cold),
@@ -1149,6 +1154,7 @@ mod tests {
         load_mvp(&mut loader);
         let mut cold = pci_identity();
         cold.namespace_labels.clear();
+        cold.namespace_labels_observed = false;
         // The MVP bundle has no selector at all: nothing to resolve.
         assert!(
             !loader

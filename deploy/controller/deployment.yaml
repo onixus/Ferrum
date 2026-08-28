@@ -22,6 +22,12 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
+        # What makes the signing key readable at all. kubelet writes a Secret
+        # volume root:root and moves the group only for an fsGroup, so without
+        # this the key is owned by a user this container is not and mode 0440
+        # leaves it nothing. See the volume below and `ferrumctl lint-deploy`
+        # FD029.
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -33,6 +39,17 @@ spec:
             - /etc/ferrum/signing/seed
             - --namespace
             - ferrum
+            # Where this controller publishes what it knows about itself:
+            # counters per failure class, the run of each, and the reasons.
+            # Deliberately a file and not a port — a listening socket is a
+            # second attack surface and an HTTP stack a dependency this crate's
+            # boundary does not carry — and deliberately not wired to any
+            # probe. Every degradation here is either recoverable, in which
+            # case a restart is a crash loop, or the deployment being wrong, in
+            # which case the process ends itself once and says which class
+            # failed. See `crates/ferrum-controller/src/health.rs`.
+            - --status-dir
+            - /run/ferrum
           resources:
             requests:
               cpu: 100m
@@ -49,10 +66,27 @@ spec:
             - name: signing-key
               mountPath: /etc/ferrum/signing
               readOnly: true
+            # The one writable path in this container. `readOnlyRootFilesystem`
+            # above stays true: the status file gets a volume, not a writable
+            # root.
+            - name: status
+              mountPath: /run/ferrum
       volumes:
         # The bundle signing key. Whoever reads this Secret can sign policy, so
         # it is mounted nowhere else in this tree.
         - name: signing-key
           secret:
             secretName: ferrum-signing-key
-            defaultMode: 0400
+            # 0440 (r--r-----), written in decimal on purpose: `0400` is octal
+            # 256 to the YAML 1.1 parser that applies this file and not an
+            # integer at all to a 1.2 one, so the mode this Pod runs with
+            # depended on which client applied it. 288 is the same number to
+            # every reader. Group-readable and not world-readable, with the
+            # fsGroup above putting the group on the running user: whoever
+            # reads this Secret can sign policy.
+            defaultMode: 288
+        # Pod-lifetime, like the state it holds: these counters are about this
+        # process, and a status file that outlived the process would report a
+        # controller that is not running.
+        - name: status
+          emptyDir: {}
