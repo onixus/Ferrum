@@ -11,7 +11,12 @@
 // Константы держим внутри метода: `def` на верхнем уровне — локальная переменная
 // скрипта, из метода она не видна (MissingPropertyException, билд #9).
 def rust(String script) {
-    def image = 'rust:1.75-bookworm'
+    rust('rust:1.75-bookworm', script)
+}
+
+// Supply chain гоняется на свежем rustc: cargo-deny 0.20 требует >=1.88, а тулчейн
+// проекта пришпилен на 1.75 (билд #10). Аудиту нужен только Cargo.lock, не тулчейн.
+def rust(String image, String script) {
     def args = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
                ' -v ferrum-cargo-target:/build-target' +
                ' -v ferrum-cargo-tools:/cargo-tools'
@@ -156,8 +161,11 @@ pipeline {
         stage('Security: supply chain') {
             steps {
                 script {
-                    rust '''
+                    rust 'rust:1-bookworm', '''
                         set -eu
+                        # Не пачкать общий /build-target чужим rustc: иначе следующая
+                        # сборка на 1.75 переедет по фингерпринтам и пересоберётся с нуля.
+                        export CARGO_TARGET_DIR=/tmp/ferrum-tools-target
                         command -v cargo-deny  >/dev/null || cargo install --locked cargo-deny
                         command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
                         cargo deny check licenses bans sources advisories
