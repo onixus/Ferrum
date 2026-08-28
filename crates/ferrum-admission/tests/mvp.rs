@@ -640,9 +640,11 @@ fn prod_restricted_example_audit_records_privileged() {
     let parsed = parse_program(&program).expect("prod-restricted FADM");
     assert_eq!(parsed.supply.trust_roots[0].public_keys[0].len(), 64);
     let mut subject = compliant();
-    subject
-        .namespace_labels
-        .insert("ferrum.io/zone".into(), "pci".into());
+    subject.namespace_labels = Some(
+        [("ferrum.io/zone".to_string(), "pci".to_string())]
+            .into_iter()
+            .collect(),
+    );
     subject.privileged = true;
     let decision = admit_bytes(&program, &subject, &[], now());
     assert!(decision.allowed);

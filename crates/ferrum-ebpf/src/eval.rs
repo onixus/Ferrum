@@ -98,9 +98,17 @@ enum RuleMatch {
 ///
 /// Cluster / namespace / ServiceAccount labels are not carried by the event:
 /// they are joined in from watch caches that can be cold, relisting after a
-/// 410, or dead. An empty map there means "never observed", not "no labels",
-/// so it is not a non-match. Admission fails closed on exactly this condition
-/// (`require_labels_if_selected`); the runtime plane must not diverge.
+/// 410, or dead. "Never observed" is not a non-match, and the identity carries
+/// that fact per group in `*_labels_observed`. It used to be read off an empty
+/// map instead, which made `LabelsUnknown` — and `DEG_LABELS_UNKNOWN` behind it
+/// — true forever on any cluster holding one unlabelled namespace: a reason
+/// that is always true decides nothing.
+///
+/// Admission fails closed on exactly this condition
+/// (`require_labels_if_selected`) and the runtime plane must not diverge; that
+/// agreement is executed by
+/// `ferrum-testkit/tests/acceptance.rs::both_planes_answer_an_unlabelled_namespace_the_same_way`,
+/// not by this sentence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectorMatch {
     Match,
@@ -225,12 +233,16 @@ pub fn selector_match(selector: &PolicySelector, identity: &WorkloadIdentity) ->
         return SelectorMatch::NoMatch;
     }
     // Workload labels ride on the pod record itself, so they are known as soon
-    // as the pod is; the other three are joined in from separate watches.
-    if labels_missing(&selector.cluster_selector, &identity.cluster_labels)
-        || labels_missing(&selector.namespace_selector, &identity.namespace_labels)
-        || labels_missing(
+    // as the pod is; the other three are joined in from separate watches, and
+    // each says whether that join found anything.
+    if labels_unobserved(&selector.cluster_selector, identity.cluster_labels_observed)
+        || labels_unobserved(
+            &selector.namespace_selector,
+            identity.namespace_labels_observed,
+        )
+        || labels_unobserved(
             &selector.service_account_selector,
-            &identity.service_account_labels,
+            identity.service_account_labels_observed,
         )
     {
         return SelectorMatch::LabelsUnknown;
@@ -250,11 +262,11 @@ pub fn selector_match(selector: &PolicySelector, identity: &WorkloadIdentity) ->
     }
 }
 
-fn labels_missing(
-    selector: &LabelSelector,
-    labels: &std::collections::BTreeMap<String, String>,
-) -> bool {
-    !selector.is_empty() && labels.is_empty()
+/// A selector this identity cannot answer. Only "the join never saw this
+/// group" counts: an observed group that holds no labels answers every
+/// selector with a plain non-match, which is a decision.
+fn labels_unobserved(selector: &LabelSelector, observed: bool) -> bool {
+    !selector.is_empty() && !observed
 }
 
 fn image_matches(selector: &PolicySelector, identity: &WorkloadIdentity) -> bool {
@@ -388,4 +400,110 @@ fn rule_matches(rule: &Rule, event: &SyscallEvent<'_>) -> RuleMatch {
         return RuleMatch::SkippedContainer;
     }
     RuleMatch::Yes(path_unknown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zone_selector() -> PolicySelector {
+        let mut selector = PolicySelector::default();
+        selector
+            .namespace_selector
+            .match_labels
+            .insert("ferrum.io/zone".into(), "pci".into());
+        selector
+    }
+
+    fn pod_in(namespace: &str) -> WorkloadIdentity {
+        WorkloadIdentity {
+            namespace: namespace.into(),
+            pod: "web-1".into(),
+            container: "app".into(),
+            service_account: "web".into(),
+            ..Default::default()
+        }
+    }
+
+    /// The mirror of the defect this cycle removed: `LabelsUnknown` used to be
+    /// read off an empty map, so every namespace that carries no labels raised
+    /// it, and `DEG_LABELS_UNKNOWN` behind it was true on every node of any
+    /// cluster holding one such namespace for as long as the policy existed. A
+    /// reason that is always true names nothing. The three cases below are the
+    /// three answers, and only the third is a reason to degrade.
+    #[test]
+    fn an_observed_namespace_without_labels_is_a_non_match_not_labels_unknown() {
+        let selector = zone_selector();
+
+        // Listed, and it genuinely has no labels: the selector does not match.
+        let mut plain = pod_in("plain");
+        plain.namespace_labels_observed = true;
+        assert!(plain.namespace_labels.is_empty());
+        assert_eq!(selector_match(&selector, &plain), SelectorMatch::NoMatch);
+        assert!(!selector_matches(&selector, &plain));
+
+        // Listed with labels that do not match: also a non-match, and the
+        // empty-map reading got this one right, which is why it survived.
+        let mut public = pod_in("public");
+        public.namespace_labels_observed = true;
+        public
+            .namespace_labels
+            .insert("ferrum.io/zone".into(), "public".into());
+        assert_eq!(selector_match(&selector, &public), SelectorMatch::NoMatch);
+
+        // Never listed: unknown, and the only one of the three that is.
+        let unseen = pod_in("unseen");
+        assert!(!unseen.namespace_labels_observed);
+        assert_eq!(
+            selector_match(&selector, &unseen),
+            SelectorMatch::LabelsUnknown
+        );
+
+        // And a match is still a match.
+        let mut pci = pod_in("pci-ns");
+        pci.namespace_labels_observed = true;
+        pci.namespace_labels
+            .insert("ferrum.io/zone".into(), "pci".into());
+        assert_eq!(selector_match(&selector, &pci), SelectorMatch::Match);
+    }
+
+    /// A group nothing selects is never asked whether it was observed: the
+    /// agent has no cluster labels at all, and that must not make every
+    /// namespaced policy unknown.
+    #[test]
+    fn an_unselected_label_group_is_never_unknown() {
+        let selector = zone_selector();
+        let mut pci = pod_in("pci-ns");
+        pci.namespace_labels_observed = true;
+        pci.namespace_labels
+            .insert("ferrum.io/zone".into(), "pci".into());
+        assert!(!pci.cluster_labels_observed);
+        assert!(!pci.service_account_labels_observed);
+        assert_eq!(selector_match(&selector, &pci), SelectorMatch::Match);
+
+        let mut with_cluster = zone_selector();
+        with_cluster
+            .cluster_selector
+            .match_labels
+            .insert("env".into(), "prod".into());
+        assert_eq!(
+            selector_match(&with_cluster, &pci),
+            SelectorMatch::LabelsUnknown,
+            "a cluster selector on a node that never receives cluster labels is unresolved"
+        );
+    }
+
+    #[test]
+    fn an_empty_selector_matches_without_asking_about_labels() {
+        let identity = pod_in("anything");
+        assert_eq!(
+            selector_match(&PolicySelector::default(), &identity),
+            SelectorMatch::Match
+        );
+        let unknown = WorkloadIdentity::unknown();
+        assert_eq!(
+            selector_match(&PolicySelector::default(), &unknown),
+            SelectorMatch::Match
+        );
+    }
 }

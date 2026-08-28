@@ -584,3 +584,57 @@ fn a_namespace_bookmark_keeps_the_label_cache_warm() {
     );
     assert!(cache.namespaces().is_warm());
 }
+
+/// `labels_of` already answers "was this object listed"; `PodCache::snapshot`
+/// counted the miss and then dropped the answer, leaving an empty map in both
+/// branches. Every consumer had to re-derive it from emptiness, and got the
+/// unlabelled namespace wrong. The record carries it now.
+#[test]
+fn an_unlabelled_namespace_resolves_as_observed_and_empty_not_as_unknown() {
+    let mut cache = labelled_cache();
+    // The list completed and named `prod`; `prod` carries no labels. That is
+    // not the fact "no list ever mentioned prod".
+    cache
+        .namespaces_mut()
+        .try_replace_all(vec![ferrum_k8smeta::LabelObject {
+            namespace: String::new(),
+            name: "prod".into(),
+            labels: std::collections::BTreeMap::new(),
+            resource_version: "2002".into(),
+        }])
+        .expect("list fits");
+
+    let pods = cache.snapshot().expect("snapshot");
+    let web = pod_named(&pods, "web-0");
+    assert!(web.namespace_labels.is_empty());
+    assert!(
+        web.namespace_labels_observed,
+        "a namespace the list named is observed even when it has no labels"
+    );
+    assert!(web.service_account_labels_observed);
+    assert_eq!(
+        cache.labels_unknown_total(),
+        0,
+        "nothing here is unknown, so nothing may be counted as such"
+    );
+    let identity = web.identity(&web.containers[0]);
+    assert!(identity.namespace_labels_observed);
+    assert!(identity.service_account_labels_observed);
+    assert!(
+        !identity.cluster_labels_observed,
+        "the node has no source of cluster labels at all, and says so"
+    );
+
+    // The other half, unchanged: a namespace no list ever named is unknown,
+    // counted, and carries the fact out on the record.
+    let mut moved = cache.get(WEB_UID).expect("web-0").clone();
+    moved.namespace = "never-listed".into();
+    cache.upsert(moved);
+    let pods = cache.snapshot().expect("snapshot");
+    let web = pod_named(&pods, "web-0");
+    assert!(!web.namespace_labels_observed);
+    assert!(!web.service_account_labels_observed);
+    assert_eq!(cache.labels_unknown_total(), 2);
+    let identity = web.identity(&web.containers[0]);
+    assert!(!identity.namespace_labels_observed);
+}

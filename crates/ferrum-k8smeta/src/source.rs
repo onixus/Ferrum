@@ -46,6 +46,12 @@ pub struct PodRecord {
     /// object: neither set of labels exists on a Pod.
     pub namespace_labels: BTreeMap<String, String>,
     pub service_account_labels: BTreeMap<String, String>,
+    /// Whether that join found the object at all. The maps above answer "which
+    /// labels", never "were there any to read": a namespace the list named
+    /// without labels and a namespace no list ever named both leave an empty
+    /// map behind, and only the second is a reason to fail closed.
+    pub namespace_labels_observed: bool,
+    pub service_account_labels_observed: bool,
     pub containers: Vec<ContainerRecord>,
 }
 
@@ -68,6 +74,14 @@ impl PodRecord {
             namespace_labels: self.namespace_labels.clone(),
             workload_labels: self.labels.clone(),
             service_account_labels: self.service_account_labels.clone(),
+            // MVP-1 gives the node no source of cluster labels at all — they
+            // are operator-stated to admission and never reach the agent — so
+            // this is honestly unobserved rather than empty. A runtime policy
+            // with a clusterSelector therefore fails closed here, which is the
+            // fact, not a placeholder.
+            cluster_labels_observed: false,
+            namespace_labels_observed: self.namespace_labels_observed,
+            service_account_labels_observed: self.service_account_labels_observed,
             image: container.image.clone(),
             image_digest: container.image_digest.clone(),
         }
@@ -304,16 +318,35 @@ impl PodMetadataSource for PodCache {
             .map(|pod| {
                 let mut pod = pod.clone();
                 let mut unknown = 0u64;
+                // `labels_of` answers both questions at once, and the answer to
+                // the second used to be counted and dropped: the record left
+                // here with an empty map either way, so every consumer had to
+                // re-derive "unknown" from "empty" and got the unlabelled case
+                // wrong. It travels with the labels now.
                 match self.namespaces.labels_of("", &pod.namespace) {
-                    Some(labels) => pod.namespace_labels = labels.clone(),
-                    None => unknown += 1,
+                    Some(labels) => {
+                        pod.namespace_labels = labels.clone();
+                        pod.namespace_labels_observed = true;
+                    }
+                    None => {
+                        pod.namespace_labels.clear();
+                        pod.namespace_labels_observed = false;
+                        unknown += 1;
+                    }
                 }
                 match self
                     .service_accounts
                     .labels_of(&pod.namespace, &pod.service_account)
                 {
-                    Some(labels) => pod.service_account_labels = labels.clone(),
-                    None => unknown += 1,
+                    Some(labels) => {
+                        pod.service_account_labels = labels.clone();
+                        pod.service_account_labels_observed = true;
+                    }
+                    None => {
+                        pod.service_account_labels.clear();
+                        pod.service_account_labels_observed = false;
+                        unknown += 1;
+                    }
                 }
                 if unknown > 0 {
                     self.labels_unknown.fetch_add(unknown, Ordering::Relaxed);

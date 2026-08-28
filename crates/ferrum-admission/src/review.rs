@@ -135,6 +135,9 @@ fn handle_with(
             &format!("namespace labels unavailable: {}", warmth.reason()),
         );
     }
+    // The source answers "observed, and here they are" or "never observed";
+    // the subject carries that answer through to `require_labels_if_selected`
+    // instead of handing it an empty map for both.
     subject.namespace_labels = cfg.labels.namespace_labels(&subject.namespace);
     let service_account = if subject.service_account.is_empty() {
         DEFAULT_SERVICE_ACCOUNT

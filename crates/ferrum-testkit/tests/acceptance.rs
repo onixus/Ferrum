@@ -67,9 +67,11 @@ fn compliant_subject() -> AdmissionSubject {
         image_signed: true,
         ..Default::default()
     };
-    subject
-        .namespace_labels
-        .insert("ferrum.io/zone".into(), "pci".into());
+    subject.namespace_labels = Some(
+        [("ferrum.io/zone".to_string(), "pci".to_string())]
+            .into_iter()
+            .collect(),
+    );
     subject
 }
 
@@ -274,6 +276,10 @@ fn payments_identity() -> WorkloadIdentity {
     };
     id.namespace_labels
         .insert("ferrum.io/zone".into(), "pci".into());
+    // The join read them off a listed namespace; without this the identity
+    // says "never observed" and the selector cannot be resolved.
+    id.namespace_labels_observed = true;
+    id.service_account_labels_observed = true;
     id.image = "registry.internal.example/app@sha256:abc".into();
     id.image_digest = "sha256:abc".into();
     id
@@ -560,4 +566,153 @@ fn controller_signed_exceptions_are_accepted_by_agent_and_admission() {
     assert_eq!(sink.events()[0].action, WAIVED_ACTION);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One namespace, two planes, one answer.
+///
+/// `ferrum-ebpf/src/eval.rs` has carried the sentence "admission fails closed on
+/// exactly this condition; the runtime plane must not diverge" in a comment
+/// since the selector was written, and nothing executed it. It was also false:
+/// admission raised `Integrity` and the runtime raised `LabelsUnknown` for a
+/// namespace that had been listed and simply carries no labels, so both planes
+/// treated "seen, and it has none" as "never seen" — admission denying the Pod
+/// and the agent flagging every record on the node, forever, on any cluster
+/// with one unlabelled namespace.
+///
+/// The gate runs the shipped `prod-restricted` selector (`ferrum.io/zone In
+/// [pci, secrets]`) against both planes for the same namespace in both states,
+/// and requires the pair of answers to agree: listed-without-labels is a
+/// non-match on both sides, never-listed is fail-closed on both sides.
+#[test]
+fn both_planes_answer_an_unlabelled_namespace_the_same_way() {
+    use ferrum_admission::{LabelSource, StaticLabels};
+    use ferrum_ebpf::{parse_febp, selector_match, SelectorMatch};
+    use ferrum_k8smeta::source::{ContainerRecord, PodCache, PodMetadataSource};
+    use ferrum_k8smeta::{LabelObject, PodRecord};
+    use std::collections::BTreeMap;
+
+    let mut spec = prod_restricted().spec;
+    spec.mode = PolicyMode::Enforce;
+    let bundle = compile_cluster_policy(&spec).expect("compile prod-restricted");
+    let ebpf = parse_febp(&bundle.ebpf_spec).expect("parse FEBP");
+    assert!(
+        !ebpf.selector.namespace_selector.is_empty(),
+        "the fixture must carry a namespace selector, or this gate asserts nothing"
+    );
+    let admission = program();
+
+    /// The runtime plane's answer for a pod in `namespace`, with the label
+    /// caches told what they listed. `None` for the namespace means the list
+    /// never named it.
+    fn runtime(namespace: &str, namespace_labels: Option<BTreeMap<String, String>>) -> PodRecord {
+        let mut cache = PodCache::new("node-a");
+        cache.upsert(PodRecord {
+            uid: "uid-1".into(),
+            namespace: namespace.into(),
+            name: "web-1".into(),
+            node_name: "node-a".into(),
+            service_account: "web".into(),
+            resource_version: "1".into(),
+            labels: BTreeMap::new(),
+            namespace_labels: BTreeMap::new(),
+            service_account_labels: BTreeMap::new(),
+            namespace_labels_observed: false,
+            service_account_labels_observed: false,
+            containers: vec![ContainerRecord {
+                name: "app".into(),
+                id: "a".repeat(64),
+                image: "registry.internal.example/app@sha256:abc".into(),
+                image_digest: "sha256:abc".into(),
+            }],
+        });
+        cache.mark_applied_at(std::time::Instant::now());
+        let mut listed = Vec::new();
+        if let Some(labels) = namespace_labels {
+            listed.push(LabelObject {
+                namespace: String::new(),
+                name: namespace.to_string(),
+                labels,
+                resource_version: "1".into(),
+            });
+        }
+        cache
+            .namespaces_mut()
+            .try_replace_all(listed)
+            .expect("namespace list fits");
+        cache
+            .service_accounts_mut()
+            .try_replace_all(vec![LabelObject {
+                namespace: namespace.to_string(),
+                name: "web".into(),
+                labels: BTreeMap::new(),
+                resource_version: "1".into(),
+            }])
+            .expect("serviceaccount list fits");
+        cache.snapshot().expect("snapshot").remove(0)
+    }
+
+    // A warm cache that listed `plain` and found no labels on it.
+    let listed_unlabelled = StaticLabels::default()
+        .with_namespace("plain", BTreeMap::new())
+        .with_service_account("plain", "default", BTreeMap::new())
+        .warm();
+    // Privileged, so "allowed" can only mean the policy did not apply: a
+    // compliant Pod would be allowed either way and would prove nothing.
+    let mut subject = compliant_subject();
+    subject.namespace = "plain".into();
+    subject.privileged = true;
+    subject.namespace_labels = listed_unlabelled.namespace_labels("plain");
+    subject.service_account_labels = listed_unlabelled.service_account_labels("plain", "default");
+    assert_eq!(
+        subject.namespace_labels,
+        Some(BTreeMap::new()),
+        "a listed namespace with no labels is observed and empty"
+    );
+    let decision = admit(&admission, &subject, &[], now());
+    assert!(
+        decision.allowed && !decision.fail_closed,
+        "admission must answer a listed unlabelled namespace with a selector miss, not an \
+         integrity failure: {:?}",
+        decision.reasons
+    );
+
+    let pod = runtime("plain", Some(BTreeMap::new()));
+    assert!(pod.namespace_labels_observed);
+    assert_eq!(
+        selector_match(&ebpf.selector, &pod.identity(&pod.containers[0])),
+        SelectorMatch::NoMatch,
+        "the runtime plane must answer the same namespace the same way"
+    );
+
+    // The same namespace, never listed. Both planes fail closed, and this is
+    // the half that must not be weakened by fixing the half above.
+    let never_listed = StaticLabels::default().warm();
+    let mut unseen = compliant_subject();
+    unseen.namespace = "plain".into();
+    unseen.privileged = true;
+    unseen.namespace_labels = never_listed.namespace_labels("plain");
+    unseen.service_account_labels = never_listed.service_account_labels("plain", "default");
+    assert_eq!(unseen.namespace_labels, None);
+    let decision = admit(&admission, &unseen, &[], now());
+    assert!(
+        !decision.allowed && decision.fail_closed,
+        "a namespace nothing ever listed is still an integrity failure: {:?}",
+        decision.reasons
+    );
+    assert!(
+        decision
+            .reasons
+            .iter()
+            .any(|r| r.contains("never observed")),
+        "the deny must name what was not known: {:?}",
+        decision.reasons
+    );
+
+    let pod = runtime("plain", None);
+    assert!(!pod.namespace_labels_observed);
+    assert_eq!(
+        selector_match(&ebpf.selector, &pod.identity(&pod.containers[0])),
+        SelectorMatch::LabelsUnknown,
+        "the runtime plane must fail closed on the same namespace admission fails closed on"
+    );
 }

@@ -512,6 +512,8 @@ pub fn parse_pod(object: &Value) -> Option<PodRecord> {
         // caches fill them in on the way out of PodCache::snapshot.
         namespace_labels: BTreeMap::new(),
         service_account_labels: BTreeMap::new(),
+        namespace_labels_observed: false,
+        service_account_labels_observed: false,
         containers,
     })
 }
