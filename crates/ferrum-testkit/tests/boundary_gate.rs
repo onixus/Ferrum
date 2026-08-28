@@ -815,8 +815,11 @@ fn documents(root: &Path) -> Vec<Value> {
     for file in files {
         let body = fs::read_to_string(&file).expect("manifest");
         for doc in serde_yaml::Deserializer::from_str(&body) {
-            if let Ok(value) = Value::deserialize(doc) {
-                out.push(value);
+            // `break` on the first bad document: libyaml does not recover, and
+            // a `continue` here reads the same error for ever.
+            match Value::deserialize(doc) {
+                Ok(value) => out.push(value),
+                Err(_) => break,
             }
         }
     }
@@ -1544,10 +1547,12 @@ fn a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose() {
     );
 }
 
-/// One shipped CRD, reduced to the three ways it can promise a status.
+/// One served version of one shipped CRD, reduced to the three ways it can
+/// promise a status.
 struct CrdStatusSurface {
     file: String,
     kind: String,
+    version: String,
     subresource: bool,
     schema: bool,
     columns: Vec<String>,
@@ -1557,59 +1562,110 @@ impl CrdStatusSurface {
     fn promises_status(&self) -> bool {
         self.subresource || self.schema || !self.columns.is_empty()
     }
+
+    fn name(&self) -> String {
+        format!("{} ({}/{})", self.file, self.kind, self.version)
+    }
 }
 
-/// Every CRD under `docs/crd/`, read for what it tells an operator it reports.
-fn crd_status_surfaces(root: &Path) -> Vec<CrdStatusSurface> {
+/// Every served version of every CRD under `docs/crd/`, read for what it tells
+/// an operator it reports, together with every file this reader could not make
+/// sense of.
+///
+/// Both halves are returned, and the caller fails on the second. A census that
+/// answers a question about promises must not decide by itself that a file has
+/// none: `serde_yaml` refuses a multi-document file outright, and a `continue`
+/// on that would drop every promise in it while the count of what remained
+/// still looked plausible. Whatever this cannot read is reported, not skipped.
+///
+/// Every version, not `versions[0]`: an operator uses the version they are
+/// served, and a status promise restored in a second version is the same
+/// promise.
+fn crd_status_surfaces(root: &Path) -> (Vec<CrdStatusSurface>, Vec<String>) {
     let mut files = Vec::new();
     yaml_files(&root.join("docs/crd"), &mut files);
     files.sort();
     let mut out = Vec::new();
+    let mut unread = Vec::new();
     for path in files {
+        let name = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
         let raw = fs::read_to_string(&path).expect("crd yaml");
-        let Ok(doc) = serde_yaml::from_str::<Value>(&raw) else {
-            continue;
-        };
-        let Some(spec) = doc.get("spec") else {
-            continue;
-        };
-        let kind = spec
-            .get("names")
-            .map(|n| scalar(n, "kind"))
-            .unwrap_or_default();
-        if kind.is_empty() {
-            continue;
+        let mut documents = 0usize;
+        for document in serde_yaml::Deserializer::from_str(&raw) {
+            // `break`, not `continue`: libyaml does not recover, so asking the
+            // same iterator for the next document after a parse error yields
+            // the error again, for ever. A gate that hangs is worse than one
+            // that skips — it has no verdict at all — and the `unread` entry
+            // below is what fails the run.
+            let doc = match Value::deserialize(document) {
+                Ok(doc) => doc,
+                Err(err) => {
+                    unread.push(format!(
+                        "  {name}: document {documents} does not parse: {err}"
+                    ));
+                    documents += 1;
+                    break;
+                }
+            };
+            documents += 1;
+            if scalar(&doc, "kind") != "CustomResourceDefinition" {
+                unread.push(format!(
+                    "  {name}: a document that is not a CustomResourceDefinition"
+                ));
+                continue;
+            }
+            let Some(spec) = doc.get("spec") else {
+                unread.push(format!("  {name}: a CRD document with no spec"));
+                continue;
+            };
+            let kind = spec
+                .get("names")
+                .map(|n| scalar(n, "kind"))
+                .unwrap_or_default();
+            if kind.is_empty() {
+                unread.push(format!("  {name}: a CRD document with no spec.names.kind"));
+                continue;
+            }
+            let versions = sequence(spec, "versions");
+            if versions.is_empty() {
+                unread.push(format!("  {name} ({kind}): no served versions"));
+                continue;
+            }
+            for version in versions {
+                let subresource = version
+                    .get("subresources")
+                    .map(|s| contains_key(s, "status"))
+                    .unwrap_or(false);
+                let schema = version
+                    .get("schema")
+                    .and_then(|s| s.get("openAPIV3Schema"))
+                    .and_then(|s| s.get("properties"))
+                    .map(|p| p.get("status").is_some())
+                    .unwrap_or(false);
+                let columns = sequence(version, "additionalPrinterColumns")
+                    .iter()
+                    .filter(|column| scalar(column, "jsonPath").starts_with(".status"))
+                    .map(|column| scalar(column, "name"))
+                    .collect();
+                out.push(CrdStatusSurface {
+                    file: name.clone(),
+                    kind: kind.clone(),
+                    version: scalar(version, "name"),
+                    subresource,
+                    schema,
+                    columns,
+                });
+            }
         }
-        let version = sequence(spec, "versions").first().cloned();
-        let Some(version) = version else { continue };
-        let subresource = version
-            .get("subresources")
-            .map(|s| contains_key(s, "status"))
-            .unwrap_or(false);
-        let schema = version
-            .get("schema")
-            .and_then(|s| s.get("openAPIV3Schema"))
-            .and_then(|s| s.get("properties"))
-            .map(|p| p.get("status").is_some())
-            .unwrap_or(false);
-        let columns = sequence(&version, "additionalPrinterColumns")
-            .iter()
-            .filter(|column| scalar(column, "jsonPath").starts_with(".status"))
-            .map(|column| scalar(column, "name"))
-            .collect();
-        out.push(CrdStatusSurface {
-            file: path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string(),
-            kind,
-            subresource,
-            schema,
-            columns,
-        });
+        if documents == 0 {
+            unread.push(format!("  {name}: no YAML documents at all"));
+        }
     }
-    out
+    (out, unread)
 }
 
 /// A status a CRD declares and no shipped subject writes, and the other
@@ -1638,11 +1694,20 @@ fn crd_status_surfaces(root: &Path) -> Vec<CrdStatusSurface> {
 #[test]
 fn a_status_no_subject_writes_is_not_a_status_this_tree_ships() {
     let root = repo_root();
-    let surfaces = crd_status_surfaces(&root);
+    let (surfaces, unread) = crd_status_surfaces(&root);
+    assert!(
+        unread.is_empty(),
+        "this census could not read part of docs/crd:\n{}\nA file it cannot parse is a file \
+         whose status promises it cannot see, and skipping one would leave this gate green \
+         over exactly the case it exists to refuse. Fix the file, or teach the reader the \
+         shape.",
+        unread.join("\n")
+    );
     assert!(
         surfaces.len() >= 7,
-        "found {} CRDs under docs/crd; there were seven when this gate was written, so it is \
-         reading the wrong tree and every absence below is true for the wrong reason",
+        "found {} served CRD versions under docs/crd; there were seven when this gate was \
+         written, so it is reading the wrong tree and every absence below is true for the \
+         wrong reason",
         surfaces.len()
     );
 
@@ -1663,13 +1728,15 @@ fn a_status_no_subject_writes_is_not_a_status_this_tree_ships() {
     for surface in &surfaces {
         match (surface.promises_status(), writer_of(&surface.kind)) {
             (true, None) => unwritten.push(format!(
-                "  {} ({}): subresource={} schema={} columns={:?}",
-                surface.file, surface.kind, surface.subresource, surface.schema, surface.columns
+                "  {}: subresource={} schema={} columns={:?}",
+                surface.name(),
+                surface.subresource,
+                surface.schema,
+                surface.columns
             )),
-            (false, Some(subject)) => undeclared.push(format!(
-                "  {} ({}): written by {subject}",
-                surface.file, surface.kind
-            )),
+            (false, Some(subject)) => {
+                undeclared.push(format!("  {}: written by {subject}", surface.name()))
+            }
             _ => {}
         }
     }
@@ -1780,8 +1847,10 @@ fn controller_container(root: &Path) -> (Value, Value) {
     let body = fs::read_to_string(root.join("deploy/controller/deployment.yaml"))
         .expect("deploy/controller/deployment.yaml");
     for doc in serde_yaml::Deserializer::from_str(&body) {
+        // `break`: see `documents` above. libyaml does not recover from a parse
+        // error, so a `continue` spins.
         let Ok(value) = Value::deserialize(doc) else {
-            continue;
+            break;
         };
         if scalar(&value, "kind") != "Deployment" {
             continue;

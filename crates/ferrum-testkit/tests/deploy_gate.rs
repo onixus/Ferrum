@@ -1147,8 +1147,11 @@ mod build_closure {
                 .display()
                 .to_string();
             for doc in serde_yaml::Deserializer::from_str(&raw) {
+                // `break`: libyaml does not recover from a parse error, so
+                // asking this iterator for the next document after one yields
+                // the same error for ever.
                 let Ok(value) = Value::deserialize(doc) else {
-                    continue;
+                    break;
                 };
                 collect_containers(&value, &name, &mut out);
             }
@@ -2875,7 +2878,13 @@ mod rollout_accounting {
             .join(rel)
     }
 
-    /// Every `args:` entry of every container in the controller Deployment.
+    /// Every `command:` and `args:` entry of every container in the controller
+    /// Deployment.
+    ///
+    /// Both keys, in that order, the way `build_closure::collect_containers`
+    /// reads them: either can carry a flag, and a reader that took only `args`
+    /// would let a `--cluster` moved into `command` past the premise below
+    /// while the `--status-dir` calibration still passed out of `args`.
     ///
     /// Flat across containers on purpose: the question is whether this manifest
     /// declares a fleet anywhere, and a `--cluster` on a sidecar would be a
@@ -2893,33 +2902,61 @@ mod rollout_accounting {
             .expect("controller pod spec has containers");
         let mut argv = Vec::new();
         for container in containers {
-            for arg in container
-                .get("args")
-                .and_then(Value::as_sequence)
-                .unwrap_or(&Vec::new())
-            {
-                argv.push(arg.as_str().expect("args are strings").to_string());
+            for key in ["command", "args"] {
+                let Some(items) = container.get(key).and_then(Value::as_sequence) else {
+                    continue;
+                };
+                argv.extend(
+                    items
+                        .iter()
+                        .map(|item| item.as_str().expect("argv entries are strings").to_string()),
+                );
             }
         }
         argv
     }
 
-    fn rollout_property(crd: &str, name: &str) -> Value {
+    /// `status.rollout.<name>` in **every** served version of `crd`, by version
+    /// name.
+    ///
+    /// Not `versions[0]`. An operator uses the version they are served, so a
+    /// second version that dropped `nullable` would be the one in the cluster
+    /// while a reader stopping at the first still said the schema was right.
+    fn rollout_properties(crd: &str, name: &str) -> Vec<(String, Value)> {
         let root: Value = serde_yaml::from_str(crd).expect("crd yaml");
-        root.get("spec")
+        let versions = root
+            .get("spec")
             .and_then(|s| s.get("versions"))
             .and_then(Value::as_sequence)
-            .and_then(|v| v.first())
-            .and_then(|v| v.get("schema"))
-            .and_then(|s| s.get("openAPIV3Schema"))
-            .and_then(|s| s.get("properties"))
-            .and_then(|p| p.get("status"))
-            .and_then(|s| s.get("properties"))
-            .and_then(|p| p.get("rollout"))
-            .and_then(|r| r.get("properties"))
-            .and_then(|p| p.get(name))
-            .unwrap_or_else(|| panic!("status.rollout.{name} is in the schema"))
-            .clone()
+            .expect("crd serves versions");
+        let out: Vec<(String, Value)> = versions
+            .iter()
+            .filter_map(|version| {
+                let property = version
+                    .get("schema")
+                    .and_then(|s| s.get("openAPIV3Schema"))
+                    .and_then(|s| s.get("properties"))
+                    .and_then(|p| p.get("status"))
+                    .and_then(|s| s.get("properties"))
+                    .and_then(|p| p.get("rollout"))
+                    .and_then(|r| r.get("properties"))
+                    .and_then(|p| p.get(name))?;
+                Some((
+                    version
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unnamed>")
+                        .to_string(),
+                    property.clone(),
+                ))
+            })
+            .collect();
+        assert!(
+            !out.is_empty(),
+            "no served version declares status.rollout.{name}, so the assertions on it would \
+             run over nothing"
+        );
+        out
     }
 
     #[test]
@@ -2984,21 +3021,27 @@ mod rollout_accounting {
             ("SecurityPolicy", super::CRD_SECURITY_POLICY),
         ] {
             for name in ["clustersReady", "clustersDegraded"] {
-                let property = rollout_property(crd, name);
-                assert_eq!(
-                    property.get("type").and_then(Value::as_str),
-                    Some("integer"),
-                    "{kind}.status.rollout.{name} is not an integer any more, so this gate is \
-                     reading something else"
-                );
-                assert_eq!(
-                    property.get("nullable").and_then(Value::as_bool),
-                    Some(true),
-                    "{kind}.status.rollout.{name} is not nullable, and the controller sends \
-                     `null` there on every install that declares no fleet. A structural \
-                     schema without `nullable` refuses that value, so every status PATCH \
-                     fails and the class it is charged to is the only trace left."
-                );
+                for (version, property) in rollout_properties(crd, name) {
+                    assert_eq!(
+                        property.get("type").and_then(Value::as_str),
+                        Some("integer"),
+                        "{kind}/{version}.status.rollout.{name} is not an integer any more, so \
+                         this gate is reading something else"
+                    );
+                    assert_eq!(
+                        property.get("nullable").and_then(Value::as_bool),
+                        Some(true),
+                        "{kind}/{version}.status.rollout.{name} is not nullable, and the \
+                         controller's own writes are not what needs it: those are JSON merge \
+                         patches, where `null` is a delete directive that never reaches schema \
+                         validation. What needs it is every other way this field is written — \
+                         an update, a server-side apply, an operator's `kubectl apply` of a \
+                         whole object — each of which sends `null` as a value a structural \
+                         schema refuses unless it is nullable. Removing this line would not \
+                         break the controller today, which is exactly why it has to be checked \
+                         rather than left to be noticed."
+                    );
+                }
             }
         }
     }
