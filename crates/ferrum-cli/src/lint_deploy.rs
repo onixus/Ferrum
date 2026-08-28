@@ -39,6 +39,14 @@ const WEBHOOK_CA_BUNDLE: &str = "FD020";
 const WEBHOOK_TLS_SECRET: &str = "FD021";
 const WEBHOOK_PKI_MISMATCH: &str = "FD022";
 const PRIVATE_KEY_IN_TREE: &str = "FD023";
+const POLICY_NAME_UNJOINED: &str = "FD024";
+
+/// Bundle Secrets the controller writes: `ferrum-bundle-cluster-<policy>` for a
+/// cluster-scoped policy, `ferrum-bundle-ns-<namespace>-<policy>` for a
+/// namespaced one.
+const BUNDLE_SECRET_PREFIX: &str = "ferrum-bundle-";
+const BUNDLE_SECRET_CLUSTER: &str = "cluster-";
+const BUNDLE_SECRET_NAMESPACED: &str = "ns-";
 
 /// The token a webhook template carries instead of a certificate. Committing a
 /// real CA is not an option, so the applied file is produced by
@@ -468,9 +476,151 @@ fn check_pod_templates(docs: &[Doc], findings: &mut Vec<Finding>) {
         for key in ["initContainers", "containers"] {
             for container in seq(spec, key) {
                 check_container(doc, &owner, container, findings);
+                check_policy_join(doc, &owner, spec, container, findings);
             }
         }
     }
+}
+
+/// `--policy-name` is an unjoined string.
+///
+/// The agent matches a `PolicyException` by comparing the exception's
+/// `target.policies` against this flag, and the FRMB carries no policy name of
+/// its own — nothing at runtime can check that the flag names the policy in
+/// the bundle actually mounted. An empty flag matches nothing at all, and a
+/// wrong one matches nothing while every signed, verified, in-scope waiver on
+/// the node is loaded, counted and logged as reloaded: kills a live waiver
+/// should have demoted keep firing, and no counter moves.
+///
+/// The join cannot be proven at runtime without a bundle format change (an ABI
+/// bump, and a bundle every deployed agent would refuse), so it is proven here
+/// instead, against objects already deployed: the flag must name the policy the
+/// mounted bundle Secret is named for. A finding, never a warning — a lint that
+/// passes on an unverifiable join is what FD005 and FD022 were each added to
+/// stop being.
+fn check_policy_join(
+    doc: &Doc,
+    owner: &str,
+    spec: &Value,
+    container: &Value,
+    findings: &mut Vec<Finding>,
+) {
+    let argv = argv_of(container);
+    let policy = container_flag(&argv, "--policy-name");
+    let bundle = container_flag(&argv, "--bundle");
+    // Nothing to join: a workload that names no policy and mounts no bundle is
+    // not in this rule's scope.
+    if policy.is_none() && bundle.is_none() {
+        return;
+    }
+    let mut finding = |msg: String| {
+        findings.push(Finding {
+            code: POLICY_NAME_UNJOINED,
+            file: doc.file.clone(),
+            msg,
+        })
+    };
+    let cname = container
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>");
+    let policy = match policy.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(policy) => policy.to_string(),
+        None => {
+            return finding(format!(
+                "{owner} container '{cname}' mounts a policy bundle with no --policy-name; the \
+                 exception target is matched on that string, so every waiver in the bundle \
+                 applies to nothing"
+            ));
+        }
+    };
+    let Some(bundle) = bundle else {
+        return finding(format!(
+            "{owner} container '{cname}' passes --policy-name '{policy}' with no --bundle; \
+             nothing joins the name to a bundle"
+        ));
+    };
+    let Some(secret) = mounted_secret(spec, container, &bundle) else {
+        return finding(format!(
+            "{owner} container '{cname}' passes --policy-name '{policy}' but '{bundle}' is not a \
+             mounted Secret volume; the policy the bundle carries cannot be checked against it"
+        ));
+    };
+    if !secret_names_policy(&secret, &policy) {
+        finding(format!(
+            "{owner} container '{cname}' passes --policy-name '{policy}' while mounting bundle \
+             Secret '{secret}'; the FRMB carries no policy name, so a mismatch here loads every \
+             waiver and applies none"
+        ));
+    }
+}
+
+/// Does `secret` name `policy`? The namespace half of a namespaced bundle
+/// Secret may itself contain '-', so this verifies the shape rather than
+/// parsing the policy back out of it.
+fn secret_names_policy(secret: &str, policy: &str) -> bool {
+    let Some(rest) = secret.strip_prefix(BUNDLE_SECRET_PREFIX) else {
+        return false;
+    };
+    if let Some(cluster) = rest.strip_prefix(BUNDLE_SECRET_CLUSTER) {
+        return cluster == policy;
+    }
+    match rest.strip_prefix(BUNDLE_SECRET_NAMESPACED) {
+        // `ns-<namespace>-<policy>`: a non-empty namespace, then the policy.
+        Some(ns) => match ns.strip_suffix(policy).and_then(|n| n.strip_suffix('-')) {
+            Some(namespace) => !namespace.is_empty(),
+            None => false,
+        },
+        None => false,
+    }
+}
+
+/// The `secretName` of the volume mounted at `mount_path` in this container.
+fn mounted_secret(spec: &Value, container: &Value, mount_path: &str) -> Option<String> {
+    let volume_name = seq(container, "volumeMounts").iter().find_map(|m| {
+        (m.get("mountPath").and_then(Value::as_str)? == mount_path)
+            .then(|| m.get("name").and_then(Value::as_str))
+            .flatten()
+    })?;
+    seq(spec, "volumes").iter().find_map(|v| {
+        (v.get("name").and_then(Value::as_str)? == volume_name)
+            .then(|| {
+                v.get("secret")
+                    .and_then(|s| s.get("secretName"))
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+            .map(str::to_string)
+    })
+}
+
+/// One container's argv, verbatim: not `str_list`, which lowercases, and a
+/// mount path is case-sensitive.
+fn argv_of(container: &Value) -> Vec<String> {
+    ["command", "args"]
+        .iter()
+        .flat_map(|key| seq(container, key))
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+/// `--flag value` and `--flag=value` both. An empty value is Some(""), which
+/// is a different finding from an absent flag.
+fn container_flag(argv: &[String], flag: &str) -> Option<String> {
+    let eq = format!("{flag}=");
+    for (i, arg) in argv.iter().enumerate() {
+        if let Some(v) = arg.strip_prefix(&eq) {
+            return Some(v.to_string());
+        }
+        if arg == flag {
+            return Some(match argv.get(i + 1) {
+                Some(next) if !next.starts_with("--") => next.clone(),
+                _ => String::new(),
+            });
+        }
+    }
+    None
 }
 
 /// `bpf_get_current_pid_tgid()` reports the tgid of the initial pid namespace.
@@ -507,16 +657,7 @@ fn runs_respond(spec: &Value) -> bool {
     seq(spec, "containers")
         .iter()
         .chain(seq(spec, "initContainers"))
-        .any(|c| {
-            let argv: Vec<String> = ["command", "args"]
-                .iter()
-                .flat_map(|key| str_list(c, key))
-                .collect();
-            argv.iter().any(|a| a == "--role=respond")
-                || argv
-                    .windows(2)
-                    .any(|w| w[0] == "--role" && w[1] == "respond")
-        })
+        .any(|c| container_flag(&argv_of(c), "--role").as_deref() == Some("respond"))
 }
 
 fn check_container(doc: &Doc, owner: &str, container: &Value, findings: &mut Vec<Finding>) {
@@ -1129,6 +1270,121 @@ mod tests {
                 .map(|c| c.to_string())
                 .collect::<BTreeSet<_>>()
         );
+    }
+
+    /// A negative tree for FD024, built from the shipped DaemonSet: only the
+    /// one line under test differs, so the finding cannot come from anywhere
+    /// else. Written to a temp dir rather than a committed fixture because
+    /// the fixture tree belongs to another crate.
+    fn agent_tree_with(tag: &str, edit: impl Fn(String) -> String) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrum-lint-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("tmpdir");
+        let raw = fs::read_to_string(repo_path("deploy/agent/daemonset.yaml"))
+            .expect("deploy/agent/daemonset.yaml");
+        fs::write(dir.join("daemonset.yaml"), edit(raw)).expect("write manifest");
+        dir
+    }
+
+    fn codes_in(dir: &Path) -> BTreeSet<String> {
+        let (findings, _) = collect_findings(dir).expect("lint fixture");
+        findings.iter().map(|f| f.code.to_string()).collect()
+    }
+
+    /// FD024. The FRMB carries no policy name, so nothing at runtime joins
+    /// `--policy-name` to the bundle in the mounted Secret: a renamed policy
+    /// loads every waiver on the node and applies none, with no counter moving
+    /// and `is_degraded()` false. This is the end of that join that can be
+    /// checked — against objects already deployed.
+    #[test]
+    fn a_policy_name_that_does_not_name_the_mounted_bundle_is_a_finding() {
+        let dir = agent_tree_with("policy-name", |raw| {
+            raw.replace(
+                "            - prod-restricted\n",
+                "            - prod-strict\n",
+            )
+        });
+        assert_eq!(
+            codes_in(&dir),
+            [POLICY_NAME_UNJOINED]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An empty or absent `--policy-name` is the same defect without a
+    /// rename: `waiver_applies` returns None on the first line.
+    #[test]
+    fn an_agent_that_mounts_a_bundle_without_a_policy_name_is_a_finding() {
+        let dir = agent_tree_with("no-policy-name", |raw| {
+            raw.replace(
+                "            - --policy-name\n            - prod-restricted\n",
+                "",
+            )
+        });
+        assert_eq!(
+            codes_in(&dir),
+            [POLICY_NAME_UNJOINED]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A policy name checked against nothing is not a join. FD024 is a
+    /// finding on an unverifiable one, never a warning: that is what FD005
+    /// and FD022 were each added to stop being.
+    #[test]
+    fn a_policy_name_with_no_resolvable_bundle_secret_is_a_finding() {
+        let dir = agent_tree_with("no-bundle-secret", |raw| {
+            raw.replace(
+                "          secret:\n            secretName: ferrum-bundle-cluster-prod-restricted\n            optional: true",
+                "          emptyDir: {}",
+            )
+        });
+        assert_eq!(
+            codes_in(&dir),
+            [POLICY_NAME_UNJOINED]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bundle_secret_names_its_policy_in_both_scopes() {
+        assert!(secret_names_policy(
+            "ferrum-bundle-cluster-prod-restricted",
+            "prod-restricted"
+        ));
+        assert!(secret_names_policy(
+            "ferrum-bundle-ns-payments-prod-restricted",
+            "prod-restricted"
+        ));
+        // A policy whose name merely ends the same way is not the same policy.
+        assert!(!secret_names_policy(
+            "ferrum-bundle-cluster-staging-restricted",
+            "restricted"
+        ));
+        assert!(!secret_names_policy(
+            "ferrum-bundle-ns-payments-prod-restricted",
+            "payments-prod-restricted"
+        ));
+        assert!(!secret_names_policy(
+            "ferrum-bundle-prod-restricted",
+            "prod-restricted"
+        ));
+        assert!(!secret_names_policy("some-other-secret", "prod-restricted"));
     }
 
     /// The key `gen-webhook-pki` writes is what the ignore rules have to cover;

@@ -172,7 +172,7 @@ fn main() {
         "observe"
     };
     let ctx = SinkContext::new(node, role_name);
-    let inner: Box<dyn EventSink + Send + Sync> = match export_dir {
+    let inner: Box<dyn EventSink + Send + Sync> = match export_dir.clone() {
         Some(dir) => Box::new(RotatingFileSink::new(
             dir,
             export_max_bytes,
@@ -187,7 +187,16 @@ fn main() {
     install_signal_handlers();
     spawn_shutdown_watcher(Arc::clone(&sink));
 
-    run(agent, sink, ctx, bundle_path, reload_ms, &flags, cgroup_rx)
+    run(
+        agent,
+        sink,
+        ctx,
+        bundle_path,
+        export_dir,
+        reload_ms,
+        &flags,
+        cgroup_rx,
+    )
 }
 
 /// Fills the cgroup→pod index and publishes its key set to whoever owns the
@@ -291,11 +300,13 @@ fn spawn_shutdown_watcher(sink: Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>
 }
 
 #[cfg(feature = "attach")]
+#[allow(clippy::too_many_arguments)]
 fn run(
     agent: Agent,
     sink: std::sync::Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>,
     ctx: SinkContext,
     bundle_path: Option<PathBuf>,
+    export_dir: Option<PathBuf>,
     reload_ms: u64,
     flags: &Flags,
     cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
@@ -316,6 +327,14 @@ fn run(
         .unwrap_or_else(|err| die(&format!("read {}: {err}", elf_path.display())));
 
     let agent = Arc::new(RwLock::new(agent));
+    // The node's own state surface: envelopes, `status.json` beside them, and
+    // the transition line. It reports and never acts — nothing here is a
+    // probe, and no probe may be wired to it.
+    let out = ferrum_agent::StatusOutput {
+        ctx: Some(&ctx),
+        sink: Some(sink.as_ref()),
+        status_dir: export_dir.as_deref(),
+    };
     let mut handle = match KernelHandle::attach_for_arch(&elf, arch) {
         Ok(handle) => {
             if !handle.unhooked_syscalls().is_empty() {
@@ -333,7 +352,7 @@ fn run(
         Err(err) => {
             eprintln!("ferrum-agent: kernel attach failed, datapath is Degraded: {err}");
             ctx.set_degraded(true);
-            park_degraded(&agent, ctx, bundle_path, reload_ms);
+            park_degraded(&agent, &out, bundle_path, reload_ms);
         }
     };
     // The datapath writes `bpf_get_current_pid_tgid()`, an initial-pid-namespace
@@ -468,40 +487,27 @@ fn run(
     });
 
     match bundle_path {
-        Some(path) => ferrum_agent::poll_bundle_shared(
-            &agent,
-            &path,
-            Duration::from_millis(reload_ms),
-            Some(&ctx),
-        ),
-        None => loop {
-            std::thread::sleep(Duration::from_millis(reload_ms));
-            let degraded = agent
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_degraded();
-            ctx.set_degraded(degraded);
-        },
+        Some(path) => {
+            ferrum_agent::poll_bundle_shared(&agent, &path, Duration::from_millis(reload_ms), &out)
+        }
+        None => ferrum_agent::poll_status(&agent, Duration::from_millis(reload_ms), &out),
     }
 }
 
 #[cfg(feature = "attach")]
 fn park_degraded(
     agent: &std::sync::Arc<std::sync::RwLock<Agent>>,
-    ctx: SinkContext,
+    out: &ferrum_agent::StatusOutput<'_>,
     bundle_path: Option<PathBuf>,
     reload_ms: u64,
 ) -> ! {
     match bundle_path {
-        Some(path) => ferrum_agent::poll_bundle_shared(
-            agent,
-            &path,
-            Duration::from_millis(reload_ms),
-            Some(&ctx),
-        ),
-        None => loop {
-            std::thread::sleep(Duration::from_millis(reload_ms));
-        },
+        // A parked agent still publishes: a node whose ELF will not attach is
+        // exactly the node whose state has to be readable from outside it.
+        Some(path) => {
+            ferrum_agent::poll_bundle_shared(agent, &path, Duration::from_millis(reload_ms), out)
+        }
+        None => ferrum_agent::poll_status(agent, Duration::from_millis(reload_ms), out),
     }
 }
 
@@ -509,31 +515,38 @@ fn park_degraded(
 /// verified and hot-reloaded, but nothing feeds `handle_event`. That is a
 /// Degraded agent, and it says so instead of sleeping quietly.
 #[cfg(not(feature = "attach"))]
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut agent: Agent,
     sink: std::sync::Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>,
     ctx: SinkContext,
     bundle_path: Option<PathBuf>,
+    export_dir: Option<PathBuf>,
     reload_ms: u64,
     _flags: &Flags,
     _cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
 ) -> ! {
-    let _ = sink;
     eprintln!(
         "ferrum-agent: built without the attach feature: no kernel datapath, \
          no syscall events, no reaction. Degraded."
     );
     ctx.set_degraded(true);
+    let out = ferrum_agent::StatusOutput {
+        ctx: Some(&ctx),
+        sink: Some(sink.as_ref()),
+        status_dir: export_dir.as_deref(),
+    };
     match bundle_path {
-        Some(path) => ferrum_agent::poll_bundle(
-            &mut agent,
-            &path,
-            Duration::from_millis(reload_ms),
-            Some(&ctx),
-        ),
-        None => loop {
-            std::thread::sleep(Duration::from_millis(reload_ms));
-        },
+        Some(path) => {
+            ferrum_agent::poll_bundle(&mut agent, &path, Duration::from_millis(reload_ms), &out)
+        }
+        None => {
+            let mut publisher = ferrum_agent::StatusPublisher::default();
+            loop {
+                std::thread::sleep(Duration::from_millis(reload_ms));
+                publisher.publish(&agent, &out);
+            }
+        }
     }
 }
 
