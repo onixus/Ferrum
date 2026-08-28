@@ -916,35 +916,153 @@ mod build_closure {
         std::fs::read_to_string(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
     }
 
-    /// Comment lines, in either language this gate reads. Both the `Jenkinsfile`
-    /// and the Dockerfiles talk *about* `docker build` and `cargo build` in
-    /// prose, and a gate that counted those would report that the pipeline
-    /// builds an image because a comment mentions one.
-    fn strip_comments(text: &str) -> String {
-        text.lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                !trimmed.starts_with("//") && !trimmed.starts_with('#')
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// The two languages this gate reads, kept apart because their comment
+    /// syntaxes contradict each other.
+    ///
+    /// `/* … */` is a block comment in the Jenkinsfile's Groovy and a path glob
+    /// in a Dockerfile's shell. Not reading it in the Jenkinsfile is the hole
+    /// this enum exists to close — a `docker build -t ghcr.io/ferrum/… -f
+    /// Dockerfile…` line inside a `/* … */` block satisfied both closure tests
+    /// below while nothing built — and reading it in a Dockerfile would let
+    /// `rm -rf /var/lib/apt/lists/*` swallow the rest of the file, which is the
+    /// same defect pointed the other way.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Lang {
+        /// `//` and `/* … */`, recognised only outside a triple-quoted string —
+        /// which is where every shell command in the Jenkinsfile lives, and
+        /// where `#` is a comment because that text is shell.
+        Groovy,
+        /// `#` only.
+        Dockerfile,
+    }
+
+    /// Comments, in whichever language this text is written in. Both the
+    /// `Jenkinsfile` and the Dockerfiles talk *about* `docker build` and
+    /// `cargo build` in prose, and a gate that counted those would report that
+    /// the pipeline builds an image because a comment mentions one.
+    ///
+    /// Line breaks inside a dropped span are kept, so a block comment spanning
+    /// lines cannot splice the code above it onto the code below.
+    fn strip_comments(text: &str, lang: Lang) -> String {
+        let bytes = text.as_bytes();
+        // Byte comparison, never `text[i..].starts_with`: this walks one byte
+        // at a time and the file carries Russian prose, so a slice taken mid
+        // codepoint panics. Every delimiter here is ASCII.
+        let starts = |at: usize, needle: &str| bytes[at..].starts_with(needle.as_bytes());
+        let mut out = String::with_capacity(text.len());
+        let mut keep_from = 0usize;
+        let mut i = 0usize;
+        // Only whitespace since the last newline. `#` opens a comment there and
+        // nowhere else, so the `#` of a fragment or an anchor is not one.
+        let mut line_blank = true;
+        let mut quote: Option<&'static str> = None;
+
+        let drop_span = |out: &mut String, keep_from: usize, from: usize, to: usize| {
+            out.push_str(&text[keep_from..from]);
+            for _ in text[from..to].bytes().filter(|c| *c == b'\n') {
+                out.push('\n');
+            }
+        };
+
+        while i < bytes.len() {
+            if let Some(q) = quote {
+                if starts(i, q) {
+                    i += q.len();
+                    quote = None;
+                    line_blank = false;
+                    continue;
+                }
+            } else if lang == Lang::Groovy {
+                if let Some(q) = ["'''", "\"\"\""].into_iter().find(|q| starts(i, q)) {
+                    quote = Some(q);
+                    i += q.len();
+                    line_blank = false;
+                    continue;
+                }
+                // A one-line Groovy string, stepped over whole. Not tracking
+                // these is what let `crates/**` in the `stash includes:` list
+                // open a block comment that ran to the next `*/` in the file
+                // and swallowed four stages, including the `'''` that opens the
+                // next shell block — after which every quote boundary in the
+                // file was off by one and the block-comment reader was pointed
+                // at exactly the wrong halves.
+                if bytes[i] == b'\'' || bytes[i] == b'"' {
+                    let q = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != q && bytes[i] != b'\n' {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == q {
+                        i += 1;
+                    }
+                    line_blank = false;
+                    continue;
+                }
+                if starts(i, "//") {
+                    let start = i;
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    drop_span(&mut out, keep_from, start, i);
+                    keep_from = i;
+                    continue;
+                }
+                if starts(i, "/*") {
+                    let start = i;
+                    i += 2;
+                    while i < bytes.len() && !starts(i, "*/") {
+                        i += 1;
+                    }
+                    i = bytes.len().min(i + 2);
+                    drop_span(&mut out, keep_from, start, i);
+                    keep_from = i;
+                    line_blank = false;
+                    continue;
+                }
+            }
+            if bytes[i] == b'#' && line_blank {
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                drop_span(&mut out, keep_from, start, i);
+                keep_from = i;
+                continue;
+            }
+            if bytes[i] == b'\n' {
+                line_blank = true;
+            } else if !bytes[i].is_ascii_whitespace() {
+                line_blank = false;
+            }
+            i += 1;
+        }
+        out.push_str(&text[keep_from..]);
+        out
     }
 
     /// Shell and Dockerfile line continuations, folded away so a command that
     /// spans six lines is one line to look at. Every build command in this
     /// repository is written that way.
-    fn joined_lines(text: &str) -> Vec<String> {
-        strip_comments(text)
+    fn joined_lines(text: &str, lang: Lang) -> Vec<String> {
+        strip_comments(text, lang)
             .replace("\\\n", " ")
             .lines()
             .map(str::to_string)
             .collect()
     }
 
-    /// The repository half of an image reference. The pipeline tags with a
-    /// build number and the manifests with `v0.1.0`, so the repository is the
-    /// only part the two can be compared on. A `:` inside the last path segment
-    /// opens the tag; one before the last `/` is a registry port.
+    /// The repository half of an image reference. A `:` inside the last path
+    /// segment opens the tag; one before the last `/` is a registry port.
+    ///
+    /// The repository is all the closure below compares, and that is a real
+    /// limit rather than a convenience: the pipeline tags with
+    /// `${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}` and the manifests pin `v0.1.0`,
+    /// so the two tag spaces do not intersect and cannot be made to by reading
+    /// them harder. `the_tag_half_of_the_closure_is_open_and_says_why` states
+    /// what that leaves open and fails the day it becomes closable.
     fn image_repo(reference: &str) -> String {
         let reference = reference.trim().trim_matches('"');
         let last_segment = reference.rfind('/').map_or(0, |i| i + 1);
@@ -1038,9 +1156,9 @@ mod build_closure {
         images: Vec<String>,
     }
 
-    fn docker_builds(script: &str) -> Vec<DockerBuild> {
+    fn docker_builds(script: &str, lang: Lang) -> Vec<DockerBuild> {
         let mut out = Vec::new();
-        for line in joined_lines(script) {
+        for line in joined_lines(script, lang) {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             let Some(start) = tokens.windows(2).position(|w| w == ["docker", "build"]) else {
                 continue;
@@ -1081,9 +1199,9 @@ mod build_closure {
     /// `build` and `run` link; `clippy`, `check`, `tree` and `fmt` do not, and
     /// `test` links a harness rather than the `[[bin]]` a manifest names. Only
     /// the first two are evidence that a shipped binary exists.
-    fn cargo_links(script: &str) -> Vec<CargoLink> {
+    fn cargo_links(script: &str, lang: Lang) -> Vec<CargoLink> {
         let mut out = Vec::new();
-        for line in joined_lines(script) {
+        for line in joined_lines(script, lang) {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             let Some(start) = tokens.iter().position(|token| *token == "cargo") else {
                 continue;
@@ -1132,8 +1250,8 @@ mod build_closure {
         }
     }
 
-    fn linked_packages(script: &str) -> BTreeSet<String> {
-        cargo_links(script)
+    fn linked_packages(script: &str, lang: Lang) -> BTreeSet<String> {
+        cargo_links(script, lang)
             .into_iter()
             .map(|link| link.package)
             .collect()
@@ -1202,17 +1320,25 @@ mod build_closure {
         read(&root.join("Jenkinsfile"))
     }
 
-    /// Every image a manifest names is produced by this pipeline.
+    /// Every image *repository* a manifest names is produced by this pipeline.
     ///
     /// The failure this closes is not hypothetical: `ferrum-admission:v0.1.0`
     /// and `ferrum-controller:v0.1.0` were named by Deployments in this tree
     /// and built by nothing in it, so `kubectl apply -f deploy/` produced two
     /// ImagePullBackOffs and an enforcement plane that admits everything.
+    ///
+    /// It closes the repository half of that failure and no more. The tag half
+    /// is open — `image_repo` says why, and
+    /// `the_tag_half_of_the_closure_is_open_and_says_why` holds the reason to
+    /// the tree — so a manifest naming a repository this pipeline builds under
+    /// a tag it never produced still ImagePullBackOffs, and this test passes.
+    /// Reading the doc comment above as covering the whole class is the mistake
+    /// this paragraph exists to stop.
     #[test]
     fn every_image_a_manifest_names_is_built_by_the_pipeline() {
         let root = repo_root();
         let containers = deploy_containers(&root);
-        let built: BTreeSet<String> = docker_builds(&jenkinsfile(&root))
+        let built: BTreeSet<String> = docker_builds(&jenkinsfile(&root), Lang::Groovy)
             .into_iter()
             .flat_map(|build| build.images)
             .collect();
@@ -1247,6 +1373,60 @@ mod build_closure {
         );
     }
 
+    /// What the closure above does not close, said in the gate's own words, and
+    /// held to the two facts that make it unclosable here.
+    ///
+    /// The decision: the tag half cannot honestly be closed *in this
+    /// repository*. Nothing pushes — no stage in the Jenkinsfile runs
+    /// `docker push` — so the tags the pipeline invents
+    /// (`dev-$BUILD_NUMBER`) exist only in one node's local image store, and a
+    /// manifest pinned to one of them would name an image no cluster can pull
+    /// and would have to be rewritten on every build. Pinning the manifests to
+    /// a tag CI invents is its own defect, not a repair. So the comparison
+    /// stays on the repository, and this test keeps the two premises honest
+    /// instead of the doc comment quietly claiming the whole class:
+    ///
+    ///   * nothing publishes an image, and
+    ///   * every manifest pins a fixed tag rather than a floating one.
+    ///
+    /// The day the first stops being true — a `docker push` appears, and the
+    /// tags become something a cluster can resolve — this test fails, and the
+    /// repair is to close the tag half rather than to delete this. `:latest` in
+    /// a manifest fails it too: that is the one tag whose value cannot be
+    /// checked against anything, on the plane that decides admission.
+    #[test]
+    fn the_tag_half_of_the_closure_is_open_and_says_why() {
+        let root = repo_root();
+        let jenkins = strip_comments(&jenkinsfile(&root), Lang::Groovy);
+        assert!(
+            !jenkins.contains("docker push") && !jenkins.contains("docker image push"),
+            "a stage now publishes an image, so the tags this pipeline produces are \
+             resolvable and the closure gate can compare them. Close the tag half: \
+             `every_image_a_manifest_names_is_built_by_the_pipeline` compares \
+             repositories only, and a manifest pinning a tag nothing pushed is the \
+             ImagePullBackOff that gate exists to refuse."
+        );
+
+        let containers = deploy_containers(&root);
+        assert!(!containers.is_empty(), "no container found under deploy/");
+        let floating: Vec<String> = containers
+            .iter()
+            .filter(|c| {
+                let tag = c.image[image_repo(&c.image).len()..].trim_start_matches(':');
+                tag.is_empty() || tag == "latest"
+            })
+            .map(|c| format!("  {} (named by {})", c.image, c.file))
+            .collect();
+        assert!(
+            floating.is_empty(),
+            "these manifests name a floating tag:\n{}\nNothing in this repository \
+             publishes an image, so the tag is the only part of the reference an \
+             operator controls; `latest` hands it to whoever pushed last, on the \
+             plane that decides admission.",
+            floating.join("\n")
+        );
+    }
+
     /// Every crate that produces a binary is linked by a stage that emits
     /// object code.
     ///
@@ -1258,7 +1438,7 @@ mod build_closure {
     fn every_crate_with_a_binary_is_linked_by_a_stage_that_emits_object_code() {
         let root = repo_root();
         let crates = binary_crates(&root);
-        let linked = linked_packages(&jenkinsfile(&root));
+        let linked = linked_packages(&jenkinsfile(&root), Lang::Groovy);
 
         assert!(
             !crates.is_empty(),
@@ -1291,43 +1471,133 @@ mod build_closure {
     /// between a clippy run and a link is the entire point.
     #[test]
     fn the_scan_counts_a_link_and_refuses_to_count_a_clippy_run() {
+        let linked = |s: &str| linked_packages(s, Lang::Groovy);
         assert!(
-            linked_packages("cargo clippy -p ferrum-probe --all-targets -- -D warnings").is_empty(),
+            linked("cargo clippy -p ferrum-probe --all-targets -- -D warnings").is_empty(),
             "clippy emits .rmeta and no object code; counting it as a link is the \
              fail-open this gate exists to refuse"
         );
         assert!(
-            linked_packages("cargo check -p ferrum-probe").is_empty(),
+            linked("cargo check -p ferrum-probe").is_empty(),
             "`cargo check` does not link either"
         );
         assert!(
-            linked_packages("cargo build --release -p ferrum-probe").contains("ferrum-probe"),
+            linked("cargo build --release -p ferrum-probe").contains("ferrum-probe"),
             "a plain `cargo build -p` must be recognised, or every check above is \
              satisfied by a scan that finds nothing"
         );
         assert!(
-            linked_packages("cargo +nightly build -p ferrum-probe --target x")
-                .contains("ferrum-probe"),
+            linked("cargo +nightly build -p ferrum-probe --target x").contains("ferrum-probe"),
             "a toolchain override must not hide the package"
         );
         assert!(
-            linked_packages("cargo run -p ferrum-probe --quiet -- validate x")
-                .contains("ferrum-probe"),
+            linked("cargo run -p ferrum-probe --quiet -- validate x").contains("ferrum-probe"),
             "`cargo run` links before it runs"
         );
         // Prose about a build is not a build.
         assert!(
-            linked_packages("# cargo build -p ferrum-probe").is_empty(),
+            linked("# cargo build -p ferrum-probe").is_empty(),
             "a comment mentioning a build must not be read as one"
         );
         assert!(
-            docker_builds("// docker build -t ghcr.io/ferrum/x:v1 .")
+            docker_builds("// docker build -t ghcr.io/ferrum/x:v1 .", Lang::Groovy)
                 .into_iter()
                 .all(|b| b.images.is_empty()),
             "a comment mentioning an image must not be read as building one"
         );
         assert_eq!(image_repo("ghcr.io/ferrum/x:v0.1.0"), "ghcr.io/ferrum/x");
         assert_eq!(image_repo("\"r:5000/ferrum/x:${TAG}\""), "r:5000/ferrum/x");
+    }
+
+    /// The third comment form, which the two above did not read.
+    ///
+    /// The Jenkinsfile is Groovy, and `/* … */` is a comment in it. A
+    /// `docker build -t ghcr.io/ferrum/ferrum-controller… -f
+    /// Dockerfile.controller .` commented out that way satisfied
+    /// `every_image_a_manifest_names_is_built_by_the_pipeline` *and*
+    /// `each_image_is_built_from_a_dockerfile_that_links_its_own_crate` while
+    /// the pipeline built nothing at all — a hole in a control this repository
+    /// deliberately built, in the one form its own test did not name.
+    ///
+    /// The same form must NOT be read in a Dockerfile, where `/*` is a path.
+    /// `rm -rf /var/lib/apt/lists/*` appears in all three of ours, and a scan
+    /// that took it as a comment opener would drop everything after it —
+    /// including the `cargo build -p` line every other check here depends on.
+    #[test]
+    fn a_groovy_block_comment_is_a_comment_and_a_shell_glob_is_not() {
+        let commented = "/*\ndocker build -t ghcr.io/ferrum/x:v1 -f Dockerfile.x .\n*/";
+        assert!(
+            docker_builds(commented, Lang::Groovy)
+                .into_iter()
+                .all(|b| b.images.is_empty()),
+            "a `docker build` inside a Groovy block comment builds nothing, and a \
+             gate that counts it reports an image the pipeline never produced"
+        );
+        assert!(
+            linked_packages("/* cargo build -p ferrum-probe */", Lang::Groovy).is_empty(),
+            "a `cargo build` inside a block comment links nothing"
+        );
+        // Trailing block comments and one-line ones, on a line that also builds.
+        assert!(
+            docker_builds(
+                "docker build -t ghcr.io/ferrum/x:v1 . /* was: ghcr.io/ferrum/y */",
+                Lang::Groovy
+            )
+            .into_iter()
+            .any(|b| b.images.contains(&"ghcr.io/ferrum/x".to_string())),
+            "closing a block comment must not swallow the build beside it"
+        );
+        assert!(
+            !docker_builds(
+                "docker build -t ghcr.io/ferrum/x:v1 . /* was: ghcr.io/ferrum/y */",
+                Lang::Groovy
+            )
+            .into_iter()
+            .any(|b| b.images.contains(&"ghcr.io/ferrum/y".to_string())),
+            "the commented-out image must not be counted"
+        );
+        // Inside a `sh '''…'''` block the same bytes are shell, not Groovy.
+        assert!(
+            linked_packages(
+                "sh '''\n    cargo build -p ferrum-probe\n    rm -rf /var/lib/apt/lists/*\n'''",
+                Lang::Groovy
+            )
+            .contains("ferrum-probe"),
+            "a glob inside a triple-quoted shell block must not open a comment: \
+             everything after it is the pipeline this gate reads"
+        );
+        // And in a Dockerfile there is no such comment at all.
+        assert!(
+            linked_packages(
+                "RUN rm -rf /var/lib/apt/lists/*\nRUN cargo build -p ferrum-probe",
+                Lang::Dockerfile
+            )
+            .contains("ferrum-probe"),
+            "`/*` is a path in a Dockerfile; reading it as a comment opener would \
+             drop every line after the apt clean-up in all three of ours"
+        );
+        assert!(
+            linked_packages("# RUN cargo build -p ferrum-probe", Lang::Dockerfile).is_empty(),
+            "`#` is the Dockerfile comment, and it still has to work"
+        );
+        // A glob in a one-line Groovy string is not a comment opener either.
+        // This is the Jenkinsfile's own `stash includes: '…,crates/**,…'`: read
+        // as `/*` it opened a comment that ran to the next `*/` in the file,
+        // ate four stages and the `'''` that opens the next shell block, and
+        // left every quote boundary after it inverted — so the block-comment
+        // reader treated shell as Groovy and Groovy as shell.
+        assert_eq!(
+            docker_builds(
+                "stash includes: 'crates/**,dist/x'\n\
+                 sh '''\n    docker build -t ghcr.io/ferrum/x:v1 .\n'''\n\
+                 /* docker build -t ghcr.io/ferrum/y:v1 . */\n",
+                Lang::Groovy
+            )
+            .into_iter()
+            .flat_map(|b| b.images)
+            .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["ghcr.io/ferrum/x".to_string()]),
+        );
     }
 
     /// The image an operator pulls is built from the Dockerfile that links the
@@ -1341,7 +1611,7 @@ mod build_closure {
     #[test]
     fn each_image_is_built_from_a_dockerfile_that_links_its_own_crate() {
         let root = repo_root();
-        let builds = docker_builds(&jenkinsfile(&root));
+        let builds = docker_builds(&jenkinsfile(&root), Lang::Groovy);
         assert!(!builds.is_empty(), "no `docker build` in the Jenkinsfile");
         let known: BTreeSet<String> = binary_crates(&root).into_iter().map(|c| c.name).collect();
 
@@ -1352,7 +1622,7 @@ mod build_closure {
                 "the Jenkinsfile builds -f {} and no such file is in the tree",
                 build.dockerfile
             );
-            let linked = linked_packages(&read(&path));
+            let linked = linked_packages(&read(&path), Lang::Dockerfile);
             for image in &build.images {
                 let crate_name = image.rsplit('/').next().unwrap_or(image);
                 assert!(
@@ -1368,8 +1638,224 @@ mod build_closure {
                      builds: it starts.",
                     build.dockerfile
                 );
+                if let Err(why) = payload_of(&read(&path), crate_name) {
+                    panic!(
+                        "{} produces {image} and {why}. An image named after a crate it \
+                         does not contain is worse than one nothing builds: it starts. \
+                         The link above is not that check — a Dockerfile can link \
+                         {crate_name} and copy some other binary into the final stage \
+                         under that name, and every assertion here passed while it did.",
+                        build.dockerfile
+                    );
+                }
             }
         }
+    }
+
+    /// One `COPY --from=<stage> <src> <dst>` as the final stage writes it.
+    struct StageCopy {
+        from: String,
+        src: String,
+        dst: String,
+    }
+
+    /// The last `FROM` and everything after it: what the image actually
+    /// contains. Everything above is a build stage that is thrown away.
+    fn final_stage(dockerfile: &str) -> String {
+        let lines = joined_lines(dockerfile, Lang::Dockerfile);
+        let last = lines
+            .iter()
+            .rposition(|l| l.trim_start().to_ascii_uppercase().starts_with("FROM "))
+            .unwrap_or(0);
+        lines[last..].join("\n")
+    }
+
+    fn stage_copies(stage: &str) -> Vec<StageCopy> {
+        let mut out = Vec::new();
+        for line in stage.lines() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.first().map(|t| t.to_ascii_uppercase()) != Some("COPY".to_string()) {
+                continue;
+            }
+            let mut from = String::new();
+            let mut operands = Vec::new();
+            for token in &tokens[1..] {
+                if let Some(stage) = token.strip_prefix("--from=") {
+                    from = stage.to_string();
+                } else if !token.starts_with("--") {
+                    operands.push(token.trim_matches('"').to_string());
+                }
+            }
+            if operands.len() < 2 {
+                continue;
+            }
+            let dst = operands.pop().expect("destination");
+            for src in operands {
+                out.push(StageCopy {
+                    from: from.clone(),
+                    src,
+                    dst: dst.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    fn basename(path: &str) -> &str {
+        path.rsplit('/').next().unwrap_or(path)
+    }
+
+    /// What this Dockerfile puts in the image under `crate_name`, traced back to
+    /// the `cargo build` that produced it — or why it cannot be traced.
+    ///
+    /// `linked_packages` above proves a link happened. It says nothing about
+    /// which file the final stage copies, and those are two different claims: a
+    /// Dockerfile that links `ferrum-admission` and then copies `/ferrum-agent`
+    /// into `/usr/local/bin/ferrum-admission` passes every link assertion in
+    /// this file, produces an image an operator pulls by the admission name,
+    /// and starts the agent. So the chain is followed all the way: the final
+    /// stage's `COPY --from` destination named after the crate, back through
+    /// whatever `cp` in the build stage produced its source, back to a path
+    /// under a `release/` directory that ends in the crate's own name.
+    ///
+    /// The ENTRYPOINT is checked with it, because a binary in the image nothing
+    /// starts is the same defect one step later.
+    fn payload_of(dockerfile: &str, crate_name: &str) -> Result<(), String> {
+        let stage = final_stage(dockerfile);
+        let copies = stage_copies(&stage);
+        if copies.is_empty() {
+            return Err(format!(
+                "its final stage copies nothing at all, so no file named after \
+                 {crate_name} enters the image"
+            ));
+        }
+        let copy = copies
+            .iter()
+            .find(|c| basename(&c.dst) == crate_name)
+            .ok_or_else(|| {
+                format!(
+                    "its final stage copies nothing to a path named {crate_name} \
+                     (it copies to: {})",
+                    copies
+                        .iter()
+                        .map(|c| c.dst.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        if copy.from.is_empty() {
+            return Err(format!(
+                "its final stage copies {} to {} from the build context rather than \
+                 from a build stage, so nothing here links that file to a compiler",
+                copy.src, copy.dst
+            ));
+        }
+
+        // The source, resolved through the build stage. Every Dockerfile here
+        // lifts the binary out of the target directory with one `cp`, because
+        // the target triple is a build arg and `COPY --from` takes no variable
+        // expansion in the middle of a path.
+        let produced = joined_lines(dockerfile, Lang::Dockerfile)
+            .into_iter()
+            .filter_map(|line| {
+                let tokens: Vec<String> = line
+                    .split_whitespace()
+                    .map(|t| t.trim_matches('"').to_string())
+                    .collect();
+                let at = tokens.iter().position(|t| t == "cp")?;
+                let src = tokens.get(at + 1)?.clone();
+                let dst = tokens.get(at + 2)?.clone();
+                Some((src, dst))
+            })
+            .find(|(_, dst)| *dst == copy.src);
+
+        let origin = match &produced {
+            Some((src, _)) => src.clone(),
+            None => copy.src.clone(),
+        };
+        if basename(&origin) != crate_name {
+            return Err(format!(
+                "its final stage copies {} to {}, and that file is {}, which is not \
+                 {crate_name}",
+                copy.src,
+                copy.dst,
+                if produced.is_some() {
+                    format!("built from {origin}")
+                } else {
+                    format!("{origin}, produced by no `cp` in a build stage")
+                }
+            ));
+        }
+        if !origin.contains("release/") && !origin.contains("debug/") {
+            return Err(format!(
+                "its final stage copies {} to {}, and nothing in this file shows that \
+                 file coming out of a cargo target directory",
+                copy.src, copy.dst
+            ));
+        }
+
+        let entrypoint = stage
+            .lines()
+            .find(|l| {
+                l.trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("ENTRYPOINT")
+            })
+            .ok_or_else(|| format!("it declares no ENTRYPOINT, so {crate_name} never runs"))?;
+        if !entrypoint.contains(&copy.dst) {
+            return Err(format!(
+                "its ENTRYPOINT is {}, which is not the {} it copied {crate_name} to: \
+                 the image starts something other than the crate it is named after",
+                entrypoint.trim(),
+                copy.dst
+            ));
+        }
+        Ok(())
+    }
+
+    /// The tracer above, against Dockerfiles whose answer is known — including
+    /// the one this whole check exists for, which every other assertion in this
+    /// file passes.
+    #[test]
+    fn the_payload_trace_refuses_an_image_that_ships_another_crates_binary() {
+        let honest = "FROM rust AS build\n\
+             RUN cargo build --release -p ferrum-admission \\\n\
+             \x20&& cp target/x/release/ferrum-admission /ferrum-admission\n\
+             FROM scratch\n\
+             COPY --from=build /ferrum-admission /usr/local/bin/ferrum-admission\n\
+             ENTRYPOINT [\"/usr/local/bin/ferrum-admission\"]\n";
+        assert_eq!(payload_of(honest, "ferrum-admission"), Ok(()));
+
+        // The finding. It links the crate the image is named after and ships
+        // the agent under that name; `linked_packages` sees the link and is
+        // satisfied.
+        let swapped = honest.replace(
+            "COPY --from=build /ferrum-admission /usr/local/bin/ferrum-admission",
+            "COPY --from=build /ferrum-agent /usr/local/bin/ferrum-admission",
+        );
+        assert!(
+            linked_packages(&swapped, Lang::Dockerfile).contains("ferrum-admission"),
+            "the link check is satisfied by this file, which is the whole point"
+        );
+        assert!(payload_of(&swapped, "ferrum-admission").is_err());
+
+        // A binary in the image that nothing starts.
+        let unstarted = honest.replace(
+            "ENTRYPOINT [\"/usr/local/bin/ferrum-admission\"]",
+            "ENTRYPOINT [\"/usr/local/bin/ferrum-agent\"]",
+        );
+        assert!(payload_of(&unstarted, "ferrum-admission").is_err());
+
+        // A COPY out of the build context is not a build.
+        let from_context = honest.replace("COPY --from=build ", "COPY ");
+        assert!(payload_of(&from_context, "ferrum-admission").is_err());
+
+        // And a final stage that copies the right name from nowhere it built.
+        let unbuilt = honest.replace(
+            "&& cp target/x/release/ferrum-admission /ferrum-admission",
+            "&& true",
+        );
+        assert!(payload_of(&unbuilt, "ferrum-admission").is_err());
     }
 
     /// A flag a manifest passes that only a cargo feature provides is built into
@@ -1388,7 +1874,7 @@ mod build_closure {
 
         let root = repo_root();
         let containers = deploy_containers(&root);
-        let builds = docker_builds(&jenkinsfile(&root));
+        let builds = docker_builds(&jenkinsfile(&root), Lang::Groovy);
 
         let mut checked = 0;
         for (flag, feature) in FEATURE_FLAGS {
@@ -1404,7 +1890,7 @@ mod build_closure {
                     .unwrap_or_else(|| {
                         panic!("{} passes {flag} and nothing builds {repo}", container.file)
                     });
-                let link = cargo_links(&read(&root.join(&build.dockerfile)))
+                let link = cargo_links(&read(&root.join(&build.dockerfile)), Lang::Dockerfile)
                     .into_iter()
                     .find(|link| link.package == crate_name)
                     .unwrap_or_else(|| panic!("{} never links {crate_name}", build.dockerfile));

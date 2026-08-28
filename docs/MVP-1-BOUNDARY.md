@@ -102,7 +102,11 @@
   — это разница между «убить workload» и «убить того, кто унаследовал его
   pid».
 - **Набор измерен, а не только код.** `crates/ferrum-agent/tests/mutations/`
-  — шесть патчей и `run.sh`, каждый обязан уронить стык. Ронять обязаны все
+  — шесть патчей и `run.sh`, каждый обязан уронить стык. Сколько именно их
+  должно быть, стоит в `tests/mutation_manifest.rs`, а не в этой прозе:
+  `run.sh` перебирал `*.patch` и о количестве не утверждал ничего, так что
+  удаление пяти из шести оставляло одну измеренную мутацию, ноль выживших
+  и зелёную стадию. Ронять обязаны все
   шесть, и все шесть роняют — измерено прогоном harness на Linux 6.18.44,
   не прочтением кода: `react`, сообщающий `executed` без сигнала (внутри
   агента этого не видит ничто — экспорт и счётчики совпадают со здоровым
@@ -172,6 +176,9 @@
 | Корень cgroup2 выводится из `mountinfo`, а не зашит: неоднозначность и нечитаемый `mountinfo` — `Degraded`, а не догадка, и fallback на константу нет ни у guard, ни у индекса | K+U | U `ferrum-agent/src/lib.rs::a_refused_cgroup_root_is_a_named_fault_and_not_a_scan_of_the_default` · U `ferrum-agent/src/lib.rs::the_carrier_has_no_fallback_to_the_hardcoded_cgroup_root` · K `attach_join.rs::a_target_that_left_the_cgroup_is_refused_and_survives` · U `cgroupfs.rs::hybrid_node_resolves_to_the_unified_mount_not_the_tmpfs` · U `cgroupfs.rs::an_ambiguous_or_absent_hierarchy_is_degraded_never_the_default` · U `cgroupfs.rs::several_views_of_one_hierarchy_pick_one_deterministically` · U `cgroupfs.rs::the_derivation_agrees_with_this_node_if_it_has_a_cgroup2_mount` |
 | Стык проходит через продакшн-конструктор `ProcCgroupCheck::new()`, а не через свой вывод корня, и требует, чтобы выведённый корень совпал с тем, в котором создан probe | K | K `attach_join.rs::a_kernel_execve_of_a_shell_is_killed_by_the_signed_bundle` · K `attach_join.rs::a_kernel_openat_of_docker_sock_is_killed_by_the_signed_bundle` · K `attach_join.rs::a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted` · K `attach_join.rs::a_target_that_left_the_cgroup_is_refused_and_survives` · K `attach_join.rs::a_kernel_record_stripped_of_the_flag_is_still_read_as_truncated` · K `attach_join.rs::a_kill_this_kernel_refuses_is_degraded_and_named` |
 | Ни стадия, трогающая ядро, ни стадия стыка не могут пройти, не исполнившись: обе требуют строку-доказательство с дальнего конца attach и SIGKILL, а не только ненулевой счётчик passed | U | U `attach_live.rs::the_gate_must_not_be_compiled_out` · U `Jenkinsfile::BPF attach` · U `attach_join.rs::the_gate_must_not_be_compiled_out` · U `Jenkinsfile::BPF join` |
+| Набор строк-доказательств, которых требует стадия стыка, задан вне файла, который она читает: выпотрошенная kill-половина любого §D-теста — падение, а не молчаливо укоротившийся набор | U | U `join_evidence.rs::every_required_kill_still_reaches_a_confirmed_sigkill` · U `join_evidence.rs::the_join_prints_exactly_the_evidence_lines_this_file_requires` · U `join_evidence.rs::every_required_kill_is_a_row_the_boundary_document_cites` · U `join_evidence.rs::the_body_reader_finds_one_test_and_notices_a_gutted_one` · U `Jenkinsfile::BPF join` |
+| Мутаций ровно шесть, и harness отказывается измерять набор, который не совпадает с этим списком: удалить пять из шести — падение под обычным `cargo test`, а не зелёная стадия, измерившая одну | U | U `mutation_manifest.rs::the_mutation_set_is_the_one_the_gate_is_measured_against` · U `mutation_manifest.rs::every_mutation_targets_a_file_that_still_exists` · U `mutation_manifest.rs::the_runner_derives_its_floor_from_this_file` · U `Jenkinsfile::BPF join mutations` |
+| Каждый образ, который называет манифест, собирается этим pipeline, собирается из Dockerfile, который линкует одноимённый crate, и содержит именно его бинарь: `COPY --from` в финальной стадии прослежен до `cargo build`, а комментарии обоих языков не считаются сборкой | U | U `deploy_gate.rs::every_image_a_manifest_names_is_built_by_the_pipeline` · U `deploy_gate.rs::each_image_is_built_from_a_dockerfile_that_links_its_own_crate` · U `deploy_gate.rs::the_payload_trace_refuses_an_image_that_ships_another_crates_binary` · U `deploy_gate.rs::a_groovy_block_comment_is_a_comment_and_a_shell_glob_is_not` · U `deploy_gate.rs::the_scan_counts_a_link_and_refuses_to_count_a_clippy_run` |
 | Продуктовая комбинация `attach,apiserver` линкуется под musl и не несёт program interpreter | U | U `Jenkinsfile::Agent binary` |
 | Оба поставляемых DaemonSet монтируют tracefs как hostPath типа `Directory`, и attach-манифест без такого монтирования — находка FD026, а не предупреждение | U | U `Jenkinsfile::Validate policies` · U `lint_deploy.rs::an_attach_build_without_tracefs_is_a_finding` · U `lint_deploy.rs::an_emptydir_where_tracefs_belongs_is_still_a_finding` · U `lint_deploy.rs::a_tracefs_hostpath_kubelet_would_create_is_still_a_finding` · U `lint_deploy.rs::the_tracefs_fixture_fails_on_that_rule_and_no_other` |
 | Манифест, называющий корень доверия дважды, — находка, а не молчаливое last-wins | U | U `lint_deploy.rs::a_trust_root_named_twice_is_a_finding` |
@@ -180,7 +187,9 @@
 | `rcgen` и `x509-parser` не попадают в графы admission и agent, и детектор доказан на `ferrum-cli` | U | U `Jenkinsfile::Crate boundary` |
 | Оба arch дают один вердикт на одних логических событиях, из записанных байтов | U | U `replay.rs::both_arches_reach_the_same_verdicts_on_the_same_logical_events` · U `replay.rs::recorded_fixture_records_still_produce_the_acceptance_verdicts` |
 | Prefilter-образ поставляемой политики — тот, который утверждает ручная копия в `ferrum-ebpf` | U | U `deploy_gate.rs::the_prefilter_image_of_the_shipped_policy_is_the_one_its_unit_test_asserts` |
-| Контейнер, называющий apiserver-watch, и спроецированный SA-токен — одна связка, и обе её половины читает FD027; поставляемое дерево падало на этом правиле до правки манифестов | U | U `lint_deploy.rs::deploy_tree_is_clean` |
+| Контейнер, называющий apiserver-watch, и спроецированный SA-токен — одна связка, и обе её половины читает FD027; поставляемое дерево падало на этом правиле до правки манифестов | U | U `lint_deploy.rs::an_apiserver_watch_without_a_projected_token_is_a_finding` · U `lint_deploy.rs::the_agents_pod_watch_needs_the_same_token` · U `lint_deploy.rs::a_selector_bearing_policy_with_no_label_source_is_a_finding` · U `lint_deploy.rs::a_policy_without_a_selector_needs_no_label_source` · U `lint_deploy.rs::the_token_fixture_fails_on_that_rule_and_no_other` · U `lint_deploy.rs::deploy_tree_is_clean` |
+| FD027 читает токен по пути, а не по факту automount: явная `projected` проекция, смонтированная туда, откуда её читает код, — не находка, а смонтированная в другое место — находка | U | U `lint_deploy.rs::a_projected_token_where_the_code_reads_it_is_not_a_finding` · U `lint_deploy.rs::a_projected_token_mounted_somewhere_else_is_still_a_finding` · U `lint_deploy.rs::a_projected_token_no_container_mounts_is_still_a_finding` |
+| Под, чьему ServiceAccount это дерево выдало RBAC, обязан нести токен, даже если не называет ни одного флага watch — иначе он аутентифицируется как `system:anonymous`, а выданный грант описывает личность, которую никто не предъявляет | U | U `lint_deploy.rs::a_granted_service_account_with_no_projected_token_is_a_finding` · U `lint_deploy.rs::a_service_account_this_tree_grants_nothing_needs_no_token` · U `lint_deploy.rs::a_binding_to_a_ruleless_role_is_not_a_grant` |
 | `ApiserverConfig` без спроецированного токена — ошибка старта, называющая файл, а не бесконечный backoff | U | U `ferrum-k8smeta/src/watch.rs::a_config_without_a_projected_token_is_an_error_that_names_the_file` |
 | `status.json` пишется целиком, переживает сбой записи и не держит замок на агенте | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::the_status_write_holds_no_lock_on_the_shared_agent` |
 
@@ -257,6 +266,19 @@
   внутри `docker build`. «Образ собирается» — не то утверждение, которое это
   дерево может сделать. `deploy/**` по-прежнему ссылается на
   `ghcr.io/ferrum/*:v0.1.0`, которых никто не публиковал.
+- **Замыкание «манифест ↔ pipeline» закрыто по репозиторию и открыто по
+  тегу.** `every_image_a_manifest_names_is_built_by_the_pipeline` сравнивает
+  только репозиторий, потому что стадии тегируют
+  `dev-$BUILD_NUMBER`, а манифесты закрепляют `v0.1.0`: два непересекающихся
+  пространства тегов, которые нельзя сравнить, читая их внимательнее.
+  Закрыть теговую половину в этом репозитории нечестно — ничто не делает
+  `docker push`, так что тег, который придумывает CI, существует только в
+  локальном сторе одного узла, а манифест, закреплённый на таком теге, —
+  отдельный дефект, а не починка. Поэтому это сказано здесь, а не спрятано
+  в doc-комментарии, который описывал весь класс отказа целиком:
+  `the_tag_half_of_the_closure_is_open_and_says_why` держит обе посылки —
+  ничто не публикует образ, и ни один манифест не называет плавающий тег —
+  и падает в тот день, когда первая перестанет быть верной.
 - **Заархивированный `dist/ferrum-agent` — не тот бинарь, что в образе.**
   Стадия `Agent binary` линкует и фингерпринтит один; `docker build` линкует
   внутри себя второй, из застэшенных исходников. Фингерпринт на артефакте про
