@@ -7,6 +7,8 @@ mod apply;
 mod bundle;
 mod health;
 mod key;
+#[cfg(test)]
+mod testapi;
 mod watch;
 
 pub use apply::{

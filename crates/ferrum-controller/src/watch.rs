@@ -212,7 +212,25 @@ fn as_class(class: FailureClass) -> impl Fn(FerrumError) -> Classified {
     move |err| Classified { class, err }
 }
 
+/// Install the process-wide rustls provider before the first `kube::Client`.
+///
+/// `kube` builds its TLS stack through `rustls::ClientConfig::builder()`, which
+/// reads a process-wide `CryptoProvider` and panics when none is installed. It
+/// installs one itself only under its `aws-lc-rs` feature, which this tree does
+/// not carry (ring everywhere, and the release binaries are static musl). So
+/// the provider is installed here, before any client exists: without it the
+/// controller panics inside rustls on the first line of `run_watch` — before a
+/// watch, before a counter, before any status file could say why.
+pub(crate) fn install_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // Err means another thread installed one first, which is the outcome
+        // this asks for.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 pub async fn run_watch(cfg: WatchConfig) -> Result<()> {
+    install_crypto_provider();
     let client = Client::try_default()
         .await
         .map_err(|e| FerrumError::Degraded(format!("kube client: {e}")))?;
@@ -422,17 +440,30 @@ async fn handle_exception_event(
             // success of this class would disarm the terminal rule for it for
             // the life of the process.
             health.note_success(published.requested);
-            for name in &published.unscopable {
-                let err = FerrumError::Integrity(format!(
-                    "secret {name} carries {}={} and no {} label: this controller cannot \
-                     scope an exception list to it, so the list it already holds is what the \
-                     agents reading it still get",
+            // A Secret this controller cannot scope a list to is that Secret
+            // being wrong, and it is wrong on every event until a human fixes
+            // its labels. Charged as a failure it was an unbounded run by
+            // construction and the process exited on the tenth event; it is a
+            // reason, in the file and in `is_degraded()`, and never a run.
+            let unscopable = published.unscopable.clone();
+            if health.note_unactionable(FailureClass::ExceptionPublish, unscopable)
+                && !published.unscopable.is_empty()
+            {
+                eprintln!(
+                    "ferrum-controller: exception publish: secret(s) {} carry {}={} and no {} \
+                     label: this controller cannot scope an exception list to them, so the list \
+                     each already holds is what the agents reading it still get",
+                    published.unscopable.join(", "),
                     crate::apply::MANAGED_BY_KEY,
                     crate::apply::MANAGED_BY_VALUE,
                     crate::apply::POLICY_LABEL_KEY,
-                ));
-                eprintln!("ferrum-controller: exception publish: {err}");
-                health.note_failure(FailureClass::ExceptionPublish, &err)?;
+                );
+            }
+            // A Secret the API server refused is an ordinary failure of this
+            // class, counted after the receipt for the ones that went through.
+            for cause in &published.refused {
+                eprintln!("ferrum-controller: exception publish: {cause}");
+                health.note_failure(FailureClass::ExceptionPublish, cause)?;
             }
             Ok(())
         }
@@ -517,21 +548,23 @@ async fn reconcile_object(
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
-        let secret = load_bundle_secret(client, &cfg.namespace, &secret_name(&name))
+        let loaded = load_bundle_secret(client, &cfg.namespace, &secret_name(&name))
             .await
             .map_err(&reconcile_class)?;
+        // The GET was issued and answered, whatever it answered. It is the
+        // only request a converged object makes, and crediting nothing for it
+        // left `reconcile` never-having-worked on a cluster where every object
+        // is converged — which is a cluster in its steady state, not a broken
+        // one.
+        health.note_success(loaded.requested);
         if should_skip_applied(
             generation,
             og,
             ready,
             &digest,
-            secret.as_ref(),
+            loaded.secret.as_ref(),
             &cfg.trust_root,
         ) {
-            // Nothing was requested, so nothing succeeded: an object that is
-            // already converged must not mark a class as having worked, or a
-            // controller that can PATCH nothing would be protected from the
-            // terminal rule by the objects it never touched.
             return Ok(());
         }
     }
@@ -582,19 +615,20 @@ async fn reconcile_namespaced_object(
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
-        let secret = load_bundle_secret(
+        let loaded = load_bundle_secret(
             client,
             &cfg.namespace,
             &namespaced_secret_name(&name, &policy_namespace),
         )
         .await
         .map_err(&reconcile_class)?;
+        health.note_success(loaded.requested);
         if should_skip_applied(
             generation,
             og,
             ready,
             &digest,
-            secret.as_ref(),
+            loaded.secret.as_ref(),
             &cfg.trust_root,
         ) {
             return Ok(());
@@ -671,17 +705,27 @@ async fn attach_exceptions(
         return Ok(Requested::NONE);
     };
     let secret = plan.secret.as_ref().expect("attach_target read the Secret");
-    let scoped = match secret
+    // The same refusal `exception_targets` makes on the publish path, and for
+    // the same reason: a Secret whose policy this controller cannot name is a
+    // Secret it cannot scope a list to, and publishing the unscoped list into
+    // it widens every exception the list carries to a policy nobody targeted
+    // them at. This arm published it. Nothing reaches it today — every plan
+    // this controller builds labels its Secret — and two paths that answer one
+    // question two ways is the state in which the next change picks the wrong
+    // one.
+    let Some(policy) = secret
         .metadata
         .labels
         .as_ref()
         .and_then(|l| l.get(crate::apply::POLICY_LABEL_KEY))
-    {
-        Some(policy) => {
-            crate::apply::exceptions_for_policy(&snapshot_exceptions(exceptions), policy)
-        }
-        None => snapshot_exceptions(exceptions),
+    else {
+        return Err(FerrumError::Integrity(format!(
+            "secret {secret_name} carries no {} label: refusing to attach an exception list \
+             this controller cannot scope to a policy",
+            crate::apply::POLICY_LABEL_KEY,
+        )));
     };
+    let scoped = crate::apply::exceptions_for_policy(&snapshot_exceptions(exceptions), policy);
     patch_secret_exceptions(
         client,
         &cfg.namespace,
@@ -1330,5 +1374,325 @@ mod tests {
         assert!(!status.active);
         assert!(live.is_none());
         assert!(!status.message.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // The receipts, measured against a stub API server rather than modelled.
+    //
+    // Everything above this line reads a pure function; the defects below
+    // live in what the reconcile path does with an answer the API server
+    // gave it, and none of them is visible without one.
+    // ---------------------------------------------------------------------
+
+    use crate::testapi::{status_error, Req, StubApi};
+    use std::sync::Arc as StdArc;
+
+    fn stub_cfg() -> WatchConfig {
+        WatchConfig {
+            namespace: DEFAULT_NAMESPACE.to_string(),
+            secret_key: RFC8032_SK.to_vec(),
+            trust_root: pk(),
+            library: None,
+            clusters: Vec::new(),
+            status_dir: None,
+        }
+    }
+
+    /// A Secret as the API server lists it: owned by this controller, and
+    /// scopable when `policy` is `Some`.
+    fn listed_secret(name: &str, policy: Option<&str>) -> serde_json::Value {
+        let mut labels = serde_json::Map::new();
+        labels.insert(
+            crate::apply::MANAGED_BY_KEY.to_string(),
+            serde_json::json!(crate::apply::MANAGED_BY_VALUE),
+        );
+        if let Some(policy) = policy {
+            labels.insert(
+                crate::apply::POLICY_LABEL_KEY.to_string(),
+                serde_json::json!(policy),
+            );
+        }
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": name, "namespace": DEFAULT_NAMESPACE, "labels": labels },
+            "type": "Opaque",
+        })
+    }
+
+    fn secret_list(items: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "SecretList",
+            "metadata": { "resourceVersion": "1" },
+            "items": items,
+        })
+    }
+
+    /// The first `kube::Client` this process builds must not be a panic.
+    ///
+    /// `kube` builds its TLS stack through `rustls::ClientConfig::builder()`,
+    /// which panics when no process-wide `CryptoProvider` is installed, and it
+    /// installs one itself only under its `aws-lc-rs` feature — which this
+    /// tree does not carry. So `Client::try_default()` on the first line of
+    /// `run_watch` panicked before a watch, before a counter and before any
+    /// status file could say why: the whole surface this module publishes was
+    /// unreachable on a real cluster. The tests below are the other half of
+    /// this one — every one of them builds a client and gets an answer.
+    #[test]
+    fn the_process_has_a_crypto_provider_before_its_first_client() {
+        install_crypto_provider();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "no rustls provider is installed, so the first kube::Client this process builds \
+             panics inside rustls"
+        );
+    }
+
+    /// One publish pass, driven through the same function the exception watch
+    /// drives: `InitDone` carries no object, so the only requests it makes are
+    /// the ones `persist_exceptions` makes.
+    async fn publish_pass(
+        client: &Client,
+        cfg: &WatchConfig,
+        health: &ControllerHealth,
+    ) -> Result<()> {
+        let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+        let staging: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+        handle_exception_event(
+            client,
+            cfg,
+            &exceptions,
+            &staging,
+            health,
+            watcher::Event::InitDone,
+        )
+        .await
+    }
+
+    /// One Secret that refuses every PATCH must not make the ones that
+    /// succeeded invisible.
+    ///
+    /// `persist_exceptions` walked its targets with `?` inside the loop, so
+    /// the first refusal returned before the receipt for the Secrets already
+    /// patched was built. `ever_ok` for `exception_publish` therefore stayed
+    /// false for the life of the process, and the tenth event ended it —
+    /// naming a class in which publishing had in fact worked on every event,
+    /// on every other Secret. The terminal rule exists to report a deployment
+    /// that never worked; this is it firing on one 413.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_secret_that_refuses_every_patch_does_not_end_a_controller_that_publishes() {
+        let stub = StubApi::start(StdArc::new(|req: &Req| {
+            match (req.method.as_str(), req.path()) {
+                ("GET", _) => (
+                    200,
+                    secret_list(vec![
+                        listed_secret("ferrum-bundle-cluster-a", Some("a")),
+                        listed_secret("ferrum-bundle-cluster-b", Some("b")),
+                    ]),
+                ),
+                ("PATCH", p) if p.ends_with("ferrum-bundle-cluster-b") => (
+                    413,
+                    status_error(413, "Request entity too large: limit is 3145728"),
+                ),
+                ("PATCH", _) => (200, listed_secret("ferrum-bundle-cluster-a", Some("a"))),
+                _ => (404, status_error(404, "not found")),
+            }
+        }));
+        let client = stub.client();
+        let cfg = stub_cfg();
+        let health = ControllerHealth::new();
+
+        for event in 1..=TERMINAL_RUN {
+            publish_pass(&client, &cfg, &health)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "event {event} of {TERMINAL_RUN} ended the process: {e}. Every one of \
+                         them published the exception list to ferrum-bundle-cluster-a"
+                    )
+                });
+        }
+        assert!(
+            health.ever_succeeded(FailureClass::ExceptionPublish),
+            "a pass that patched one Secret and was refused by another reported no publish at all"
+        );
+        assert_eq!(
+            stub.seen_matching("PATCH", "ferrum-bundle-cluster-a").len() as u64,
+            TERMINAL_RUN,
+            "one publish per event, including the events after the first refusal"
+        );
+        assert!(
+            health.is_degraded(),
+            "the Secret that refuses every patch must still be a reason"
+        );
+    }
+
+    /// A Secret this controller cannot scope a list to is one object being
+    /// wrong, and one object may not end the process.
+    ///
+    /// The `unscopable` list is charged to `exception_publish` once per event,
+    /// while the pass that found it patched nothing and so returned
+    /// `Requested::NONE`. Ten events — ten watch relists, or ten exceptions
+    /// being edited — and the controller exits, calling a hand-made Secret a
+    /// deployment fault of the class that publishes exceptions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_secret_that_cannot_be_scoped_is_a_reason_and_never_a_terminal_run() {
+        let stub = StubApi::start(StdArc::new(|req: &Req| match req.method.as_str() {
+            "GET" => (200, secret_list(vec![listed_secret("hand-made", None)])),
+            _ => (404, status_error(404, "not found")),
+        }));
+        let client = stub.client();
+        let cfg = stub_cfg();
+        let health = ControllerHealth::new();
+
+        for event in 1..=TERMINAL_RUN * 2 {
+            publish_pass(&client, &cfg, &health)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "event {event} ended the process: {e}. One Secret with no {} label is \
+                         that Secret being wrong; the process publishes to every other one and \
+                         must keep running",
+                        crate::apply::POLICY_LABEL_KEY
+                    )
+                });
+        }
+        assert!(
+            stub.seen_matching("PATCH", "hand-made").is_empty(),
+            "the unscoped list was published into a Secret this controller cannot scope"
+        );
+        let reasons = health.degraded_reasons();
+        assert!(
+            reasons.iter().any(|r| r.contains("hand-made")),
+            "the Secret nobody can scope is not in any reason an operator reads: {reasons:?}"
+        );
+    }
+
+    /// An object that is already converged asked the API server for its Secret
+    /// and got an answer, and that is a request of `reconcile` that worked.
+    ///
+    /// The skip returned `Ok(())` and credited nothing, so on a cluster in its
+    /// steady state — every object converged — `reconcile.ever_ok` stayed
+    /// false for the life of the process, and ten failures with no success
+    /// between them end it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_converged_object_credits_the_get_it_made() {
+        let outcome = reconcile(ReconcileInput {
+            spec: &prod_restricted().spec,
+            observed_generation: 3,
+            secret_key: &RFC8032_SK,
+            library: None,
+            clusters: &[],
+        });
+        let applied = match outcome {
+            ReconcileOutcome::Applied(applied) => applied,
+            ReconcileOutcome::Failed(s) => panic!("{}", s.compile.message),
+        };
+        let secret = bundle_secret("prod-restricted", DEFAULT_NAMESPACE, &applied.bundle, &pk())
+            .expect("secret");
+        let secret_json = serde_json::to_value(&secret).expect("secret json");
+        let digest = applied.bundle.digest.as_str().to_string();
+
+        let stub = StubApi::start(StdArc::new(move |req: &Req| match req.method.as_str() {
+            "GET" => (200, secret_json.clone()),
+            _ => (404, status_error(404, "not found")),
+        }));
+        let client = stub.client();
+        let cfg = stub_cfg();
+        let health = ControllerHealth::new();
+        let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let obj = converged_object("prod-restricted", 3, &digest);
+        assert!(
+            reconcile_object(&client, &cfg, &exceptions, &health, obj)
+                .await
+                .is_ok(),
+            "a converged object is not a failure"
+        );
+        assert_eq!(
+            stub.seen_matching("GET", "secrets").len(),
+            1,
+            "the skip is decided from a Secret the API server was asked for"
+        );
+        assert!(
+            stub.seen_matching("PATCH", "").is_empty(),
+            "a converged object writes nothing, which is the point of the skip"
+        );
+        assert!(
+            health.ever_succeeded(FailureClass::Reconcile),
+            "the GET that decided the skip was issued and answered, and nothing recorded it: a \
+             controller in its steady state can never mark `reconcile` as having worked"
+        );
+    }
+
+    /// The object the API server holds for a policy that is already applied.
+    fn converged_object(name: &str, generation: i64, digest: &str) -> DynamicObject {
+        let spec = prod_restricted().spec;
+        let v = serde_json::json!({
+            "apiVersion": "ferrum.io/v1",
+            "kind": "ClusterSecurityPolicy",
+            "metadata": { "name": name, "generation": generation, "resourceVersion": "42" },
+            "spec": spec,
+            "status": {
+                "observedGeneration": generation,
+                "compile": { "ready": true, "bundleDigest": digest, "message": "" },
+                "rollout": {},
+            },
+        });
+        serde_json::from_value(v).expect("DynamicObject")
+    }
+
+    /// A Secret with no policy label gets no exception list, on both paths
+    /// that can publish one.
+    ///
+    /// `persist_exceptions` refuses it — that is what `exception_targets` is
+    /// for — and `attach_exceptions` published the whole unscoped list into it
+    /// instead, which is the widening the scoping exists to prevent. The plan
+    /// this controller builds always carries the label, so nothing reaches
+    /// this today; two paths that answer one question differently is the state
+    /// in which the next change picks the wrong one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attaching_to_an_unlabelled_secret_publishes_nothing() {
+        let stub = StubApi::start(StdArc::new(|_req: &Req| {
+            (
+                200,
+                serde_json::json!({ "kind": "Secret", "apiVersion": "v1" }),
+            )
+        }));
+        let client = stub.client();
+        let cfg = stub_cfg();
+        let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
+
+        let outcome = reconcile(ReconcileInput {
+            spec: &prod_restricted().spec,
+            observed_generation: 1,
+            secret_key: &RFC8032_SK,
+            library: None,
+            clusters: &[],
+        });
+        let mut plan = plan_apply("prod-restricted", DEFAULT_NAMESPACE, &outcome, &pk());
+        let secret = plan.secret.as_mut().expect("the plan carries a Secret");
+        secret
+            .metadata
+            .labels
+            .as_mut()
+            .expect("labels")
+            .remove(crate::apply::POLICY_LABEL_KEY);
+
+        let err = attach_exceptions(&client, &cfg, &exceptions, &plan)
+            .await
+            .expect_err(
+                "an exception list scoped to no policy was published into a Secret whose policy \
+                 this controller cannot name",
+            );
+        assert!(
+            matches!(err, FerrumError::Integrity(_)),
+            "refusing to widen an exception list is an integrity refusal: {err:?}"
+        );
+        assert!(
+            stub.seen_matching("PATCH", "").is_empty(),
+            "the unscoped list reached the API server"
+        );
     }
 }

@@ -236,6 +236,28 @@ pub const REFUSE_ROLE: &str = "respond role disabled";
 pub const REFUSE_AGENT_SELF: &str = "agent-self event: the agent does not kill itself";
 pub const REFUSE_NOT_CONTAINER: &str = "not a container process";
 pub const REFUSE_UNKNOWN_IDENTITY: &str = "unknown workload identity (cgroup not in cache)";
+/// The selector that decides whether this policy covers this workload could
+/// not be resolved: the label caches are cold, relisting after a 410, or held
+/// down after a frame the parser could not read.
+///
+/// The decision still applies the program — skipping the rules there is a
+/// silent fail-open, and admission fails closed on exactly this state — but
+/// applying it and *signalling* on it are not the same act. Admission's
+/// fail-closed refuses to admit a Pod, which the next retry undoes once the
+/// cache is warm. Here the same fail-closed would be a SIGKILL, which nothing
+/// undoes, and the group whose labels are unknown is unknown for every pod on
+/// the node at once: one 410 on the namespace watch, and a `Kill` rule under a
+/// `namespaceSelector` reaches every workload the node runs. That is not the
+/// policy being enforced against the workloads it selects; it is the policy
+/// being executed against workloads nobody has established it selects.
+///
+/// So the match is recorded, exported with the rule that matched and
+/// `labels_unknown`, counted in `respond_refused_total`, and left in
+/// `DEG_LABELS_UNKNOWN` — and no signal is sent until the identity can be
+/// resolved. `Deny` and `Audit` are unaffected: neither ends a process.
+pub const REFUSE_LABELS_UNKNOWN: &str =
+    "selector unresolved (label caches cold, relisting or held down): the policy's scope for \
+     this workload is unproven, so no signal is sent";
 pub const REFUSE_TGID_ZERO: &str = "tgid 0: no process to signal";
 pub const REFUSE_TGID_INIT: &str = "tgid 1: init is never a target";
 pub const REFUSE_TGID_SELF: &str = "tgid is this agent process";
@@ -271,6 +293,7 @@ pub fn refuse_reason(
     agent_self: bool,
     in_container: bool,
     identity_unknown: bool,
+    scope_unproven: bool,
 ) -> Option<&'static str> {
     if !respond_role {
         return Some(REFUSE_ROLE);
@@ -283,6 +306,13 @@ pub fn refuse_reason(
     }
     if identity_unknown {
         return Some(REFUSE_UNKNOWN_IDENTITY);
+    }
+    // The workload is named and the policy's scope over it is not. See
+    // `REFUSE_LABELS_UNKNOWN`: the two are the same refusal one step apart —
+    // «which workload is this» and «does this policy cover it» — and a signal
+    // needs both answered.
+    if scope_unproven {
+        return Some(REFUSE_LABELS_UNKNOWN);
     }
     if tgid == 0 {
         return Some(REFUSE_TGID_ZERO);
@@ -320,34 +350,34 @@ mod tests {
     #[test]
     fn guards_run_in_order_and_cover_every_hard_refusal() {
         assert_eq!(
-            refuse_reason(false, 42, false, true, false),
+            refuse_reason(false, 42, false, true, false, false),
             Some(REFUSE_ROLE)
         );
         assert_eq!(
-            refuse_reason(true, 42, true, true, false),
+            refuse_reason(true, 42, true, true, false, false),
             Some(REFUSE_AGENT_SELF)
         );
         assert_eq!(
-            refuse_reason(true, 42, false, false, false),
+            refuse_reason(true, 42, false, false, false, false),
             Some(REFUSE_NOT_CONTAINER)
         );
         assert_eq!(
-            refuse_reason(true, 42, false, true, true),
+            refuse_reason(true, 42, false, true, true, false),
             Some(REFUSE_UNKNOWN_IDENTITY)
         );
         assert_eq!(
-            refuse_reason(true, 0, false, true, false),
+            refuse_reason(true, 0, false, true, false, false),
             Some(REFUSE_TGID_ZERO)
         );
         assert_eq!(
-            refuse_reason(true, 1, false, true, false),
+            refuse_reason(true, 1, false, true, false, false),
             Some(REFUSE_TGID_INIT)
         );
         assert_eq!(
-            refuse_reason(true, std::process::id(), false, true, false),
+            refuse_reason(true, std::process::id(), false, true, false, false),
             Some(REFUSE_TGID_SELF)
         );
-        assert_eq!(refuse_reason(true, 424242, false, true, false), None);
+        assert_eq!(refuse_reason(true, 424242, false, true, false, false), None);
     }
 
     /// `u32 as pid_t` on these values is a negative pid: -1 is "every process
@@ -356,12 +386,15 @@ mod tests {
     fn tgid_that_would_wrap_negative_is_refused() {
         for tgid in [u32::MAX, 0x8000_0000, 0xFFFF_FFFE, MAX_TGID, MAX_TGID + 1] {
             assert_eq!(
-                refuse_reason(true, tgid, false, true, false),
+                refuse_reason(true, tgid, false, true, false, false),
                 Some(REFUSE_TGID_RANGE),
                 "tgid {tgid}"
             );
         }
-        assert_eq!(refuse_reason(true, MAX_TGID - 1, false, true, false), None);
+        assert_eq!(
+            refuse_reason(true, MAX_TGID - 1, false, true, false, false),
+            None
+        );
     }
 
     /// Even bypassing the guards, the responder itself refuses the signal.

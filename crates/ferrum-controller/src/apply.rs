@@ -145,6 +145,18 @@ pub fn exceptions_secret_patch(
 pub struct ExceptionsPublished {
     /// `ExceptionPublish` only if at least one Secret was actually patched.
     pub requested: Requested,
+    /// Secrets the API server refused this pass, one message each, in the
+    /// order they were tried.
+    ///
+    /// The pass used to leave on the first of them with `?`, which threw away
+    /// the receipt for every Secret it had already patched — so one Secret
+    /// that refuses permanently (413 on an oversized list, a conflict that
+    /// keeps recurring) made a class in which publishing works on every other
+    /// Secret look like a class in which nothing has ever worked, and the
+    /// tenth event ended the process. Continuing is also the better answer for
+    /// the Secrets after it in the list: an exception that cannot reach one
+    /// agent must still reach the rest.
+    pub refused: Vec<String>,
     /// Secrets carrying this controller's managed-by label that it cannot
     /// scope a list to: no name, or no `ferrum.io/policy` label. This
     /// controller writes that label on every Secret it creates, so such a
@@ -202,16 +214,28 @@ pub async fn persist_exceptions(
         .map_err(|e| FerrumError::Degraded(format!("secret list {namespace}: {e}")))?;
     let (targets, unscopable) = exception_targets(&list.items);
     let mut patched = 0usize;
+    let mut refused = Vec::new();
     for (name, policy) in targets {
-        let patch = exceptions_secret_patch(&exceptions_for_policy(specs, &policy), secret_key)?;
-        api.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+        let patch =
+            match exceptions_secret_patch(&exceptions_for_policy(specs, &policy), secret_key) {
+                Ok(patch) => patch,
+                Err(err) => {
+                    refused.push(format!("exception list for secret {name}: {err}"));
+                    continue;
+                }
+            };
+        match api
+            .patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
-            .map_err(|e| FerrumError::Degraded(format!("secret patch {name}: {e}")))?;
-        // Counted after the patch, never before it.
-        patched += 1;
+        {
+            // Counted after the patch, never before it.
+            Ok(_) => patched += 1,
+            Err(err) => refused.push(format!("secret patch {name}: {err}")),
+        }
     }
     Ok(ExceptionsPublished {
         requested: publish_receipt(patched),
+        refused,
         unscopable,
     })
 }
@@ -318,15 +342,36 @@ pub fn live_secret_matches(secret: &Secret, trust_root: &[u8], expected_digest: 
     }
 }
 
+/// The bundle Secret as the API server holds it, and the receipt for the GET
+/// that asked for it.
+///
+/// The receipt is the point. `get_opt` is a request of the `reconcile` class —
+/// it is charged there when it fails — and it is the only request an object
+/// that is already converged makes. The caller returned `Ok(())` from that
+/// path crediting nothing, so on a cluster in its steady state, where every
+/// object is converged, `reconcile.ever_ok` was false for the life of the
+/// controller and the terminal rule was armed against a process doing exactly
+/// what it should. `None` is not the absent case here: a Secret that is not
+/// there was still asked for and answered.
+pub(crate) struct LoadedSecret {
+    pub secret: Option<Secret>,
+    pub requested: Requested,
+}
+
 pub(crate) async fn load_bundle_secret(
     client: &Client,
     namespace: &str,
     secret_name: &str,
-) -> Result<Option<Secret>> {
+) -> Result<LoadedSecret> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    api.get_opt(secret_name)
+    let secret = api
+        .get_opt(secret_name)
         .await
-        .map_err(|e| FerrumError::Degraded(format!("secret get {secret_name}: {e}")))
+        .map_err(|e| FerrumError::Degraded(format!("secret get {secret_name}: {e}")))?;
+    Ok(LoadedSecret {
+        secret,
+        requested: Requested::of(FailureClass::Reconcile),
+    })
 }
 
 #[derive(Debug, Clone)]

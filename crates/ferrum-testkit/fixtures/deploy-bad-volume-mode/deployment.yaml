@@ -1,0 +1,61 @@
+# A key the process cannot read, in an install that looks careful. Clean
+# everywhere else — ServiceAccount, limits, no privilege, no hostPID, no
+# bundle to join a policy name to — so the only finding this tree can produce
+# is the mode one. Do not fix.
+#
+# `defaultMode: 0400` under `runAsUser: 65532` with no `fsGroup` is the whole
+# defect: kubelet writes a Secret volume root:root and moves the group only
+# for an fsGroup, so the file is `-r-------- root root` and the process that
+# has to read it is uid 65532. Every flag is right, the mount is right, the
+# file is there, and `open()` returns EACCES on a cluster. The literal is
+# ambiguous on top of that: `0400` is octal 256 to the YAML 1.1 parser that
+# applies this manifest and not an integer at all to a 1.2 one.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-unreadable-key
+  namespace: ferrum
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-unreadable-key
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-unreadable-key
+    spec:
+      serviceAccountName: ferrum-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: ghcr.io/ferrum/ferrum-controller:v0.1.0
+          args:
+            - run
+            - --namespace
+            - ferrum
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: signing-key
+              mountPath: /etc/ferrum/signing
+              readOnly: true
+      volumes:
+        - name: signing-key
+          secret:
+            secretName: ferrum-signing-key
+            defaultMode: 0400

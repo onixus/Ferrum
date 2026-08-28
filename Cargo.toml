@@ -71,6 +71,13 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
 # PEM + webpki only, ring backend, no openssl-sys (deny.toml).
+#
+# `rustls` itself is linked by exactly one member: `kube`'s TLS stack installs a
+# process-wide CryptoProvider only under its `aws-lc-rs` feature, and building a
+# `kube::Client` without one panics inside rustls before any request is made.
+# The controller is the only crate that builds a client, so it is the only crate
+# that carries this, and it selects the same backend the rest of the tree uses.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pki-types = "1"
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
