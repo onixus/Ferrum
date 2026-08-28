@@ -23,6 +23,10 @@ spec:
       # Base install runs observe. Switching to --role respond alone changes
       # nothing until optional-respond.yaml binds the respond ServiceAccount.
       serviceAccountName: ferrum-agent-observe
+      # --node below scopes the pod watch that fills the cgroup index, and the
+      # projected token is the only credential it has. Off, the index stays
+      # empty: no event is flagged as a container and no namespaced policy
+      # ever matches.
       automountServiceAccountToken: true
       priorityClassName: system-node-critical
       terminationGracePeriodSeconds: 30

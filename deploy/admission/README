@@ -47,6 +47,17 @@ deployment.yaml passes --apiserver, so the image must be built with the
 the flag only if you accept that every policy carrying a namespace or
 ServiceAccount selector denies each Pod it selects.
 
+The label watch behind that flag authenticates with the projected
+ServiceAccount token and nothing else, so --apiserver and
+automountServiceAccountToken have to agree: both serviceaccount.yaml and the
+pod spec set it true, and the ClusterRole in rbac.yaml is what that token is
+allowed to do. Turning either off does not fail at startup — the config is
+built from KUBERNETES_SERVICE_HOST, which is always set — it fails on every
+connect afterwards, behind a backoff, with the cache never listing and every
+selected Pod denied. `ferrumctl lint-deploy` (FD027) fails on that
+contradiction, and on its mirror: a --policy-name whose policy carries a
+selector while no --apiserver is passed at all.
+
 Rotation
 ========
 
