@@ -40,6 +40,7 @@ const WEBHOOK_TLS_SECRET: &str = "FD021";
 const WEBHOOK_PKI_MISMATCH: &str = "FD022";
 const PRIVATE_KEY_IN_TREE: &str = "FD023";
 const POLICY_NAME_UNJOINED: &str = "FD024";
+const DUPLICATE_JOINED_FLAG: &str = "FD025";
 
 /// Bundle Secrets the controller writes: `ferrum-bundle-cluster-<policy>` for a
 /// cluster-scoped policy, `ferrum-bundle-ns-<namespace>-<policy>` for a
@@ -476,6 +477,7 @@ fn check_pod_templates(docs: &[Doc], findings: &mut Vec<Finding>) {
         for key in ["initContainers", "containers"] {
             for container in seq(spec, key) {
                 check_container(doc, &owner, container, findings);
+                check_flag_ambiguity(doc, &owner, container, findings);
                 check_policy_join(doc, &owner, spec, container, findings);
             }
         }
@@ -605,22 +607,96 @@ fn argv_of(container: &Value) -> Vec<String> {
         .collect()
 }
 
-/// `--flag value` and `--flag=value` both. An empty value is Some(""), which
-/// is a different finding from an absent flag.
-fn container_flag(argv: &[String], flag: &str) -> Option<String> {
-    let eq = format!("{flag}=");
-    for (i, arg) in argv.iter().enumerate() {
-        if let Some(v) = arg.strip_prefix(&eq) {
-            return Some(v.to_string());
+/// Mirrors `parse_flags` in `crates/ferrum-agent/src/main.rs`, and the
+/// identical function in `crates/ferrum-admission/src/main.rs`: both binaries
+/// read their argv by inserting into a map, so a repeated flag keeps the
+/// **last** occurrence and silently drops the earlier ones.
+///
+/// A lint that read the first occurrence would prove its joins against a
+/// string the process never sees: `--policy-name a … --policy-name b` would be
+/// checked as `a` while the agent runs `b`. Change this function whenever
+/// either `parse_flags` changes; the occurrence count it also returns is what
+/// FD025 is built on.
+///
+/// Keyed without the leading `--`, as the agent keys it. `--flag=value`,
+/// `--flag value` where the value does not itself start with `--`, and a bare
+/// `--flag` as an empty value — which is a different finding from an absent
+/// flag.
+fn parse_argv(argv: &[String]) -> BTreeMap<String, (usize, String)> {
+    let mut map: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let mut i = 0;
+    while i < argv.len() {
+        if let Some(rest) = argv[i].strip_prefix("--") {
+            let (key, value) = match rest.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => match argv.get(i + 1) {
+                    Some(val) if !val.starts_with("--") => {
+                        i += 1;
+                        (rest.to_string(), val.clone())
+                    }
+                    _ => (rest.to_string(), String::new()),
+                },
+            };
+            let seen = map.get(&key).map_or(0, |(n, _)| *n);
+            map.insert(key, (seen + 1, value));
         }
-        if arg == flag {
-            return Some(match argv.get(i + 1) {
-                Some(next) if !next.starts_with("--") => next.clone(),
-                _ => String::new(),
+        i += 1;
+    }
+    map
+}
+
+/// The value the process would actually run with, or None if the flag is
+/// absent.
+fn container_flag(argv: &[String], flag: &str) -> Option<String> {
+    parse_argv(argv)
+        .get(flag.trim_start_matches("--"))
+        .map(|(_, v)| v.clone())
+}
+
+/// Flags whose value this lint proves something about: the FD024 join, the
+/// FD018/FD019 role, the FD021 serving paths. Nothing here about a flag it
+/// makes no claim on — the controller's `--cluster` is repeated on purpose and
+/// accumulates instead of overwriting.
+const JOINED_FLAGS: [&str; 5] = [
+    "--policy-name",
+    "--bundle",
+    "--role",
+    "--tls-cert",
+    "--tls-key",
+];
+
+/// Mirroring the binary's last-wins parse is only half an answer: a flag
+/// written twice in one container's argv is a defect of its own — an overlay
+/// or a merge that meant to replace a value and appended it instead — and the
+/// value the lint then proves a join for is whichever the parser happened to
+/// keep, not one anybody chose. So the ambiguity is its own finding rather
+/// than something the lint silently resolves in the binary's favour.
+///
+/// This is also what keeps `runs_respond` no less catching than the `.any()`
+/// over every occurrence that it replaced: an argv naming `respond` somewhere
+/// but `observe` last no longer reaches FD018, and lands here instead.
+fn check_flag_ambiguity(doc: &Doc, owner: &str, container: &Value, findings: &mut Vec<Finding>) {
+    let cname = container
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>");
+    let parsed = parse_argv(&argv_of(container));
+    for flag in JOINED_FLAGS {
+        let Some((count, value)) = parsed.get(flag.trim_start_matches("--")) else {
+            continue;
+        };
+        if *count > 1 {
+            findings.push(Finding {
+                code: DUPLICATE_JOINED_FLAG,
+                file: doc.file.clone(),
+                msg: format!(
+                    "{owner} container '{cname}' passes {flag} {count} times; the binary keeps \
+                     only the last ('{value}') and drops the rest, so every other value here is \
+                     one this manifest states and the process never reads"
+                ),
             });
         }
     }
-    None
 }
 
 /// `bpf_get_current_pid_tgid()` reports the tgid of the initial pid namespace.
@@ -653,6 +729,10 @@ fn check_host_pid(doc: &Doc, owner: &str, spec: &Value, findings: &mut Vec<Findi
     }
 }
 
+/// The role each container would actually run with — the last `--role`, not
+/// the first. A pod whose argv names `respond` somewhere but runs `observe`
+/// is not a respond pod and does not need hostPID; that it says both is
+/// FD025's finding, so nothing an `.any()` here would have caught is lost.
 fn runs_respond(spec: &Value) -> bool {
     seq(spec, "containers")
         .iter()
@@ -1052,24 +1132,13 @@ fn tls_mount_dir(spec: &Value, secret: &str) -> Option<String> {
 /// `--flag value` and `--flag=value` both count; container args are written
 /// either way across this tree.
 fn flag_value(spec: &Value, flag: &str) -> Option<String> {
-    for container in seq(spec, "containers") {
-        // Not `str_list`: it lowercases, and a mount path is case-sensitive.
-        let argv: Vec<String> = ["command", "args"]
-            .iter()
-            .flat_map(|key| seq(container, key))
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect();
-        for (i, arg) in argv.iter().enumerate() {
-            if let Some(v) = arg.strip_prefix(&format!("{flag}=")) {
-                return Some(v.to_string());
-            }
-            if arg == flag {
-                return argv.get(i + 1).cloned();
-            }
-        }
-    }
-    None
+    // The first container that passes the flag, and inside it the occurrence
+    // that container's own `parse_flags` keeps — see `container_flag`. Two
+    // containers passing the same flag are two processes, not an ambiguity;
+    // one container passing it twice is FD025.
+    seq(spec, "containers")
+        .iter()
+        .find_map(|c| container_flag(&argv_of(c), flag))
 }
 
 fn namespace_exclusions(webhook: &Value) -> BTreeSet<String> {
@@ -1338,6 +1407,106 @@ mod tests {
                 .collect::<BTreeSet<_>>()
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The bypass: `parse_flags` keeps the last `--policy-name`, so the agent
+    /// joins waivers against `prod-strict` while the Secret it mounts is named
+    /// for `prod-restricted`. A lint reading the first occurrence proves the
+    /// join for a string the process never sees and reports ok — FD024's whole
+    /// claim, that the join is checked against objects already deployed, is
+    /// false for exactly this manifest.
+    #[test]
+    fn the_last_policy_name_is_the_one_joined() {
+        let dir = agent_tree_with("dup-policy-name", |raw| {
+            raw.replace(
+                "            - --policy-name\n            - prod-restricted\n",
+                "            - --policy-name\n            - prod-restricted\n            - \
+                 --policy-name\n            - prod-strict\n",
+            )
+        });
+        assert_eq!(
+            codes_in(&dir),
+            [POLICY_NAME_UNJOINED, DUPLICATE_JOINED_FLAG]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same bypass on `--role`: the agent runs respond, the DaemonSet has
+    /// no hostPID, and a lint reading the first occurrence sees `observe` and
+    /// never fires FD018.
+    #[test]
+    fn the_last_role_is_the_one_run() {
+        let dir = agent_tree_with("dup-role-respond", |raw| {
+            raw.replace(
+                "            - --role\n            - observe\n",
+                "            - --role\n            - observe\n            - --role\n            \
+                 - respond\n",
+            )
+        });
+        assert_eq!(
+            codes_in(&dir),
+            [RESPOND_WITHOUT_HOST_PID, DUPLICATE_JOINED_FLAG]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// And the other order, which the `.any()` over every occurrence used to
+    /// catch: the agent runs observe, so FD018 is right not to fire — but the
+    /// manifest still names two roles, and that is not something this lint
+    /// resolves silently.
+    #[test]
+    fn a_role_named_twice_is_a_finding_whichever_one_runs() {
+        let dir = agent_tree_with("dup-role-observe", |raw| {
+            raw.replace(
+                "            - --role\n            - observe\n",
+                "            - --role\n            - respond\n            - --role\n            \
+                 - observe\n",
+            )
+        });
+        assert_eq!(
+            codes_in(&dir),
+            [DUPLICATE_JOINED_FLAG]
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The lint's argv reader must agree with `parse_flags` in
+    /// `crates/ferrum-agent/src/main.rs` on every shape that function handles,
+    /// not only on the duplicate: a value is never taken from an argument that
+    /// itself starts with `--`, and a consumed value is not re-read as a flag.
+    #[test]
+    fn the_argv_reader_mirrors_the_agents_parse_flags() {
+        let argv = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cases: [(&[&str], &str, Option<&str>); 7] = [
+            (&["--role", "respond"], "--role", Some("respond")),
+            (&["--role=respond"], "--role", Some("respond")),
+            (&["--role", "--bundle", "/b"], "--role", Some("")),
+            (&["--role"], "--role", Some("")),
+            (&["--role="], "--role", Some("")),
+            (&["--bundle", "--role"], "--role", Some("")),
+            (&["--bundle", "/etc/role"], "--role", None),
+        ];
+        for (args, flag, want) in cases {
+            assert_eq!(
+                container_flag(&argv(args), flag).as_deref(),
+                want,
+                "{args:?} {flag}"
+            );
+        }
+        // A value is consumed, so it cannot open a second occurrence of the
+        // flag it belongs to.
+        let parsed = parse_argv(&argv(&["--bundle", "--role", "--role", "respond"]));
+        assert_eq!(parsed.get("role"), Some(&(2usize, "respond".to_string())));
+        assert_eq!(parsed.get("bundle"), Some(&(1usize, String::new())));
     }
 
     /// A policy name checked against nothing is not a join. FD024 is a
