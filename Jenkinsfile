@@ -62,9 +62,20 @@ pipeline {
                     set -eu
                     # Один проход: --error роняет стадию, --output оставляет артефакт.
                     # В semgrep.json попадают находки уровня ERROR — те, что и есть гейт.
+                    # --exclude называет ровно один файл, и это не смягчение
+                    # правила. crates/ferrum-testkit/fixtures/deploy-bad-private-key/ca.key
+                    # существует затем, чтобы FD023 было на чём срабатывать: PEM-заголовок
+                    # в дереве, которое коммитят. Секретное правило semgrep читает тот же
+                    # заголовок — и два гейта оказались взаимным отказом: SAST ронял каждый
+                    # билд на фикстуре, которая доказывает, что lint-deploy работает.
+                    # Исключение держит `deploy_gate.rs::scan_exclusions`: он требует, чтобы
+                    # исключён был ровно этот путь, чтобы тело файла не было ключевым
+                    # материалом, и чтобы lint по-прежнему называл его находкой. Список
+                    # расширять только вместе с тем гейтом — иначе это дыра без читателя.
                     docker run --rm -v "$WORKSPACE":/src -w /src semgrep/semgrep:latest \
                         semgrep scan --config p/rust --config p/secrets \
                             --metrics=off --severity ERROR --error \
+                            --exclude='crates/ferrum-testkit/fixtures/deploy-bad-private-key/ca.key' \
                             --json --output semgrep.json
                 '''
             }

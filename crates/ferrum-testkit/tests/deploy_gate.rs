@@ -2620,3 +2620,136 @@ mod build_closure {
         );
     }
 }
+
+/// The one file the SAST stage does not scan, and the reason that is not a hole.
+///
+/// `deploy-bad-private-key/ca.key` exists so FD023 has something to fire on: a
+/// PEM header inside a tree that gets committed. semgrep's secret rule reads
+/// the same header and calls it a leaked key, so the two gates were each
+/// other's failure — the SAST stage denied every build on the fixture that
+/// proves the deploy lint works, and it denied it first, so nothing below it
+/// ran at all.
+///
+/// An exclusion nobody watches is the more expensive of the two failures. This
+/// module is the watcher, and it holds three things, none of which semgrep can
+/// hold for itself: the stage excludes exactly this one path, the file it
+/// excludes is not key material, and the lint that owns the fixture still
+/// calls it a finding. Break any one and this gate fails — a second
+/// `--exclude`, a fixture quietly replaced by a real key, or an FD023 that
+/// stopped firing.
+mod scan_exclusions {
+    use ferrum_cli::lint_deploy::lint_deploy_dir;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// Every path the pipeline is allowed to hide from the secret scanner.
+    /// Adding an entry is a deliberate act: it fails this gate until it is
+    /// written here, and then it has to survive the checks below.
+    const EXCLUDED: [&str; 1] = ["crates/ferrum-testkit/fixtures/deploy-bad-private-key/ca.key"];
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    /// Every `--exclude='…'` the pipeline passes to semgrep, from any stage.
+    /// Deliberately not scoped to `SAST (semgrep)`: an exclusion added to some
+    /// other stage would be exactly as unwatched.
+    fn pipeline_exclusions() -> BTreeSet<String> {
+        let text = std::fs::read_to_string(repo_root().join("Jenkinsfile")).expect("Jenkinsfile");
+        text.lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("--exclude=")?;
+                let rest = rest.strip_prefix('\'')?;
+                let (path, _) = rest.split_once('\'')?;
+                Some(path.to_string())
+            })
+            .collect()
+    }
+
+    /// The first byte of a PEM block's payload.
+    ///
+    /// Every DER-encoded private key — SEC1, PKCS#1, PKCS#8 alike — opens with
+    /// a SEQUENCE tag, `0x30`. A fixture that only has to carry the header can
+    /// put anything after it, and this is what tells the two apart without a
+    /// parser and without a base64 crate in this graph.
+    fn pem_payload_first_byte(text: &str) -> u8 {
+        let payload = text
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("-----BEGIN "))
+            .skip(1)
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("-----END"))
+            .expect("PEM payload");
+        let quad: Vec<u8> = payload
+            .trim()
+            .bytes()
+            .take(4)
+            .map(|c| {
+                B64.iter()
+                    .position(|&a| a == c)
+                    .unwrap_or_else(|| panic!("not base64: {c:?}")) as u8
+            })
+            .collect();
+        assert_eq!(quad.len(), 4, "PEM payload shorter than one base64 quad");
+        (quad[0] << 2) | (quad[1] >> 4)
+    }
+
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    #[test]
+    fn the_scanner_skips_exactly_the_files_this_gate_vouches_for() {
+        let expected: BTreeSet<String> = EXCLUDED.iter().map(|p| p.to_string()).collect();
+        assert_eq!(
+            pipeline_exclusions(),
+            expected,
+            "an --exclude this gate does not vouch for is a file nothing scans"
+        );
+    }
+
+    #[test]
+    fn every_excluded_file_is_a_fixture_that_only_looks_like_a_key() {
+        for rel in EXCLUDED {
+            assert!(
+                rel.starts_with("crates/") && rel.contains("/fixtures/"),
+                "{rel}: only a fixture may be hidden from the scanner"
+            );
+            let text = std::fs::read_to_string(repo_root().join(rel))
+                .unwrap_or_else(|err| panic!("{rel}: {err}"));
+            assert!(
+                text.lines()
+                    .any(|l| l.trim_start().starts_with("-----BEGIN ")
+                        && l.trim_end().trim_end_matches('-').ends_with("PRIVATE KEY")),
+                "{rel}: excluded from the secret scanner but carries no PEM private-key \
+                 header — then it was excluded for some other reason, and this gate does \
+                 not know what it is"
+            );
+            assert_ne!(
+                pem_payload_first_byte(&text),
+                0x30,
+                "{rel}: payload opens with a DER SEQUENCE, which is what real key material \
+                 does. This is not a fixture any more, and the scanner is being told to \
+                 ignore a key"
+            );
+        }
+    }
+
+    /// The direction the exclusion could rot in: FD023 stops firing, the
+    /// fixture stops being checked by anything at all, and both gates are
+    /// green.
+    #[test]
+    fn the_excluded_fixture_is_still_a_finding_for_the_lint_that_owns_it() {
+        for rel in EXCLUDED {
+            let dir = repo_root()
+                .join(rel)
+                .parent()
+                .expect("fixture dir")
+                .to_path_buf();
+            let err = lint_deploy_dir(&dir)
+                .expect_err("a private key in the deploy tree must still fail the lint");
+            assert!(err.to_string().contains("violated"), "{err}");
+        }
+    }
+}
