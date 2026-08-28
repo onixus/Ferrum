@@ -5,15 +5,31 @@ metadata:
   labels:
     app.kubernetes.io/part-of: ferrum
 rules:
+  # Only the kinds this controller can actually address. Each of the three has
+  # a `GroupVersionKind::gvk` literal in `watch.rs`, therefore an `ApiResource`,
+  # therefore an `Api<DynamicObject>` a `get`, a `list` and a `watch` can be
+  # issued against.
+  #
+  # Four read grants of the opposite shape have been deleted here:
+  # `policylibraries`, `runtimeprofiles`, `ferrumclusters` and
+  # `compliancesnapshots`. No source file under `crates/ferrum-controller/src`
+  # names any of those Kinds in a `gvk` call, so nothing in this binary could
+  # have issued a single request against them under any verb. That is the same
+  # finding as the four `<kind>/status` write grants deleted below, and it went
+  # undetected for a cycle longer because the census that found those asked
+  # only about writes: a read grant was decided by nothing, in either
+  # direction. It is not a harmless surplus — a permission with no purpose is
+  # what this project's threat model calls a lateral-movement target, and RBAC
+  # is also where an operator reads what this controller watches, so a grant
+  # for a kind nothing watches is a false statement about the system.
+  #
+  # Restore any of them in the change that adds the watch, not before
+  # (`boundary_gate.rs::a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose`).
   - apiGroups: ["ferrum.io"]
     resources:
       - clustersecuritypolicies
       - securitypolicies
       - policyexceptions
-      - policylibraries
-      - runtimeprofiles
-      - ferrumclusters
-      - compliancesnapshots
     verbs: ["get", "list", "watch"]
   # Only the status subresources this controller actually PATCHes. Each of the
   # three below has an `ApiResource` in `watch.rs`, a watch loop that reaches
