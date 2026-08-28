@@ -25,6 +25,14 @@
 //! asserts what the row says, and not that it is a `#[test]`. The marker is
 //! the author's word for where the test ran. Neither is closable by grep, and
 //! pretending otherwise here would be this project's own defect, one level up.
+//!
+//! And it is one-directional. It requires that what is cited exists; it does
+//! not — cannot — require that what exists is cited. So the document rots
+//! silently downward: a slice that proves something and does not rewrite its
+//! row leaves the boundary understating the tree, and no build turns red. That
+//! happened twice in cycle 9, to two rows this file had no way to notice. The
+//! only reader of that direction is a person with `git log`, which is why the
+//! document says so in its own words as well.
 
 use ferrum_testkit::AcceptanceCase;
 use std::collections::BTreeMap;
