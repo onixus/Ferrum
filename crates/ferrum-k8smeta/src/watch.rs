@@ -661,7 +661,7 @@ mod client {
     use ferrum_common::{FerrumError, Result};
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
 
@@ -728,13 +728,39 @@ mod client {
                 .unwrap_or_else(|_| "443".into())
                 .parse::<u16>()
                 .map_err(|e| FerrumError::Degraded(format!("KUBERNETES_SERVICE_PORT: {e}")))?;
-            let dir = PathBuf::from(SERVICE_ACCOUNT_DIR);
+            Self::from_sa_dir(node_name, host, port, Path::new(SERVICE_ACCOUNT_DIR))
+        }
+
+        /// The half of `in_cluster` that does not read the environment, so
+        /// the token check below is reachable from a test without a projected
+        /// volume and without touching process-global env vars.
+        fn from_sa_dir(node_name: String, host: String, port: u16, dir: &Path) -> Result<Self> {
+            let token_path = dir.join("token");
+            // Checked at construction, not left to the first connect.
+            // `automountServiceAccountToken: false` on the pod spec or the
+            // ServiceAccount projects no token at all, and that is the shipped
+            // install defect cycle 10 slice A fixed in the manifests: without
+            // this check the config is built, the watch thread spawns, every
+            // connect authenticates with nothing, and the only symptom is an
+            // endless backoff on a cache that never warms. A failure here
+            // names the file that is missing, at startup, where the operator
+            // is looking. The token is still re-read on every connect —
+            // projected tokens rotate — so this is an existence check and not
+            // a value the config holds.
+            if !token_path.exists() {
+                return Err(FerrumError::Degraded(format!(
+                    "{} does not exist: no ServiceAccount token is projected into this pod, so \
+                     every apiserver request would authenticate as nobody. Check \
+                     automountServiceAccountToken on the pod spec and on the ServiceAccount.",
+                    token_path.display()
+                )));
+            }
             Ok(Self {
                 host,
                 port,
                 server_name: DEFAULT_SERVER_NAME.to_string(),
                 node_name,
-                token_path: dir.join("token"),
+                token_path,
                 ca_path: dir.join("ca.crt"),
             })
         }
@@ -1498,6 +1524,39 @@ mod client {
                 FerrumError::Degraded(msg) => msg,
                 other => panic!("expected Degraded, got {other:?}"),
             }
+        }
+
+        /// A pod with `automountServiceAccountToken: false` projects no token,
+        /// and construction used to succeed anyway: the watcher spawned, every
+        /// connect authenticated as nobody, and the whole install failure
+        /// showed up only as an endless backoff on a cache that never warmed.
+        /// The error must name the file.
+        #[test]
+        fn a_config_without_a_projected_token_is_an_error_that_names_the_file() {
+            let dir = std::env::temp_dir().join(format!(
+                "ferrum-sa-missing-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let err = ApiserverConfig::from_sa_dir("node-a".into(), "10.0.0.1".into(), 443, &dir)
+                .expect_err("a directory with no token is not a usable config");
+            let msg = degraded_text(err);
+            assert!(
+                msg.contains(&dir.join("token").display().to_string()),
+                "{msg}"
+            );
+            assert!(msg.contains("automountServiceAccountToken"), "{msg}");
+
+            // And the same directory once the token is there: a config, with
+            // the path kept for the per-connect re-read.
+            std::fs::write(dir.join("token"), b"tok").expect("write token");
+            let config =
+                ApiserverConfig::from_sa_dir("node-a".into(), "10.0.0.1".into(), 443, &dir)
+                    .expect("a projected token is a usable config");
+            assert_eq!(config.token_path, dir.join("token"));
+            assert_eq!(config.node_name, "node-a");
+            std::fs::remove_dir_all(&dir).ok();
         }
 
         #[test]

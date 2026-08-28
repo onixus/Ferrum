@@ -74,6 +74,46 @@ pub const CGROUP_PUBLISHER_GONE: &str =
     "cgroup publisher gone: the container map can no longer follow the index";
 /// The carrier that applies published sets is gone; publishing is pointless.
 pub const CGROUP_CARRIER_GONE: &str = "cgroup carrier gone: nothing applies the published set";
+/// The cgroup2 hierarchy the index would be keyed on could not be derived, so
+/// the refresher does not scan at all.
+///
+/// The alternative was a fallback to `DEFAULT_CGROUP_ROOT`, which is what
+/// shipped: on a node where the derivation refuses for ambiguity the index was
+/// then filled from a hierarchy nobody chose, and the inodes it produced came
+/// from the wrong filesystem while the pre-signal guard — which does *not*
+/// fall back — reported the target unprovable. Under `observe`, the shipped
+/// default, `TARGET_CHECK_UNPROVABLE` is respond-scoped and never fires, so
+/// the only signal left was `DEG_IDENTITY_UNKNOWN`: "a cgroup the index cannot
+/// name", when the truth was that the index was keyed on the wrong hierarchy.
+///
+/// One derivation for the index and the guard, or two roots that can disagree
+/// (`cgroupfs.rs`), and a failed derivation is kept rather than replaced by
+/// the constant (`respond.rs`). This is that rule applied to the second
+/// caller. Latched, like the guard's own copy: the mount table is read once
+/// and a node does not grow a unified hierarchy at runtime.
+pub const CGROUP_ROOT_UNDERIVABLE: &str =
+    "cgroup2 root not derivable: the index is not scanned rather than keyed on a hierarchy \
+     nobody chose, so no cgroup resolves to a pod and every namespaced selector misses";
+/// The root the cgroup index is scanned against, or `None` — in which case
+/// the agent has been given the fault and the refresher must not scan.
+///
+/// Takes the derivation's answer rather than performing it, so both branches
+/// are reachable from a test on a host that does have a cgroup2 mount, and so
+/// the policy lives beside the reason it raises instead of inside a `main`
+/// nothing can call.
+///
+/// There is no fallback to `DEFAULT_CGROUP_ROOT` here, and that is the whole
+/// of it: see `CGROUP_ROOT_UNDERIVABLE`.
+pub fn cgroup_scan_root(agent: &Agent, derived: Result<PathBuf>) -> Option<PathBuf> {
+    match derived {
+        Ok(root) => Some(root),
+        Err(err) => {
+            agent.mark_terminal_fault(format!("{CGROUP_ROOT_UNDERIVABLE} ({err})"));
+            None
+        }
+    }
+}
+
 /// Nothing decodes ring records any more: the reader still drains the ring, so
 /// the kernel does not stall, but every record it takes out is discarded
 /// before a rule sees it. Terminal in this process — the pump thread is not
@@ -166,6 +206,50 @@ pub const TARGET_NEVER_PROVEN: &str =
 /// here, and an operator who asked for respond should not wait on a threshold
 /// to learn the node reacts to nothing.
 pub const RESPOND_TARGET_UNPROVEN_MIN: u64 = 8;
+/// Respond is on, the guard passed, the syscall was made, and it failed —
+/// every time, with no kill on this node ever having succeeded.
+///
+/// This is the one path in `react` that is the signal *being attempted and
+/// failing*, and it was the one path with no reason. A respond DaemonSet whose
+/// `capabilities.add` lost `KILL`, or a node whose targets live in a user
+/// namespace this process cannot signal, gets `EPERM` from every `kill(2)`:
+/// `respond_kill_total` stays 0, `respond_failed_total` climbs, every export
+/// carries `executed=false` with the errno on it — and nothing made the node
+/// Degraded.
+///
+/// `TARGET_NEVER_PROVEN` cannot cover it, by construction. The guard
+/// *succeeded* on the step before the syscall, so `respond_target_confirmed`
+/// is non-zero, and a single confirmation clears that reason permanently.
+/// The step that disarms it is the step that precedes the failure.
+///
+/// Resetting `respond_target_confirmed` on a failed kill would make it fire,
+/// and would be wrong: it conflates "the guard cannot find the target" with
+/// "the kernel refused the syscall", which is exactly the conflation cycle 9
+/// split into two reasons. One fault reported under another's name is how a
+/// reason stops meaning anything.
+///
+/// The discriminator is whether a kill has ever succeeded here, not a rate.
+/// A node whose workloads occasionally die between `kill(2)` and its own
+/// bookkeeping has had at least one success; a node without `CAP_KILL` never
+/// will and never recovers by itself. Respond-scoped for the same reason as
+/// the two reasons above: under observe this path is never reached.
+pub const RESPOND_SIGNAL_FAILING: &str =
+    "respond is on and no signal has ever been delivered: every reaction that passed every guard \
+     failed in the kill syscall itself, and not one has ever succeeded — the agent is deciding \
+     kills it cannot execute, most often a respond DaemonSet without CAP_KILL over its targets";
+/// Failed signals a node may accumulate before never having delivered one
+/// becomes a reason.
+///
+/// Not the first failure, and deliberately so: cycle 6's identity-miss and
+/// cycle 7's `SELF_TGID_UNPUBLISHED` both shipped a reason true on every busy
+/// node, and both had to be undone because a reason that is always true drowns
+/// every reason that is not. The floor exists so that a single transient
+/// `ESRCH` — the target exited between the guard and the syscall — is not a
+/// verdict on the node. It is small for the same reason
+/// `RESPOND_TARGET_UNPROVEN_MIN` is: on a node that cannot signal at all,
+/// *every* reaction lands here, so the floor is reached by the same traffic
+/// that would have proved the node healthy.
+pub const RESPOND_SIGNAL_FAILING_MIN: u64 = 4;
 /// The reasons `is_degraded` can give, in the words the operator reads in
 /// `status.json` and in the transition line. Constants rather than literals:
 /// the file and the log line are a surface, and a reason that changes wording
@@ -202,6 +286,26 @@ pub const DEG_CONTAINER_FLAG: &str =
 pub const DEG_STATUS_UNWRITABLE: &str =
     "status file unwritable: this node's state cannot be published, so status.json is absent \
      rather than stale";
+/// Every approved waiver this node held was dropped, and it is now enforcing
+/// as if none had ever been signed.
+///
+/// The drop itself is right: a bad signature, a tampered payload, a parse
+/// error or a spec-count overflow must never leave a stale waiver table
+/// standing, so `try_reload_exceptions` clears all of them. It is fail-closed
+/// and it is not an enforcement hole. What it was, was silent —
+/// `exceptions_reload_failed` counted and nothing read the counter, and
+/// `WAIVERS_UNJOINED` cannot fire on an empty list, so a node that had just
+/// lost every approved exception was indistinguishable from one that
+/// legitimately has none. The deny storm that follows then has no cause
+/// anywhere an operator looks. Same shape as `--policy-name` joining nothing,
+/// which cycle 8 did give a reason.
+///
+/// Cleared by the next reload that installs a table, so a Secret that is
+/// republished correctly recovers the node without a restart.
+pub const DEG_WAIVERS_DROPPED: &str =
+    "waivers dropped: the exception table failed to load and every approved exception on this \
+     node was discarded, so enforcement is stricter than the policy that was signed and the \
+     denials it causes name no reason";
 /// Waivers on this node that can never demote anything here.
 pub const WAIVERS_UNJOINED: &str =
     "waivers do not join this agent's policy: they are signed, verified, in scope and apply to \
@@ -365,6 +469,10 @@ pub struct Agent {
     exceptions: Vec<PolicyExceptionSpec>,
     policy_name: String,
     exceptions_reload_failed: AtomicU64,
+    /// The live waiver table was emptied by a failed reload rather than by a
+    /// Secret that carries no waivers. Not latched: the next reload that
+    /// installs a table clears it.
+    exceptions_dropped: AtomicBool,
     decode_failed: AtomicU64,
     /// Consecutive decode failures with no successful decode between them.
     /// Reset by every record that decodes: it separates "some records are
@@ -520,6 +628,7 @@ impl Agent {
             exceptions: config.exceptions,
             policy_name: config.policy_name,
             exceptions_reload_failed: AtomicU64::new(0),
+            exceptions_dropped: AtomicBool::new(false),
             decode_failed: AtomicU64::new(0),
             decode_failed_run: AtomicU64::new(0),
             datapath_abi_mismatch: AtomicU64::new(0),
@@ -685,6 +794,12 @@ impl Agent {
         if let Some(reason) = self.waivers_unjoined() {
             out.push(reason);
         }
+        // And the other way of holding none: the table was emptied by a
+        // failed reload. `waivers_unjoined` cannot see this — it has no list
+        // left to look at — so without this arm the two are the same node.
+        if self.waivers_dropped() {
+            out.push(DEG_WAIVERS_DROPPED.to_string());
+        }
         // Under respond only. Without `hostPID` the agent cannot publish
         // `ferrum_self`, and that is the shipped base install: observe,
         // no `hostPID`, and `lint-deploy` raises UNNEEDED_HOST_PID if an
@@ -717,6 +832,18 @@ impl Agent {
                 && self.respond_stale_target.load(Ordering::Relaxed) >= RESPOND_TARGET_UNPROVEN_MIN
             {
                 out.push(TARGET_NEVER_PROVEN.to_string());
+            }
+            // A third claim, about the step after both of those: the guard was
+            // satisfied, the syscall was made, and it failed. Not an `else` on
+            // them — the two above are about reactions that never reached the
+            // syscall, this one is about reactions that did — but unreachable
+            // beside `TARGET_CHECK_UNPROVABLE` anyway, because a guard that
+            // cannot run refuses before anything is signalled and
+            // `respond_failed` then cannot move at all.
+            if self.respond_kill.load(Ordering::Relaxed) == 0
+                && self.respond_failed.load(Ordering::Relaxed) >= RESPOND_SIGNAL_FAILING_MIN
+            {
+                out.push(RESPOND_SIGNAL_FAILING.to_string());
             }
         }
         out
@@ -1542,6 +1669,12 @@ impl Agent {
         self.exceptions_reload_failed.load(Ordering::Relaxed)
     }
 
+    /// The live waiver table is empty because a reload failed, not because the
+    /// Secret carries no waivers. See `DEG_WAIVERS_DROPPED`.
+    pub fn waivers_dropped(&self) -> bool {
+        self.exceptions_dropped.load(Ordering::Relaxed)
+    }
+
     /// Verify an `exceptions.fsig` envelope against the pinned trust-root,
     /// then parse the signed JSON payload into the live table. Verification
     /// and parsing happen only here, never on the per-event path. Plain JSON,
@@ -1553,12 +1686,14 @@ impl Agent {
                 let n = list.len();
                 self.clock.anchor_from_exceptions(&list);
                 self.exceptions = list;
+                self.exceptions_dropped.store(false, Ordering::Relaxed);
                 Ok(n)
             }
             Err(err) => {
                 self.exceptions.clear();
                 self.exceptions_reload_failed
                     .fetch_add(1, Ordering::Relaxed);
+                self.exceptions_dropped.store(true, Ordering::Relaxed);
                 Err(err)
             }
         }
@@ -1582,14 +1717,19 @@ impl Agent {
     pub fn reload_exceptions_path(&mut self, path: &Path) -> Result<usize> {
         match read_exceptions_path(path) {
             Ok(Some(bytes)) => self.try_reload_exceptions(&bytes),
+            // No file is not a failure: a Secret that carries no waivers is a
+            // node that legitimately has none, and the table is emptied
+            // without a reason being raised.
             Ok(None) => {
                 self.exceptions.clear();
+                self.exceptions_dropped.store(false, Ordering::Relaxed);
                 Ok(0)
             }
             Err(err) => {
                 self.exceptions.clear();
                 self.exceptions_reload_failed
                     .fetch_add(1, Ordering::Relaxed);
+                self.exceptions_dropped.store(true, Ordering::Relaxed);
                 Err(err)
             }
         }
@@ -4105,6 +4245,34 @@ mod tests {
         }
     }
 
+    /// A responder whose `kill` fails, as `SignalResponder`'s does on a
+    /// DaemonSet without `CAP_KILL` over its targets: the guards all pass, the
+    /// syscall is made, and the kernel refuses it.
+    struct FailingResponder(&'static str);
+
+    impl Responder for FailingResponder {
+        fn kill(&self, _tgid: u32) -> Result<()> {
+            Err(FerrumError::Degraded(self.0.into()))
+        }
+    }
+
+    /// Fails a given number of times and then succeeds, so a node that has had
+    /// one delivered signal can be told from one that has never had any.
+    #[derive(Default)]
+    struct FlakyResponder {
+        fail_first: std::sync::atomic::AtomicU64,
+    }
+
+    impl Responder for std::sync::Arc<FlakyResponder> {
+        fn kill(&self, _tgid: u32) -> Result<()> {
+            if self.fail_first.load(Ordering::Relaxed) > 0 {
+                self.fail_first.fetch_sub(1, Ordering::Relaxed);
+                return Err(FerrumError::Degraded("ESRCH: the target exited".into()));
+            }
+            Ok(())
+        }
+    }
+
     /// Stands in for `/proc/<tgid>/cgroup`: the cgroup the target is in right
     /// now, or `None` for a process that is already gone.
     struct StaticCheck(Option<u64>);
@@ -4529,6 +4697,308 @@ mod tests {
             !agent.is_degraded(),
             "{:?}",
             agent.degraded_reasons_at(Instant::now())
+        );
+    }
+
+    /// The one path in `react` that is the signal being attempted and failing,
+    /// and the one that had no reason.
+    ///
+    /// A respond DaemonSet whose `capabilities.add` lost `KILL` gets `EPERM`
+    /// from every `kill(2)`. Every guard passes, so no refusal reason is
+    /// raised; `respond_kill_total` stays 0, `respond_failed_total` climbs,
+    /// and `executed=false` rides the export while the node reports healthy.
+    ///
+    /// The interaction is the point. `TARGET_NEVER_PROVEN` cannot cover this
+    /// *by design*: the guard succeeded on the step before the syscall, so
+    /// `respond_target_confirmed` is non-zero, and one confirmation clears
+    /// that reason permanently. This test asserts that too, so a later change
+    /// that tries to close the hole by resetting the confirmation on a failed
+    /// kill has to argue with a test rather than with a comment.
+    #[test]
+    fn a_node_that_can_decide_kills_and_never_send_one_is_degraded() {
+        let (mut agent, _fake) = respond_agent_with_fake();
+        agent.set_responder(Box::new(FailingResponder("EPERM: operation not permitted")));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+
+        // One failure is not a verdict: a node that has not killed anything
+        // yet is a node, not a fault.
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &MemorySink::new(),
+        );
+        assert_eq!(agent.respond_failed_total(), 1);
+        assert_eq!(agent.respond_kill_total(), 0);
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+
+        let sink = MemorySink::new();
+        for _ in 1..RESPOND_SIGNAL_FAILING_MIN {
+            agent.handle_event(
+                container_meta(4242),
+                &ev("execve", "sh", "/bin/sh", true, false),
+                &sink,
+            );
+        }
+        assert_eq!(agent.respond_failed_total(), RESPOND_SIGNAL_FAILING_MIN);
+
+        // The state every other signal reads as healthy, which is the defect.
+        assert_eq!(agent.respond_refused_total(), 0);
+        assert_eq!(agent.respond_stale_target_total(), 0);
+        assert_eq!(
+            agent.respond_target_confirmed_total(),
+            RESPOND_SIGNAL_FAILING_MIN
+        );
+        assert!(agent.target_check_unprovable().is_none());
+        let events = sink.events();
+        assert!(
+            !events.is_empty() && events.iter().all(|e| !e.executed),
+            "a signal that failed must not be exported as executed"
+        );
+
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == RESPOND_SIGNAL_FAILING),
+            "{reasons:?}"
+        );
+        // And not under another fault's name: the guard was satisfied every
+        // time, so neither target reason may be claiming this one.
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r == TARGET_NEVER_PROVEN || r.starts_with(TARGET_CHECK_UNPROVABLE)),
+            "the refused syscall is being reported as a target the guard could not prove: \
+             {reasons:?}"
+        );
+    }
+
+    /// The other half, and the one that decides whether the reason is worth
+    /// having: a node that has delivered one signal and then fails many times
+    /// is a busy node, not a broken one, and must never be told it has stopped
+    /// enforcing.
+    ///
+    /// Same argument as `TARGET_NEVER_PROVEN`, one step later. A rate cannot
+    /// separate these two nodes; "has one ever succeeded" can.
+    #[test]
+    fn a_node_that_has_delivered_one_signal_is_not_degraded_by_later_failures() {
+        let mut agent = Agent::new(cfg_respond());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        let flaky = std::sync::Arc::new(FlakyResponder::default());
+        agent.set_responder(Box::new(std::sync::Arc::clone(&flaky)));
+
+        // One success first, then nothing but failures, well past the floor.
+        agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &MemorySink::new(),
+        );
+        assert_eq!(agent.respond_kill_total(), 1);
+        flaky
+            .fail_first
+            .store(RESPOND_SIGNAL_FAILING_MIN * 8, Ordering::Relaxed);
+        for _ in 0..RESPOND_SIGNAL_FAILING_MIN * 8 {
+            agent.handle_event(
+                container_meta(4242),
+                &ev("execve", "sh", "/bin/sh", true, false),
+                &MemorySink::new(),
+            );
+        }
+        assert!(agent.respond_failed_total() > RESPOND_SIGNAL_FAILING_MIN);
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+    }
+
+    /// Respond-scoped, for the same reason the two target reasons are: under
+    /// observe `react` returns REFUSE_ROLE before any responder is reached, so
+    /// `respond_failed` cannot move and the reason would be a claim about a
+    /// path the node never takes.
+    #[test]
+    fn an_observe_node_is_not_degraded_by_a_signal_it_never_sends() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
+        agent.set_responder(Box::new(FailingResponder("EPERM")));
+        for _ in 0..RESPOND_SIGNAL_FAILING_MIN * 4 {
+            agent.handle_event(
+                container_meta(4242),
+                &ev("execve", "sh", "/bin/sh", true, false),
+                &MemorySink::new(),
+            );
+        }
+        assert_eq!(agent.respond_failed_total(), 0);
+        assert!(agent.respond_role_skipped_total() > 0);
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+    }
+
+    /// A node that just lost every approved exception must not look like a
+    /// node that legitimately has none.
+    ///
+    /// The drop is right and fail-closed — a bad signature must never leave a
+    /// stale waiver table standing — so this is not an enforcement hole. It
+    /// was a reporting hole: `waivers_unjoined` cannot fire on an empty list,
+    /// so the deny storm that follows had no cause anywhere an operator looks.
+    #[test]
+    fn losing_every_waiver_is_a_reason_and_a_reload_that_works_clears_it() {
+        let mut agent = Agent::new(cfg_respond_named("p1"));
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
+
+        let signed = exceptions_fsig(&[waiver("ns", "p1", &["no-runtime-sock"])]);
+        assert_eq!(agent.try_reload_exceptions(&signed).expect("reload"), 1);
+        assert!(!agent.waivers_dropped());
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+
+        // A tampered envelope: every waiver goes, fail-closed.
+        let mut tampered = signed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xff;
+        agent
+            .try_reload_exceptions(&tampered)
+            .expect_err("a broken envelope must not install");
+        assert!(agent.exceptions().is_empty());
+        assert_eq!(agent.exceptions_reload_failed_total(), 1);
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == DEG_WAIVERS_DROPPED),
+            "a node that lost every approved exception reports: {reasons:?}"
+        );
+        // Not the other empty-table reason: nothing here fails to join.
+        assert!(agent.waivers_unjoined().is_none());
+
+        // Recoverable: a Secret republished correctly clears it without a
+        // restart. A latch here would mark the node for the process lifetime
+        // over a rollout that fixed itself.
+        assert_eq!(agent.try_reload_exceptions(&signed).expect("reload"), 1);
+        assert!(!agent.waivers_dropped());
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+    }
+
+    /// A Secret that carries no `exceptions.fsig` at all is a node that
+    /// legitimately has no waivers, and must not be reported as one that lost
+    /// them: a reason true of every node without waivers is a reason nobody
+    /// can act on.
+    #[test]
+    fn a_secret_with_no_exceptions_file_is_not_a_node_that_lost_them() {
+        let dir = temp_lkg();
+        fs::create_dir_all(&dir).expect("temp dir");
+        let mut agent = Agent::new(cfg_respond_named("p1"));
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_attached(true);
+        agent.set_container_map_synced(1);
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
+        assert_eq!(
+            agent
+                .reload_exceptions_path(&dir.join("bundle.fsig"))
+                .expect("a missing exceptions file is not a failure"),
+            0
+        );
+        assert!(!agent.waivers_dropped());
+        assert!(
+            !agent.is_degraded(),
+            "{:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The index derives its cgroup2 root the same way the pre-signal guard
+    /// does, and neither falls back to the constant.
+    ///
+    /// One caller did. `spawn_cgroup_refresh` caught a refused derivation and
+    /// scanned `/sys/fs/cgroup` anyway, which on a hybrid node is a tmpfs of
+    /// v1 controller directories: the index then filled with inodes from a
+    /// filesystem nobody chose, while the guard — which keeps its failure —
+    /// answered `unprovable`. Under `observe`, the shipped default,
+    /// `TARGET_CHECK_UNPROVABLE` is respond-scoped and never fires, so the
+    /// only thing an operator saw was `DEG_IDENTITY_UNKNOWN`: "a cgroup the
+    /// index cannot name", when the truth was that the index was keyed on the
+    /// wrong hierarchy.
+    #[test]
+    fn a_refused_cgroup_root_is_a_named_fault_and_not_a_scan_of_the_default() {
+        let agent = Agent::new(cfg());
+        let root = cgroup_scan_root(
+            &agent,
+            Err(FerrumError::Degraded(
+                "two cgroup2 hierarchies on different superblocks".into(),
+            )),
+        );
+        assert!(
+            root.is_none(),
+            "the refresher was handed a root to scan after the derivation refused: {root:?}"
+        );
+        let fault = agent
+            .terminal_fault()
+            .expect("a refused derivation is a fault");
+        assert!(fault.starts_with(CGROUP_ROOT_UNDERIVABLE), "{fault}");
+        assert!(
+            fault.contains("two cgroup2 hierarchies on different superblocks"),
+            "the fault must carry what the derivation said: {fault}"
+        );
+        assert!(
+            !fault.contains(ferrum_k8smeta::DEFAULT_CGROUP_ROOT),
+            "the constant is named in the fault, so something still reaches for it: {fault}"
+        );
+        // And it is a reason, not just a counter: this is the whole point.
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(reasons.iter().any(|r| r == &fault), "{reasons:?}");
+
+        // The derivation that succeeds is passed straight through: a node with
+        // one unified hierarchy scans it and raises nothing.
+        let agent = Agent::new(cfg());
+        assert_eq!(
+            cgroup_scan_root(&agent, Ok(PathBuf::from("/sys/fs/cgroup/unified"))),
+            Some(PathBuf::from("/sys/fs/cgroup/unified"))
+        );
+        assert!(agent.terminal_fault().is_none());
+    }
+
+    /// The claim the test above cannot make on its own: that the shipped
+    /// carrier has no second, private way back to the constant. `main.rs` is a
+    /// binary and this branch of it is behind a `cfg` and a thread, so the
+    /// only mechanical statement available is that the fallback is not written
+    /// there any more — which is exactly what was written there.
+    #[test]
+    fn the_carrier_has_no_fallback_to_the_hardcoded_cgroup_root() {
+        const MAIN: &str = include_str!("main.rs");
+        assert!(
+            MAIN.contains("cgroup_scan_root"),
+            "the carrier no longer derives its scan root through the library, so this gate reads \
+             nothing"
+        );
+        assert!(
+            !MAIN.contains("DEFAULT_CGROUP_ROOT"),
+            "`main.rs` names DEFAULT_CGROUP_ROOT again: a hierarchy nobody chose is not a \
+             substitute for a derivation that refused"
         );
     }
 
@@ -6082,5 +6552,394 @@ mod tests {
             fixed_now(),
         );
         assert_eq!(d.action, Action::Audit);
+    }
+
+    /// The census: every piece of state `Agent` keeps must either reach a
+    /// reason or be defended in writing.
+    ///
+    /// `boundary_gate.rs` runs the opposite direction — every reason the agent
+    /// can raise is named in the boundary document — and that direction cannot
+    /// see the defect this one exists for. `respond_failed` and
+    /// `exceptions_reload_failed` were both incremented on a path where the
+    /// agent had already failed, exported the failure, and reported healthy:
+    /// there was no reason to name, so a gate over reasons had nothing to say
+    /// about either. The generator of that defect is a counter that traverses
+    /// the whole system and terminates nowhere, and this is a gate on the
+    /// generator rather than on its instances.
+    ///
+    /// Deliberately not in `boundary_gate.rs`. There the claim available is
+    /// "the document names it", and that is a different claim from "the agent
+    /// reports it" — substituting the first for the second is precisely what
+    /// the boundary document exists to refuse.
+    ///
+    /// What it is, mechanically: read this file's own source, take every
+    /// `AtomicU64` / `AtomicBool` / `Mutex<Option<_>>` field of `Agent`, and
+    /// compute which of them the body of `degraded_reasons_at` reads — through
+    /// its own `self.field` accesses and, transitively, through the `self.m()`
+    /// predicates it calls, because reasons are routinely raised by a
+    /// `*_recent_at` helper rather than by touching the field in the arm. A
+    /// field not in that set must appear in `COUNTERS_WITHOUT_A_REASON` with
+    /// its defence on the line.
+    ///
+    /// What it cannot do, and the table is where that shows: it reads calls,
+    /// not meanings. It cannot tell that an arm reading a field raises the
+    /// right reason for it, only that the arm reads it. That half stays a
+    /// person's job, which is why the table holds sentences and not a count.
+    mod counter_census {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        /// This file, as the gate reads it. `include_str!` rather than a path
+        /// walk: the gate must read the source that was compiled into it, and
+        /// a test that resolves a path can be pointed at another tree.
+        const SOURCE: &str = include_str!("lib.rs");
+
+        /// State of `Agent` that no arm of `degraded_reasons_at` reads, each
+        /// with the reason it does not need to.
+        ///
+        /// Adding a row here is a deliberate act. The two defects that made
+        /// this gate exist would both have had to be written down as "the
+        /// agent decided a kill, could not send it, and that is fine" and "the
+        /// node lost every approved waiver, and that is fine" — sentences
+        /// nobody would sign.
+        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 17] = [
+            (
+                "respond_refused",
+                "the aggregate of every guard that said no. A refusal is the guards working, and \
+                 each one already names itself on its own exported envelope; the reasons that do \
+                 degrade are about refusals of a particular shape, not about their number.",
+            ),
+            (
+                "respond_role_skipped",
+                "kill rules matching on an observe node. That is the shipped configuration, not a \
+                 fault: it is counted apart from `respond_refused` for exactly that reason.",
+            ),
+            (
+                "respond_target_unprovable",
+                "the count behind `TARGET_CHECK_UNPROVABLE`, which the guard raises from its own \
+                 construction rather than from this counter — a guard that cannot be built is \
+                 known before any record arrives.",
+            ),
+            (
+                "identity_unknown",
+                "the lifetime total behind `DEG_IDENTITY_UNKNOWN`, which is raised by the decaying \
+                 `identity_unknown_at` stamp. A total is not a state: latching on it would pin \
+                 every node that ever saw one unnamed cgroup.",
+            ),
+            (
+                "labels_unknown",
+                "the lifetime total behind `DEG_LABELS_UNKNOWN`, raised by `labels_unknown_at`. \
+                 Same argument.",
+            ),
+            (
+                "path_truncated",
+                "the lifetime total behind `DEG_PATH_TRUNCATED`, raised by `path_truncated_at`. \
+                 Same argument.",
+            ),
+            (
+                "decode_failed",
+                "the lifetime total behind `DEG_DECODE_FAILURES`, raised by `decode_failed_at`. \
+                 Same argument.",
+            ),
+            (
+                "decode_failed_run",
+                "the consecutive run, which raises `DATAPATH_UNDECODABLE` as a terminal fault — a \
+                 reason `degraded_reasons_at` reads through `terminal_fault`, so the state does \
+                 reach a reason and this field is not where it is read.",
+            ),
+            (
+                "datapath_abi_mismatch",
+                "the count beside `DATAPATH_ABI_MISMATCH`, which is likewise latched as a terminal \
+                 fault on the first refused record.",
+            ),
+            (
+                "unknown_syscalls",
+                "the count beside `datapath_degraded`, which `record_unknown_syscall` sets in the \
+                 same call and which raises `DEG_DATAPATH`.",
+            ),
+            (
+                "lkg_rules_dropped",
+                "the count beside `lkg_partial`, set in the same branch, which raises \
+                 `DEG_LKG_PARTIAL`.",
+            ),
+            (
+                "status_write_failed_count",
+                "the count beside `status_write_failed`, set in the same call, which raises \
+                 `DEG_STATUS_UNWRITABLE`. It exists so the next file that IS written can say the \
+                 surface was down and came back.",
+            ),
+            (
+                "exceptions_reload_failed",
+                "the count beside `exceptions_dropped`, set in the same branch, which raises \
+                 `DEG_WAIVERS_DROPPED`. Until that reason existed this counter was the whole of \
+                 what the agent said about losing every approved exception, which is the second \
+                 defect this gate was built for.",
+            ),
+            (
+                "container_flag_disagreement",
+                "the lifetime total of a disagreement whose reason is decided per cgroup: \
+                 `note_container_flag_disagreement` raises `container_flag_fault_at` only for a \
+                 disagreement that outlived its pod-start publish window, and that stamp is what \
+                 `DEG_CONTAINER_FLAG` reads. Degrading on the total would degrade on every pod \
+                 start.",
+            ),
+            (
+                "container_unproven",
+                "`containerOnly` rules skipped on a caller that could not be shown not to be a \
+                 container. Every pod start opens this window one refresh wide, so a node that \
+                 degraded on it would degrade on ordinary healthy behaviour; what outlives the \
+                 window is the disagreement above. The counter exists so the skipped record does \
+                 not leave silently.",
+            ),
+            (
+                "export_lost_seen",
+                "the agent's monotonic mirror of what the sink has lost, which exists so a new \
+                 loss can be told from an old total. The reason is `DEG_EXPORT_LOSSY`, raised by \
+                 `export_lost_at`, which `note_export_state_at` marks in the same call whenever \
+                 this number grows.",
+            ),
+            (
+                "degraded_reported",
+                "not a fault: the reasons as last handed to a caller that logs transitions. It is \
+                 the memory of this list, so it cannot be an entry in it.",
+            ),
+        ];
+
+        #[test]
+        fn every_agent_counter_is_either_a_reason_or_defended() {
+            let fields = state_fields();
+            assert!(
+                fields.len() >= 32,
+                "the field scan found {} pieces of state on `Agent`; the scan is broken rather \
+                 than the agent, and a broken scan is a gate that passes having read nothing",
+                fields.len()
+            );
+            let methods = agent_methods();
+            assert!(
+                methods.len() >= 60,
+                "the method scan found {} methods on `Agent`; same objection",
+                methods.len()
+            );
+            let read = read_by_degraded_reasons(&fields, &methods);
+            assert!(
+                read.len() >= 12,
+                "`degraded_reasons_at` was found to read {} of the agent's own fields; it read \
+                 more than twelve when this floor was written, so the walk is broken: {read:?}",
+                read.len()
+            );
+
+            let defended: BTreeMap<&str, &str> =
+                COUNTERS_WITHOUT_A_REASON.iter().copied().collect();
+            assert_eq!(
+                defended.len(),
+                COUNTERS_WITHOUT_A_REASON.len(),
+                "a field is defended twice in COUNTERS_WITHOUT_A_REASON"
+            );
+
+            for (field, defence) in COUNTERS_WITHOUT_A_REASON {
+                assert!(
+                    defence.split_whitespace().count() >= 8,
+                    "`{field}` is excused by {defence:?}, which is not a defence. The table takes \
+                     a sentence saying where the state DOES reach a reason, or why it needs none."
+                );
+                assert!(
+                    fields.contains(field),
+                    "COUNTERS_WITHOUT_A_REASON defends `{field}`, which is no longer a state field \
+                     of `Agent`. Remove the row: a defence of something that does not exist is how \
+                     the table stops describing the agent."
+                );
+                assert!(
+                    !read.contains(field),
+                    "`{field}` is now read by `degraded_reasons_at` and is still listed in \
+                     COUNTERS_WITHOUT_A_REASON as needing no reason. One of the two is wrong."
+                );
+            }
+
+            let undefended: Vec<&String> = fields
+                .iter()
+                .filter(|f| !read.contains(*f) && !defended.contains_key(f.as_str()))
+                .collect();
+            assert!(
+                undefended.is_empty(),
+                "state on `Agent` that no arm of `degraded_reasons_at` reads and that nothing \
+                 defends: {undefended:?}\n\
+                 Each of these is a number that can climb on a node reporting healthy. Either \
+                 give it an arm in `degraded_reasons_at`, or add it to COUNTERS_WITHOUT_A_REASON \
+                 with the sentence that says why it needs none."
+            );
+        }
+
+        /// A `{`-opened item's text, from its header to the line that closes it
+        /// at column zero. Brace counting is not used: the bodies here contain
+        /// `format!` strings with braces in them, and a counter would have to
+        /// lex Rust to be right. rustfmt closes a top-level item on a line that
+        /// is exactly `}`.
+        fn top_level_items<'a>(header: &str, src: &'a str) -> Vec<&'a str> {
+            let mut out = Vec::new();
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find(header) {
+                let start = from + rel;
+                let tail = &src[start..];
+                let end = tail
+                    .find("\n}\n")
+                    .unwrap_or_else(|| panic!("{header} does not close at column zero"));
+                out.push(&tail[..end]);
+                from = start + end;
+            }
+            out
+        }
+
+        /// The `AtomicU64` / `AtomicBool` / `Mutex<Option<_>>` fields of
+        /// `Agent`: the state that survives a call and can therefore be a
+        /// number climbing on a node nobody looks at. Plain values, the
+        /// loader, the responder and the index are not in scope — they are not
+        /// observations the agent accumulates about itself.
+        fn state_fields() -> BTreeSet<String> {
+            // Anchored at a line start: this gate's own source is part of
+            // SOURCE, so an unanchored needle matches the needle.
+            let block = top_level_items("\npub struct Agent {", SOURCE);
+            assert_eq!(block.len(), 1, "`pub struct Agent` is not declared once");
+            let mut out = BTreeSet::new();
+            for line in block[0].lines() {
+                let Some(rest) = line.strip_prefix("    ") else {
+                    continue;
+                };
+                if rest.starts_with(' ') || rest.starts_with("//") || rest.starts_with('#') {
+                    continue;
+                }
+                let Some((name, ty)) = rest.split_once(": ") else {
+                    continue;
+                };
+                let Some(ty) = ty.strip_suffix(',') else {
+                    continue;
+                };
+                if ty.starts_with("AtomicU64")
+                    || ty.starts_with("AtomicBool")
+                    || ty.starts_with("Mutex<Option<")
+                {
+                    out.insert(name.to_string());
+                }
+            }
+            out
+        }
+
+        /// Every inherent method of `Agent`, by name, with its body. Both
+        /// `impl Agent` blocks: one of them is behind a `cfg` and a walk that
+        /// reads only the first would silently lose whatever moves there.
+        fn agent_methods() -> BTreeMap<String, String> {
+            let mut out = BTreeMap::new();
+            for block in top_level_items("\nimpl Agent {", SOURCE) {
+                let mut current: Option<String> = None;
+                let mut body = String::new();
+                for line in block.lines() {
+                    if let Some(name) = method_name(line) {
+                        if let Some(prev) = current.take() {
+                            out.insert(prev, std::mem::take(&mut body));
+                        }
+                        current = Some(name);
+                    }
+                    if current.is_some() {
+                        body.push_str(line);
+                        body.push('\n');
+                    }
+                }
+                if let Some(prev) = current {
+                    out.insert(prev, body);
+                }
+            }
+            out
+        }
+
+        /// A method header at method indentation, or `None`.
+        fn method_name(line: &str) -> Option<String> {
+            let mut rest = line.strip_prefix("    ")?;
+            if rest.starts_with(' ') {
+                return None;
+            }
+            loop {
+                let before = rest;
+                for modifier in [
+                    "pub(crate) ",
+                    "pub(super) ",
+                    "pub ",
+                    "default ",
+                    "const ",
+                    "async ",
+                    "unsafe ",
+                ] {
+                    rest = rest.strip_prefix(modifier).unwrap_or(rest);
+                }
+                if rest.len() == before.len() {
+                    break;
+                }
+            }
+            let rest = rest.strip_prefix("fn ")?;
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        }
+
+        /// `self.<ident>` in a body, with whether it is a call. Comment lines
+        /// are dropped first: a doc comment naming a field is prose about it,
+        /// not a read of it, and this whole file is written in prose that names
+        /// its fields.
+        fn self_refs(body: &str) -> Vec<(String, bool)> {
+            let mut out = Vec::new();
+            for line in body.lines() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                let mut rest = code;
+                while let Some(at) = rest.find("self.") {
+                    let after = &rest[at + "self.".len()..];
+                    let name: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    let tail = after[name.len()..].trim_start();
+                    if !name.is_empty() {
+                        out.push((name.clone(), tail.starts_with('(')));
+                    }
+                    rest = &after[name.len()..];
+                }
+            }
+            out
+        }
+
+        /// The fields `degraded_reasons_at` reads, directly or through the
+        /// predicates it calls, to a fixed point.
+        ///
+        /// Transitive on purpose. Almost no arm touches a field: they call
+        /// `path_truncated_recent_at`, `container_map_ready_at`,
+        /// `waivers_unjoined`. A one-level walk would report every one of
+        /// those fields undefended and the table would fill up with rows that
+        /// are not true.
+        fn read_by_degraded_reasons(
+            fields: &BTreeSet<String>,
+            methods: &BTreeMap<String, String>,
+        ) -> BTreeSet<String> {
+            let seed = methods
+                .get("degraded_reasons_at")
+                .expect("`Agent::degraded_reasons_at` is gone: this gate walks nothing");
+            let mut covered = BTreeSet::new();
+            let mut visited: BTreeSet<String> = BTreeSet::new();
+            let mut queue = vec![seed.clone()];
+            while let Some(body) = queue.pop() {
+                for (name, is_call) in self_refs(&body) {
+                    if fields.contains(&name) {
+                        covered.insert(name.clone());
+                    }
+                    if is_call && !visited.contains(&name) {
+                        if let Some(next) = methods.get(&name) {
+                            visited.insert(name);
+                            queue.push(next.clone());
+                        }
+                    }
+                }
+            }
+            covered
+        }
     }
 }

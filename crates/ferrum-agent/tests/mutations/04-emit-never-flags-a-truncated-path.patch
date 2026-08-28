@@ -8,8 +8,9 @@
 #
 # This header said, for one cycle, that the patch survived on purpose. It does
 # not, and never did: measured on Linux 6.18.44 with the harness beside it, the
-# join reports `FAILED. 3 passed; 1 failed`, panicking at the one `assert!` on
-# `Event::path_truncated()`.
+# join reports `FAILED. 4 passed; 2 failed` (it was `3 passed; 1 failed` before
+# cycle 10 added a second test that reads the raw flag), panicking at the
+# `assert!` on `Event::path_truncated()`.
 # Nothing had run the harness; the claim came from reading `Event::flags` and
 # from a separate hand-run, and it was wrong in both directions.
 #

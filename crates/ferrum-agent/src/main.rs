@@ -3,7 +3,6 @@
 use ferrum_agent::{parse_trust_root, Agent, AgentConfig, AgentRole, RESPOND_NO_HOST_PIDNS};
 use ferrum_common::FerrumError;
 use ferrum_export::{EventSink, QueueSink, RotatingFileSink, SinkContext};
-use ferrum_k8smeta::SharedCgroupIndex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::exit;
@@ -138,7 +137,7 @@ fn main() {
     // Each message is the whole desired cgroup set, so a full channel drops an
     // update instead of queueing: the next refresh carries the current truth.
     let (cgroup_tx, cgroup_rx) = std::sync::mpsc::sync_channel::<CgroupPublish>(1);
-    spawn_cgroup_refresh(agent.cgroup_index(), node.clone(), cgroup_tx);
+    spawn_cgroup_refresh(&agent, node.clone(), cgroup_tx);
 
     if let Err(err) = agent.restore_last_known_good() {
         eprintln!("ferrum-agent: {err}");
@@ -205,13 +204,27 @@ fn main() {
 /// container. Both are Degraded.
 #[cfg(feature = "apiserver")]
 fn spawn_cgroup_refresh(
-    index: SharedCgroupIndex,
+    agent: &Agent,
     node: String,
     sync_tx: std::sync::mpsc::SyncSender<CgroupPublish>,
 ) {
     use ferrum_agent::{CGROUP_CARRIER_GONE, CGROUP_REFRESH};
     use ferrum_k8smeta::watch::{ApiserverConfig, ApiserverWatcher};
-    use ferrum_k8smeta::{detect_cgroup2_root, CgroupResolver, StdCgroupFs, DEFAULT_CGROUP_ROOT};
+    use ferrum_k8smeta::{detect_cgroup2_root, CgroupResolver, StdCgroupFs};
+
+    let index = agent.cgroup_index();
+    // Derived here, before the thread exists, so a failure is the agent's
+    // reason rather than a line on stderr from a thread that then loops
+    // forever over the wrong filesystem. The scan needs a root and there is
+    // exactly one right answer for it; where that answer cannot be had, the
+    // index is left empty and said so, not filled from a guess.
+    let Some(root) = ferrum_agent::cgroup_scan_root(agent, detect_cgroup2_root()) else {
+        eprintln!(
+            "ferrum-agent: {}",
+            agent.terminal_fault().unwrap_or_default()
+        );
+        return;
+    };
 
     let config = match ApiserverConfig::from_service_account(node) {
         Ok(config) => config,
@@ -232,22 +245,6 @@ fn spawn_cgroup_refresh(
         let resolver = CgroupResolver::new(index);
         let source = ferrum_agent::SharedPodSource::new(cache);
         let fs = StdCgroupFs;
-        // The same hierarchy the pre-signal target check keys on, derived the
-        // same way. A hardcoded root on a hybrid node makes the index and the
-        // guard disagree about which filesystem an inode came from, and every
-        // reaction then refuses on a target that never moved. `scan` reports
-        // the failure it would hit here anyway; naming the root that was tried
-        // is what makes that report readable.
-        let root = match detect_cgroup2_root() {
-            Ok(root) => root,
-            Err(err) => {
-                eprintln!(
-                    "ferrum-agent: cgroup2 mount point not derivable ({err}); falling back to \
-                     {DEFAULT_CGROUP_ROOT}, where the scan below reports what it finds. Degraded."
-                );
-                PathBuf::from(DEFAULT_CGROUP_ROOT)
-            }
-        };
         let mut resolved_at: Option<Instant> = None;
         loop {
             match resolver.refresh(&fs, &root, &source) {
@@ -278,11 +275,11 @@ fn spawn_cgroup_refresh(
 
 #[cfg(not(feature = "apiserver"))]
 fn spawn_cgroup_refresh(
-    index: SharedCgroupIndex,
+    agent: &Agent,
     _node: String,
     _sync_tx: std::sync::mpsc::SyncSender<CgroupPublish>,
 ) {
-    let _ = index;
+    let _ = agent.cgroup_index();
     eprintln!(
         "ferrum-agent: built without the apiserver feature: no pod metadata, the cgroup index \
          stays empty and namespaced policies cannot match. Degraded."

@@ -17,7 +17,7 @@
 # the other direction — the flag is left alone and the derivation is deleted —
 # against a test that takes the record *this kernel wrote* and clears the one
 # bit in the bytes. Measured on Linux 6.18.44: the join reports
-# `FAILED. 4 passed; 1 failed`, and the failure is the shape of the original
+# `FAILED. 5 passed; 1 failed`, and the failure is the shape of the original
 # defect, not an assertion about a flag — `expected exactly one no-runtime-sock
 # verdict, got [("default", "openat", "audit")]`. A §D kill rule silently
 # downgraded to an audit on a path the buffer could not carry whole.

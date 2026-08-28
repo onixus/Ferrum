@@ -6,9 +6,11 @@
 # tell the difference: this is precisely the shape of every §D `-> kill` proof
 # that stopped at a `Responder` trait object backed by a fake.
 #
-# Must fail: the three killing tests in `tests/attach_join.rs`, at
+# Must fail: every killing test in `tests/attach_join.rs`, at
 # `Probe::wait_for_death` - the export says the process was killed and the
-# process is still running.
+# process is still running - plus
+# `a_kill_this_kernel_refuses_is_degraded_and_named`, whose whole subject is a
+# kill that did *not* happen and which this patch makes the agent claim did.
 diff --git a/crates/ferrum-agent/src/lib.rs b/crates/ferrum-agent/src/lib.rs
 index bfb8cca..e17fcd7 100644
 --- a/crates/ferrum-agent/src/lib.rs
