@@ -85,7 +85,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn hash(seed: char) -> String {
-        std::iter::repeat(seed).take(64).collect()
+        std::iter::repeat_n(seed, 64).collect()
     }
 
     fn entry(inode: u64, uid: &str, cid: &str) -> CgroupEntry {

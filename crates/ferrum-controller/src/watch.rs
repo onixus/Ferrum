@@ -308,15 +308,20 @@ async fn run_exception_watch(
     health: &ControllerHealth,
 ) -> Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &policy_exception_resource());
-    // Raw watcher events: Deleted must revoke, applied_objects would hide it.
+    // Raw watcher events: Delete must revoke, applied_objects would hide it.
     let mut stream = std::pin::pin!(watcher(api, watcher::Config::default()));
+    // kube 1.x отдаёт релист потоком Init/InitApply/InitDone вместо одного
+    // Restarted(objs). Собираем его в сторонний набор и подменяем живой одним
+    // шагом на InitDone: иначе в середине релиста опубликуется пустой набор,
+    // то есть массовая отмена действующих exception.
+    let staging: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => {
                 health.note_success(Requested::of(FailureClass::Watch));
                 // Reports and counts each object's own failure itself; what
                 // comes back here is the terminal case and nothing else.
-                handle_exception_event(client, cfg, exceptions, health, ev).await?;
+                handle_exception_event(client, cfg, exceptions, &staging, health, ev).await?;
             }
             Err(err) => {
                 eprintln!("ferrum-controller watch: {err}");
@@ -332,6 +337,7 @@ async fn handle_exception_event(
     client: &Client,
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
+    staging: &ExceptionSet,
     health: &ControllerHealth,
     event: watcher::Event<DynamicObject>,
 ) -> Result<()> {
@@ -340,13 +346,19 @@ async fn handle_exception_event(
     // revoked/narrowed exception live in the Secrets (that is fail-open).
     //
     // Each object's own failure is reported and counted here rather than
-    // returned, because one `Restarted` carries many objects and one bad one
-    // must not stop the rest. What this function returns is the terminal case:
-    // a class in which nothing has ever succeeded.
-    let mut objects: Vec<&DynamicObject> = Vec::new();
+    // returned, because one relist carries many objects and one bad one must
+    // not stop the rest. What this function returns is the terminal case: a
+    // class in which nothing has ever succeeded.
+    //
+    // Each object is paired with the set it belongs in: a live `Apply` goes
+    // straight to the published set, while a relist is accumulated in
+    // `staging` and swapped in whole at `InitDone`, so a relist in progress
+    // never publishes a partial set — that would be a mass revocation of
+    // exceptions that are still in force.
+    let mut objects: Vec<(&DynamicObject, &ExceptionSet)> = Vec::new();
     match &event {
-        watcher::Event::Applied(obj) => objects.push(obj),
-        watcher::Event::Deleted(obj) => {
+        watcher::Event::Apply(obj) => objects.push((obj, exceptions)),
+        watcher::Event::Delete(obj) => {
             match (
                 obj.metadata.namespace.as_deref(),
                 obj.metadata.name.as_deref(),
@@ -378,13 +390,17 @@ async fn handle_exception_event(
                 }
             }
         }
-        watcher::Event::Restarted(objs) => {
-            exceptions.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            objects.extend(objs.iter());
+        watcher::Event::Init => {
+            staging.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        watcher::Event::InitApply(obj) => objects.push((obj, staging)),
+        watcher::Event::InitDone => {
+            let relisted = staging.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            *exceptions.lock().unwrap_or_else(|e| e.into_inner()) = relisted;
         }
     }
-    for obj in objects {
-        match apply_exception_object(client, exceptions, obj).await {
+    for (obj, target) in objects {
+        match apply_exception_object(client, target, obj).await {
             Ok(requested) => health.note_success(requested),
             Err(failure) => {
                 eprintln!("ferrum-controller: exception status: {}", failure.err);
@@ -1288,7 +1304,7 @@ mod tests {
         let (status, live) = exception_disposition(&obj);
         assert!(status.active, "{}", status.message);
         let spec = live.expect("live spec");
-        let json = crate::exceptions_json(&[spec.clone()]).expect("json");
+        let json = crate::exceptions_json(std::slice::from_ref(&spec)).expect("json");
         let decoded: Vec<ferrum_api::PolicyExceptionSpec> =
             serde_json::from_slice(&json).expect("admission-side decode");
         assert_eq!(decoded, vec![spec]);

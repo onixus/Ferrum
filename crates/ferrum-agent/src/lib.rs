@@ -977,7 +977,7 @@ impl Agent {
     pub fn waivers_unjoined_total(&self) -> u64 {
         self.exceptions
             .iter()
-            .filter(|spec| !spec.target.policies.iter().any(|p| *p == self.policy_name))
+            .filter(|spec| !spec.target.policies.contains(&self.policy_name))
             .count() as u64
     }
 
@@ -1067,7 +1067,7 @@ impl Agent {
         let mut expired = 0usize;
         let mut rest = 0usize;
         for spec in &inert {
-            if !spec.target.policies.iter().any(|p| *p == self.policy_name) {
+            if !spec.target.policies.contains(&self.policy_name) {
                 unjoined.push(spec);
             } else if now >= spec.expires_at {
                 expired += 1;

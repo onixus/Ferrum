@@ -14,6 +14,8 @@ use ferrum_admission::{
     parse_program, poll_serving_cert, serve_listener, ReviewConfig, TlsSource, WebhookState,
 };
 use ferrum_api::ClusterSecurityPolicySpec;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -30,9 +32,7 @@ fn fixture(name: &str) -> PathBuf {
 
 fn fixture_der(name: &str) -> Vec<u8> {
     let pem = std::fs::read(fixture(name)).expect("fixture");
-    rustls_pemfile::certs(&mut pem.as_slice())
-        .expect("pem")
-        .remove(0)
+    CertificateDer::from_pem_slice(&pem).expect("pem").to_vec()
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -82,13 +82,16 @@ fn state() -> Arc<WebhookState> {
 fn served_certificate(addr: SocketAddr) -> Vec<u8> {
     let mut roots = rustls::RootCertStore::empty();
     roots
-        .add(&rustls::Certificate(fixture_der("ca.crt")))
+        .add(CertificateDer::from(fixture_der("ca.crt")))
         .expect("test CA");
-    let config = rustls::ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let name = rustls::ServerName::try_from(SERVICE_NAME).expect("server name");
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let name = ServerName::try_from(SERVICE_NAME).expect("server name");
     let mut conn = rustls::ClientConnection::new(Arc::new(config), name).expect("client");
     let mut sock = TcpStream::connect(addr).expect("connect");
     {
@@ -104,8 +107,7 @@ fn served_certificate(addr: SocketAddr) -> Vec<u8> {
         .expect("peer certificates")
         .first()
         .expect("leaf")
-        .0
-        .clone()
+        .to_vec()
 }
 
 #[test]

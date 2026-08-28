@@ -723,7 +723,8 @@ mod tests {
     #[test]
     fn exceptions_patch_signs_fsig_and_nulls_legacy_json_key() {
         let spec = live_exception();
-        let patch = exceptions_secret_patch(&[spec.clone()], &RFC8032_SK).expect("patch");
+        let patch =
+            exceptions_secret_patch(std::slice::from_ref(&spec), &RFC8032_SK).expect("patch");
         let data = patch["data"].as_object().expect("data");
         assert_eq!(data.len(), 2);
         assert!(
@@ -773,7 +774,7 @@ mod tests {
     #[test]
     fn per_policy_scoping_survives_signing() {
         let spec = live_exception();
-        let scoped = exceptions_for_policy(&[spec.clone()], "prod-restricted");
+        let scoped = exceptions_for_policy(std::slice::from_ref(&spec), "prod-restricted");
         let fsig = exceptions_fsig(&scoped, &RFC8032_SK).expect("fsig");
         let payload = crate::bundle::verify_fsig_envelope(&fsig, &pk()).expect("verify");
         let decoded: Vec<PolicyExceptionSpec> = serde_json::from_slice(&payload).expect("decode");

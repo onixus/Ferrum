@@ -11,6 +11,8 @@
 //! x509-parser, and the Jenkins `Crate boundary` stage fails if either reaches
 //! this binary.
 
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -188,9 +190,8 @@ impl TlsSource {
     /// serving and are counted.
     pub fn reload(&self) -> Result<(), String> {
         let previous = self.facts();
-        let (config, facts) = read_material(&self.cert_path, &self.key_path).map_err(|e| {
+        let (config, facts) = read_material(&self.cert_path, &self.key_path).inspect_err(|_e| {
             self.reload_failures.fetch_add(1, Ordering::Relaxed);
-            e
         })?;
         if !facts.covers(&previous.dns_names) {
             self.reload_failures.fetch_add(1, Ordering::Relaxed);
@@ -368,15 +369,13 @@ fn read_material(
 ) -> Result<(Arc<ServerConfig>, CertFacts), String> {
     let cert_file = std::fs::File::open(cert_path).map_err(|e| format!("tls cert: {e}"))?;
     let mut cert_reader = BufReader::new(cert_file);
-    let certs = rustls_pemfile::certs(&mut cert_reader)
-        .map_err(|e| format!("tls cert parse: {e}"))?
-        .into_iter()
-        .map(rustls::Certificate)
-        .collect::<Vec<_>>();
+    let certs = CertificateDer::pem_reader_iter(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("tls cert parse: {e}"))?;
     let leaf = certs
         .first()
         .ok_or_else(|| "tls cert file contains no certificates".to_string())?;
-    let facts = certificate_facts(&leaf.0)?;
+    let facts = certificate_facts(leaf.as_ref())?;
     let now = now_unix();
     if facts.not_after <= now {
         return Err(format!(
@@ -395,23 +394,17 @@ fn read_material(
 
     let key_file = std::fs::File::open(key_path).map_err(|e| format!("tls key: {e}"))?;
     let mut key_reader = BufReader::new(key_file);
-    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+    // Разбор PEM живёт в pki-types: rustls-pemfile объявлен unmaintained
+    // (RUSTSEC-2025-0134). pkcs8/rsa/sec1 распознаются сами.
+    let key = PrivateKeyDer::from_pem_reader(&mut key_reader)
         .map_err(|e| format!("tls key parse: {e}"))?;
-    if keys.is_empty() {
-        let key_file = std::fs::File::open(key_path).map_err(|e| format!("tls key: {e}"))?;
-        let mut key_reader = BufReader::new(key_file);
-        keys = rustls_pemfile::rsa_private_keys(&mut key_reader)
-            .map_err(|e| format!("tls key parse: {e}"))?;
-    }
-    let key = keys
-        .into_iter()
-        .next()
-        .ok_or_else(|| "tls key file contains no private key".to_string())?;
-    let config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, rustls::PrivateKey(key))
-        .map_err(|e| format!("tls config: {e}"))?;
+    let config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("tls config: {e}"))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("tls config: {e}"))?;
     Ok((Arc::new(config), facts))
 }
 
@@ -628,9 +621,9 @@ mod tests {
     const EXPIRED: &str = include_str!("../tests/fixtures/pki/expired.crt");
 
     fn der(pem: &str) -> Vec<u8> {
-        rustls_pemfile::certs(&mut pem.as_bytes())
+        CertificateDer::from_pem_slice(pem.as_bytes())
             .expect("pem")
-            .remove(0)
+            .to_vec()
     }
 
     fn unix(text: &str) -> i64 {

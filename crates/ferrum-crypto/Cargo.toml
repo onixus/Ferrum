@@ -10,6 +10,9 @@ rust-version.workspace = true
 ed25519-compact.workspace = true
 ferrum-common.workspace = true
 ferrum-ids.workspace = true
+ring = "0.17"
+rustls-pki-types.workspace = true
+rustls-webpki.workspace = true
 # X.509 issuance only. Admission and agent link this crate on the decision
 # path and must not pull a certificate generator; the Jenkins 'Crate boundary'
 # stage checks their per-crate graphs. See the workspace manifest.
@@ -20,3 +23,6 @@ x509-parser = { workspace = true, optional = true }
 [features]
 default = []
 x509 = ["dep:rcgen", "dep:x509-parser"]
+
+[dev-dependencies]
+rcgen.workspace = true

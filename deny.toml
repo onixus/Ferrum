@@ -1,9 +1,13 @@
 [licenses]
-allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Unicode-DFS-2016", "Unicode-3.0"]
+# Свои crate под GPL-3.0-only: список ниже — про сторонние зависимости.
+private = { ignore = true }
+allow = ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "ISC", "Unicode-DFS-2016", "Unicode-3.0", "Zlib"]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Внутренние crate подключаются через workspace path без версии — это не wildcard-риск.
+allow-wildcard-paths = true
 
 deny = [
     { name = "openssl-sys", deny-multiple-versions = true },

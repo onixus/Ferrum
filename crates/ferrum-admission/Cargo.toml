@@ -18,8 +18,8 @@ ferrum-policy.workspace = true
 # path must not grow a second client.
 # Not `workspace = true`: that form cannot turn default features off here.
 ferrum-k8smeta = { path = "../ferrum-k8smeta", default-features = false, optional = true }
-rustls = "=0.21.11"
-rustls-pemfile = "=1.0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

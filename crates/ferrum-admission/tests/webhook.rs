@@ -43,7 +43,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn b64_encode(data: &[u8]) -> String {
     const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i < data.len() {
         let rem = data.len() - i;
@@ -1029,7 +1029,7 @@ fn exceptions_reload_missing_file_is_empty_and_unverifiable_resets() {
     );
     assert_eq!(state.exceptions_resets(), 1);
 
-    let signed = exceptions_fsig_bytes(&[live.clone()], &SK);
+    let signed = exceptions_fsig_bytes(std::slice::from_ref(&live), &SK);
     let n = state.try_reload_exceptions(&signed).expect("signed list");
     assert_eq!(n, 1);
     assert_eq!(handle_json(&state, &body)["response"]["allowed"], true);
@@ -1045,7 +1045,10 @@ fn exceptions_reload_missing_file_is_empty_and_unverifiable_resets() {
 
     state.try_reload_exceptions(&signed).expect("signed again");
     assert!(state
-        .try_reload_exceptions(&exceptions_fsig_bytes(&[live.clone()], &SK_OTHER))
+        .try_reload_exceptions(&exceptions_fsig_bytes(
+            std::slice::from_ref(&live),
+            &SK_OTHER
+        ))
         .is_err());
     assert_eq!(
         handle_json(&state, &body)["response"]["allowed"],

@@ -1,4 +1,4 @@
-//! HTTP/1.1 webhook. std::net only; TLS optional via rustls 0.21.
+//! HTTP/1.1 webhook. std::net only; TLS optional via rustls 0.23 (ring provider).
 
 use chrono::Utc;
 use ferrum_api::PolicyExceptionSpec;
@@ -243,8 +243,7 @@ fn handle_connection(
         // Read the config per connection: rotation swaps it, and a handshake
         // already in flight keeps the certificate it started with.
         Some(source) => {
-            let conn = rustls::ServerConnection::new(source.config())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let conn = rustls::ServerConnection::new(source.config()).map_err(io::Error::other)?;
             let mut tls_stream = rustls::StreamOwned::new(conn, stream);
             serve_http(&mut tls_stream, state)
         }

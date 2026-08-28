@@ -1105,10 +1105,10 @@ mod build_closure {
     fn collect_containers(node: &Value, file: &str, out: &mut Vec<Container>) {
         match node {
             Value::Mapping(map) => {
-                if let Some(Value::String(image)) = map.get(&Value::from("image")) {
+                if let Some(Value::String(image)) = map.get(Value::from("image")) {
                     let mut argv = Vec::new();
                     for key in ["command", "args"] {
-                        let Some(items) = map.get(&Value::from(key)).and_then(Value::as_sequence)
+                        let Some(items) = map.get(Value::from(key)).and_then(Value::as_sequence)
                         else {
                             continue;
                         };

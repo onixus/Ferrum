@@ -790,7 +790,7 @@ fn sequence<'a>(node: &'a Value, key: &str) -> &'a [Value] {
 fn collect_field(node: &Value, key: &str, out: &mut BTreeSet<String>) {
     match node {
         Value::Mapping(map) => {
-            if let Some(Value::String(value)) = map.get(&Value::from(key)) {
+            if let Some(Value::String(value)) = map.get(Value::from(key)) {
                 out.insert(value.clone());
             }
             for (_, value) in map.iter() {
@@ -941,7 +941,7 @@ fn granted_status_writes(
                     Some(prefix) if ferrum_group => {
                         for (status, _, _) in STATUS_TYPES {
                             let names = prefix
-                                .map_or(true, |kind| status.strip_suffix("/status") == Some(kind));
+                                .is_none_or(|kind| status.strip_suffix("/status") == Some(kind));
                             if names {
                                 granted.insert(status.to_string());
                             }
@@ -1548,7 +1548,7 @@ fn a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose() {
 fn contains_key(node: &Value, key: &str) -> bool {
     match node {
         Value::Mapping(map) => {
-            map.contains_key(&Value::from(key))
+            map.contains_key(Value::from(key))
                 || map.iter().any(|(_, value)| contains_key(value, key))
         }
         Value::Sequence(items) => items.iter().any(|item| contains_key(item, key)),

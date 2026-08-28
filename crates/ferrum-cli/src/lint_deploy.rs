@@ -3162,7 +3162,7 @@ mod tests {
         )
         .unwrap();
         let bundle = ferrum_crypto::x509::base64_encode(ca.cert_pem.as_bytes());
-        let docs = vec![Doc {
+        let docs = [Doc {
             file: "webhook.yaml".into(),
             base: true,
             template: false,
