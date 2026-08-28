@@ -221,6 +221,7 @@
 | Долг relist, поднятый нечитаемым кадром, гасится истечением hold-down на любом следующем кадре, а не приходом второго нечитаемого: одиночный плохой кадр на здоровом потоке не оставляет кэш нетёплым на всё время соединения, и при этом всплеск нечитаемых кадров не стоит переподключения на кадр | U | U `ferrum-k8smeta/src/watch.rs::one_unreadable_frame_on_an_otherwise_healthy_stream_still_relists` · U `ferrum-k8smeta/src/watch.rs::an_unreadable_pod_frame_ends_the_stream_once_its_debt_stands` · U `ferrum-k8smeta/src/watch.rs::a_rolling_stream_of_unknown_frames_is_not_a_reconnect_per_frame` |
 | Несосчитанный rollout отличается на проводе от сосчитанного нуля: поставляемый манифест контроллера флота не объявляет, пустой срез даёт `null` в обоих счётчиках, объявленный вставший флот — `0`, и обе CRD принимают `null`, иначе каждый PATCH статуса отказывал бы | U | U `ferrum-controller/src/lib.rs::an_undeclared_fleet_is_absent_from_status_and_a_stuck_one_is_a_counted_zero` · U `deploy_gate.rs::the_shipped_controller_declares_no_fleet_so_its_rollout_counts_are_absent_not_zero` · U `deploy_gate.rs::both_rollout_counts_are_nullable_in_every_crd_that_carries_them` |
 | Подписанный bundle, чей wasm-слот несёт модуль, которого этот бинарь не исполняет, отвергается обеими плоскостями, и агент остаётся на last-known-good; отличие от принимаемого bundle — один байт kind, подписанный тем же ключом | U | U `acceptance.rs::a_signed_bundle_whose_wasm_slot_no_plane_can_execute_is_refused_by_both` · U `ferrum-wasm-host/src/lib.rs::only_the_versioned_placeholder_is_a_loadable_slot` |
+| Ни одна поставляемая CRD не объявляет status, которого никто не пишет, и ни один писатель status не остаётся без объявления в CRD; фикстура §D тоже не несёт статуса, за который никто не отвечает | U | U `boundary_gate.rs::a_status_no_subject_writes_is_not_a_status_this_tree_ships` · U `ferrum-testkit/src/lib.rs::the_cp_down_fixture_is_a_spec_no_component_answers` |
 | `status.json` пишется целиком, переживает сбой записи и не держит замок на агенте | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::the_status_write_holds_no_lock_on_the_shared_agent` |
 
 ### Сигналы деградации
@@ -703,6 +704,26 @@ watcher релистит и передаёт **каждый** объект за�
   `boundary_gate.rs::a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose`:
   грант на kind, которого не достаёт ни один `gvk`, — падение сборки, а не
   строка в документе.
+
+  Третий слой той же находки закрыт этим циклом, и он был самым громким:
+  `docs/crd/` объявлял подресурс `status`, схему статуса и printer-колонки для
+  четырёх kind, которых не пишет никто — `FerrumCluster`, `ComplianceSnapshot`,
+  `PolicyLibrary`, `RuntimeProfile`. Объявленный статус не пустое поле: API
+  server его дефолтит, и `kubectl get` печатает нулевое значение каждой колонки
+  вечно — `Degraded false` на упавшем члене флота, `Pass 0 Fail 0 Waived 0` на
+  аудите, которого не было. RBAC читает тот, кто разбирается с доступом; CRD
+  читает тот, кто решает, о чём эта система вообще сообщает, а колонки видит
+  каждый. Подресурс, колонки и схема сняты у всех четырёх; `spec`-колонки
+  остались, потому что печатают написанное оператором. Вместе с ними ушли: одно
+  CEL-правило `FerrumCluster` («`degraded=true` без `lastBundleDigest` — это
+  fail-open»), которое сторожило поле без писателя и потому не решило ни разу, и
+  блок `status:` из фикстуры `cp-down-lkg.yaml` — вместе с тестом, который
+  читал из неё `degraded: true` обратно под именем `rfc_d_*` и утверждал этим
+  YAML, а не продукт. §D-случай держит `acceptance.rs`, и держал всегда.
+  Механическую форму этому даёт
+  `boundary_gate.rs::a_status_no_subject_writes_is_not_a_status_this_tree_ships`,
+  и он двусторонний: писатель статуса, которого CRD не объявляет, — тоже
+  падение, потому что такой PATCH API server срезает молча.
 - **`.status.rollout` на любой настоящей установке не сообщает ничего — и
   теперь так и написано в объекте.** `deploy/controller/deployment.yaml`
   по-прежнему не передаёт `--cluster`, и `plan_rollout` по-прежнему получает

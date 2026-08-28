@@ -1544,6 +1544,225 @@ fn a_granted_resource_no_subject_can_reach_is_a_permission_with_no_purpose() {
     );
 }
 
+/// One shipped CRD, reduced to the three ways it can promise a status.
+struct CrdStatusSurface {
+    file: String,
+    kind: String,
+    subresource: bool,
+    schema: bool,
+    columns: Vec<String>,
+}
+
+impl CrdStatusSurface {
+    fn promises_status(&self) -> bool {
+        self.subresource || self.schema || !self.columns.is_empty()
+    }
+}
+
+/// Every CRD under `docs/crd/`, read for what it tells an operator it reports.
+fn crd_status_surfaces(root: &Path) -> Vec<CrdStatusSurface> {
+    let mut files = Vec::new();
+    yaml_files(&root.join("docs/crd"), &mut files);
+    files.sort();
+    let mut out = Vec::new();
+    for path in files {
+        let raw = fs::read_to_string(&path).expect("crd yaml");
+        let Ok(doc) = serde_yaml::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(spec) = doc.get("spec") else {
+            continue;
+        };
+        let kind = spec
+            .get("names")
+            .map(|n| scalar(n, "kind"))
+            .unwrap_or_default();
+        if kind.is_empty() {
+            continue;
+        }
+        let version = sequence(spec, "versions").first().cloned();
+        let Some(version) = version else { continue };
+        let subresource = version
+            .get("subresources")
+            .map(|s| contains_key(s, "status"))
+            .unwrap_or(false);
+        let schema = version
+            .get("schema")
+            .and_then(|s| s.get("openAPIV3Schema"))
+            .and_then(|s| s.get("properties"))
+            .map(|p| p.get("status").is_some())
+            .unwrap_or(false);
+        let columns = sequence(&version, "additionalPrinterColumns")
+            .iter()
+            .filter(|column| scalar(column, "jsonPath").starts_with(".status"))
+            .map(|column| scalar(column, "name"))
+            .collect();
+        out.push(CrdStatusSurface {
+            file: path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string(),
+            kind,
+            subresource,
+            schema,
+            columns,
+        });
+    }
+    out
+}
+
+/// A status a CRD declares and no shipped subject writes, and the other
+/// direction with it.
+///
+/// The RBAC censuses above ask what a subject is *permitted* to write. This
+/// asks what the API surface *promises* is written, which is the same question
+/// one layer out and reaches further: RBAC is read by an operator debugging
+/// access, a CRD is read by an operator deciding what the system reports, and
+/// `kubectl get` prints the columns to anyone. A status subresource with no
+/// writer is not an empty field — the API server defaults it, so every column
+/// reads out the zero value of its own struct forever, and `Degraded false` on
+/// a cluster that is down is a false report rather than a missing one. Four of
+/// the seven kinds here shipped exactly that, with the printer columns to
+/// display it, for as long as this catalog has existed.
+///
+/// The reverse direction is checked in the same pass because it fails in a way
+/// nothing else here would catch: a controller that PATCHes a status the CRD
+/// does not declare has its write pruned by the API server and gets no error
+/// for it, so the plane believes it published and the object never changes.
+///
+/// What it cannot do, said rather than left to be read in: `writes_status` sees
+/// a `gvk` literal for the Kind and a `patch_status` call in the same crate,
+/// not the two joined. That is the same limit the grant census carries and it
+/// fails in the safe direction here — toward believing a writer exists.
+#[test]
+fn a_status_no_subject_writes_is_not_a_status_this_tree_ships() {
+    let root = repo_root();
+    let surfaces = crd_status_surfaces(&root);
+    assert!(
+        surfaces.len() >= 7,
+        "found {} CRDs under docs/crd; there were seven when this gate was written, so it is \
+         reading the wrong tree and every absence below is true for the wrong reason",
+        surfaces.len()
+    );
+
+    let subjects = shipped_subjects(&root);
+    let sources: BTreeMap<String, String> = subjects
+        .keys()
+        .map(|subject| (subject.clone(), crate_sources(&root, subject)))
+        .collect();
+    let writer_of = |kind: &str| -> Option<String> {
+        sources
+            .iter()
+            .find(|(_, body)| writes_status(body, kind))
+            .map(|(subject, _)| subject.clone())
+    };
+
+    let mut unwritten = Vec::new();
+    let mut undeclared = Vec::new();
+    for surface in &surfaces {
+        match (surface.promises_status(), writer_of(&surface.kind)) {
+            (true, None) => unwritten.push(format!(
+                "  {} ({}): subresource={} schema={} columns={:?}",
+                surface.file, surface.kind, surface.subresource, surface.schema, surface.columns
+            )),
+            (false, Some(subject)) => undeclared.push(format!(
+                "  {} ({}): written by {subject}",
+                surface.file, surface.kind
+            )),
+            _ => {}
+        }
+    }
+
+    assert!(
+        unwritten.is_empty(),
+        "these CRDs declare a status nothing in this tree writes:\n{}\nThe API server defaults \
+         what a schema declares, so every one of those columns prints a zero value forever and \
+         reads as a report that was taken. Either add the writer — a gvk, a watch and a \
+         patch_status — or delete the subresource, the columns and the schema, and restore \
+         them in the change that adds it.",
+        unwritten.join("\n")
+    );
+    assert!(
+        undeclared.is_empty(),
+        "these kinds have a status writer and a CRD that declares no status:\n{}\nA PATCH \
+         against a subresource the CRD does not carry is pruned by the API server without an \
+         error, so the plane records a publish that never landed.",
+        undeclared.join("\n")
+    );
+
+    // Positive controls. Every assertion above is an absence, and a reader that
+    // had stopped seeing statuses or writers would produce the same absence.
+    let policy = surfaces
+        .iter()
+        .find(|s| s.kind == "ClusterSecurityPolicy")
+        .expect("the catalog ships ClusterSecurityPolicy");
+    assert!(
+        policy.subresource && policy.schema && !policy.columns.is_empty(),
+        "the CRD this census is calibrated on declares no status any more: {:?}",
+        policy.columns
+    );
+    assert_eq!(
+        writer_of("ClusterSecurityPolicy").as_deref(),
+        Some("ferrum-controller"),
+        "the writer this census is calibrated on is gone, so every kind would read as unwritten"
+    );
+    let cluster = surfaces
+        .iter()
+        .find(|s| s.kind == "FerrumCluster")
+        .expect("the catalog ships FerrumCluster");
+    assert!(
+        writer_of(&cluster.kind).is_none(),
+        "something now writes FerrumCluster's status. Restore the subresource, the columns and \
+         the schema in docs/crd/ferrumcluster.yaml in the same change and delete this control; \
+         if nothing does, this scan has stopped telling a writer from a mention."
+    );
+
+    // And the reader on inputs whose answer is known, because with the tree
+    // clean a parser that found nothing would look exactly like this one.
+    let declared: Value = serde_yaml::from_str(
+        r#"
+spec:
+  names:
+    kind: Synthetic
+  versions:
+    - subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Spec
+          jsonPath: .spec.mode
+        - name: Ready
+          jsonPath: .status.ready
+      schema:
+        openAPIV3Schema:
+          properties:
+            status:
+              type: object
+"#,
+    )
+    .expect("synthetic crd");
+    let version = sequence(declared.get("spec").expect("spec"), "versions")[0].clone();
+    assert!(
+        version
+            .get("subresources")
+            .map(|s| contains_key(s, "status"))
+            .unwrap_or(false),
+        "the subresource reader stopped seeing a declared status"
+    );
+    let status_columns: Vec<String> = sequence(&version, "additionalPrinterColumns")
+        .iter()
+        .filter(|column| scalar(column, "jsonPath").starts_with(".status"))
+        .map(|column| scalar(column, "name"))
+        .collect();
+    assert_eq!(
+        status_columns,
+        vec!["Ready".to_string()],
+        "the column reader must take a .status column and leave a .spec one: a filter that \
+         took both would report every surviving spec column as an unwritten status, and one \
+         that took neither would pass this gate on a catalog full of them"
+    );
+}
+
 /// Whether any mapping anywhere under `node` carries `key`.
 fn contains_key(node: &Value, key: &str) -> bool {
     match node {

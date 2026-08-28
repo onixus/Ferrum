@@ -16,21 +16,30 @@ spec:
     - name: v1
       served: true
       storage: true
-      subresources:
-        status: {}
-      additionalPrinterColumns:
-        - name: Connected
-          type: boolean
-          jsonPath: .status.connected
-        - name: Degraded
-          type: boolean
-          jsonPath: .status.degraded
-        - name: AgentAbi
-          type: integer
-          jsonPath: .status.agentAbi
-        - name: LastDigest
-          type: string
-          jsonPath: .status.lastBundleDigest
+      # No `subresources: status`, no status columns and no status schema, on
+      # purpose. Nothing in this workspace writes FerrumCluster's status: no
+      # source file under `crates/ferrum-controller/src` builds a
+      # `GroupVersionKind::gvk(…, "FerrumCluster")`, so there is no
+      # ApiResource, no watch and no PATCH, and the RBAC grant that would have
+      # carried one was deleted for the same reason
+      # (`deploy/controller/rbac.yaml`).
+      #
+      # A declared status nobody fills is not an empty field. The API server
+      # defaults it, `kubectl get` prints the zero value of every column
+      # forever, and that reads as a report: `Degraded false` on a member that
+      # is down. An operator consults a CRD to learn what a system tells them,
+      # so a status this tree cannot fill is a false statement in the one place
+      # it is least checkable.
+      #
+      # One CEL rule went with the schema: «degraded=true without
+      # lastBundleDigest is fail-open, not last-known-good». It guarded a field
+      # no writer produces, so it never once decided anything; it belongs in
+      # the change that starts producing that field, next to the code that
+      # does.
+      #
+      # Restore the subresource, the columns and the schema in the change that
+      # adds the writer, not before
+      # (`boundary_gate.rs::a_status_no_subject_writes_is_not_a_status_this_tree_ships`).
       schema:
         openAPIV3Schema:
           type: object
@@ -51,20 +60,3 @@ spec:
                   type: object
                   additionalProperties:
                     type: string
-            status:
-              type: object
-              x-kubernetes-validations:
-                # CP down keeps last-known-good; degraded without a digest would
-                # mean fail-open.
-                - rule: "!has(self.degraded) || !self.degraded || (has(self.lastBundleDigest) && size(self.lastBundleDigest) > 0)"
-                  message: "degraded=true without lastBundleDigest is fail-open, not last-known-good"
-              properties:
-                connected:
-                  type: boolean
-                degraded:
-                  type: boolean
-                agentAbi:
-                  type: integer
-                  format: int32
-                lastBundleDigest:
-                  type: string

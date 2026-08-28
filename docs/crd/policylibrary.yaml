@@ -16,8 +16,23 @@ spec:
     - name: v1
       served: true
       storage: true
-      subresources:
-        status: {}
+      # No `subresources: status`, no status column and no status schema, on
+      # purpose. Nothing in this workspace writes PolicyLibrary's status: no
+      # source file under `crates/ferrum-controller/src` builds a
+      # `GroupVersionKind::gvk(…, "PolicyLibrary")`, so there is no
+      # ApiResource, no watch and no PATCH, and the RBAC grant that would have
+      # carried one was deleted for the same reason
+      # (`deploy/controller/rbac.yaml`).
+      #
+      # A declared status nobody fills is not an empty field. The API server
+      # defaults it, `kubectl get` prints the zero value of the column forever,
+      # and `Verified false` on a library nobody checked reads as a verdict
+      # rather than as silence. The `.spec` columns below stay: they print what
+      # the operator wrote.
+      #
+      # Restore the subresource, the columns and the schema in the change that
+      # adds the writer, not before
+      # (`boundary_gate.rs::a_status_no_subject_writes_is_not_a_status_this_tree_ships`).
       additionalPrinterColumns:
         - name: Source
           type: string
@@ -28,9 +43,6 @@ spec:
         - name: MinAgentAbi
           type: integer
           jsonPath: .spec.minAgentAbi
-        - name: Verified
-          type: boolean
-          jsonPath: .status.verified
       schema:
         openAPIV3Schema:
           type: object
@@ -60,12 +72,3 @@ spec:
                   type: integer
                   format: int32
                   minimum: 0
-            status:
-              type: object
-              properties:
-                ready:
-                  type: boolean
-                verified:
-                  type: boolean
-                message:
-                  type: string

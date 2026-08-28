@@ -519,17 +519,27 @@ mod tests {
         );
     }
 
+    /// The CP-down fixture is a spec and carries no status, because nothing
+    /// in this workspace writes one.
+    ///
+    /// It used to carry `degraded: true` with a digest, and a test named
+    /// `rfc_d_cp_down_keeps_last_known_good` read those four fields back and
+    /// passed. That asserted the YAML, not the product: no writer for
+    /// `FerrumClusterStatus` exists here, the RBAC grant that would have
+    /// carried one is deleted, and `docs/crd/ferrumcluster.yaml` no longer
+    /// declares the subresource. A fixture stating a signal nothing produces is
+    /// the same defect as a document stating it. What actually holds the §D
+    /// case is `acceptance.rs::cp_down_keeps_last_known_good_not_fail_open`,
+    /// which drives the agent.
     #[test]
-    fn rfc_d_cp_down_keeps_last_known_good() {
+    fn the_cp_down_fixture_is_a_spec_no_component_answers() {
         let obj = cp_down_last_known_good();
         assert_eq!(obj.kind, "FerrumCluster");
-        let status = obj
-            .status
-            .expect("LKG is recorded on status, not a live client");
-        assert!(!status.connected);
-        assert!(status.degraded);
-        assert!(!status.last_bundle_digest.trim().is_empty());
-        assert_eq!(status.last_bundle_digest.len(), 64);
+        assert!(!obj.spec.kubeconfig_secret_ref.trim().is_empty());
+        assert!(
+            obj.status.is_none(),
+            "a fixture must not carry a status this tree has no writer for"
+        );
     }
 
     #[test]
