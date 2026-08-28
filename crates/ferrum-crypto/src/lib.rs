@@ -16,6 +16,9 @@ mod mtls;
 
 pub use mtls::{load_mtls_pem, verify_mtls_material, verify_mtls_peer, MtlsMaterial, PeerRole};
 
+#[cfg(feature = "x509")]
+pub mod x509;
+
 use ed25519_compact::{KeyPair, PublicKey, Seed, Signature};
 use ferrum_common::{FerrumError, Result};
 use ferrum_ids::Digest;

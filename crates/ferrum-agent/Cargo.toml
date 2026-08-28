@@ -7,17 +7,36 @@ publish.workspace = true
 rust-version.workspace = true
 description = "Only BPF carrier. Forbidden: ferrum-compiler, cluster-admin SA."
 
+[features]
+# Real kernel datapath (aya, CAP_BPF, a compiled bpf-target ELF). Off by
+# default: the default build verifies bundles but has no datapath.
+attach = ["ferrum-ebpf/attach"]
+# Pod metadata from the apiserver (`spec.nodeName=$NODE`). Without it nothing
+# fills the cgroup index, so the agent runs Degraded instead of pretending
+# every namespaced policy simply has no workloads.
+apiserver = ["ferrum-k8smeta/apiserver"]
+
 [dependencies]
+chrono.workspace = true
+ferrum-api.workspace = true
 ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ebpf.workspace = true
 ferrum-export.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+ferrum-policy.workspace = true
 ferrum-proto.workspace = true
 ferrum-wasm-host.workspace = true
+# kill(2) for the respond role; no other syscall wrapper is used.
+libc.workspace = true
+# Exceptions JSON is parsed only at reload time, never on the per-event path.
+serde_json.workspace = true
 
 [dev-dependencies]
-ferrum-api.workspace = true
 ferrum-compiler.workspace = true
+# The `prod-restricted` fixture the RFC acceptance cases are written against.
+# The join test must decide against the shipped policy, not a copy of it: a
+# copy is what cycle 7 found quietly rotting in a round-trip test.
+ferrum-testkit = { path = "../ferrum-testkit" }
 serde_yaml.workspace = true

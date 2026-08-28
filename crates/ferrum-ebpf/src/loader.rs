@@ -1,6 +1,6 @@
 use crate::envelope::extract_febp;
-use crate::eval::{decide, matched_action, Decision, SyscallEvent};
-use crate::spec::{parse_febp, Action, EbpfSpec};
+use crate::eval::{decide_with, matched_action, Decision, SyscallEvent};
+use crate::spec::{parse_febp_with, Action, DeadRules, EbpfSpec};
 use ferrum_common::{FerrumError, Result};
 use ferrum_ids::Digest;
 use ferrum_k8smeta::WorkloadIdentity;
@@ -86,6 +86,21 @@ impl Loader {
     ///
     /// Does not write disk. Does not attach kernel pins.
     pub fn load_bundle(&mut self, digest: &Digest, bytes: &[u8]) -> Result<()> {
+        self.load_bundle_with(digest, bytes, DeadRules::Reject)
+            .map(|_| ())
+    }
+
+    /// `load_bundle` with a say over rules no record can match. Only the
+    /// last-known-good restore path passes `DeadRules::Drop`, and only because
+    /// refusing the whole snapshot there leaves the node with no policy at
+    /// all. Returns the reason for each dropped rule; the caller must surface
+    /// them, since the node then enforces less than what was signed.
+    pub fn load_bundle_with(
+        &mut self,
+        digest: &Digest,
+        bytes: &[u8],
+        dead: DeadRules,
+    ) -> Result<Vec<String>> {
         if let Err(err) = ferrum_crypto::verify_bundle_digest(bytes, digest) {
             self.degraded = true;
             return Err(err);
@@ -97,15 +112,15 @@ impl Loader {
                 return Err(err);
             }
         };
-        match parse_febp(febp) {
-            Ok(parsed) => {
+        match parse_febp_with(febp, dead) {
+            Ok((parsed, dropped)) => {
                 self.last_good = Some(LoadedBundle {
                     digest: digest.clone(),
                     spec: parsed,
                     raw: bytes.to_vec(),
                 });
                 self.degraded = false;
-                Ok(())
+                Ok(dropped)
             }
             Err(err) => {
                 self.degraded = true;
@@ -114,7 +129,9 @@ impl Loader {
         }
     }
 
-    /// Pins are not created. aya is not linked on this toolchain.
+    /// Pins are not created. Program attach exists only behind the opt-in
+    /// `attach` feature (`KernelHandle`), and even that does not pin at
+    /// PIN_PATH yet, so this stays Degraded instead of pretending.
     pub fn attach_pins(&self) -> Result<()> {
         Err(FerrumError::Degraded(format!(
             "kernel eBPF attach not wired; pins not loaded at {PIN_PATH}"
@@ -127,16 +144,33 @@ impl Loader {
             None => Decision {
                 action: Action::Deny,
                 rule_id: None,
+                labels_unknown: false,
+                path_unknown: false,
+                container_unknown: false,
             },
         }
     }
 
     pub fn decide(&self, event: &SyscallEvent<'_>, identity: &WorkloadIdentity) -> Decision {
+        self.decide_with(event, identity, false)
+    }
+
+    /// `decide`, told whether the carrier can prove this record's caller is
+    /// not a container. See `eval::matched_action_with`.
+    pub fn decide_with(
+        &self,
+        event: &SyscallEvent<'_>,
+        identity: &WorkloadIdentity,
+        container_unproven: bool,
+    ) -> Decision {
         match &self.last_good {
-            Some(loaded) => decide(&loaded.spec, event, identity),
+            Some(loaded) => decide_with(&loaded.spec, event, identity, container_unproven),
             None => Decision {
                 action: Action::Deny,
                 rule_id: None,
+                labels_unknown: false,
+                path_unknown: false,
+                container_unknown: false,
             },
         }
     }

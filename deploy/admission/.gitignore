@@ -1,0 +1,9 @@
+# Output of `ferrumctl gen-webhook-pki`. A real CA and a serving key never
+# belong in git.
+validatingwebhookconfiguration.yaml
+*.secret.yaml
+ca.crt
+# The CA private key, and anything else shaped like a key. It can issue a leaf
+# the applied ValidatingWebhookConfiguration trusts, i.e. a forged webhook.
+ca.key
+*.key

@@ -28,6 +28,13 @@ pub const SIGNED_FORMAT: u32 = 1;
 pub const BUNDLE_FSIG_KEY: &str = "bundle.fsig";
 /// Controller Secret data key for SHA-256(raw) as UTF-8 hex bytes.
 pub const BUNDLE_DIGEST_KEY: &str = "digest";
+/// Controller Secret data key for the live PolicyException list: FSIG envelope
+/// (same format and signing key as `bundle.fsig`) whose payload is the JSON
+/// array of PolicyExceptionSpec. Duplicated on purpose: this crate must not
+/// depend on ferrum-controller or ferrum-admission.
+pub const EXCEPTIONS_FSIG_KEY: &str = "exceptions.fsig";
+/// Cap on the exceptions FSIG file; a bigger file is rejected before read.
+pub const MAX_EXCEPTIONS_BYTES: u64 = 2 * 1024 * 1024;
 /// kubelet projected-volume symlink to the current Secret snapshot directory.
 pub const KUBELET_DATA_DIR: &str = "..data";
 
@@ -107,6 +114,76 @@ pub fn read_source_path(path: &Path) -> Result<(Vec<u8>, Option<Digest>)> {
     let bytes = std::fs::read(path)
         .map_err(|err| FerrumError::Integrity(format!("read {}: {err}", path.display())))?;
     Ok((bytes, None))
+}
+
+/// `exceptions.fsig` next to whatever `--bundle` points at: a directory means
+/// the key inside the current kubelet `..data` snapshot (same snapshot as
+/// `bundle.fsig`), a Secret-mounted `bundle.fsig` means its snapshot sibling,
+/// any other file means a plain sibling file.
+pub(crate) fn exceptions_file_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        return snapshot_dir(path).join(EXCEPTIONS_FSIG_KEY);
+    }
+    if is_secret_fsig_file(path) {
+        if let Some(parent) = path.parent() {
+            return snapshot_dir(parent).join(EXCEPTIONS_FSIG_KEY);
+        }
+    }
+    match path.parent() {
+        Some(parent) => parent.join(EXCEPTIONS_FSIG_KEY),
+        None => PathBuf::from(EXCEPTIONS_FSIG_KEY),
+    }
+}
+
+/// `Ok(None)` = file absent = empty exception list (not an error, not deny-all).
+/// An unreadable or oversized file is `Err`; the caller drops waivers and counts it.
+pub fn read_exceptions_path(path: &Path) -> Result<Option<Vec<u8>>> {
+    let file = exceptions_file_path(path);
+    match std::fs::metadata(&file) {
+        Ok(meta) if meta.len() > MAX_EXCEPTIONS_BYTES => {
+            return Err(FerrumError::Integrity(format!(
+                "{}: {} bytes exceeds the {MAX_EXCEPTIONS_BYTES}-byte exceptions cap",
+                file.display(),
+                meta.len()
+            )));
+        }
+        _ => {}
+    }
+    match std::fs::read(&file) {
+        Ok(bytes) if bytes.len() as u64 > MAX_EXCEPTIONS_BYTES => {
+            Err(FerrumError::Integrity(format!(
+                "{}: {} bytes exceeds the {MAX_EXCEPTIONS_BYTES}-byte exceptions cap",
+                file.display(),
+                bytes.len()
+            )))
+        }
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(FerrumError::Degraded(format!(
+            "read {}: {err}",
+            file.display()
+        ))),
+    }
+}
+
+/// Verify an `exceptions.fsig` envelope against the caller pin and return the
+/// signed payload (JSON array bytes). Plain JSON, a foreign key, or a tampered
+/// payload is Integrity — the caller drops all waivers.
+pub fn load_exceptions_source(bytes: &[u8], trust_root: &[u8]) -> Result<Vec<u8>> {
+    pin_bytes(trust_root)?;
+    if !bytes.starts_with(&SIGNED_MAGIC) {
+        return Err(FerrumError::Integrity(
+            "exceptions are not a signed FSIG envelope; plain JSON is rejected".into(),
+        ));
+    }
+    let (public_key, signature, raw) = decode_fsig(bytes)?;
+    if public_key.as_slice() != trust_root {
+        return Err(FerrumError::Integrity(
+            "embedded exceptions FSIG public key does not match caller trust-root pin".into(),
+        ));
+    }
+    ferrum_crypto::verify_bundle_signature(&raw, &signature, trust_root)?;
+    Ok(raw)
 }
 
 /// Verify and extract whatever kubelet/file `--bundle` points at.
@@ -360,42 +437,118 @@ impl<'a> RawReader<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileStamp {
     mtime: SystemTime,
     len: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SourceStamp {
     fsig: FileStamp,
     digest: Option<FileStamp>,
 }
 
-fn stamp_one(path: &Path) -> Option<FileStamp> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.is_dir() {
-        return None;
-    }
-    Some(FileStamp {
-        mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        len: meta.len(),
-    })
+/// What a stat of `exceptions.fsig` established.
+///
+/// Three answers, not two. `std::fs::metadata(..).ok()` collapses "no such
+/// file" and "there, but the stat refused" into the same `None`, and the poll
+/// loop's answer to those two is opposite: the first empties the waiver table
+/// because the Secret carries no waivers, the second must drop them and say
+/// so. Collapsing them is how a node that lost every approved waiver went back
+/// to reporting healthy through the one branch that never reaches
+/// `read_exceptions_path`, which has separated them all along.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ExceptionsStamp {
+    /// ENOENT: a Secret that carries no waivers.
+    #[default]
+    Absent,
+    Present(FileStamp),
+    /// The stat failed for a reason that is not ENOENT — EACCES after a
+    /// remount, EIO, ELOOP, a symlink loop caught mid-rotation — or it
+    /// succeeded on something that is not a regular file, e.g. a directory
+    /// where the file was. Never equal to `Absent`.
+    Unreadable,
 }
 
-/// Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
-/// Vanished files return `None` so a poll loop keeps last-known-good.
-pub(crate) fn source_stamp(path: &Path) -> Option<SourceStamp> {
-    if let Some(snap) = source_snapshot_dir(path) {
-        Some(SourceStamp {
-            fsig: stamp_one(&snap.join(BUNDLE_FSIG_KEY))?,
-            digest: Some(stamp_one(&snap.join(BUNDLE_DIGEST_KEY))?),
-        })
-    } else {
-        Some(SourceStamp {
-            fsig: stamp_one(path)?,
-            digest: None,
-        })
+pub(crate) fn exceptions_stamp(path: &Path) -> ExceptionsStamp {
+    let file = exceptions_file_path(path);
+    match std::fs::metadata(file) {
+        Ok(meta) if meta.is_file() => ExceptionsStamp::Present(FileStamp {
+            mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            len: meta.len(),
+        }),
+        Ok(_) => ExceptionsStamp::Unreadable,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => ExceptionsStamp::Absent,
+        Err(_) => ExceptionsStamp::Unreadable,
+    }
+}
+
+/// What a stat of the bundle mount established.
+///
+/// Three answers, for the reason `ExceptionsStamp` above is three-valued: an
+/// `Option<SourceStamp>` collapses ENOENT, EACCES after a remount, EIO, ELOOP
+/// and a dangling `..data` symlink into the same `None`, and the poll loop
+/// reads that `None` as "unchanged". A mount that will not stat then looks
+/// exactly like a bundle nobody has republished — the node stops taking policy
+/// for the rest of the process lifetime and every counter it publishes reads
+/// healthy, because `DEG_LOADER` is raised on a bundle that was offered and
+/// refused, never on one that was never offered at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BundleStamp {
+    /// ENOENT: no bundle at this path. The poll loop keeps last-known-good and
+    /// says nothing, which is what a node before its first policy looks like.
+    #[default]
+    Absent,
+    Present(SourceStamp),
+    /// The stat failed for a reason that is not ENOENT, or succeeded on
+    /// something that cannot be a bundle. Never equal to `Absent`.
+    Unreadable,
+}
+
+/// Stat the path as given so kubelet `..data` rotates are visible; do not
+/// canonicalize.
+pub(crate) fn bundle_stamp(path: &Path) -> BundleStamp {
+    let (fsig, digest) = match source_snapshot_dir(path) {
+        Some(snap) => (
+            snap.join(BUNDLE_FSIG_KEY),
+            Some(snap.join(BUNDLE_DIGEST_KEY)),
+        ),
+        None => (path.to_path_buf(), None),
+    };
+    let fsig = match stamp_kind(&fsig) {
+        FileStampKind::Present(stamp) => stamp,
+        FileStampKind::Absent => return BundleStamp::Absent,
+        FileStampKind::Unreadable => return BundleStamp::Unreadable,
+    };
+    let digest = match digest {
+        None => None,
+        // A snapshot carrying an fsig and no digest is half a rotate in
+        // progress, not a bundle: the pair is stamped or nothing is.
+        Some(path) => match stamp_kind(&path) {
+            FileStampKind::Present(stamp) => Some(stamp),
+            FileStampKind::Absent => return BundleStamp::Absent,
+            FileStampKind::Unreadable => return BundleStamp::Unreadable,
+        },
+    };
+    BundleStamp::Present(SourceStamp { fsig, digest })
+}
+
+enum FileStampKind {
+    Present(FileStamp),
+    Absent,
+    Unreadable,
+}
+
+fn stamp_kind(path: &Path) -> FileStampKind {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => FileStampKind::Unreadable,
+        Ok(meta) => FileStampKind::Present(FileStamp {
+            mtime: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            len: meta.len(),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => FileStampKind::Absent,
+        Err(_) => FileStampKind::Unreadable,
     }
 }
 
@@ -546,15 +699,29 @@ mod tests {
         std::os::unix::fs::symlink("..snap2", &tmp).expect("tmp link");
         std::fs::rename(&tmp, dir.join(KUBELET_DATA_DIR)).expect("rotate ..data");
         assert_integrity(load_path(&dir, &pk));
-        assert!(source_stamp(&dir).is_some());
+        assert!(matches!(bundle_stamp(&dir), BundleStamp::Present(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn vanished_mount_has_no_stamp() {
+    fn vanished_mount_is_absent_and_an_unreadable_one_is_not() {
         let dir = temp_dir("vanished");
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(source_stamp(&dir).is_none());
+        assert_eq!(bundle_stamp(&dir), BundleStamp::Absent);
+
+        // A mount whose bundle the loader can never read is not the same
+        // answer as no bundle: collapsing the two is what let a node stop
+        // taking policy in silence.
+        std::fs::create_dir_all(dir.join(BUNDLE_FSIG_KEY)).expect("dir where the file goes");
+        assert_eq!(bundle_stamp(&dir), BundleStamp::Unreadable);
+        std::fs::remove_dir_all(dir.join(BUNDLE_FSIG_KEY)).expect("rm");
+
+        // And a symlink loop caught mid-rotation: ELOOP, not ENOENT.
+        std::os::unix::fs::symlink("loop-b", dir.join("loop-a")).expect("loop-a");
+        std::os::unix::fs::symlink("loop-a", dir.join("loop-b")).expect("loop-b");
+        std::os::unix::fs::symlink("loop-a", dir.join(BUNDLE_FSIG_KEY)).expect("fsig link");
+        assert_eq!(bundle_stamp(&dir), BundleStamp::Unreadable);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

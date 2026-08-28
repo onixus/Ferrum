@@ -1,0 +1,59 @@
+# An admission plane that watches the apiserver with no token to watch it
+# with. Clean everywhere else — right ServiceAccount, limits, no privilege, no
+# hostPath, --policy-name joined to the bundle Secret it mounts — so the only
+# finding this tree can produce is the label-source one. Do not fix.
+#
+# The contradiction is between this file's --apiserver and the
+# automountServiceAccountToken: false in serviceaccount.yaml, which the pod
+# spec here does not override. ApiserverConfig::in_cluster reads only
+# KUBERNETES_SERVICE_HOST, which is always set, so the config builds and the
+# watcher spawns; token() then fails on every connect, forever, behind a
+# backoff. is_warm() stays false, and because prod-restricted carries a
+# namespaceSelector, review() denies every Pod it selects — for as long as the
+# install stands, with the RBAC, the bundle and the serving certificate all
+# correct.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-admission-no-token
+  namespace: ferrum
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-admission
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-admission
+    spec:
+      serviceAccountName: ferrum-admission
+      containers:
+        - name: admission
+          image: ghcr.io/ferrum/ferrum-admission:v0.1.0
+          args:
+            - serve
+            - --listen
+            - 0.0.0.0:8443
+            - --bundle
+            - /etc/ferrum/bundle
+            - --policy-name
+            - prod-restricted
+            - --apiserver
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: bundle
+              mountPath: /etc/ferrum/bundle
+              readOnly: true
+      volumes:
+        - name: bundle
+          secret:
+            secretName: ferrum-bundle-cluster-prod-restricted

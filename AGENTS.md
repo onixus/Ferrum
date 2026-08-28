@@ -31,9 +31,12 @@ Control plane собран: controller → compile → Secret → admission/agen
   После коммита в `main` джоба стартует сама (post-commit hook + поллинг раз в 2 минуты).
 - API-токена нет, UI недоступен: лог билда читать из
   `/Users/onixus/jenkins_home/jobs/ferrum/builds/<N>/log`, артефакты — в `.../archive/`.
-- Стадии функциональные: `Functional tests`, `Functional: policy validation`.
+- Функциональные стадии: `Test`, `Validate policies` (в ней же негативные кейсы),
+  плюс стадии сборки бинарей, образов и BPF. Имена стадий цитирует
+  `docs/MVP-1-BOUNDARY.md`, и `crates/ferrum-testkit/tests/boundary_gate.rs` роняет
+  сборку на переименовании — стадию не переименовывать в одиночку.
 - Стадии security: `SAST (semgrep)`, `Security: policy invariants`,
-  `Security: MVP acceptance` (приёмка из раздела MVP-1), `Security: negative validation`,
+  `Security: MVP acceptance` (приёмка из раздела MVP-1),
   `Security: supply chain` (cargo-deny + cargo-audit).
 - Новый инвариант или новый пункт приёмки — добавлять тест в security-стадию,
   а не в общий `cargo test`. Красная security-стадия не «флейк»: это нарушенный инвариант.

@@ -3,11 +3,12 @@
 mod common;
 
 use chrono::{DateTime, Days, TimeZone, Utc};
+use ferrum_admission::StaticLabels;
 use ferrum_admission::{
     encode_fsig, handle_review_bytes, load_bundle, load_path, load_source, parse_program,
-    poll_bundle_file, AdmissionProgram, ReviewConfig, WebhookState, ADMISSION_ABI,
-    BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, IMAGE_SIGNATURE_ANNOTATION, RULE_CLUSTER_ADMIN_BIND,
-    RULE_PRIVILEGED, RULE_UNSIGNED,
+    poll_bundle_file, poll_exceptions_file, AdmissionProgram, ReviewConfig, WebhookState,
+    ADMISSION_ABI, BUNDLE_DIGEST_KEY, BUNDLE_FSIG_KEY, EXCEPTIONS_FSIG_KEY,
+    IMAGE_SIGNATURE_ANNOTATION, RULE_CLUSTER_ADMIN_BIND, RULE_PRIVILEGED, RULE_UNSIGNED,
 };
 use ferrum_api::{
     AdmitDeny, AdmitMutate, AdmitSpec, ClusterSecurityPolicy, ClusterSecurityPolicySpec,
@@ -471,6 +472,7 @@ fn in_scope_exception_waives_only_that_rule() {
     let cfg = ReviewConfig {
         policy_name: "prod-restricted".into(),
         policy_namespace: String::new(),
+        ..Default::default()
     };
     let waived = cfg.handle_bytes(&body, Some(&program), &exceptions, now());
     assert_eq!(waived.status, 200);
@@ -489,6 +491,7 @@ fn in_scope_exception_waives_only_that_rule() {
     let other = ReviewConfig {
         policy_name: "other-policy".into(),
         policy_namespace: String::new(),
+        ..Default::default()
     };
     let other = other.handle_bytes(&body, Some(&program), &exceptions, now());
     let other: Value = serde_json::from_slice(&other.body).unwrap();
@@ -789,6 +792,297 @@ fn serve_missing_bundle_exits_2() {
     assert_eq!(output.status.code(), Some(2));
 }
 
+/// Exception with wall-clock expiry: `WebhookState::handle` evaluates at
+/// real `Utc::now()`, unlike the fixed-clock helpers above.
+fn wallclock_exception(
+    policy: &str,
+    rule: &str,
+    expires: DateTime<Utc>,
+    ticket: &str,
+) -> PolicyExceptionSpec {
+    PolicyExceptionSpec {
+        ticket: ticket.into(),
+        requested_by: "sre".into(),
+        approved_by: "ib".into(),
+        reason: "temporary debug sidecar after incident".into(),
+        expires_at: expires,
+        mode: PolicyMode::Audit,
+        four_eyes: true,
+        target: ExceptionTarget {
+            namespace: String::new(),
+            policies: vec![policy.into()],
+            rules: vec![rule.into()],
+        },
+    }
+}
+
+/// Controller-format `exceptions.fsig`: FSIG envelope over the JSON array,
+/// signed with the bundle key.
+fn exceptions_fsig_bytes(list: &[PolicyExceptionSpec], sk: &[u8; 32]) -> Vec<u8> {
+    let payload = serde_json::to_vec(list).expect("controller-format json");
+    let pk = public_key_from_secret(sk).expect("pk");
+    let sig = sign_bundle(&payload, sk).expect("sign exceptions");
+    encode_fsig(&payload, &sig, &pk).expect("exceptions fsig")
+}
+
+fn write_exceptions(dir: &std::path::Path, list: &[PolicyExceptionSpec]) {
+    std::fs::write(
+        dir.join(EXCEPTIONS_FSIG_KEY),
+        exceptions_fsig_bytes(list, &SK),
+    )
+    .expect("exceptions.fsig");
+}
+
+fn wait_decision(state: &WebhookState, body: &[u8], want: bool, why: &str) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let resp = handle_json(state, body);
+        if resp["response"]["allowed"] == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{why}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn exceptions_mount_rotation_gates_scope_and_ttl() {
+    let (fsig, pk) = make_fsig(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let cfg = ReviewConfig {
+        policy_name: "prod-restricted".into(),
+        policy_namespace: String::new(),
+        ..Default::default()
+    };
+    let state = Arc::new(WebhookState::new(
+        load_ok(&fsig, &pk),
+        pk.clone(),
+        vec![],
+        cfg,
+    ));
+    let dir = temp_dir("exceptions-mount");
+    poll_exceptions_file(dir.clone(), Duration::from_millis(50), Arc::clone(&state));
+    let body = review(pod(IMAGE, image_annotations(IMAGE, &SK), true), "uid-exc");
+
+    // Missing exceptions.json = empty list, not an error.
+    assert_eq!(handle_json(&state, &body)["response"]["allowed"], false);
+
+    let live = Utc::now() + Days::new(7);
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-LIVE-1",
+        )],
+    );
+    wait_decision(
+        &state,
+        &body,
+        true,
+        "live in-scope exception must waive privileged deny",
+    );
+
+    std::fs::write(dir.join(EXCEPTIONS_FSIG_KEY), b"{{{ not exceptions fsig").expect("garbage");
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "garbage exceptions.fsig must reset the list to empty, restoring the deny",
+    );
+
+    let live_list = [wallclock_exception(
+        "prod-restricted",
+        RULE_PRIVILEGED,
+        live,
+        "JIRA-UNSIGNED-2",
+    )];
+    std::fs::write(
+        dir.join(EXCEPTIONS_FSIG_KEY),
+        serde_json::to_vec(&live_list.to_vec()).expect("json"),
+    )
+    .expect("plain json");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "unsigned plain-JSON exceptions must be rejected, deny stays deny"
+    );
+
+    std::fs::write(
+        dir.join(EXCEPTIONS_FSIG_KEY),
+        exceptions_fsig_bytes(&live_list, &SK_OTHER),
+    )
+    .expect("foreign-key fsig");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "exceptions signed with a foreign key must be rejected"
+    );
+
+    let mut tampered = exceptions_fsig_bytes(&live_list, &SK);
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    std::fs::write(dir.join(EXCEPTIONS_FSIG_KEY), &tampered).expect("tampered fsig");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "tampered exceptions payload must be rejected"
+    );
+
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "other-policy",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-OTHER-22",
+        )],
+    );
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "out-of-scope exception must not waive the deny",
+    );
+
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-LIVE-333",
+        )],
+    );
+    wait_decision(
+        &state,
+        &body,
+        true,
+        "rotation back to in-scope must waive again",
+    );
+
+    let expired = Utc::now() - Days::new(1);
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            expired,
+            "JIRA-EXPIRED-4444",
+        )],
+    );
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "expired exception after rotation must deny again",
+    );
+
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-LIVE-55555",
+        )],
+    );
+    wait_decision(&state, &body, true, "fresh live exception must waive again");
+
+    std::fs::remove_file(dir.join(EXCEPTIONS_FSIG_KEY)).expect("remove");
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "removed exceptions.fsig must reset to an empty list",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exceptions_reload_missing_file_is_empty_and_unverifiable_resets() {
+    let (fsig, pk) = make_fsig(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let cfg = ReviewConfig {
+        policy_name: "prod-restricted".into(),
+        policy_namespace: String::new(),
+        ..Default::default()
+    };
+    let live = wallclock_exception(
+        "prod-restricted",
+        RULE_PRIVILEGED,
+        Utc::now() + Days::new(7),
+        "JIRA-LIVE-1",
+    );
+    let state = WebhookState::new(load_ok(&fsig, &pk), pk.clone(), vec![live.clone()], cfg);
+    let body = review(pod(IMAGE, image_annotations(IMAGE, &SK), true), "uid-st");
+    assert_eq!(handle_json(&state, &body)["response"]["allowed"], true);
+    assert_eq!(state.exceptions_resets(), 0);
+
+    assert!(state.try_reload_exceptions(b"{{{ garbage").is_err());
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "unverifiable bytes reset the list to empty, restoring the deny"
+    );
+    assert_eq!(state.exceptions_resets(), 1);
+
+    let signed = exceptions_fsig_bytes(std::slice::from_ref(&live), &SK);
+    let n = state.try_reload_exceptions(&signed).expect("signed list");
+    assert_eq!(n, 1);
+    assert_eq!(handle_json(&state, &body)["response"]["allowed"], true);
+
+    assert!(state
+        .try_reload_exceptions(&serde_json::to_vec(&vec![live.clone()]).expect("json"))
+        .is_err());
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "unsigned plain JSON resets to empty; deny stays deny"
+    );
+
+    state.try_reload_exceptions(&signed).expect("signed again");
+    assert!(state
+        .try_reload_exceptions(&exceptions_fsig_bytes(
+            std::slice::from_ref(&live),
+            &SK_OTHER
+        ))
+        .is_err());
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "foreign-key envelope resets to empty"
+    );
+
+    state.try_reload_exceptions(&signed).expect("signed again");
+    let mut tampered = signed.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    assert!(state.try_reload_exceptions(&tampered).is_err());
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "tampered payload resets to empty"
+    );
+    assert_eq!(state.exceptions_resets(), 4);
+
+    state.try_reload_exceptions(&signed).expect("signed again");
+    let dir = temp_dir("exceptions-missing");
+    let n = state
+        .try_reload_exceptions_path(&dir)
+        .expect("missing file is empty, not an error");
+    assert_eq!(n, 0);
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "empty list restores the deny"
+    );
+    assert_eq!(state.exceptions_resets(), 4, "missing file is not a reset");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn cargo_toml_hot_path_keeps_boundary() {
     let toml = include_str!("../Cargo.toml");
@@ -808,5 +1102,608 @@ fn cargo_toml_hot_path_keeps_boundary() {
             !present,
             "{forbidden} must not be in [dependencies]: {deps}"
         );
+    }
+}
+
+const ZONE: &str = "ferrum.io/zone";
+const TIER: &str = "ferrum.io/tier";
+
+fn labels(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Signed, PSS-clean apart from `privileged`: the policy denies it wherever it
+/// applies, and allows it wherever it does not.
+fn privileged_pod_in(namespace: &str, service_account: &str) -> Value {
+    let mut obj = pod(IMAGE, image_annotations(IMAGE, &SK), true);
+    obj["metadata"]["namespace"] = json!(namespace);
+    obj["spec"]["serviceAccountName"] = json!(service_account);
+    obj
+}
+
+fn selected_program(mutate: impl FnOnce(&mut ClusterSecurityPolicySpec)) -> AdmissionProgram {
+    let mut spec = enforce_spec(PolicyMode::Enforce, pk_hex(&SK));
+    mutate(&mut spec);
+    let (fsig, pk) = make_fsig(spec, &SK);
+    load_ok(&fsig, &pk)
+}
+
+fn cfg_with(labels: StaticLabels) -> ReviewConfig {
+    ReviewConfig {
+        policy_name: "prod-restricted".into(),
+        labels: Arc::new(labels),
+        ..Default::default()
+    }
+}
+
+fn decide(cfg: &ReviewConfig, program: &AdmissionProgram, object: Value, uid: &str) -> Value {
+    let reply = cfg.handle_bytes(&review(object, uid), Some(program), &[], now());
+    assert_eq!(reply.status, 200, "expected HTTP 200 AdmissionReview");
+    serde_json::from_slice(&reply.body).expect("response json")
+}
+
+#[test]
+fn warm_cache_applies_a_namespace_selector_to_its_own_namespace_only() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .namespace_selector
+            .match_labels
+            .insert(ZONE.into(), "pci".into());
+    });
+    assert!(
+        !program.selector.namespace_selector.match_labels.is_empty(),
+        "fixture must carry the selector into the bundle"
+    );
+    let cfg = cfg_with(
+        StaticLabels::default()
+            .with_namespace("pci-ns", labels(&[(ZONE, "pci")]))
+            .with_namespace("public-ns", labels(&[(ZONE, "public")]))
+            .warm(),
+    );
+
+    let denied = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("pci-ns", "default"),
+        "uid-pci",
+    );
+    assert_eq!(denied["response"]["allowed"], false);
+    let msg = deny_msg(&denied);
+    assert!(
+        msg.contains(RULE_PRIVILEGED) || msg.contains("privileged"),
+        "denied by the rule, not by a missing-label fallback: {msg}"
+    );
+
+    let allowed = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("public-ns", "default"),
+        "uid-public",
+    );
+    assert_eq!(
+        allowed["response"]["allowed"], true,
+        "a namespace that does not match the selector is not this policy's business"
+    );
+}
+
+#[test]
+fn warm_cache_keeps_service_account_labels_inside_their_namespace() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .service_account_selector
+            .match_labels
+            .insert(TIER.into(), "frontend".into());
+    });
+    let cfg = cfg_with(
+        StaticLabels::default()
+            .with_service_account("prod", "web-sa", labels(&[(TIER, "frontend")]))
+            .with_service_account("dev", "web-sa", labels(&[(TIER, "sandbox")]))
+            .warm(),
+    );
+
+    let denied = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("prod", "web-sa"),
+        "uid-sa-prod",
+    );
+    assert_eq!(denied["response"]["allowed"], false);
+
+    let allowed = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("dev", "web-sa"),
+        "uid-sa-dev",
+    );
+    assert_eq!(
+        allowed["response"]["allowed"], true,
+        "same ServiceAccount name in another namespace is a different subject"
+    );
+}
+
+#[test]
+fn cold_cache_denies_a_selected_policy_but_not_an_unselected_one() {
+    let selected = selected_program(|spec| {
+        spec.selector
+            .namespace_selector
+            .match_labels
+            .insert(ZONE.into(), "pci".into());
+    });
+    let cold = cfg_with(StaticLabels::default());
+    let reply = decide(
+        &cold,
+        &selected,
+        privileged_pod_in("pci-ns", "default"),
+        "uid-cold",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    let msg = deny_msg(&reply);
+    assert!(msg.contains("labels unavailable"), "{msg}");
+
+    // No namespace/SA selector: the cold cache is irrelevant, nothing changes.
+    let unselected = selected_program(|_| {});
+    let clean = pod(IMAGE, image_annotations(IMAGE, &SK), false);
+    let reply = decide(&cold, &unselected, clean, "uid-cold-clean");
+    assert_eq!(reply["response"]["allowed"], true);
+    let reply = decide(
+        &cold,
+        &unselected,
+        privileged_pod_in("any-ns", "default"),
+        "uid-cold-priv",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    assert!(deny_msg(&reply).contains(RULE_PRIVILEGED) || deny_msg(&reply).contains("privileged"));
+}
+
+#[test]
+fn cluster_labels_come_from_the_flag_and_need_no_warm_cache() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .cluster_selector
+            .match_labels
+            .insert("env".into(), "prod".into());
+    });
+    let cfg = cfg_with(StaticLabels::cluster(labels(&[("env", "prod")])));
+    let reply = decide(
+        &cfg,
+        &program,
+        privileged_pod_in("any-ns", "default"),
+        "uid-cluster",
+    );
+    assert_eq!(reply["response"]["allowed"], false);
+    assert!(!deny_msg(&reply).contains("labels unavailable"));
+
+    let elsewhere = cfg_with(StaticLabels::cluster(labels(&[("env", "staging")])));
+    let reply = decide(
+        &elsewhere,
+        &program,
+        privileged_pod_in("any-ns", "default"),
+        "uid-cluster-2",
+    );
+    assert_eq!(reply["response"]["allowed"], true);
+}
+
+/// A1: the mount the binary cannot survive the absence of must not claim it
+/// can. `optional: true` on this Secret produced two replicas in
+/// CrashLoopBackOff that a TCP readiness probe still called Ready, under a
+/// failurePolicy that denies every Pod in the cluster meanwhile.
+#[test]
+fn bundle_secret_mount_is_not_optional() {
+    let yaml = include_str!("../../../deploy/admission/deployment.yaml");
+    let volumes = yaml
+        .split_once("\n      volumes:")
+        .expect("deployment declares volumes")
+        .1;
+    let bundle = volumes
+        .split_once("- name: bundle")
+        .expect("bundle volume")
+        .1;
+    let bundle_block = bundle.split_once("- name: ").map_or(bundle, |(b, _)| b);
+    assert!(
+        bundle_block.contains("secretName: ferrum-bundle-"),
+        "bundle volume is the controller-written Secret: {bundle_block}"
+    );
+    for line in bundle_block.lines() {
+        let line = line.trim();
+        assert!(
+            line.starts_with('#') || !line.starts_with("optional:"),
+            "the binary exits 2 without a verified bundle, before the poll loop that would \
+             pick one up: the mount may not be optional, or the manifest promises a \
+             tolerance the process does not have"
+        );
+    }
+}
+
+/// B2, bundle mount: unreadable and deleted must not look alike. Both keep the
+/// last-known-good program — that part is right — but only one of them means
+/// the poll loop has stopped working, and before this it said nothing at all.
+#[test]
+fn unreadable_bundle_mount_is_counted_and_a_deleted_one_is_not() {
+    let (fsig_enforce, pk, digest_enforce) =
+        make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let (fsig_observe, _, digest_observe) =
+        make_signed(enforce_spec(PolicyMode::Observe, pk_hex(&SK)), &SK);
+    let body = review(pod(IMAGE, image_annotations(IMAGE, &SK), true), "uid-stat");
+
+    // Deleted: the keys leave the mount. Last-known-good stays, silently.
+    let gone = temp_dir("bundle-gone");
+    write_secret_dir(&gone, &fsig_enforce, &digest_enforce);
+    let state = Arc::new(webhook_state(&fsig_enforce, &pk));
+    poll_bundle_file(gone.clone(), Duration::from_millis(50), Arc::clone(&state));
+    std::fs::remove_file(gone.join(BUNDLE_FSIG_KEY)).expect("remove fsig");
+    std::fs::remove_file(gone.join(BUNDLE_DIGEST_KEY)).expect("remove digest");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "a deleted mount keeps the last-known-good program"
+    );
+    assert_eq!(
+        state.bundle_unreadable(),
+        0,
+        "an absent key is a Secret being rewritten, not a broken mount"
+    );
+    let _ = std::fs::remove_dir_all(&gone);
+
+    // Unreadable: bundle.fsig is there and does not stat as a file. Same
+    // last-known-good, different observable.
+    let broken = temp_dir("bundle-unreadable");
+    write_secret_dir(&broken, &fsig_enforce, &digest_enforce);
+    let state = Arc::new(webhook_state(&fsig_enforce, &pk));
+    poll_bundle_file(
+        broken.clone(),
+        Duration::from_millis(50),
+        Arc::clone(&state),
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    std::fs::remove_file(broken.join(BUNDLE_FSIG_KEY)).expect("remove fsig");
+    std::fs::create_dir(broken.join(BUNDLE_FSIG_KEY)).expect("directory in its place");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state.bundle_unreadable() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "an unreadable bundle mount must be counted, not silently skipped"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "an unreadable mount keeps the last-known-good program too"
+    );
+
+    // And it does not latch: a mount that comes back is picked up, which is
+    // the swap the frozen loop could never make.
+    std::fs::remove_dir(broken.join(BUNDLE_FSIG_KEY)).expect("remove placeholder dir");
+    write_secret_dir(&broken, &fsig_observe, &digest_observe);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if handle_json(&state, &body)["response"]["allowed"] == true {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the poll loop must resume after the mount is readable again"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(state.bundle_unreadable(), 1, "counted once per transition");
+    let _ = std::fs::remove_dir_all(&broken);
+}
+
+/// M3: keeping the last-known-good across an absent key is the right policy —
+/// a Secret mid-rewrite looks exactly like a deleted one — but the arm said
+/// nothing and moved nothing. Delete the key for real and the webhook goes on
+/// enforcing a program with no source behind it, forever, with no trace: absent
+/// collapsed into nothing happened.
+#[test]
+fn a_bundle_key_that_vanished_is_counted_not_silent() {
+    let (fsig, pk, digest) = make_signed(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let body = review(
+        pod(IMAGE, image_annotations(IMAGE, &SK), true),
+        "uid-absent",
+    );
+
+    let dir = temp_dir("bundle-absent-counted");
+    write_secret_dir(&dir, &fsig, &digest);
+    let state = Arc::new(webhook_state(&fsig, &pk));
+    poll_bundle_file(dir.clone(), Duration::from_millis(50), Arc::clone(&state));
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(state.bundle_absent(), 0, "nothing is missing yet");
+
+    std::fs::remove_file(dir.join(BUNDLE_FSIG_KEY)).expect("remove fsig");
+    std::fs::remove_file(dir.join(BUNDLE_DIGEST_KEY)).expect("remove digest");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state.bundle_absent() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "a bundle key that vanished must move something; the webhook is enforcing a \
+             program whose source is gone"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        handle_json(&state, &body)["response"]["allowed"],
+        false,
+        "and the last-known-good still enforces, which is the policy that must not change"
+    );
+    assert_eq!(
+        state.bundle_unreadable(),
+        0,
+        "an absent key is still not a broken mount"
+    );
+    // The poll loop dedupes by stat, so this is a transition count, not a tick
+    // count: the same missing key does not keep filling the log.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(state.bundle_absent(), 1, "counted once per transition");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B2, exceptions mount: emptying the whole waiver table must not be quieter
+/// than failing to reload it. Absent and unreadable both end with no waivers
+/// applying, and they are different events.
+#[test]
+fn absent_and_unreadable_exceptions_mounts_are_counted_apart() {
+    let (fsig, pk) = make_fsig(enforce_spec(PolicyMode::Enforce, pk_hex(&SK)), &SK);
+    let cfg = ReviewConfig {
+        policy_name: "prod-restricted".into(),
+        policy_namespace: String::new(),
+        ..Default::default()
+    };
+    let state = Arc::new(WebhookState::new(
+        load_ok(&fsig, &pk),
+        pk.clone(),
+        vec![],
+        cfg,
+    ));
+    let dir = temp_dir("exceptions-stat");
+    let live = Utc::now() + Days::new(7);
+    write_exceptions(
+        &dir,
+        &[wallclock_exception(
+            "prod-restricted",
+            RULE_PRIVILEGED,
+            live,
+            "JIRA-STAT-1",
+        )],
+    );
+    poll_exceptions_file(dir.clone(), Duration::from_millis(50), Arc::clone(&state));
+    let body = review(
+        pod(IMAGE, image_annotations(IMAGE, &SK), true),
+        "uid-exc-stat",
+    );
+    wait_decision(&state, &body, true, "live in-scope exception must waive");
+    assert_eq!(state.exceptions_resets(), 0);
+    let cleared_before = state.exceptions_clears();
+
+    // Unreadable: the key is there and does not stat as a file. It cannot be
+    // verified, so the waivers stop applying — as a reload failure, counted.
+    std::fs::remove_file(dir.join(EXCEPTIONS_FSIG_KEY)).expect("remove");
+    std::fs::create_dir(dir.join(EXCEPTIONS_FSIG_KEY)).expect("directory in its place");
+    wait_decision(
+        &state,
+        &body,
+        false,
+        "an unreadable exceptions mount must drop the waivers, not keep them",
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state.exceptions_resets() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "an unreadable exceptions mount is a failed reload, and is counted as one"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        state.exceptions_clears(),
+        cleared_before,
+        "unreadable is not the same event as a Secret that carries no waivers"
+    );
+
+    // Absent: the key is gone. Same empty table, the other counter.
+    std::fs::remove_dir(dir.join(EXCEPTIONS_FSIG_KEY)).expect("remove dir");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while state.exceptions_clears() == cleared_before {
+        assert!(
+            Instant::now() < deadline,
+            "dropping every approved waiver because the key is gone must be counted"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        state.exceptions_resets(),
+        1,
+        "an absent key is not a failed reload"
+    );
+    assert_eq!(state.exception_count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B5: after the first seconds the fixed sentence was wrong. A cache that
+/// listed and went stale, and one that owes a relist, are not a cache that has
+/// never listed, and the deny reply is the only place the difference can be
+/// said.
+#[test]
+fn cold_stale_and_relist_pending_deny_with_different_causes() {
+    let program = selected_program(|spec| {
+        spec.selector
+            .namespace_selector
+            .match_labels
+            .insert(ZONE.into(), "pci".into());
+    });
+    let object = || privileged_pod_in("pci-ns", "default");
+
+    let cold = cfg_with(StaticLabels::default());
+    let cold_msg = deny_msg(&decide(&cold, &program, object(), "uid-warm-cold"));
+
+    let stale = cfg_with(StaticLabels::default().stale(Duration::from_secs(7_200)));
+    let stale_msg = deny_msg(&decide(&stale, &program, object(), "uid-warm-stale"));
+
+    let relist = cfg_with(StaticLabels::default().relist_pending());
+    let relist_msg = deny_msg(&decide(&relist, &program, object(), "uid-warm-relist"));
+
+    for msg in [&cold_msg, &stale_msg, &relist_msg] {
+        assert!(msg.contains("labels unavailable"), "{msg}");
+    }
+    assert!(cold_msg.contains("has not listed yet"), "{cold_msg}");
+    assert!(
+        stale_msg.contains("7200s") && !stale_msg.contains("has not listed yet"),
+        "a stale cache must not be reported as one that never listed: {stale_msg}"
+    );
+    assert!(
+        relist_msg.contains("410 Gone") && !relist_msg.contains("has not listed yet"),
+        "a relist obligation must not be reported as a cold start: {relist_msg}"
+    );
+    assert_ne!(cold_msg, stale_msg);
+    assert_ne!(cold_msg, relist_msg);
+    assert_ne!(stale_msg, relist_msg);
+
+    // Warmth is only consulted for a policy that needs those labels.
+    let unselected = selected_program(|_| {});
+    let clean = pod(IMAGE, image_annotations(IMAGE, &SK), false);
+    let reply = decide(&stale, &unselected, clean, "uid-warm-unselected");
+    assert_eq!(reply["response"]["allowed"], true);
+}
+
+/// The `apiserver` feature is what production builds with, and until now no
+/// test target enabled it: `WatchedLabels` shipped unexercised. Same denies,
+/// driven by real `LabelCache` state instead of a stated flag.
+#[cfg(feature = "apiserver")]
+mod watched_labels {
+    use super::*;
+    use ferrum_admission::{LabelSource, LabelWarmth, WatchedLabels};
+    use ferrum_k8smeta::{LabelCache, LabelObject};
+    use std::sync::RwLock;
+
+    fn cache(objects: Vec<LabelObject>) -> LabelCache {
+        let mut cache = LabelCache::new();
+        cache.try_replace_all(objects).expect("list");
+        cache
+    }
+
+    /// Both namespaces carry a zone label: eval fails closed on an *empty*
+    /// label map, so "not selected" has to be a label that does not match, not
+    /// the absence of one.
+    fn pci_namespace() -> Vec<LabelObject> {
+        vec![
+            LabelObject {
+                namespace: String::new(),
+                name: "pci-ns".into(),
+                labels: labels(&[(ZONE, "pci")]),
+                resource_version: "1".into(),
+            },
+            LabelObject {
+                namespace: String::new(),
+                name: "other-ns".into(),
+                labels: labels(&[(ZONE, "public")]),
+                resource_version: "1".into(),
+            },
+        ]
+    }
+
+    fn source(namespaces: LabelCache, service_accounts: LabelCache) -> Arc<WatchedLabels> {
+        Arc::new(WatchedLabels::new(
+            Arc::new(RwLock::new(namespaces)),
+            Arc::new(RwLock::new(service_accounts)),
+            std::collections::BTreeMap::new(),
+        ))
+    }
+
+    fn cfg(source: Arc<WatchedLabels>) -> ReviewConfig {
+        ReviewConfig {
+            policy_name: "prod-restricted".into(),
+            labels: source,
+            ..Default::default()
+        }
+    }
+
+    fn ns_selected() -> AdmissionProgram {
+        selected_program(|spec| {
+            spec.selector
+                .namespace_selector
+                .match_labels
+                .insert(ZONE.into(), "pci".into());
+        })
+    }
+
+    #[test]
+    fn a_warm_watch_decides_and_a_cold_one_denies_with_the_cold_reason() {
+        let program = ns_selected();
+
+        let warm = cfg(source(cache(pci_namespace()), cache(vec![])));
+        let reply = decide(
+            &warm,
+            &program,
+            privileged_pod_in("pci-ns", "default"),
+            "w1",
+        );
+        assert_eq!(reply["response"]["allowed"], false);
+        let msg = deny_msg(&reply);
+        assert!(
+            !msg.contains("labels unavailable"),
+            "a warm watch denies by the rule: {msg}"
+        );
+        let reply = decide(
+            &warm,
+            &program,
+            privileged_pod_in("other-ns", "default"),
+            "w2",
+        );
+        assert_eq!(
+            reply["response"]["allowed"], true,
+            "a namespace the selector does not match is not this policy's business"
+        );
+
+        // One cache that never listed is enough to hold the whole source cold.
+        let half = cfg(source(cache(pci_namespace()), LabelCache::new()));
+        let reply = decide(
+            &half,
+            &program,
+            privileged_pod_in("pci-ns", "default"),
+            "w3",
+        );
+        assert_eq!(reply["response"]["allowed"], false);
+        assert!(deny_msg(&reply).contains("has not listed yet"));
+    }
+
+    #[test]
+    fn a_stale_watch_says_stale_and_a_gone_watch_says_relist() {
+        let program = ns_selected();
+
+        let mut aged = cache(pci_namespace());
+        aged.set_max_age(Duration::from_secs(60));
+        aged.mark_fresh_at(Instant::now() - Duration::from_secs(4_000));
+        let stale = source(aged, cache(vec![]));
+        assert!(matches!(stale.warmth(), LabelWarmth::Stale { .. }));
+        let reply = decide(
+            &cfg(Arc::clone(&stale)),
+            &program,
+            privileged_pod_in("pci-ns", "default"),
+            "w4",
+        );
+        assert_eq!(reply["response"]["allowed"], false);
+        let stale_msg = deny_msg(&reply);
+        assert!(
+            !stale_msg.contains("has not listed yet"),
+            "the cache listed; it went stale: {stale_msg}"
+        );
+
+        let mut gone = cache(pci_namespace());
+        gone.raise_relist_pending();
+        let relist = source(gone, cache(vec![]));
+        assert_eq!(relist.warmth(), LabelWarmth::RelistPending);
+        let reply = decide(
+            &cfg(relist),
+            &program,
+            privileged_pod_in("pci-ns", "default"),
+            "w5",
+        );
+        assert_eq!(reply["response"]["allowed"], false);
+        let relist_msg = deny_msg(&reply);
+        assert!(relist_msg.contains("410 Gone"), "{relist_msg}");
+        assert_ne!(stale_msg, relist_msg);
     }
 }

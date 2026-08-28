@@ -13,8 +13,12 @@ use ferrum_common::{FerrumError, Result};
 
 pub use eval::{evaluate, exception_applies, RuleHit};
 
-pub(crate) const MIN_REASON_LEN: usize = 8;
-pub(crate) const MAX_EXCEPTION_DAYS: u64 = 90;
+/// Shortest `reason` a waiver may carry. Public because the CRD schema states
+/// the same bound as `minLength` and the drift gate derives one from the other.
+pub const MIN_REASON_LEN: usize = 8;
+/// Longest TTL a waiver may carry, in days. Same reason: the CEL copy spells it
+/// as a duration and must be derivable from this.
+pub const MAX_EXCEPTION_DAYS: u64 = 90;
 
 pub fn validate_cluster_policy(spec: &ClusterSecurityPolicySpec) -> Result<()> {
     validate_common(
@@ -54,9 +58,15 @@ pub fn validate_exception(spec: &PolicyExceptionSpec) -> Result<()> {
             "reason короче восьми символов — это не обоснование, это статус в Slack".into(),
         ));
     }
-    if spec.four_eyes && spec.approved_by.trim().is_empty() {
+    // approvedBy обязателен всегда: fourEyes self-declared и не может быть рубильником.
+    if spec.approved_by.trim().is_empty() {
         return Err(FerrumError::Validation(
-            "fourEyes=true без approvedBy".into(),
+            "PolicyException.approvedBy пуст — waiver без второго согласующего не waiver".into(),
+        ));
+    }
+    if spec.approved_by.trim() == spec.requested_by.trim() {
+        return Err(FerrumError::Validation(
+            "requestedBy совпадает с approvedBy — self-approve запрещён".into(),
         ));
     }
     let now = Utc::now();
@@ -102,7 +112,9 @@ fn validate_common(
     Ok(())
 }
 
-const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
+/// Hex length of an Ed25519 verifying key. The CRD repeats it as an item
+/// `pattern`, and the drift gate derives that pattern from this constant.
+pub const ED25519_PUBLIC_KEY_HEX_LEN: usize = 64;
 
 fn is_ed25519_public_key_hex(s: &str) -> bool {
     s.len() == ED25519_PUBLIC_KEY_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
@@ -146,6 +158,95 @@ fn validate_admit(admit: &AdmitSpec) -> Result<()> {
     Ok(())
 }
 
+/// Инвариант «правило может сработать»: датапас хукает конечное множество
+/// syscall'ов, всё остальное — правило, которое валидируется, компилируется,
+/// подписывается и не срабатывает никогда. Симметрично «Kill/Isolate без
+/// match»: тот ловит слишком широкое правило, этот — слишком узкое.
+pub fn validate_rule_syscalls(rule_id: &str, syscalls: &[String]) -> Result<()> {
+    for syscall in syscalls {
+        let name = syscall.trim();
+        if !ferrum_ids::is_datapath_syscall(name) {
+            return Err(FerrumError::Validation(format!(
+                "rule '{rule_id}': syscall '{name}' — датапас его не наблюдает; правило не может сработать. Наблюдаемые: {}",
+                ferrum_ids::DATAPATH_SYSCALLS.join(", ")
+            )));
+        }
+    }
+    if let Some((listed, missing)) = ferrum_ids::uncovered_equivalent_syscall(syscalls) {
+        return Err(FerrumError::Validation(format!(
+            "rule '{rule_id}': syscall '{listed}' назван без '{missing}' — {}. Bundle один на кластер: перечислите обе формы",
+            equivalence_gap(listed, missing)
+        )));
+    }
+    Ok(())
+}
+
+/// Тот же инвариант «правило может сработать», но для предикатов, а не для
+/// syscall'ов: ядро отдаёт `comm` не длиннее TASK_COMM_LEN с NUL, а путь — не
+/// длиннее буфера датапаса. Литерал длиннее границы компилируется, подписывается
+/// и не совпадает никогда.
+pub fn validate_rule_predicates(
+    rule_id: &str,
+    comm_in: &[String],
+    path_prefix: &[String],
+    path_suffix: &[String],
+) -> Result<()> {
+    if let Some((comm, len)) = ferrum_ids::unobservable_comm(comm_in) {
+        return Err(FerrumError::Validation(format!(
+            "rule '{rule_id}': comm '{comm}' длиной {len} байт, ядро отдаёт не больше {} — правило не может совпасть никогда",
+            ferrum_ids::COMM_MATCH_MAX
+        )));
+    }
+    for (field, patterns) in [("pathPrefix", path_prefix), ("pathSuffix", path_suffix)] {
+        if let Some((pattern, len)) = ferrum_ids::unobservable_path_pattern(patterns) {
+            return Err(FerrumError::Validation(format!(
+                "rule '{rule_id}': {field} '{pattern}' длиной {len} байт, датапас несёт не больше {} — правило не может совпасть никогда",
+                ferrum_ids::PATH_MATCH_MAX
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Тот же инвариант «правило может сработать», но для действия: runtime-план
+/// исполняет ровно Allow / Audit / Kill. `Deny` он решает и не исполняет —
+/// tracepoint срабатывает после того, как syscall уже выполнен, отменять
+/// нечего; это глагол admission. `Isolate` не реализован ни в одном плане.
+/// Правило с таким действием валидируется, компилируется, подписывается,
+/// совпадает — и не делает ничего, оставляя поток решений, которых не было.
+pub fn validate_rule_action(rule_id: &str, action: RuntimeAction) -> Result<()> {
+    match action {
+        RuntimeAction::Deny => Err(FerrumError::Validation(format!(
+            "rule '{rule_id}': action=deny — runtime-план его не исполняет: tracepoint срабатывает после syscall, отменить вызов нечем. Deny — глагол admission (admit.deny); в runtime исполнимы allow, audit, kill"
+        ))),
+        RuntimeAction::Isolate => Err(FerrumError::Validation(format!(
+            "rule '{rule_id}': action=isolate — реализации изоляции нет; правило совпадёт и не сделает ничего. В runtime исполнимы allow, audit, kill"
+        ))),
+        RuntimeAction::Allow | RuntimeAction::Audit | RuntimeAction::Kill => Ok(()),
+    }
+}
+
+/// Why naming one spelling of an operation and not the other breaks
+/// enforcement. Both directions are holes, but of opposite kinds: the missing
+/// form either lets the call through on the arches that serve it, or the named
+/// form never exists on the arches that do not.
+fn equivalence_gap(listed: &str, missing: &str) -> String {
+    match (
+        ferrum_ids::arch_restricted_syscall(listed),
+        ferrum_ids::arch_restricted_syscall(missing),
+    ) {
+        (_, Some(r)) => format!(
+            "это одна операция ядра, и на {} вызов '{missing}' обходит правило",
+            r.arches.join(", ")
+        ),
+        (Some(r), None) => format!(
+            "'{listed}' есть только на {}, на остальных арках правило мертво",
+            r.arches.join(", ")
+        ),
+        (None, None) => format!("это одна операция ядра, вызов '{missing}' обходит правило"),
+    }
+}
+
 fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
     if matches!(
         runtime.default_action,
@@ -153,6 +254,13 @@ fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
     ) {
         return Err(FerrumError::Validation(
             "runtime.defaultAction Kill/Isolate — это kill-all, не политика".into(),
+        ));
+    }
+    // Тот же инвариант, что и для действия правила: defaultAction=deny — это
+    // решение на каждое событие, которое план не исполняет ни разу.
+    if runtime.default_action == RuntimeAction::Deny {
+        return Err(FerrumError::Validation(
+            "runtime.defaultAction deny — runtime-план его не исполняет: tracepoint срабатывает после syscall. Deny — глагол admission (admit.deny); по умолчанию исполнимы allow и audit".into(),
         ));
     }
     let mut ids = std::collections::BTreeSet::new();
@@ -166,6 +274,14 @@ fn validate_runtime(runtime: &RuntimeSpec) -> Result<()> {
                 rule.id
             )));
         }
+        validate_rule_action(&rule.id, rule.action)?;
+        validate_rule_syscalls(&rule.id, &rule.syscalls)?;
+        validate_rule_predicates(
+            &rule.id,
+            &rule.match_on.comm_in,
+            &rule.match_on.path_prefix,
+            &rule.match_on.path_suffix,
+        )?;
         if matches!(rule.action, RuntimeAction::Kill | RuntimeAction::Isolate)
             && rule.match_on.comm_in.is_empty()
             && rule.match_on.path_prefix.is_empty()
@@ -254,6 +370,47 @@ mod tests {
     }
 
     #[test]
+    fn exception_empty_approved_by_rejected_even_without_four_eyes() {
+        let mut spec = live_exception(
+            "",
+            &["prod-restricted"],
+            &["no-shell"],
+            Utc::now() + Days::new(7),
+        );
+        spec.four_eyes = false;
+        spec.approved_by = "".into();
+        assert!(validate_exception(&spec).is_err());
+        spec.approved_by = "   ".into();
+        assert!(validate_exception(&spec).is_err());
+    }
+
+    #[test]
+    fn exception_self_approve_rejected() {
+        let mut spec = live_exception(
+            "",
+            &["prod-restricted"],
+            &["no-shell"],
+            Utc::now() + Days::new(7),
+        );
+        spec.requested_by = "sre".into();
+        spec.approved_by = "sre".into();
+        assert!(validate_exception(&spec).is_err());
+        spec.four_eyes = false;
+        assert!(validate_exception(&spec).is_err());
+    }
+
+    #[test]
+    fn exception_distinct_approver_ok() {
+        let spec = live_exception(
+            "",
+            &["prod-restricted"],
+            &["no-shell"],
+            Utc::now() + Days::new(7),
+        );
+        assert!(validate_exception(&spec).is_ok());
+    }
+
+    #[test]
     fn kill_all_rejected() {
         let spec = ClusterSecurityPolicySpec {
             runtime: RuntimeSpec {
@@ -285,6 +442,235 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_cluster_policy(&spec).is_err());
+    }
+
+    fn action_rule_spec(action: RuntimeAction) -> ClusterSecurityPolicySpec {
+        ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                rules: vec![RuntimeRule {
+                    id: "no-module".into(),
+                    syscalls: vec!["init_module".into(), "finit_module".into(), "bpf".into()],
+                    match_on: RuntimeMatch {
+                        not_agent_self: true,
+                        ..Default::default()
+                    },
+                    action,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Same family as the unobserved syscall and the oversized predicate, but
+    /// on the action: a rule the runtime plane decides and cannot execute is a
+    /// permanent stream of verdicts that never happened. A match cannot save
+    /// it, so the well-matched rule is the one that has to be rejected here.
+    #[test]
+    fn an_action_the_runtime_plane_cannot_execute_is_rejected() {
+        let err = validate_cluster_policy(&action_rule_spec(RuntimeAction::Deny))
+            .expect_err("runtime deny is not executable");
+        let msg = err.to_string();
+        assert!(matches!(err, FerrumError::Validation(_)), "{msg}");
+        assert!(msg.contains("no-module"), "{msg}");
+        assert!(msg.contains("deny"), "{msg}");
+        assert!(msg.contains("admission"), "{msg}");
+
+        let err = validate_cluster_policy(&action_rule_spec(RuntimeAction::Isolate))
+            .expect_err("isolate has no implementation");
+        let msg = err.to_string();
+        assert!(matches!(err, FerrumError::Validation(_)), "{msg}");
+        assert!(msg.contains("no-module"), "{msg}");
+        assert!(msg.contains("isolate"), "{msg}");
+
+        for executable in [
+            RuntimeAction::Allow,
+            RuntimeAction::Audit,
+            RuntimeAction::Kill,
+        ] {
+            validate_cluster_policy(&action_rule_spec(executable))
+                .unwrap_or_else(|e| panic!("{executable:?} is executable: {e}"));
+        }
+    }
+
+    /// The namespaced kind compiles from the same validator; a policy author
+    /// must not get the unexecutable action back by writing a SecurityPolicy.
+    #[test]
+    fn namespaced_policy_rejects_the_same_action() {
+        let spec = SecurityPolicySpec {
+            runtime: action_rule_spec(RuntimeAction::Deny).runtime,
+            ..Default::default()
+        };
+        let err = validate_namespaced_policy(&spec).expect_err("runtime deny is not executable");
+        assert!(err.to_string().contains("no-module"), "{err}");
+    }
+
+    /// `defaultAction: deny` is the same defect on every event rather than on
+    /// one rule: nothing matches, everything decides an action nobody runs.
+    #[test]
+    fn default_action_deny_rejected() {
+        let spec = ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                default_action: RuntimeAction::Deny,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = validate_cluster_policy(&spec).expect_err("default deny is not executable");
+        assert!(err.to_string().contains("defaultAction"), "{err}");
+    }
+
+    fn runtime_rule_spec(syscalls: &[&str], action: RuntimeAction) -> ClusterSecurityPolicySpec {
+        ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                rules: vec![RuntimeRule {
+                    id: "probe".into(),
+                    syscalls: syscalls.iter().map(|s| (*s).to_string()).collect(),
+                    match_on: RuntimeMatch {
+                        comm_in: vec!["gdb".into()],
+                        ..Default::default()
+                    },
+                    action,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn predicate_rule_spec(m: RuntimeMatch) -> ClusterSecurityPolicySpec {
+        ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                rules: vec![RuntimeRule {
+                    id: "probe".into(),
+                    syscalls: vec![],
+                    match_on: m,
+                    action: RuntimeAction::Audit,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Same class of defect as an unhooked syscall: `comm` is capped at
+    /// TASK_COMM_LEN in the kernel and the path buffer is finite, so a longer
+    /// literal is a rule that validates, signs, loads and never matches.
+    #[test]
+    fn a_predicate_the_kernel_cannot_report_is_rejected() {
+        let over_comm = "kubectl-exec-helper".to_string();
+        assert!(over_comm.len() > ferrum_ids::COMM_MATCH_MAX);
+        let err = validate_cluster_policy(&predicate_rule_spec(RuntimeMatch {
+            comm_in: vec![over_comm.clone()],
+            ..Default::default()
+        }))
+        .expect_err("19-byte comm is unobservable");
+        let msg = err.to_string();
+        assert!(msg.contains("probe"), "{msg}");
+        assert!(msg.contains(&over_comm), "{msg}");
+        // Names the length and the bound, not just "invalid".
+        assert!(msg.contains("19"), "{msg}");
+        assert!(
+            msg.contains(&ferrum_ids::COMM_MATCH_MAX.to_string()),
+            "{msg}"
+        );
+
+        let over_path = "p".repeat(ferrum_ids::PATH_MATCH_MAX + 1);
+        for m in [
+            RuntimeMatch {
+                path_prefix: vec![over_path.clone()],
+                ..Default::default()
+            },
+            RuntimeMatch {
+                path_suffix: vec![over_path.clone()],
+                ..Default::default()
+            },
+        ] {
+            let msg = validate_cluster_policy(&predicate_rule_spec(m))
+                .expect_err("oversize path pattern")
+                .to_string();
+            assert!(
+                msg.contains(&(ferrum_ids::PATH_MATCH_MAX + 1).to_string()),
+                "{msg}"
+            );
+            assert!(
+                msg.contains(&ferrum_ids::PATH_MATCH_MAX.to_string()),
+                "{msg}"
+            );
+        }
+
+        // At the bound, and empty, both stay valid.
+        validate_cluster_policy(&predicate_rule_spec(RuntimeMatch {
+            comm_in: vec!["x".repeat(ferrum_ids::COMM_MATCH_MAX)],
+            path_prefix: vec!["p".repeat(ferrum_ids::PATH_MATCH_MAX)],
+            path_suffix: vec!["s".repeat(ferrum_ids::PATH_MATCH_MAX)],
+            ..Default::default()
+        }))
+        .expect("a predicate the buffers can hold is valid");
+    }
+
+    #[test]
+    fn syscall_outside_the_datapath_is_rejected() {
+        for action in [
+            RuntimeAction::Kill,
+            RuntimeAction::Allow,
+            RuntimeAction::Audit,
+        ] {
+            let err = validate_cluster_policy(&runtime_rule_spec(&["ptrace"], action))
+                .expect_err("ptrace is not hooked");
+            let msg = err.to_string();
+            assert!(msg.contains("probe"), "{msg}");
+            assert!(msg.contains("ptrace"), "{msg}");
+            assert!(msg.contains("не наблюдает"), "{msg}");
+        }
+        // A rule that mixes one observable syscall with one unobservable one is
+        // still a rule that only half fires.
+        assert!(validate_cluster_policy(&runtime_rule_spec(
+            &["execve", "ptrace"],
+            RuntimeAction::Kill
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn every_datapath_syscall_is_accepted() {
+        for syscall in ferrum_ids::DATAPATH_SYSCALLS {
+            let names: Vec<&str> = match ferrum_ids::syscall_equivalence_class(syscall) {
+                Some(class) => class.to_vec(),
+                None => vec![syscall],
+            };
+            validate_cluster_policy(&runtime_rule_spec(&names, RuntimeAction::Kill))
+                .unwrap_or_else(|e| panic!("{syscall} must validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn open_without_openat_is_dead_on_aarch64() {
+        let err = validate_cluster_policy(&runtime_rule_spec(&["open"], RuntimeAction::Kill))
+            .expect_err("open alone is arch-split enforcement");
+        let msg = err.to_string();
+        assert!(msg.contains("x86_64"), "{msg}");
+        assert!(msg.contains("openat"), "{msg}");
+        validate_cluster_policy(&runtime_rule_spec(&["open", "openat"], RuntimeAction::Kill))
+            .expect("open+openat is portable");
+    }
+
+    #[test]
+    fn openat_without_open_is_bypassed_on_x86_64() {
+        let err = validate_cluster_policy(&runtime_rule_spec(&["openat"], RuntimeAction::Kill))
+            .expect_err("openat alone leaves open(2) unenforced on x86_64");
+        let msg = err.to_string();
+        assert!(msg.contains("x86_64"), "{msg}");
+        assert!(msg.contains("'open'"), "{msg}");
+    }
+
+    #[test]
+    fn path_match_without_syscalls_stays_portable() {
+        // path_prefix-only rules expand to every path-bearing syscall in the
+        // datapath, so they never carry a half-named equivalence class.
+        let mut spec = runtime_rule_spec(&[], RuntimeAction::Kill);
+        spec.runtime.rules[0].match_on.path_prefix = vec!["/var/run/docker.sock".into()];
+        validate_cluster_policy(&spec).expect("path-only rule is portable");
     }
 
     #[test]
@@ -637,6 +1023,30 @@ mod tests {
                         policies: vec!["prod-restricted".into()],
                         rules: vec!["no-shell".into()],
                     },
+                }],
+                want: RuntimeAction::Deny,
+            },
+            Case {
+                name: "empty approvedBy with fourEyes=false is a no-op",
+                hits: vec![hit("prod-restricted", "no-shell", RuntimeAction::Kill)],
+                default_action: RuntimeAction::Allow,
+                exceptions: vec![{
+                    let mut ex = live_exception("", &["prod-restricted"], &["no-shell"], live);
+                    ex.four_eyes = false;
+                    ex.approved_by = "".into();
+                    ex
+                }],
+                want: RuntimeAction::Kill,
+            },
+            Case {
+                name: "self-approved exception is a no-op",
+                hits: vec![hit("prod-restricted", "no-shell", RuntimeAction::Deny)],
+                default_action: RuntimeAction::Allow,
+                exceptions: vec![{
+                    let mut ex = live_exception("", &["prod-restricted"], &["no-shell"], live);
+                    ex.requested_by = "sre".into();
+                    ex.approved_by = "sre".into();
+                    ex
                 }],
                 want: RuntimeAction::Deny,
             },

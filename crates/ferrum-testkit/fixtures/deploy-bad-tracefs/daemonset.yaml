@@ -1,0 +1,59 @@
+# An attach build with nowhere to read the tracepoint catalogue. Clean
+# everywhere else — right ServiceAccount, limits, no privilege, no hostPID, no
+# bundle to join a policy name to — so the only finding this tree can produce
+# is the tracefs one. Do not fix.
+#
+# tracefs is its own filesystem and no container runtime propagates it into a
+# container. The agent below has the ELF, CAP_BPF and CAP_PERFMON, and cannot
+# read a single `events/<category>/<name>/id`: the probe answers "cannot tell",
+# every attach is tried, every one fails, and the node parks Degraded with the
+# four RFC section D runtime cases dead. Nothing at runtime repairs this and
+# nothing else in the manifest looks wrong, which is why it is a finding here.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ferrum-agent-no-tracefs
+  namespace: ferrum
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-agent
+    spec:
+      serviceAccountName: ferrum-agent-observe
+      containers:
+        - name: agent
+          image: ghcr.io/ferrum/ferrum-agent:v0.1.0
+          args:
+            - --role
+            - observe
+            - --bpf-elf
+            - /usr/share/ferrum/ferrum-ebpf-progs.bpf.o
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "PERFMON"]
+          volumeMounts:
+            - name: bpf-pins
+              mountPath: /sys/fs/bpf/ferrum
+            # An emptyDir where tracefs belongs is the same blindness with a
+            # mount to point at: a directory that exists, holds no `events`,
+            # and makes the manifest look complete.
+            - name: tracefs
+              mountPath: /sys/kernel/tracing
+      volumes:
+        - name: bpf-pins
+          hostPath:
+            path: /sys/fs/bpf/ferrum
+            type: DirectoryOrCreate
+        - name: tracefs
+          emptyDir: {}

@@ -1,0 +1,43 @@
+# Clean serving side, so the only findings this tree can produce come from the
+# caBundle in validatingwebhookconfiguration.yaml. Do not fix.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-admission
+  namespace: ferrum
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-admission
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-admission
+    spec:
+      serviceAccountName: ferrum-admission
+      containers:
+        - name: admission
+          image: ghcr.io/ferrum/ferrum-admission:v0.1.0
+          args:
+            - serve
+            - --tls-cert
+            - /etc/ferrum/tls/tls.crt
+            - --tls-key
+            - /etc/ferrum/tls/tls.key
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/ferrum/tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: ferrum-admission-tls

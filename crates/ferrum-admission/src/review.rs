@@ -1,20 +1,39 @@
 //! admission.k8s.io/v1 AdmissionReview. Fail closed; Cluster Ignore is not an integrity bypass.
 
 use chrono::{DateTime, Utc};
-use ferrum_api::{PolicyExceptionSpec, PolicyMode};
+use ferrum_api::{LabelSelector, PolicyExceptionSpec, PolicyMode};
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 
 use crate::encoding::b64_encode;
 use crate::eval::{admit, AdmissionDecision, Patch};
+use crate::labels::{ColdLabels, LabelSource};
 use crate::program::AdmissionProgram;
 use crate::subject::subject_from_object;
 
+/// A Pod that names no ServiceAccount runs as this one, so that is the key to
+/// look labels up under.
+const DEFAULT_SERVICE_ACCOUNT: &str = "default";
+
 /// Policy identity for exception scope. Empty namespace is cluster-scoped.
 /// `policy_name` is never inferred from exception targets.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ReviewConfig {
     pub policy_name: String,
     pub policy_namespace: String,
+    /// Namespace/ServiceAccount/cluster labels. Defaults to a cold source, so
+    /// a webhook that was never given one denies every selected policy.
+    pub labels: Arc<dyn LabelSource>,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            policy_name: String::new(),
+            policy_namespace: String::new(),
+            labels: Arc::new(ColdLabels::default()),
+        }
+    }
 }
 
 /// HTTP status + AdmissionReview (or error) body.
@@ -104,8 +123,42 @@ fn handle_with(
     subject.policy_name = cfg.policy_name.clone();
     subject.policy_namespace = cfg.policy_namespace.clone();
 
+    // A cold cache denies only what it would actually decide: a policy with no
+    // namespace/ServiceAccount selector never needed those labels. Sample the
+    // warmth once and carry its cause into the reply: this message is the only
+    // channel admission has, and it reaches the human running kubectl at the
+    // moment of the deny.
+    let warmth = cfg.labels.warmth();
+    if !warmth.is_warm() && watched_labels_selected(program) {
+        return ok_deny(
+            &uid,
+            &format!("namespace labels unavailable: {}", warmth.reason()),
+        );
+    }
+    subject.namespace_labels = cfg.labels.namespace_labels(&subject.namespace);
+    let service_account = if subject.service_account.is_empty() {
+        DEFAULT_SERVICE_ACCOUNT
+    } else {
+        subject.service_account.as_str()
+    };
+    subject.service_account_labels = cfg
+        .labels
+        .service_account_labels(&subject.namespace, service_account);
+    subject.cluster_labels = cfg.labels.cluster_labels();
+
     let decision = admit(program, &subject, exceptions, now);
     decision_response(&uid, object, &decision)
+}
+
+/// Cluster labels come from a flag, not from the watch, so a cluster selector
+/// alone does not depend on the cache being warm.
+fn watched_labels_selected(program: &AdmissionProgram) -> bool {
+    selector_nonempty(&program.selector.namespace_selector)
+        || selector_nonempty(&program.selector.service_account_selector)
+}
+
+fn selector_nonempty(selector: &LabelSelector) -> bool {
+    !selector.match_labels.is_empty() || !selector.match_expressions.is_empty()
 }
 
 fn http_400(message: &str) -> ReviewReply {

@@ -1,0 +1,27 @@
+{
+  "kind": "NamespaceList",
+  "apiVersion": "v1",
+  "metadata": { "resourceVersion": "2001" },
+  "items": [
+    {
+      "metadata": {
+        "name": "prod",
+        "resourceVersion": "1900",
+        "labels": {
+          "kubernetes.io/metadata.name": "prod",
+          "ferrum.io/zone": "pci"
+        }
+      }
+    },
+    {
+      "metadata": {
+        "name": "dev",
+        "resourceVersion": "1901",
+        "labels": {
+          "kubernetes.io/metadata.name": "dev",
+          "ferrum.io/zone": "public"
+        }
+      }
+    }
+  ]
+}

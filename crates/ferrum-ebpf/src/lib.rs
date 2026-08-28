@@ -4,21 +4,139 @@
 
 mod envelope;
 mod eval;
+mod event;
+mod kernel;
 mod loader;
+mod prefilter;
 mod spec;
 
 pub use envelope::{extract_febp, BUNDLE_FORMAT, BUNDLE_MAGIC};
-pub use eval::{decide, matched_action, selector_matches, Decision, SyscallEvent};
-pub use ferrum_ebpf_progs::{EVENTS_DROPPED_TOTAL, MAP_EVENTS, MAP_RULES};
-pub use ferrum_ids::AGENT_ABI;
+pub use eval::{
+    decide, decide_with, matched_action, matched_action_with, selector_match, selector_matches,
+    Decision, EventMeta, SelectorMatch, SyscallEvent,
+};
+pub use event::{
+    abi_stamp_mismatch, decode_event, encode_event, event_meta, path_truncated, syscall_event,
+    syscall_name, SyscallArch, EVENT_FLAGS_OFFSET, EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
+};
+pub use ferrum_ebpf_progs::{
+    Event, CGROUPS_MAX_ENTRIES, COMM_LEN, DATAPATH_ABI, EVENTS_DROPPED_TOTAL, EVENTS_RING_BYTES,
+    EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, MAP_CGROUPS,
+    MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
+};
+pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
+pub use kernel::{
+    elf_map_def, plan_cgroup_sync, verify_map_defs, CgroupSyncPlan, MapDef, Memlock, SyncStats,
+    MAP_DEF_LEN, REQUIRED_MAPS,
+};
+#[cfg(feature = "attach")]
+pub use kernel::{raise_memlock, KernelHandle, RingReader};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
+pub use prefilter::{prefilter_image, PrefilterImage, PATH_BEARING_SYSCALLS};
 pub use spec::{
-    parse_febp, Action, EbpfSpec, ImageSelector, LabelRequirement, LabelSelector, Mode,
-    PolicySelector, Rule, EBPF_MAGIC,
+    parse_febp, parse_febp_with, Action, DeadRules, EbpfSpec, ImageSelector, LabelRequirement,
+    LabelSelector, Mode, PolicySelector, Rule, EBPF_MAGIC,
 };
 
 use ferrum_common::Result;
 use ferrum_ids::Digest;
+
+/// (program symbol in the ELF, tracepoint category, tracepoint name).
+///
+/// Lives outside the `attach` gate so ELF inspection (CI symbol check,
+/// `tests/elf_inspect.rs`) can use the same list without CAP_BPF or aya.
+pub const TRACEPOINTS: &[(&str, &str, &str)] = &[
+    ("ferrum_sys_enter_execve", "syscalls", "sys_enter_execve"),
+    (
+        "ferrum_sys_enter_execveat",
+        "syscalls",
+        "sys_enter_execveat",
+    ),
+    ("ferrum_sys_enter_open", "syscalls", "sys_enter_open"),
+    ("ferrum_sys_enter_openat", "syscalls", "sys_enter_openat"),
+    ("ferrum_sys_enter_bpf", "syscalls", "sys_enter_bpf"),
+    (
+        "ferrum_sys_enter_init_module",
+        "syscalls",
+        "sys_enter_init_module",
+    ),
+    (
+        "ferrum_sys_enter_finit_module",
+        "syscalls",
+        "sys_enter_finit_module",
+    ),
+];
+
+/// One entry of [`TRACEPOINTS`]: program symbol, category, tracepoint name.
+pub type Tracepoint = (&'static str, &'static str, &'static str);
+
+/// The syscall a tracepoint observes, or `None` if the name is not a
+/// `sys_enter_*` hook.
+pub fn tracepoint_syscall(tracepoint: &Tracepoint) -> Option<&'static str> {
+    tracepoint.2.strip_prefix("sys_enter_")
+}
+
+/// Tracepoints that exist on `arch`.
+///
+/// A syscall absent on an arch has no tracepoint there, and attaching to it
+/// fails with ENOENT. Attaching the whole set unconditionally therefore left
+/// the agent with no hooks at all on such a host, so the arch-restricted ones
+/// are filtered out here rather than allowed to fail: a real attach error
+/// must stay an error.
+pub fn tracepoints_for_arch(arch: SyscallArch) -> Vec<&'static Tracepoint> {
+    let observable = ferrum_ids::datapath_syscalls_for_arch(arch.as_str());
+    TRACEPOINTS
+        .iter()
+        .filter(|tp| match tracepoint_syscall(tp) {
+            Some(syscall) => observable.contains(&syscall),
+            None => true,
+        })
+        .collect()
+}
+
+/// Where the kernel exposes its tracepoint catalogue.
+const TRACEFS_ROOTS: [&str; 2] = ["/sys/kernel/tracing", "/sys/kernel/debug/tracing"];
+
+/// Whether *this running kernel* exposes `category:name`, read from tracefs.
+///
+/// The arch table answers a different question — which syscalls the ABI has —
+/// and a kernel can lack a tracepoint the arch does have: one built without
+/// `CONFIG_MODULES` has neither `init_module` nor `finit_module`, and so no
+/// tracepoint for either. Deriving that from the table alone made the whole
+/// attach fail and left the node's runtime plane blind.
+///
+/// `None` when no tracefs is mounted at all: absence cannot be established
+/// there, and "cannot tell" must never widen into "not there" — the attach
+/// then tries every hook and a real failure stays fatal.
+pub fn tracepoint_in_tracefs(category: &str, name: &str) -> Option<bool> {
+    let mut mounted = false;
+    for root in TRACEFS_ROOTS {
+        if !std::path::Path::new(root).join("events").is_dir() {
+            continue;
+        }
+        mounted = true;
+        if std::path::Path::new(root)
+            .join("events")
+            .join(category)
+            .join(name)
+            .join("id")
+            .exists()
+        {
+            return Some(true);
+        }
+    }
+    mounted.then_some(false)
+}
+
+/// Tracepoints skipped on `arch` because the syscall does not exist there.
+pub fn tracepoints_absent_on_arch(arch: SyscallArch) -> Vec<&'static str> {
+    let observable = ferrum_ids::datapath_syscalls_for_arch(arch.as_str());
+    TRACEPOINTS
+        .iter()
+        .filter_map(tracepoint_syscall)
+        .filter(|syscall| !observable.contains(syscall))
+        .collect()
+}
 
 /// Parse `spec` as FEBP and install it on `loader` as last-known-good.
 pub fn load_bundle(loader: &mut Loader, digest: &Digest, spec: &[u8]) -> Result<()> {
@@ -34,6 +152,72 @@ mod tests {
 
     fn digest_of(bytes: &[u8]) -> Digest {
         ferrum_crypto::bundle_digest(bytes)
+    }
+
+    /// Third copy of the datapath's syscall set: what is attached. A hook here
+    /// with no entry in `DATAPATH_SYSCALLS` is a syscall no rule may name; an
+    /// entry there with no hook is a rule that validates and never fires.
+    ///
+    /// Per arch, not against the whole list: `open` has no tracepoint on
+    /// aarch64, and pinning the attach set to the full list is what made a
+    /// single missing tracepoint kill every hook there.
+    #[test]
+    fn tracepoints_match_datapath_syscalls_per_arch() {
+        for arch in [SyscallArch::X86_64, SyscallArch::Aarch64] {
+            let mut hooked: Vec<&str> = tracepoints_for_arch(arch)
+                .iter()
+                .map(|tp| {
+                    assert_eq!(tp.1, "syscalls");
+                    tracepoint_syscall(tp).expect("tracepoint name is sys_enter_<syscall>")
+                })
+                .collect();
+            hooked.sort_unstable();
+            let mut want = ferrum_ids::datapath_syscalls_for_arch(arch.as_str());
+            want.sort_unstable();
+            assert_eq!(hooked, want, "TRACEPOINTS drifted on {}", arch.as_str());
+            assert!(!hooked.is_empty(), "no hooks left on {}", arch.as_str());
+        }
+    }
+
+    /// The skip list is exactly what the arch lacks, and nothing more: a
+    /// tracepoint dropped for any other reason is a silently blind hook.
+    #[test]
+    fn only_arch_missing_tracepoints_are_skipped() {
+        assert!(tracepoints_absent_on_arch(SyscallArch::X86_64).is_empty());
+        assert_eq!(
+            tracepoints_absent_on_arch(SyscallArch::Aarch64),
+            vec!["open"]
+        );
+        for arch in [SyscallArch::X86_64, SyscallArch::Aarch64] {
+            assert_eq!(
+                tracepoints_for_arch(arch).len() + tracepoints_absent_on_arch(arch).len(),
+                TRACEPOINTS.len()
+            );
+        }
+    }
+
+    /// The kernel half of "the tracepoint is not there", which the arch table
+    /// cannot answer. Every assertion is conditional on tracefs being mounted,
+    /// because that is exactly the distinction under test: with no tracefs the
+    /// answer is "cannot tell", never "not there", and the attach must then
+    /// try every hook rather than skip one.
+    #[test]
+    fn tracefs_answers_absent_present_or_cannot_tell() {
+        let openat = tracepoint_in_tracefs("syscalls", "sys_enter_openat");
+        let nonsense = tracepoint_in_tracefs("syscalls", "sys_enter_ferrum_not_a_syscall");
+        match openat {
+            None => assert_eq!(nonsense, None, "no tracefs, so nothing can be established"),
+            Some(present) => {
+                assert!(present, "tracefs is mounted but has no sys_enter_openat");
+                assert_eq!(
+                    nonsense,
+                    Some(false),
+                    "a tracepoint no kernel has must read as absent, not as unknown"
+                );
+            }
+        }
+        // A category that is not there at all is absent, not a panic.
+        assert_ne!(tracepoint_in_tracefs("ferrum", "nothing"), Some(true));
     }
 
     struct Writer(Vec<u8>);
@@ -202,6 +386,7 @@ mod tests {
             path,
             in_container,
             agent_self,
+            path_truncated: false,
         }
     }
 
@@ -224,6 +409,78 @@ mod tests {
         assert_eq!(MAP_EVENTS, "ferrum_events");
         assert_eq!(MAP_RULES, "ferrum_rules");
         assert_eq!(EVENTS_DROPPED_TOTAL, "events_dropped_total");
+    }
+
+    /// `DeadRules::Drop` relaxes exactly one thing. A rule that can match no
+    /// record is dropped so the rest of a last-known-good snapshot can still
+    /// be restored; a kill-all rule, a bad ABI and a malformed spec are still
+    /// refused whole, because dropping those would change what the node
+    /// enforces rather than only what it cannot.
+    #[test]
+    fn dropping_dead_rules_relaxes_nothing_else() {
+        let long = format!("/{}", "a".repeat(ferrum_ids::PATH_MATCH_MAX));
+        let spec = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[
+                RuleSpec {
+                    id: "unmatchable",
+                    syscalls: &["openat"],
+                    action: Action::Deny,
+                    comm_in: &[],
+                    container_only: false,
+                    path_prefix: &[long.as_str()],
+                    path_suffix: &[],
+                    not_agent_self: false,
+                },
+                RuleSpec {
+                    id: "no-proc-poke",
+                    syscalls: &["openat"],
+                    action: Action::Deny,
+                    comm_in: &[],
+                    container_only: false,
+                    path_prefix: &["/proc/"],
+                    path_suffix: &[],
+                    not_agent_self: false,
+                },
+            ],
+        );
+        assert_compile(parse_febp(&spec));
+        let (parsed, dropped) =
+            parse_febp_with(&spec, DeadRules::Drop).expect("the rest of the spec still loads");
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].contains("unmatchable"));
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].id, "no-proc-poke");
+        assert_eq!(
+            matched_action(&parsed, &ev("openat", "app", "/proc/1/mem", true, false)).action,
+            Action::Deny
+        );
+
+        let kill_all = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[RuleSpec {
+                id: "kill-all",
+                syscalls: &[],
+                action: Action::Kill,
+                comm_in: &[],
+                container_only: false,
+                path_prefix: &[],
+                path_suffix: &[],
+                not_agent_self: false,
+            }],
+        );
+        assert_compile(parse_febp_with(&kill_all, DeadRules::Drop));
+        assert_degraded(parse_febp_with(
+            &encode(AGENT_ABI + 1, Mode::Enforce, false, Action::Allow, &[]),
+            DeadRules::Drop,
+        ));
+        assert_compile(parse_febp_with(b"XXXX", DeadRules::Drop));
     }
 
     #[test]
@@ -311,6 +568,132 @@ mod tests {
         );
         assert_eq!(d.action, Action::Kill);
         assert_eq!(d.rule_id.as_deref(), Some("no-runtime-sock"));
+    }
+
+    /// The datapath buffer is 256 bytes; `open("/var/run/" + "./"*130 +
+    /// "docker.sock")` resolves fine in the kernel and arrives here as a head
+    /// that ends in neither sock name. Without the flag `ends_with` says "no
+    /// match" and the kill rule silently does not fire.
+    #[test]
+    fn a_truncated_path_cannot_talk_a_suffix_rule_out_of_firing() {
+        let spec = parse_febp(&mvp_enforce()).expect("parse");
+        let head = format!("/var/run/{}", "./".repeat(130));
+        let mut event = ev("openat", "app", &head[..255], true, false);
+        event.path_truncated = true;
+        let d = matched_action(&spec, &event);
+        assert_eq!(d.action, Action::Kill);
+        assert_eq!(d.rule_id.as_deref(), Some("no-runtime-sock"));
+        assert!(d.path_unknown);
+
+        // Same bytes without the flag: the head really is the whole path, so
+        // the suffix genuinely does not match. This is the regression anchor.
+        let mut honest = event.clone();
+        honest.path_truncated = false;
+        let d = matched_action(&spec, &honest);
+        assert_eq!(d.action, Action::Audit);
+        assert!(d.rule_id.is_none());
+        assert!(!d.path_unknown);
+    }
+
+    /// The flag says nothing about `comm` or the syscall, so it must not leak
+    /// into a decision that never consulted the path.
+    #[test]
+    fn truncation_does_not_infect_a_decision_taken_without_the_path() {
+        let spec = parse_febp(&mvp_enforce()).expect("parse");
+        let long = "x".repeat(255);
+        let mut event = ev("execve", "sh", &long, true, false);
+        event.path_truncated = true;
+        let d = matched_action(&spec, &event);
+        assert_eq!(d.action, Action::Kill);
+        assert_eq!(d.rule_id.as_deref(), Some("no-shell"));
+        assert!(!d.path_unknown);
+    }
+
+    /// Truncation must not turn a prefix rule into a guess: the head is
+    /// exactly the part a prefix looks at, and it arrived intact.
+    #[test]
+    fn a_prefix_rule_is_still_decided_on_a_truncated_path() {
+        let spec = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[RuleSpec {
+                id: "no-proc-poke",
+                syscalls: &["openat"],
+                action: Action::Deny,
+                comm_in: &[],
+                container_only: false,
+                path_prefix: &["/proc/"],
+                path_suffix: &[],
+                not_agent_self: false,
+            }],
+        );
+        let spec = parse_febp(&spec).expect("parse");
+        let deep = format!("/proc/{}", "a".repeat(249));
+        let mut hit = ev("openat", "app", &deep, true, false);
+        hit.path_truncated = true;
+        assert_eq!(matched_action(&spec, &hit).action, Action::Deny);
+        let elsewhere = "/srv/".repeat(51);
+        let mut miss = ev("openat", "app", &elsewhere, true, false);
+        miss.path_truncated = true;
+        let d = matched_action(&spec, &miss);
+        assert_eq!(d.action, Action::Allow);
+        assert!(!d.path_unknown);
+    }
+
+    /// The other half of the same flag. `bpf_probe_read_user_*` cannot fault
+    /// in a non-resident page, so a path string on one (mmap, or
+    /// `madvise(MADV_DONTNEED)` before the call) comes back `-EFAULT` while
+    /// the syscall itself succeeds: the buffer is empty, and a prefix rule
+    /// asked to decide on it would answer "no match" for every prefix there
+    /// is. Nothing is known about that path, so the rule applies and says so.
+    #[test]
+    fn an_unreadable_path_cannot_talk_a_prefix_rule_out_of_firing() {
+        let spec = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[RuleSpec {
+                id: "no-proc-poke",
+                syscalls: &["openat"],
+                action: Action::Deny,
+                comm_in: &[],
+                container_only: false,
+                path_prefix: &["/proc/"],
+                path_suffix: &[],
+                not_agent_self: false,
+            }],
+        );
+        let spec = parse_febp(&spec).expect("parse");
+        let mut unreadable = ev("openat", "app", "", true, false);
+        unreadable.path_truncated = true;
+        let d = matched_action(&spec, &unreadable);
+        assert_eq!(d.action, Action::Deny);
+        assert_eq!(d.rule_id.as_deref(), Some("no-proc-poke"));
+        assert!(d.path_unknown);
+
+        // Regression anchor: an empty path with no flag is an honest record
+        // from a syscall that carried no path, and must decide as before.
+        let honest = ev("openat", "app", "", true, false);
+        let d = matched_action(&spec, &honest);
+        assert_eq!(d.action, Action::Allow);
+        assert!(d.rule_id.is_none());
+        assert!(!d.path_unknown);
+    }
+
+    /// Same failure against the MVP bundle: the docker.sock rule names a
+    /// suffix, and an unreadable path must not silently take it out either.
+    #[test]
+    fn an_unreadable_path_still_kills_on_the_runtime_sock_rule() {
+        let spec = parse_febp(&mvp_enforce()).expect("parse");
+        let mut unreadable = ev("openat", "app", "", true, false);
+        unreadable.path_truncated = true;
+        let d = matched_action(&spec, &unreadable);
+        assert_eq!(d.action, Action::Kill);
+        assert_eq!(d.rule_id.as_deref(), Some("no-runtime-sock"));
+        assert!(d.path_unknown);
     }
 
     #[test]
@@ -519,6 +902,259 @@ mod tests {
         let good = loader.last_good().expect("lkg").digest.clone();
         assert_compile(loader.load_bundle(&digest_of(&spec), &spec));
         assert_eq!(loader.last_good().expect("lkg").digest, good);
+    }
+
+    fn one_rule(id: &str, syscalls: &[&str], action: Action) -> Vec<u8> {
+        encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Audit,
+            &[RuleSpec {
+                id,
+                syscalls,
+                action,
+                comm_in: &["sh"],
+                container_only: false,
+                path_prefix: &[],
+                path_suffix: &[],
+                not_agent_self: false,
+            }],
+        )
+    }
+
+    /// The validator and the compiler compare `trim()`ed syscall names, so
+    /// `syscalls: [" execve"]` from YAML passes both gates and gets signed.
+    /// The matcher has to see the same name, or the rule is dead in a bundle
+    /// everything upstream called valid.
+    #[test]
+    fn whitespace_around_a_syscall_name_still_matches() {
+        for raw in [" execve", "execve\r", "\texecve\n", "  execve  "] {
+            let spec = parse_febp(&one_rule("no-shell", &[raw], Action::Kill))
+                .unwrap_or_else(|err| panic!("parse {raw:?}: {err}"));
+            assert_eq!(spec.rules[0].syscalls, vec!["execve".to_string()]);
+            let d = matched_action(&spec, &ev("execve", "sh", "/bin/sh", true, false));
+            assert_eq!(d.action, Action::Kill, "{raw:?} did not match");
+            assert_eq!(d.rule_id.as_deref(), Some("no-shell"));
+        }
+    }
+
+    /// Load-path copy of the compiler gate: a bundle produced by anything
+    /// that calls the encoder directly must not install a rule the datapath
+    /// never observes.
+    #[test]
+    fn unobservable_syscall_is_rejected_on_load() {
+        for name in ["ptrace", "", " ", "execve2", "sys_enter_execve"] {
+            match parse_febp(&one_rule("dead", &[name], Action::Deny)) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("not hooked by the datapath"), "{msg}")
+                }
+                other => panic!("expected Compile for {name:?}, got {other:?}"),
+            }
+        }
+        // Every hooked syscall still loads, whitespace included.
+        for name in ferrum_ids::DATAPATH_SYSCALLS {
+            parse_febp(&one_rule("ok", &[name], Action::Audit)).expect("hooked syscall loads");
+            let padded = format!(" {name}\r\n");
+            parse_febp(&one_rule("ok", &[padded.as_str()], Action::Audit)).expect("trimmed loads");
+        }
+        // Last-known-good survives the rejection.
+        let spec = one_rule("dead", &["ptrace"], Action::Deny);
+        let mut loader = Loader::new();
+        load_mvp(&mut loader);
+        let good = loader.last_good().expect("lkg").digest.clone();
+        assert_compile(loader.load_bundle(&digest_of(&spec), &spec));
+        assert_eq!(loader.last_good().expect("lkg").digest, good);
+    }
+
+    /// The other half of the same load-path gate. A bundle built by a compiler
+    /// that predates the length bound is signed and well-formed; it must still
+    /// not install a predicate no record can carry.
+    #[test]
+    fn an_unobservable_predicate_is_rejected_on_load() {
+        let over_comm = "x".repeat(ferrum_ids::COMM_MATCH_MAX + 1);
+        let over_path = "p".repeat(ferrum_ids::PATH_MATCH_MAX + 1);
+        struct Case<'a> {
+            what: &'a str,
+            comm_in: &'a [&'a str],
+            path_prefix: &'a [&'a str],
+            path_suffix: &'a [&'a str],
+            needle: &'a str,
+        }
+        let cases = [
+            Case {
+                what: "comm",
+                comm_in: &[over_comm.as_str()],
+                path_prefix: &[],
+                path_suffix: &[],
+                needle: "the kernel reports",
+            },
+            Case {
+                what: "prefix",
+                comm_in: &[],
+                path_prefix: &[over_path.as_str()],
+                path_suffix: &[],
+                needle: "path buffer",
+            },
+            Case {
+                what: "suffix",
+                comm_in: &[],
+                path_prefix: &[],
+                path_suffix: &[over_path.as_str()],
+                needle: "path buffer",
+            },
+        ];
+        for Case {
+            what,
+            comm_in,
+            path_prefix,
+            path_suffix,
+            needle,
+        } in cases
+        {
+            let spec = encode(
+                AGENT_ABI,
+                Mode::Enforce,
+                false,
+                Action::Allow,
+                &[RuleSpec {
+                    id: "too-long",
+                    syscalls: &[],
+                    action: Action::Deny,
+                    comm_in,
+                    container_only: false,
+                    path_prefix,
+                    path_suffix,
+                    not_agent_self: false,
+                }],
+            );
+            match parse_febp(&spec) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains(needle), "{what}: {msg}");
+                    // The message must name the length and the bound, not
+                    // just call the rule invalid.
+                    assert!(msg.contains("bytes"), "{what}: {msg}");
+                }
+                other => panic!("expected Compile for {what}, got {other:?}"),
+            }
+            // Last-known-good survives the rejection.
+            let mut loader = Loader::new();
+            load_mvp(&mut loader);
+            let good = loader.last_good().expect("lkg").digest.clone();
+            assert_compile(loader.load_bundle(&digest_of(&spec), &spec));
+            assert_eq!(loader.last_good().expect("lkg").digest, good);
+        }
+
+        // Exactly at the bound still loads: the NUL is the only byte lost.
+        let at_comm = "x".repeat(ferrum_ids::COMM_MATCH_MAX);
+        let at_path = "p".repeat(ferrum_ids::PATH_MATCH_MAX);
+        let spec = encode(
+            AGENT_ABI,
+            Mode::Enforce,
+            false,
+            Action::Allow,
+            &[RuleSpec {
+                id: "at-bound",
+                syscalls: &[],
+                action: Action::Deny,
+                comm_in: &[at_comm.as_str()],
+                container_only: false,
+                path_prefix: &[at_path.as_str()],
+                path_suffix: &[at_path.as_str()],
+                not_agent_self: false,
+            }],
+        );
+        parse_febp(&spec).expect("a predicate the buffers can hold must load");
+    }
+
+    /// Enforcing program whose namespace selector is `ferrum.io/zone In
+    /// (pci, secrets)`, with one container-only shell kill rule.
+    fn zone_selected_spec() -> EbpfSpec {
+        let mut w = Writer::new();
+        w.put_magic(&EBPF_MAGIC);
+        w.put_u32(AGENT_ABI);
+        w.put_u8(Mode::Enforce.as_u8());
+        w.put_bool(false);
+        w.put_i32(100);
+        w.put_u8(Action::Audit.as_u8());
+        put_empty_label_selector(&mut w);
+        w.put_u16(0);
+        w.put_u16(1);
+        w.put_str("ferrum.io/zone");
+        w.put_str("In");
+        w.put_str_list(&["pci", "secrets"]);
+        put_empty_label_selector(&mut w);
+        put_empty_label_selector(&mut w);
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        w.put_u16(1);
+        w.put_str("no-shell");
+        w.put_str_list(&["execve"]);
+        w.put_u8(Action::Kill.as_u8());
+        w.put_str_list(&["sh"]);
+        w.put_bool(true);
+        w.put_str_list(&[]);
+        w.put_str_list(&[]);
+        w.put_bool(false);
+        parse_febp(&w.finish()).expect("parse")
+    }
+
+    /// The label caches are cold, relisting or dead: the pod is known, its
+    /// namespace labels are not. Empty labels are not a non-match, and the
+    /// program must not be silently skipped — admission fails closed on the
+    /// very same condition.
+    #[test]
+    fn unobserved_labels_are_not_a_non_match() {
+        let spec = zone_selected_spec();
+        let shell = ev("execve", "sh", "/bin/sh", true, false);
+        let mut cold = pci_identity();
+        cold.namespace_labels.clear();
+
+        assert_eq!(
+            selector_match(&spec.selector, &cold),
+            SelectorMatch::LabelsUnknown
+        );
+        assert!(!selector_matches(&spec.selector, &cold));
+
+        let decision = decide(&spec, &shell, &cold);
+        assert_eq!(
+            decision.action,
+            Action::Kill,
+            "a rule must not be skipped because its selector could not be resolved"
+        );
+        assert!(decision.labels_unknown);
+
+        // Resolved identities are unaffected in both directions.
+        let hot = pci_identity();
+        assert_eq!(selector_match(&spec.selector, &hot), SelectorMatch::Match);
+        assert!(!decide(&spec, &shell, &hot).labels_unknown);
+        let mut public = pci_identity();
+        public
+            .namespace_labels
+            .insert("ferrum.io/zone".into(), "public".into());
+        assert_eq!(
+            selector_match(&spec.selector, &public),
+            SelectorMatch::NoMatch
+        );
+        let miss = decide(&spec, &shell, &public);
+        assert_eq!(miss.action, Action::Allow);
+        assert!(!miss.labels_unknown);
+    }
+
+    /// An unresolved selector still reports through the loader, so the carrier
+    /// can degrade on it.
+    #[test]
+    fn loader_reports_unresolved_labels() {
+        let mut loader = Loader::new();
+        load_mvp(&mut loader);
+        let mut cold = pci_identity();
+        cold.namespace_labels.clear();
+        // The MVP bundle has no selector at all: nothing to resolve.
+        assert!(
+            !loader
+                .decide(&ev("execve", "sh", "/bin/sh", true, false), &cold)
+                .labels_unknown
+        );
     }
 
     #[test]

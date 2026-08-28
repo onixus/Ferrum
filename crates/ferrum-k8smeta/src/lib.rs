@@ -5,6 +5,26 @@
 use ferrum_common::{FerrumError, Result};
 use std::collections::{BTreeMap, HashMap};
 
+pub mod cgroupfs;
+pub mod index;
+pub mod labels;
+pub mod resolver;
+pub mod source;
+pub mod watch;
+
+pub use cgroupfs::{
+    cgroup2_root_from_mountinfo, detect_cgroup2_root, scan, CgroupEntry, CgroupFs, StdCgroupFs,
+    DEFAULT_CGROUP_ROOT, SELF_MOUNTINFO,
+};
+pub use index::SharedCgroupIndex;
+pub use labels::{
+    apply_labels_event, apply_labels_stream, label_key, try_apply_labels_event, LabelCache,
+    LabelObject, LabelWatchEvent, DEFAULT_MAX_AGE, MAX_LABEL_ENTRIES, MAX_OBJECT_LABEL_BYTES,
+    MAX_TOTAL_LABEL_BYTES, RELIST_DEBT_HOLDDOWN,
+};
+pub use resolver::{CgroupResolver, RefreshStats};
+pub use source::{ContainerRecord, PodCache, PodMetadataSource, PodRecord, POD_WATCH_BUDGET};
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkloadIdentity {
     pub namespace: String,
@@ -56,11 +76,6 @@ impl CgroupIndex {
     }
 }
 
-/// Empty index. Callers that need a live cache must hold [`CgroupIndex`].
-pub fn lookup_cgroup(inode: u64) -> Result<WorkloadIdentity> {
-    CgroupIndex::new().lookup_cgroup(inode)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +112,5 @@ mod tests {
             other => panic!("miss must be Degraded, got {other:?}"),
         }
         assert!(WorkloadIdentity::unknown().is_unknown());
-        assert!(lookup_cgroup(1).is_err());
     }
 }

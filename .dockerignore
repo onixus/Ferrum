@@ -1,0 +1,12 @@
+# One file, three contexts: Dockerfile, Dockerfile.admission and
+# Dockerfile.controller all take the repository root as their context and all
+# `COPY . .`, and docker reads this file by name regardless of -f.
+#
+# The build context is copied into the builder stage wholesale. target/ is a
+# host-target build directory that the musl build must not inherit, and it is
+# larger than everything else in the tree put together.
+/target
+.git
+# dist/ is deliberately NOT here: the bpf object the image ships comes in
+# through the context, and COPY failing on its absence is the check that an
+# agent image cannot be built without a datapath.

@@ -1,0 +1,94 @@
+Pin path /sys/fs/bpf/ferrum is writable by root on the node. Protecting it
+requires BPF-LSM or an AppArmor profile applied on the node itself.
+These manifests do not provide that and cannot: root on the node is not a
+threat Kubernetes objects can fence off.
+
+Base install binds only ferrum-agent-observe. Respond stays inert until
+optional-respond.yaml is applied; that file carries both the ClusterRoleBinding
+and a DaemonSet of the same name that replaces the base one — --role respond,
+serviceAccountName ferrum-agent-respond, hostPID: true and CAP_KILL.
+
+hostPID is in the respond variant only. The kernel reports tgid from the
+initial pid namespace, so kill without hostPID would signal the wrong process;
+granting it to an observe-only install would hand over every process on the
+node for nothing.
+
+The datapath ELF lives at /usr/share/ferrum/ferrum-ebpf-progs.bpf.o inside the
+agent image and is passed as --bpf-elf in both DaemonSets. An agent built with
+the attach feature exits rather than run without it; an agent built without
+attach ignores the flag and reports Degraded. The image is built by the
+Dockerfile at the root of this repository: ferrum-agent linked for musl with
+--features attach,apiserver, which is the only combination that compiles the
+cgroup sync into ferrum_cgroups, plus that ELF at that path.
+
+Both DaemonSets mount /sys/kernel/tracing read-only. Attaching a tracepoint
+means reading events/<category>/<name>/id out of tracefs, and so does the probe
+that decides which hooks this kernel has. tracefs is a filesystem of its own
+and no container runtime propagates it, so without the mount the probe can
+establish nothing, every attach is tried, every one fails, and the agent parks
+with "kernel attach failed, datapath is Degraded" on every node — the ELF, the
+capabilities and the RBAC all correct. `ferrumctl lint-deploy` FD026 is a
+finding on an attach build without it. hostPath type is Directory, and FD026
+requires that too: a node whose tracefs is somewhere else leaves the pod
+unschedulable and visible rather than running an agent that can hook nothing,
+which is what DirectoryOrCreate would produce — kubelet makes an empty
+directory, mounts it, and the pod starts blind with the manifest looking
+complete.
+
+CAP_BPF and CAP_PERFMON, and no CAP_SYS_RESOURCE. Kernels before 5.11 charge
+the event ring and the cgroup hash against RLIMIT_MEMLOCK; the agent raises its
+soft limit to the hard one before every load, which needs no capability, and
+cannot raise the hard one, which would. Where that is not enough the load fails
+and says so on stderr and in status.json (containerMapError, and the
+container-map reason in degradedReasons). It is never a silent degrade.
+
+The numbers are on one of those errors and not on all of them. `memlock.describe()`
+is attached to the failure of `Bpf::load`, which is the call the ring and the
+hash are charged inside of and the only one RLIMIT_MEMLOCK can decide. A later
+`tracepoint.load()` or `attach()` failure, and a cgroup-map failure, name the
+program and the cause and do not repeat the limit — those failures are not
+about it. So "the attach error names the limit it ran under" is true of the
+load and false of everything after it; read which call failed before reading
+the limit out of a message that may not carry one.
+
+The respond ClusterRole grants pods delete only. pods/eviction and
+networkpolicies were there for Isolate, which the agent does not implement and
+refuses; they come back when it does.
+
+Node state is a file, not a port: the agent rewrites status.json in
+--export-dir (/var/log/ferrum) on every reload tick, beside events.jsonl, with
+every counter it keeps, whether it is Degraded and the reasons for it. Read it
+with the same cat as the events. It is written whole (temp file + rename), so a
+reader never sees a partial one. There is no listening port and no probe on
+these DaemonSets by design: the surface reports, it never acts, and a liveness
+probe wired to the degraded state would restart a node through cold caches and
+loop forever on a genuinely wrong ELF.
+
+status.json is a snapshot, not a stream, and its ts is a freshness contract:
+the file is rewritten every reload tick (--reload-ms, 1000 by default), so a ts
+more than a few ticks behind wall-clock means the tick that should have
+rewritten it did not run. Check ts before believing any other field. A tick
+that cannot write the file removes the one already there rather than leave the
+previous tick's snapshot asserting the state it had — /var/log/ferrum filling
+up is the commonest cause of a failed write, and it is the same condition that
+makes every event write fail, so the moment the file matters most is the moment
+it would otherwise freeze on its last healthy answer. So: no status.json at
+all, on an agent started with --export-dir, means the agent cannot publish, not
+that it is not running. That state also sets Degraded with the reason "status
+file unwritable", which rides the degraded field of every exported envelope and
+the transition line on stderr; statusWriteFailedTotal in the next file that
+does get written counts the publishes that failed.
+
+Without --export-dir there is no status.json: the agent says so once on stderr
+and then logs the whole status object there on every state change instead. That
+is the whole reader in that configuration — the shipped DaemonSets both set
+--export-dir, and the file is the surface this was built for.
+
+--policy-name must name the policy the mounted bundle Secret is named for
+(ferrum-bundle-cluster-<policy>). The FRMB carries no policy name, so nothing
+at runtime can prove that join: a mismatch loads every PolicyException on the
+node and applies none. `ferrumctl lint-deploy` FD024 checks it here, and the
+agent says so in status.json if it holds waivers that can waive nothing:
+waiversUnjoinedTotal counts the ones naming another policy, waiversInertTotal
+also the expired and the malformed, and waiversUnjoined names them. One live
+waiver does not excuse the rest — the count is per waiver.

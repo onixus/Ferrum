@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferrum-admission
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-admission
+    app.kubernetes.io/part-of: ferrum
+spec:
+  # failurePolicy=Fail plus one replica is a cluster-wide outage on eviction.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-admission
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-admission
+        app.kubernetes.io/part-of: ferrum
+    spec:
+      serviceAccountName: ferrum-admission
+      # --apiserver below opens the namespace/ServiceAccount label watch, and
+      # the projected token is the only credential it has: with automount off
+      # there is no token file, every connect fails behind a backoff, the
+      # cache never lists and every policy carrying a selector denies each Pod
+      # it selects. This is also what makes the ClusterRole in rbac.yaml
+      # reachable at all.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ferrum-admission
+      containers:
+        - name: admission
+          image: ghcr.io/ferrum/ferrum-admission:v0.1.0
+          args:
+            - serve
+            - --listen
+            - 0.0.0.0:8443
+            - --bundle
+            - /etc/ferrum/bundle
+            - --exceptions
+            - /etc/ferrum/bundle/exceptions.fsig
+            - --policy-name
+            - prod-restricted
+            - --trust-root
+            - $(FERRUM_TRUST_ROOT)
+            - --tls-cert
+            - /etc/ferrum/tls/tls.crt
+            - --tls-key
+            - /etc/ferrum/tls/tls.key
+            # Without this the namespace/SA label cache stays cold, and a
+            # policy carrying a namespaceSelector denies every Pod.
+            - --apiserver
+          env:
+            - name: FERRUM_TRUST_ROOT
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-trust-root
+                  key: trustRoot
+          ports:
+            - name: https
+              containerPort: 8443
+          # The server answers POST only; a GET probe would read as 405, so
+          # readiness is a TCP connect.
+          readinessProbe:
+            tcpSocket:
+              port: 8443
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: bundle
+              mountPath: /etc/ferrum/bundle
+              readOnly: true
+            - name: tls
+              mountPath: /etc/ferrum/tls
+              readOnly: true
+      volumes:
+        # Not optional. The binary refuses to start without a verified bundle
+        # and exits 2 before the poll loop that would pick one up later, so
+        # `optional: true` promised a tolerance it does not have: two replicas
+        # in CrashLoopBackOff, and — because readiness here is a TCP connect —
+        # Ready throughout, while failurePolicy: Fail denies every Pod outside
+        # ferrum/kube-system. Without it the Pod waits in ContainerCreating and
+        # `kubectl describe` names the Secret it is waiting for. The install
+        # order in README puts the bundle before this file for that reason.
+        - name: bundle
+          secret:
+            secretName: ferrum-bundle-cluster-prod-restricted
+        # Serving certificate, issued offline by `ferrumctl gen-webhook-pki`,
+        # which writes this Secret and the caBundle that matches it.
+        - name: tls
+          secret:
+            secretName: ferrum-admission-tls

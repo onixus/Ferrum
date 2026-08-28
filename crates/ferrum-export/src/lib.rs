@@ -2,6 +2,12 @@
 
 #![deny(unsafe_code)]
 
+mod file;
+mod queue;
+
+pub use file::{EnvelopeWriterSink, RotatingFileSink, SinkContext};
+pub use queue::QueueSink;
+
 use ferrum_proto::EnforcementEvent;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,8 +16,55 @@ use std::sync::Mutex;
 pub trait EventSink {
     fn emit(&self, event: &EnforcementEvent);
 
-    fn events_dropped_total(&self) -> u64 {
+    /// Events the sink accepted and could not write out (serialisation, a
+    /// full disk, a torn file). Deliberately NOT named `events_dropped_total`:
+    /// that name belongs to the in-kernel ring counter on `Agent`, and an
+    /// operator reading one must never be shown the other.
+    fn export_write_failed_total(&self) -> u64 {
         0
+    }
+
+    /// Events lost because the export queue was full. Distinct from
+    /// `export_write_failed_total` (a failed write) and from the in-kernel ring
+    /// counter: this one means the export path could not keep up.
+    fn export_queue_dropped_total(&self) -> u64 {
+        0
+    }
+
+    /// Events lost because the writer behind the queue is gone. Distinct from
+    /// a full queue: this one never recovers in this process.
+    fn export_writer_lost_total(&self) -> u64 {
+        0
+    }
+
+    /// True once the export writer has died. The agent is Degraded from here
+    /// on: enforcement still runs, but nothing records it.
+    fn export_writer_dead(&self) -> bool {
+        false
+    }
+}
+
+/// Lets a caller pick a sink at runtime (file vs stdout) and still hand one
+/// concrete type to `QueueSink`.
+impl EventSink for Box<dyn EventSink + Send + Sync> {
+    fn emit(&self, event: &EnforcementEvent) {
+        (**self).emit(event)
+    }
+
+    fn export_write_failed_total(&self) -> u64 {
+        (**self).export_write_failed_total()
+    }
+
+    fn export_queue_dropped_total(&self) -> u64 {
+        (**self).export_queue_dropped_total()
+    }
+
+    fn export_writer_lost_total(&self) -> u64 {
+        (**self).export_writer_lost_total()
+    }
+
+    fn export_writer_dead(&self) -> bool {
+        (**self).export_writer_dead()
     }
 }
 
@@ -49,7 +102,7 @@ impl<W: Write> EventSink for WriterSink<W> {
         }
     }
 
-    fn events_dropped_total(&self) -> u64 {
+    fn export_write_failed_total(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
@@ -101,7 +154,7 @@ impl EventSink for MemorySink {
             .push(event.clone());
     }
 
-    fn events_dropped_total(&self) -> u64 {
+    fn export_write_failed_total(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
 }
@@ -121,6 +174,14 @@ mod tests {
             namespace: "prod".into(),
             comm: "sh".into(),
             syscall: "execve".into(),
+            pid: 0,
+            tgid: 0,
+            executed: false,
+            labels_unknown: false,
+            path_unknown: false,
+            container_unknown: false,
+            respond_error: None,
+            waiver: None,
         }
     }
 
@@ -132,7 +193,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].rule.to_string(), "no-shell");
         assert_eq!(events[0].action, "kill");
-        assert_eq!(sink.events_dropped_total(), 0);
+        assert_eq!(sink.export_write_failed_total(), 0);
     }
 
     #[test]
@@ -144,13 +205,13 @@ mod tests {
         assert!(line.contains("\"rule\":\"no-shell\""));
         assert!(line.contains("\"action\":\"kill\""));
         assert!(line.ends_with('\n'));
-        assert_eq!(sink.events_dropped_total(), 0);
+        assert_eq!(sink.export_write_failed_total(), 0);
     }
 
     #[test]
     fn drops_are_counted() {
         let sink = MemorySink::new();
         sink.record_drop(4);
-        assert_eq!(sink.events_dropped_total(), 4);
+        assert_eq!(sink.export_write_failed_total(), 4);
     }
 }

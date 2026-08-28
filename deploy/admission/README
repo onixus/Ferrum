@@ -1,0 +1,126 @@
+Install order
+=============
+
+The webhook cannot be applied from this directory as it stands: the API server
+needs a caBundle, and the serving Secret does not exist yet. Both come from one
+offline command.
+
+1. Issue the PKI. Writes ferrum-admission-tls.secret.yaml (mode 0600), ca.crt,
+   ca.key (mode 0600), and validatingwebhookconfiguration.yaml rendered from
+   the template:
+
+       ferrumctl gen-webhook-pki --service ferrum-admission --namespace ferrum \
+           --days 365 --out-dir deploy/admission
+
+   It refuses to overwrite existing output. Neither the Secret, the rendered
+   configuration, nor ca.key belongs in git. ca.key never reaches the cluster;
+   it is what step 4 rotates with, so keep it offline and keep it. The
+   .gitignore in this directory covers all four, and `ferrumctl lint-deploy`
+   (FD023) fails on a PEM private key anywhere under the deploy tree — whoever
+   holds ca.key can issue a leaf the applied webhook trusts, i.e. forge this
+   webhook. Move ca.key out of the tree once step 2 is done; the lint keeps
+   failing while it is there.
+
+   The CA is issued for the longest lifetime the rule allows (398 days),
+   whatever --days the serving certificate gets. That headroom is the only
+   reason the leaf can be rotated later without touching the caBundle.
+
+2. Apply the Secret, then the rest of this directory:
+
+       kubectl apply -f deploy/namespace.yaml
+       kubectl apply -f deploy/admission/ferrum-admission-tls.secret.yaml
+       kubectl apply -f deploy/admission/serviceaccount.yaml \
+                     -f deploy/admission/rbac.yaml \
+                     -f deploy/admission/service.yaml \
+                     -f deploy/admission/deployment.yaml
+
+   deployment.yaml mounts ferrum-bundle-cluster-prod-restricted, which the
+   controller writes once a ClusterSecurityPolicy of that name exists and
+   compiles. The mount is deliberately not optional: the binary refuses to
+   start without a verified bundle, so until that Secret exists the Pods sit in
+   ContainerCreating and `kubectl describe pod` names the Secret they are
+   waiting for. Create the policy, or apply this file after it. The
+   alternative — a webhook that starts without a bundle — is two Ready
+   replicas denying every Pod in the cluster with nothing on the Deployment to
+   say why (readiness here is a TCP connect, and the process answers it long
+   before it has a policy to answer with).
+
+3. Apply the webhook configuration last: with failurePolicy=Fail it starts
+   rejecting requests the moment it exists. Nothing before this point can deny
+   a Pod, which is why the wait in step 2 costs nothing.
+
+       kubectl apply -f deploy/admission/validatingwebhookconfiguration.yaml
+
+Build features
+==============
+
+deployment.yaml passes --apiserver, so the image must be built with the
+`apiserver` feature: without it the binary refuses that flag and exits. Drop
+the flag only if you accept that every policy carrying a namespace or
+ServiceAccount selector denies each Pod it selects.
+
+The label watch behind that flag authenticates with the projected
+ServiceAccount token and nothing else, so --apiserver and
+automountServiceAccountToken have to agree: both serviceaccount.yaml and the
+pod spec set it true, and the ClusterRole in rbac.yaml is what that token is
+allowed to do. Turning either off does not fail at startup — the config is
+built from KUBERNETES_SERVICE_HOST, which is always set — it fails on every
+connect afterwards, behind a backoff, with the cache never listing and every
+selected Pod denied. `ferrumctl lint-deploy` (FD027) fails on that
+contradiction, and on its mirror: a --policy-name whose policy carries a
+selector while no --apiserver is passed at all.
+
+Rotation
+========
+
+4. Before the serving certificate expires, reissue only the leaf, under the CA
+   the cluster already trusts. The caBundle does not change, so the
+   ValidatingWebhookConfiguration from step 3 stays applied untouched — nothing
+   in the cluster is briefly without a webhook:
+
+       mkdir deploy/admission/rotated
+       ferrumctl gen-webhook-pki --service ferrum-admission --namespace ferrum \
+           --days 90 --out-dir deploy/admission/rotated \
+           --ca-cert deploy/admission/ca.crt --ca-key deploy/admission/ca.key \
+           --webhook-config <the validatingwebhookconfiguration.yaml applied in step 3>
+
+       kubectl apply -f deploy/admission/rotated/ferrum-admission-tls.secret.yaml
+
+   The command writes the Secret and nothing else: no new CA, no re-rendered
+   configuration. It refuses if --days would outlive the CA (a leaf may not
+   outlive its issuer, and it reports how many days the CA has left), and it
+   refuses if the applied configuration carries a different CA.
+
+   --webhook-config is what makes "the CA the cluster trusts" checkable:
+   --ca-cert on its own only names a file. It may be omitted when a rendered
+   configuration sits next to --ca-cert or --out-dir; when neither holds one —
+   which is the case for a fresh rotation directory — the command refuses
+   rather than issue a leaf under an unchecked CA.
+
+   kubelet refreshes the mounted Secret in place, and the webhook re-reads
+   tls.crt/tls.key when it changes; no restart is needed. Material that does not
+   parse, has expired, drops a Service name from the SAN, or names a different
+   issuer than the certificate the process started with is logged and does not
+   replace what is serving. The server refuses to start on an expired
+   certificate and logs from 30 days before notAfter
+   (serving_cert_expiring_total).
+
+   The issuer check is a pin on the issuer name and key id, not chain
+   verification — the webhook cannot link a certificate parser. It is what
+   stops a Secret from some other installation being applied here: that leaf
+   parses and has not expired, and the API server, which trusts one caBundle,
+   would reject every handshake made with it. So step 5 — a new CA — needs the
+   webhook Pods restarted, not just the Secret replaced.
+
+   A swap onto material that is already inside the 30-day window, replacing
+   material that was not, is an old Secret being re-applied; the webhook undoes
+   it and keeps serving what it had (serving_cert_rollbacks_total). Rotate with
+   more than 30 days of --days.
+
+   `ferrumctl lint-deploy <dir>` (FD022) checks a directory that holds both the
+   rendered configuration and the Secret: the caBundle must be the CA that
+   signed the leaf, and neither may be expired or inside that 30-day window.
+
+5. When the CA itself runs out, step 4 is not enough: re-run step 1 into a clean
+   directory and re-apply steps 2 and 3, in that order. Applying a new caBundle
+   before its Secret leaves the API server trusting an issuer nothing serves.

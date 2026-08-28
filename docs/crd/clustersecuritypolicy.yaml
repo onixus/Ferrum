@@ -41,6 +41,19 @@ spec:
           properties:
             spec:
               type: object
+              x-kubernetes-validations:
+                - rule: "!(has(self.disabled) && self.disabled && has(self.mode) && self.mode == 'enforce')"
+                  message: "disabled=true together with mode=enforce"
+                - rule: "!has(self.runtime) || !has(self.runtime.defaultAction) || !(self.runtime.defaultAction in ['kill', 'isolate'])"
+                  message: "runtime.defaultAction kill/isolate is kill-all, not a policy"
+                - rule: "!has(self.runtime) || !has(self.runtime.defaultAction) || !(self.runtime.defaultAction in ['deny'])"
+                  message: "runtime.defaultAction deny: the runtime plane never executes it, a tracepoint fires after the syscall has already run; deny is admission's verb (admit.deny)"
+                - rule: "!has(self.runtime) || !has(self.runtime.rules) || self.runtime.rules.all(r, !has(r.action) || !(r.action in ['kill', 'isolate']) || (has(r.syscalls) && size(r.syscalls) > 0) || (has(r.match) && ((has(r.match.commIn) && size(r.match.commIn) > 0) || (has(r.match.pathPrefix) && size(r.match.pathPrefix) > 0) || (has(r.match.pathSuffix) && size(r.match.pathSuffix) > 0))))"
+                  message: "runtime rule with action kill/isolate needs syscalls or match, otherwise it is kill-all"
+                - rule: "!has(self.runtime) || !has(self.runtime.rules) || self.runtime.rules.all(r, !has(r.action) || !(r.action in ['deny', 'isolate']))"
+                  message: "runtime rule action deny/isolate: the runtime plane executes allow/audit/kill only, deny is admission's verb (admit.deny) and isolate has no implementation"
+                - rule: "!has(self.supply) || !((has(self.supply.requireSigned) && self.supply.requireSigned) || (has(self.supply.denyUnsigned) && self.supply.denyUnsigned)) || (has(self.supply.trustRoots) && size(self.supply.trustRoots) > 0)"
+                  message: "requireSigned/denyUnsigned without trustRoots: trust roots ride in the bundle"
               properties:
                 mode:
                   type: string
@@ -170,7 +183,12 @@ spec:
                           publicKeys:
                             type: array
                             items:
+                              # Ed25519 verifying key, hex. ferrum-policy
+                              # refuses anything else, so a key that reaches
+                              # the compiler in any other shape is a policy the
+                              # API server admitted and nothing can build.
                               type: string
+                              pattern: "^[0-9a-fA-F]{64}$"
                 admit:
                   type: object
                   properties:
@@ -222,12 +240,22 @@ spec:
                       enum: [allow, audit, deny, kill, isolate]
                     rules:
                       type: array
+                      # Rule ids are the names exceptions and audit records
+                      # refer to, so two rules may not share one. A list-map
+                      # key is the API server's own uniqueness check and costs
+                      # no CEL budget, unlike a quadratic exists_one().
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [id]
                       items:
                         type: object
                         required: [id]
                         properties:
                           id:
                             type: string
+                            minLength: 1
+                            # Not merely non-empty: ferrum-policy trims before
+                            # it decides, so a blank id is no id either.
+                            pattern: "\\S"
                           syscalls:
                             type: array
                             items:
@@ -238,17 +266,31 @@ spec:
                               commIn:
                                 type: array
                                 items:
+                                  # ferrum_ids::COMM_MATCH_MAX: the kernel
+                                  # copies at most TASK_COMM_LEN bytes with the
+                                  # NUL, so a longer literal never matches.
                                   type: string
+                                  maxLength: 15
                               containerOnly:
                                 type: boolean
                               pathPrefix:
                                 type: array
                                 items:
+                                  # ferrum_ids::PATH_MATCH_MAX: the datapath
+                                  # path buffer minus the NUL. A longer
+                                  # fragment cannot be contained in anything
+                                  # the datapath reports.
                                   type: string
+                                  maxLength: 255
                               pathSuffix:
                                 type: array
                                 items:
+                                  # ferrum_ids::PATH_MATCH_MAX: the datapath
+                                  # path buffer minus the NUL. A longer
+                                  # fragment cannot be contained in anything
+                                  # the datapath reports.
                                   type: string
+                                  maxLength: 255
                               notAgentSelf:
                                 type: boolean
                           action:

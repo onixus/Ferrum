@@ -10,10 +10,18 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
-struct TypedMeta {
+pub(crate) struct TypedMeta {
     #[serde(rename = "apiVersion")]
-    api_version: String,
-    kind: String,
+    pub(crate) api_version: String,
+    pub(crate) kind: String,
+}
+
+pub(crate) fn typed_meta(raw: &str) -> Result<TypedMeta> {
+    let meta: TypedMeta = serde_yaml::from_str(raw).context("parse apiVersion/kind")?;
+    if meta.api_version != "ferrum.io/v1" {
+        bail!("unsupported apiVersion {}", meta.api_version);
+    }
+    Ok(meta)
 }
 
 pub fn validate_file(path: &Path) -> Result<()> {
@@ -24,10 +32,7 @@ pub fn validate_file(path: &Path) -> Result<()> {
 }
 
 pub fn validate_yaml(raw: &str) -> Result<()> {
-    let meta: TypedMeta = serde_yaml::from_str(raw).context("parse apiVersion/kind")?;
-    if meta.api_version != "ferrum.io/v1" {
-        bail!("unsupported apiVersion {}", meta.api_version);
-    }
+    let meta = typed_meta(raw)?;
 
     match meta.kind.as_str() {
         "ClusterSecurityPolicy" => {
@@ -105,7 +110,7 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn parse_resource<T, S>(raw: &str, build: fn(&str, S) -> T) -> Result<T>
+pub(crate) fn parse_resource<T, S>(raw: &str, build: fn(&str, S) -> T) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
     S: for<'de> Deserialize<'de>,

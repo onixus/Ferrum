@@ -10,8 +10,9 @@ use ring::signature::{
     EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING,
     ECDSA_P384_SHA384_ASN1_SIGNING, RSA_PKCS1_SHA256,
 };
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{
-    CertificateDer, DnsName, ServerName, SignatureVerificationAlgorithm, UnixTime,
+    CertificateDer, DnsName, PrivateKeyDer, ServerName, SignatureVerificationAlgorithm, UnixTime,
 };
 use webpki::{anchor_from_trusted_cert, EndEntityCert, KeyUsage};
 
@@ -228,7 +229,7 @@ fn parse_pem_certs(pem: &[u8], empty: &str, missing: &str) -> Result<Vec<Vec<u8>
     }
     let mut reader = Cursor::new(pem);
     let mut certs = Vec::new();
-    for item in rustls_pemfile::certs(&mut reader) {
+    for item in CertificateDer::pem_reader_iter(&mut reader) {
         let der =
             item.map_err(|e| integrity(format!("truncated or invalid certificate PEM: {e}")))?;
         certs.push(der.to_vec());
@@ -245,15 +246,13 @@ fn parse_pem_key(pem: &[u8]) -> Result<Vec<u8>> {
     }
     let mut reader = Cursor::new(pem);
     let mut keys = Vec::new();
-    for item in rustls_pemfile::read_all(&mut reader) {
-        let item =
+    // pki-types вместо rustls-pemfile (unmaintained, RUSTSEC-2025-0134): итератор
+    // отдаёт только ключи, pkcs8/pkcs1/sec1 распознаются сами, прочие секции PEM
+    // пропускаются — счёт ключей и запрет второго остаются прежними.
+    for item in PrivateKeyDer::pem_reader_iter(&mut reader) {
+        let der =
             item.map_err(|e| integrity(format!("truncated or invalid private key PEM: {e}")))?;
-        match item {
-            rustls_pemfile::Item::Pkcs8Key(der) => keys.push(der.secret_pkcs8_der().to_vec()),
-            rustls_pemfile::Item::Pkcs1Key(der) => keys.push(der.secret_pkcs1_der().to_vec()),
-            rustls_pemfile::Item::Sec1Key(der) => keys.push(der.secret_sec1_der().to_vec()),
-            _ => {}
-        }
+        keys.push(der.secret_der().to_vec());
     }
     if keys.is_empty() {
         return Err(integrity("private key PEM contains no private key"));

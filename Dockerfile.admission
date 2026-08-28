@@ -1,0 +1,91 @@
+# The webhook image. Produces ghcr.io/ferrum/ferrum-admission, which
+# deploy/admission/deployment.yaml names and which nothing in this repository
+# built until now.
+#
+# Its own file rather than a `--build-arg CRATE` on the agent's. The three
+# images do not differ by a name: the agent's welds a bpf object to a userspace
+# that must agree with its map layout, this one welds nothing and must instead
+# prove the `apiserver` feature is in the binary, and the controller's needs
+# neither. One parameterised file would put each of those checks behind an `if`
+# that a build arg can miss, which is the shape of defect the `Crate boundary`
+# audit already caught once: an assertion with no positive control.
+#
+# The check this file exists for, and which no other stage of the pipeline can
+# make: `ferrum-admission`'s `apiserver` feature is off by default.
+# `cargo test --workspace` runs default features and `cargo clippy` stops at
+# .rmeta, so the combination this Deployment actually runs — the one that opens
+# the namespace/ServiceAccount label watch — had never produced an object file.
+# Built without it, the `--apiserver` flag that Deployment passes reaches
+# `die("--apiserver requires the `apiserver` feature at build time")` and the
+# Pod CrashLoops on a node: a build-time defect turned into a runtime one.
+#
+#   docker build -f Dockerfile.admission \
+#       -t ghcr.io/ferrum/ferrum-admission:v0.1.0 .
+
+ARG RUST_IMAGE=rust:1.75-bookworm
+ARG TARGET=x86_64-unknown-linux-musl
+
+FROM ${RUST_IMAGE} AS build
+ARG TARGET
+
+# musl, not gnu: AGENTS.md requires it of userspace. rustls pulls ring, which
+# compiles C, so the target needs its own cc as well as the Rust std.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends musl-tools \
+ && rm -rf /var/lib/apt/lists/* \
+ && rustup target add "${TARGET}"
+
+WORKDIR /src
+COPY . .
+
+# --features apiserver is not an option here. It is the production combination:
+# deploy/admission/deployment.yaml passes --apiserver, and without the feature
+# the label cache stays cold and every policy carrying a namespaceSelector
+# denies each Pod it selects. --locked because the image is a release artefact,
+# and a build that may resolve a different dependency set than CI tested is not
+# one.
+RUN CC_x86_64_unknown_linux_musl=musl-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+    cargo build --release --locked --target "${TARGET}" \
+        -p ferrum-admission --features apiserver \
+ && cp "target/${TARGET}/release/ferrum-admission" /ferrum-admission
+
+# The base below is scratch: a dynamically linked "musl" build would produce an
+# image whose only executable cannot start, and nothing in the image could say
+# why. `file` is not in this image; the interpreter entry is, and its absence is
+# the whole claim. This repeats the check the 'Admission binary' stage makes
+# because that stage checks a different file — its binary is archived, not
+# copied here, and `docker build` links a second one from the same sources.
+RUN if readelf -lW /ferrum-admission | grep -q 'Requesting program interpreter'; then \
+        echo "the webhook linked for ${TARGET} requests an interpreter: it would not" >&2; \
+        echo "start on the scratch base this image is built on" >&2; \
+        exit 1; \
+    fi
+
+# The feature is in the binary, checked on the binary rather than trusted to the
+# cargo line above surviving an edit. Two-sided on purpose, and the two sides
+# are each other's positive control: exactly one of these strings is compiled in
+# — the die() message only when the feature is off, the apiserver error prefix
+# only when it is on. A default-feature build fails the first check; a grep that
+# has stopped matching anything at all fails the second.
+RUN if grep -aq 'requires the `apiserver` feature at build time' /ferrum-admission; then \
+        echo "the webhook was linked without --features apiserver: --apiserver in" >&2; \
+        echo "deploy/admission/deployment.yaml would die() on a node" >&2; \
+        exit 1; \
+    fi \
+ && if ! grep -aq 'error: apiserver: ' /ferrum-admission; then \
+        echo "the apiserver code path is not in this binary, so the check above" >&2; \
+        echo "cannot detect anything and proved nothing" >&2; \
+        exit 1; \
+    fi
+
+# scratch, not distroless: the binary is static-pie musl, its serving
+# certificate comes from the ferrum-admission-tls Secret the Deployment mounts,
+# and the only root it trusts towards the apiserver is the cluster CA projected
+# with its ServiceAccount token. There is nothing left for a base image to
+# provide, which is what makes readOnlyRootFilesystem cost nothing.
+FROM scratch
+COPY --from=build /ferrum-admission /usr/local/bin/ferrum-admission
+# No USER: the Deployment sets runAsNonRoot with a numeric runAsUser, which
+# needs no passwd entry and is the bound that actually holds.
+ENTRYPOINT ["/usr/local/bin/ferrum-admission"]

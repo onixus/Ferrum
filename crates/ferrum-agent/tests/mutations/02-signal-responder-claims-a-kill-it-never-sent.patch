@@ -1,0 +1,30 @@
+# Mutation: `SignalResponder::kill` returns Ok without making the system call.
+#
+# `pid_of` still runs, so every unit test in `respond.rs` - all of which assert
+# that an unsignalable tgid is *refused* - passes unchanged. The only unsafe
+# call in the agent is deleted and nothing in the crate notices.
+#
+# Must fail: every killing test in `tests/attach_join.rs`, at
+# `Probe::wait_for_death`, and
+# `a_kill_this_kernel_refuses_is_degraded_and_named` - which is the exact
+# inverse of this defect and, on its own, cannot see it: a responder that lies
+# about success and one that cannot succeed are told apart only by a test that
+# knows which of the two it set up.
+diff --git a/crates/ferrum-agent/src/respond.rs b/crates/ferrum-agent/src/respond.rs
+index 4b5c781..5bb95bc 100644
+--- a/crates/ferrum-agent/src/respond.rs
++++ b/crates/ferrum-agent/src/respond.rs
+@@ -38,10 +38,9 @@ impl Responder for SignalResponder {
+     #[cfg(unix)]
+     fn kill(&self, tgid: u32) -> Result<()> {
+         let pid = pid_of(tgid)?;
+-        // The only unsafe call in the agent: kill(2) on a tgid already
+-        // filtered by the guards. Errors are read from errno immediately.
+-        #[allow(unsafe_code)]
+-        let rc = unsafe { libc::kill(pid, libc::SIGKILL) };
++        // MUTATION: the signal is never sent; the responder claims it was.
++        let rc = 0;
++        let _ = pid;
+         if rc == 0 {
+             Ok(())
+         } else {

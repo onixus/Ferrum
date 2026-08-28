@@ -10,3 +10,26 @@ rust-version.workspace = true
 ferrum-api.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
+
+# Acceptance tests drive the real pipeline; none of this leaks into the
+# fixture library itself.
+[dev-dependencies]
+chrono.workspace = true
+ferrum-admission = { path = "../ferrum-admission" }
+ferrum-agent = { path = "../ferrum-agent" }
+# Only for the error type of `ferrum_agent::Responder`, which the replay
+# harness has to implement to observe a kill without CAP_KILL.
+ferrum-common.workspace = true
+# The deploy gate runs the lint and the PKI issuance the CLI ships, not a copy.
+ferrum-cli = { path = "../ferrum-cli" }
+ferrum-compiler.workspace = true
+# Only to prove the controller's on-wire exceptions.fsig is what the agent and
+# admission actually accept; the four codec copies cannot drift silently.
+ferrum-controller = { path = "../ferrum-controller" }
+ferrum-crypto.workspace = true
+ferrum-ebpf.workspace = true
+ferrum-export.workspace = true
+ferrum-ids.workspace = true
+ferrum-k8smeta.workspace = true
+ferrum-policy.workspace = true
+serde_json.workspace = true

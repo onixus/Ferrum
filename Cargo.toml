@@ -50,6 +50,17 @@ clap = { version = "4", features = ["derive"] }
 ed25519-compact = { version = "2", default-features = false, features = ["std"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 home = "0.5"
+libc = "0.2"
+# Offline PKI for the admission webhook serving cert (ferrum-crypto, feature
+# "x509"; ferrum-cli is the only crate that turns it on). Without an issuer in
+# this tree the deploy manifests carry a caBundle placeholder and cannot be
+# applied at all. Per-crate builds of admission/agent must not link it; the
+# Jenkins 'Crate boundary' stage checks the graphs a release build resolves.
+# A --workspace build unifies features across members and does link it.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Same feature, other half: issuance without verification would be a fake Ok.
+# `verify` is what actually checks the serving cert against the CA key.
+x509-parser = { version = "0.17", features = ["verify"] }
 indexmap = { version = "2", default-features = false, features = ["std"] }
 k8s-openapi = { version = "0.25", default-features = false, features = ["v1_33"] }
 kube = { version = "1", default-features = false, features = ["client", "runtime", "rustls-tls"] }
@@ -60,7 +71,6 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "2"
 # PEM + webpki only, ring backend, no openssl-sys (deny.toml).
-rustls-pemfile = "2"
 rustls-pki-types = "1"
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

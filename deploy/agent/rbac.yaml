@@ -1,0 +1,54 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-agent-observe
+  labels:
+    app.kubernetes.io/part-of: ferrum
+# cgroup -> pod resolution only. No delete, no pods/exec, no secrets: an agent
+# that can exec into workloads is a better foothold than the workload itself.
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # Label selectors resolve here, not on the workload's word for it.
+  - apiGroups: [""]
+    resources: ["namespaces", "serviceaccounts"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-agent-observe
+  labels:
+    app.kubernetes.io/part-of: ferrum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ferrum-agent-observe
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-agent-observe
+    namespace: ferrum
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ferrum-agent-respond
+  labels:
+    app.kubernetes.io/part-of: ferrum
+    ferrum.io/optional: "respond"
+# Defined here, bound nowhere in the base install. Binding lives in
+# optional-respond.yaml.
+#
+# pods/eviction and networkpolicies were granted for Action::Isolate, which
+# does not exist in the agent: every Isolate decision is refused
+# (REFUSE_ISOLATE), so those verbs are only reachable by an attacker who owns
+# the respond ServiceAccount token. Restore them in the same change that
+# implements Isolate, not before.
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]

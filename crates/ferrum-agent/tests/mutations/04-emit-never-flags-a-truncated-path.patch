@@ -1,0 +1,49 @@
+# Mutation: `emit()` never sets EVENT_FLAG_PATH_TRUNCATED. Rebuilding the bpf
+# ELF is required for this one; `run.sh` does it.
+#
+# Must fail: `a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted`,
+# at the one assertion in that file which reads the raw record flag rather than
+# what the agent made of it. That assertion exists because a silent fallback is
+# a defect waiting for the next producer that has no fallback.
+#
+# This header said, for one cycle, that the patch survived on purpose. It does
+# not, and never did: measured on Linux 6.18.44 with the harness beside it, the
+# join reports `FAILED. 4 passed; 2 failed` (it was `3 passed; 1 failed` before
+# cycle 10 added a second test that reads the raw flag), panicking at the
+# `assert!` on `Event::path_truncated()`.
+# Nothing had run the harness; the claim came from reading `Event::flags` and
+# from a separate hand-run, and it was wrong in both directions.
+#
+# The property it was reaching for is real. Cycle 8 closed the fail-open twice —
+# `emit()` sets the flag from the length it read, and `ferrum_ebpf::path_truncated`
+# derives the same answer from the bytes that arrived, so an ELF predating the
+# fix cannot fail open. The second half is what covers a pre-fix object, and
+# this patch still cannot measure it: the raw-flag assertion runs *before* the
+# verdict assertions in that test, so with this patch applied the run stops at
+# that assertion and never reaches the kill, the `path_unknown` or the SIGKILL
+# it would have to observe to make the claim.
+#
+# That is what `05-decoder-trusts-the-truncation-flag.patch` is for. It comes at
+# the same property from the consumer's side, against a test that takes the
+# over-long record *this kernel wrote* and clears the one bit in the bytes, so
+# the derivation is what decides and deleting it is visible as a verdict rather
+# than as a flag assertion. The two patches are not redundant: this one says the
+# datapath still flags what it could not carry, that one says a producer which
+# never learned to is still covered.
+diff --git a/crates/ferrum-ebpf-progs/src/main.rs b/crates/ferrum-ebpf-progs/src/main.rs
+index fe1cdd4..d741930 100644
+--- a/crates/ferrum-ebpf-progs/src/main.rs
++++ b/crates/ferrum-ebpf-progs/src/main.rs
+@@ -130,9 +130,9 @@ mod progs {
+                 Ok(len) => len < PATH_LEN - 1,
+                 Err(_) => false,
+             };
+-            if !fits {
+-                event.flags |= EVENT_FLAG_PATH_TRUNCATED;
+-            }
++            // MUTATION: a path the helper could not carry whole is recorded
++            // as if it had arrived intact.
++            let _ = fits;
+         }
+         match FERRUM_EVENTS.reserve::<Event>(0) {
+             Some(mut slot) => {

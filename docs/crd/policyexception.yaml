@@ -38,14 +38,23 @@ spec:
           properties:
             spec:
               type: object
-              required: [ticket, requestedBy, reason, expiresAt]
+              # approvedBy is required unconditionally, not only under
+              # fourEyes: fourEyes is self-declared by the requester and cannot
+              # be the switch that decides whether a second approver is needed.
+              # `ferrum-policy` refuses a waiver without one either way, so a
+              # conditional CEL copy would admit objects the compiler refuses.
+              required: [ticket, requestedBy, approvedBy, reason, expiresAt]
               x-kubernetes-validations:
                 - rule: "self.expiresAt > now()"
                   message: "expiresAt already in the past"
                 - rule: "self.expiresAt <= now() + duration('2160h')"
                   message: "expiresAt more than 90 days from now"
-                - rule: "!has(self.fourEyes) || !self.fourEyes || (has(self.approvedBy) && size(self.approvedBy) > 0)"
-                  message: "fourEyes=true requires approvedBy"
+                # `has()` guards the evaluation, not the invariant: approvedBy
+                # is required above, and an absent one is refused there. A CEL
+                # rule that dereferences a missing key errors instead of
+                # answering, which is a worse message for the same rejection.
+                - rule: "!has(self.approvedBy) || self.approvedBy != self.requestedBy"
+                  message: "self-approve is forbidden: approvedBy must differ from requestedBy"
                 - rule: "has(self.target) && size(self.target.policies) > 0 && size(self.target.rules) > 0"
                   message: "target.policies and target.rules are required"
               properties:
@@ -57,9 +66,12 @@ spec:
                   minLength: 1
                 approvedBy:
                   type: string
-                reason:
-                  type: string
                   minLength: 1
+                reason:
+                  # ferrum_policy::MIN_REASON_LEN. A shorter reason is a Slack
+                  # status, not a justification, and the compiler says so.
+                  type: string
+                  minLength: 8
                 expiresAt:
                   type: string
                   format: date-time

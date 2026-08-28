@@ -1,0 +1,15 @@
+# The observe ServiceAccount bound to a built-in role this tree does not define.
+# `admin` is not spelled cluster-admin, and its rules are nowhere in the
+# manifests, so nothing here can show what the agent may reach. Do not fix.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ferrum-agent-observe-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admin
+subjects:
+  - kind: ServiceAccount
+    name: ferrum-agent-observe
+    namespace: ferrum

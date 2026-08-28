@@ -30,62 +30,12 @@ pub struct SignedBundle {
 
 impl SignedBundle {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        if self.signature.is_empty() {
-            return Err(FerrumError::Integrity(
-                "refusing to encode unsigned bundle".into(),
-            ));
-        }
-        let mut out = Vec::with_capacity(
-            4 + 4 + 4 + self.public_key.len() + 4 + self.signature.len() + 4 + self.raw.len(),
-        );
-        out.extend_from_slice(&SIGNED_MAGIC);
-        out.extend_from_slice(&SIGNED_FORMAT.to_le_bytes());
-        append_len_prefixed(&mut out, &self.public_key, "public_key")?;
-        append_len_prefixed(&mut out, &self.signature, "signature")?;
-        append_len_prefixed(&mut out, &self.raw, "raw")?;
-        Ok(out)
+        encode_fsig_envelope(&self.public_key, &self.signature, &self.raw)
     }
 
     /// Parse FSIG bytes. Does not treat the embedded public key as trusted.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut pos = 0usize;
-        let magic = take(bytes, &mut pos, 4)?;
-        if magic != SIGNED_MAGIC {
-            return Err(FerrumError::Integrity(
-                "signed bundle magic is not FSIG".into(),
-            ));
-        }
-        let format = u32_le(take(bytes, &mut pos, 4)?);
-        if format != SIGNED_FORMAT {
-            return Err(FerrumError::Integrity(format!(
-                "unsupported signed bundle format {format}"
-            )));
-        }
-        let public_key = take_len_prefixed(bytes, &mut pos)?.to_vec();
-        let signature = take_len_prefixed(bytes, &mut pos)?.to_vec();
-        let raw = take_len_prefixed(bytes, &mut pos)?.to_vec();
-        if pos != bytes.len() {
-            return Err(FerrumError::Integrity(
-                "trailing bytes in signed bundle".into(),
-            ));
-        }
-        if signature.is_empty() {
-            return Err(FerrumError::Integrity(
-                "bundle signature is empty; unsigned bundles are rejected".into(),
-            ));
-        }
-        if public_key.len() != ED25519_PUBLIC_KEY_LEN {
-            return Err(FerrumError::Integrity(format!(
-                "Ed25519 public key must be {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
-                public_key.len()
-            )));
-        }
-        if signature.len() != ED25519_SIGNATURE_LEN {
-            return Err(FerrumError::Integrity(format!(
-                "Ed25519 signature must be {ED25519_SIGNATURE_LEN} bytes, got {}",
-                signature.len()
-            )));
-        }
+        let (public_key, signature, raw) = decode_fsig_envelope(bytes)?;
         let (min_agent_abi, min_admission_abi) = parse_framb_abis(&raw)?;
         Ok(Self {
             digest: bundle_digest(&raw),
@@ -102,6 +52,97 @@ impl SignedBundle {
 /// Agents must not call this with the embedded key unless it is that trust root.
 pub fn verify_signed_bundle(bundle: &SignedBundle, trusted_public_key: &[u8]) -> Result<Digest> {
     ferrum_crypto::verify_bundle_signature(&bundle.raw, &bundle.signature, trusted_public_key)
+}
+
+/// Encode any signed payload into the FSIG envelope shared by `bundle.fsig`
+/// and `exceptions.fsig`. Empty signatures are refused.
+pub fn encode_fsig_envelope(
+    public_key: &[u8],
+    signature: &[u8],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if signature.is_empty() {
+        return Err(FerrumError::Integrity(
+            "refusing to encode unsigned bundle".into(),
+        ));
+    }
+    if public_key.len() != ED25519_PUBLIC_KEY_LEN {
+        return Err(FerrumError::Integrity(format!(
+            "Ed25519 public key must be {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
+            public_key.len()
+        )));
+    }
+    if signature.len() != ED25519_SIGNATURE_LEN {
+        return Err(FerrumError::Integrity(format!(
+            "Ed25519 signature must be {ED25519_SIGNATURE_LEN} bytes, got {}",
+            signature.len()
+        )));
+    }
+    let mut out =
+        Vec::with_capacity(4 + 4 + 4 + public_key.len() + 4 + signature.len() + 4 + payload.len());
+    out.extend_from_slice(&SIGNED_MAGIC);
+    out.extend_from_slice(&SIGNED_FORMAT.to_le_bytes());
+    append_len_prefixed(&mut out, public_key, "public_key")?;
+    append_len_prefixed(&mut out, signature, "signature")?;
+    append_len_prefixed(&mut out, payload, "raw")?;
+    Ok(out)
+}
+
+/// Decode `(public_key, signature, payload)` from an FSIG envelope. The
+/// embedded public key is not a trust root; callers verify against their pin.
+pub fn decode_fsig_envelope(bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let mut pos = 0usize;
+    let magic = take(bytes, &mut pos, 4)?;
+    if magic != SIGNED_MAGIC {
+        return Err(FerrumError::Integrity(
+            "signed bundle magic is not FSIG".into(),
+        ));
+    }
+    let format = u32_le(take(bytes, &mut pos, 4)?);
+    if format != SIGNED_FORMAT {
+        return Err(FerrumError::Integrity(format!(
+            "unsupported signed bundle format {format}"
+        )));
+    }
+    let public_key = take_len_prefixed(bytes, &mut pos)?.to_vec();
+    let signature = take_len_prefixed(bytes, &mut pos)?.to_vec();
+    let payload = take_len_prefixed(bytes, &mut pos)?.to_vec();
+    if pos != bytes.len() {
+        return Err(FerrumError::Integrity(
+            "trailing bytes in signed bundle".into(),
+        ));
+    }
+    if signature.is_empty() {
+        return Err(FerrumError::Integrity(
+            "bundle signature is empty; unsigned bundles are rejected".into(),
+        ));
+    }
+    if public_key.len() != ED25519_PUBLIC_KEY_LEN {
+        return Err(FerrumError::Integrity(format!(
+            "Ed25519 public key must be {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
+            public_key.len()
+        )));
+    }
+    if signature.len() != ED25519_SIGNATURE_LEN {
+        return Err(FerrumError::Integrity(format!(
+            "Ed25519 signature must be {ED25519_SIGNATURE_LEN} bytes, got {}",
+            signature.len()
+        )));
+    }
+    Ok((public_key, signature, payload))
+}
+
+/// Verify an FSIG envelope against a caller-supplied trust root: the embedded
+/// key must equal the pin and the signature must verify. Returns the payload.
+pub fn verify_fsig_envelope(bytes: &[u8], trusted_public_key: &[u8]) -> Result<Vec<u8>> {
+    let (public_key, signature, payload) = decode_fsig_envelope(bytes)?;
+    if public_key != trusted_public_key {
+        return Err(FerrumError::Integrity(
+            "embedded FSIG public key does not match caller trust-root pin".into(),
+        ));
+    }
+    ferrum_crypto::verify_bundle_signature(&payload, &signature, trusted_public_key)?;
+    Ok(payload)
 }
 
 pub(crate) fn parse_framb_abis(raw: &[u8]) -> Result<(u32, u32)> {

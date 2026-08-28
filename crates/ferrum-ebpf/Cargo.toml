@@ -6,9 +6,28 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+# Real kernel attach via aya. Opt-in: the default build must stay stable-1.75
+# offline, and attach is not exercised by CI (needs CAP_BPF and a compiled
+# bpf-target ELF from ferrum-ebpf-progs).
+attach = ["dep:aya", "dep:libc"]
+
 [dependencies]
+aya = { version = "=0.12.0", default-features = false, optional = true }
 ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ebpf-progs.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+# getrlimit/setrlimit for the RLIMIT_MEMLOCK raise `attach` does before every
+# Bpf::load. Under `attach` this adds nothing to the graph: aya 0.12 already
+# resolves libc there, and this only stops the crate borrowing it. The default
+# build carries neither aya nor libc, and the Jenkins 'Crate boundary' stage
+# checks both halves of that.
+libc = { workspace = true, optional = true }
+
+[dev-dependencies]
+# tests/attach_live.rs makes the hooked syscalls by hand: a path longer than
+# PATH_LEN and a pointer into a non-resident page cannot be produced through
+# std::fs.
+libc.workspace = true

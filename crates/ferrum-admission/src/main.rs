@@ -3,8 +3,9 @@
 #![deny(unsafe_code)]
 
 use ferrum_admission::{
-    admit_bytes, load_path, load_tls_config, parse_trust_root, poll_bundle_file, serve_listener,
-    AdmissionSubject, ReviewConfig, WebhookState,
+    admit_bytes, load_path, parse_trust_root, poll_bundle_file, poll_exceptions_file,
+    poll_serving_cert, serve_listener, verify_exceptions_fsig, AdmissionSubject, LabelSource,
+    ReviewConfig, StaticLabels, TlsSource, WebhookState,
 };
 use ferrum_api::PolicyExceptionSpec;
 use std::collections::BTreeMap;
@@ -25,8 +26,8 @@ fn main() {
 fn cmd_eval(args: &[String]) {
     if args.len() != 3 {
         eprintln!("usage: ferrum-admission <program.fadm> <subject.json>");
-        eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <json> --policy-name <name>] <admissionreview.json>");
-        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--tls-cert --tls-key] [--reload-ms 1000]");
+        eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <exceptions.fsig> --policy-name <name>] <admissionreview.json>");
+        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000] [--apiserver [host:port]] [--cluster-label k=v]");
         eprintln!("missing or invalid compiled program denies the request (fail closed)");
         exit(2);
     }
@@ -89,7 +90,7 @@ fn cmd_review(args: &[String]) {
             exit(2);
         }
     };
-    let (exceptions, cfg) = exceptions_and_config(&flags);
+    let (exceptions, cfg) = exceptions_and_config(&flags, &trust_root);
     let body = read_file(&review_path);
     let reply = cfg.handle_bytes(&body, Some(&program), &exceptions, chrono::Utc::now());
     match serde_json::from_slice::<serde_json::Value>(&reply.body) {
@@ -135,11 +136,25 @@ fn cmd_serve(args: &[String]) {
             exit(2);
         }
     };
-    let (exceptions, cfg) = exceptions_and_config(&flags);
+    // In serve mode --exceptions is a mount, not a static file: the list is
+    // hot-reloaded alongside the bundle. Missing file = empty list.
+    let mut cfg = review_config(&flags);
+    cfg.labels = label_source(&flags);
+    let exceptions_path = flags
+        .map
+        .get("exceptions")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    if exceptions_path.is_some() && cfg.policy_name.is_empty() {
+        die("--policy-name is required when --exceptions is set");
+    }
     let tls = match (flags.map.get("tls-cert"), flags.map.get("tls-key")) {
         (Some(cert), Some(key)) if !cert.is_empty() && !key.is_empty() => {
-            match load_tls_config(cert, key) {
-                Ok(cfg) => Some(cfg),
+            // An expired or unreadable serving certificate is a hard start
+            // failure: under failurePolicy: Fail a handshake the API server
+            // rejects stops Pod creation cluster-wide.
+            match TlsSource::load(cert, key) {
+                Ok(source) => Some(source),
                 Err(err) => {
                     eprintln!("error: tls: {err}");
                     exit(2);
@@ -158,7 +173,12 @@ fn cmd_serve(args: &[String]) {
         _ => 1000,
     };
 
-    let state = Arc::new(WebhookState::new(program, trust_root, exceptions, cfg));
+    let state = Arc::new(WebhookState::new(program, trust_root, Vec::new(), cfg));
+    if let Some(path) = &exceptions_path {
+        if let Err(err) = state.try_reload_exceptions_path(path) {
+            eprintln!("ferrum-admission: exceptions load failed, starting with empty list: {err}");
+        }
+    }
     let listener = match std::net::TcpListener::bind(&listen) {
         Ok(l) => l,
         Err(err) => {
@@ -172,6 +192,12 @@ fn cmd_serve(args: &[String]) {
         Duration::from_millis(reload_ms),
         Arc::clone(&state),
     );
+    if let Some(path) = exceptions_path {
+        poll_exceptions_file(path, Duration::from_millis(reload_ms), Arc::clone(&state));
+    }
+    if let Some(source) = &tls {
+        poll_serving_cert(Arc::clone(source), Duration::from_millis(reload_ms));
+    }
     if let Err(err) = serve_listener(listener, state, tls) {
         eprintln!("error: serve: {err}");
         exit(2);
@@ -225,11 +251,88 @@ fn review_config(flags: &Flags) -> ReviewConfig {
             .get("policy-namespace")
             .cloned()
             .unwrap_or_default(),
+        ..Default::default()
     }
 }
 
-fn exceptions_and_config(flags: &Flags) -> (Vec<PolicyExceptionSpec>, ReviewConfig) {
-    let exceptions = load_exceptions(flags.map.get("exceptions"));
+/// `--cluster-label k=v`, repeatable as `k=v,k2=v2`. MVP-1 has no cluster
+/// object to read these from; they are operator-stated, not discovered.
+fn cluster_labels(flags: &Flags) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(raw) = flags.map.get("cluster-label") else {
+        return out;
+    };
+    for pair in raw.split(',').filter(|s| !s.trim().is_empty()) {
+        match pair.split_once('=') {
+            Some((k, v)) if !k.trim().is_empty() => {
+                out.insert(k.trim().to_string(), v.trim().to_string());
+            }
+            _ => die(&format!("--cluster-label expects k=v, got {pair:?}")),
+        }
+    }
+    out
+}
+
+/// Live namespace/ServiceAccount labels, or a cold source that denies every
+/// policy with such a selector until the watch lists.
+#[cfg(feature = "apiserver")]
+fn label_source(flags: &Flags) -> Arc<dyn LabelSource> {
+    use ferrum_k8smeta::watch::{ApiserverConfig, LabelWatcher};
+
+    let cluster = cluster_labels(flags);
+    let Some(target) = flags.map.get("apiserver") else {
+        eprintln!(
+            "ferrum-admission: --apiserver not set; policies with a namespace or \
+             ServiceAccount selector will fail closed"
+        );
+        return Arc::new(StaticLabels::cluster(cluster));
+    };
+    let mut config = match ApiserverConfig::cluster_wide() {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("error: apiserver: {err}");
+            exit(2);
+        }
+    };
+    if !target.is_empty() {
+        match target.rsplit_once(':') {
+            Some((host, port)) => {
+                config.host = host.to_string();
+                config.port = port
+                    .parse()
+                    .unwrap_or_else(|_| die("invalid --apiserver port"));
+            }
+            None => config.host = target.clone(),
+        }
+    }
+    let watcher = LabelWatcher::new(config);
+    let source = ferrum_admission::WatchedLabels::new(
+        watcher.namespaces(),
+        watcher.service_accounts(),
+        cluster,
+    );
+    watcher.spawn();
+    // The watcher owns nothing the caches need; the threads keep the Arcs alive.
+    Arc::new(source)
+}
+
+#[cfg(not(feature = "apiserver"))]
+fn label_source(flags: &Flags) -> Arc<dyn LabelSource> {
+    if flags.map.contains_key("apiserver") {
+        die("--apiserver requires the `apiserver` feature at build time");
+    }
+    eprintln!(
+        "ferrum-admission: built without the `apiserver` feature; policies with a namespace or \
+         ServiceAccount selector will fail closed"
+    );
+    Arc::new(StaticLabels::cluster(cluster_labels(flags)))
+}
+
+fn exceptions_and_config(
+    flags: &Flags,
+    trust_root: &[u8],
+) -> (Vec<PolicyExceptionSpec>, ReviewConfig) {
+    let exceptions = load_exceptions(flags.map.get("exceptions"), trust_root);
     let cfg = review_config(flags);
     if !exceptions.is_empty() && cfg.policy_name.is_empty() {
         die("--policy-name is required when --exceptions is set");
@@ -237,7 +340,9 @@ fn exceptions_and_config(flags: &Flags) -> (Vec<PolicyExceptionSpec>, ReviewConf
     (exceptions, cfg)
 }
 
-fn load_exceptions(path: Option<&String>) -> Vec<PolicyExceptionSpec> {
+/// `--exceptions` must be a signed `exceptions.fsig` verified against the
+/// same trust root as the bundle; plain JSON is rejected (fail closed).
+fn load_exceptions(path: Option<&String>, trust_root: &[u8]) -> Vec<PolicyExceptionSpec> {
     let Some(path) = path else {
         return Vec::new();
     };
@@ -245,13 +350,17 @@ fn load_exceptions(path: Option<&String>) -> Vec<PolicyExceptionSpec> {
         return Vec::new();
     }
     let raw = read_file(path);
-    if let Ok(list) = serde_json::from_slice::<Vec<PolicyExceptionSpec>>(&raw) {
-        return list;
-    }
-    match serde_json::from_slice::<PolicyExceptionSpec>(&raw) {
-        Ok(one) => vec![one],
+    let payload = match verify_exceptions_fsig(&raw, trust_root) {
+        Ok(payload) => payload,
         Err(err) => {
-            eprintln!("error: exceptions json: {err}");
+            eprintln!("error: exceptions: {err}");
+            exit(2);
+        }
+    };
+    match serde_json::from_slice::<Vec<PolicyExceptionSpec>>(&payload) {
+        Ok(list) => list,
+        Err(err) => {
+            eprintln!("error: exceptions payload json: {err}");
             exit(2);
         }
     }

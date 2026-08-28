@@ -42,14 +42,10 @@ pub fn compile_namespaced_policy(spec: &SecurityPolicySpec) -> Result<CompiledBu
 }
 
 fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
-    if matches!(
-        fx.runtime.default_action,
-        RuntimeAction::Kill | RuntimeAction::Isolate
-    ) {
-        return Err(FerrumError::Validation(
-            "runtime.defaultAction Kill/Isolate — это kill-all, не политика".into(),
-        ));
-    }
+    reject_kill_all(&fx)?;
+    reject_unobservable_syscalls(&fx)?;
+    reject_unobservable_predicates(&fx)?;
+    reject_unexecutable_actions(&fx)?;
     let admission_program = encode::encode_admission(&fx)?;
     let ebpf_spec = encode::encode_ebpf(&fx)?;
     let wasm = ferrum_wasm_abi::placeholder_module().to_vec();
@@ -66,6 +62,143 @@ fn emit_bundle(fx: Effects<'_>) -> Result<CompiledBundle> {
         ebpf_spec,
         wasm,
     })
+}
+
+/// Second gate on `ferrum_policy`'s kill-all invariant, in both of the places
+/// that invariant lives: `runtime.defaultAction` and every rule.
+///
+/// The two halves are one gate because they are one hazard. `kill` on a rule
+/// with no match fires on every record that rule sees; `kill` on the default
+/// fires on every record *no* rule matched, which on a respond node with the
+/// cgroup index synced is the same kill-all reached by writing no rule at all.
+/// Holding them apart is how this copy came to carry only the default while
+/// the loader's copy (`ferrum_ebpf::spec::reject_kill_all`) carried only the
+/// rules, each blind to exactly what the other saw.
+///
+/// `FerrumError::Compile`, like the siblings below and unlike the validator:
+/// a second gate exists to refuse independently of the advisory first one, and
+/// the error kind is where a caller sees which of the two spoke.
+fn reject_kill_all(fx: &Effects<'_>) -> Result<()> {
+    let default_verb = match fx.runtime.default_action {
+        RuntimeAction::Kill => Some("kill"),
+        RuntimeAction::Isolate => Some("isolate"),
+        RuntimeAction::Allow | RuntimeAction::Audit | RuntimeAction::Deny => None,
+    };
+    if let Some(verb) = default_verb {
+        return Err(FerrumError::Compile(format!(
+            "runtime.defaultAction {verb} is kill-all: it decides every record no rule matched and no match can narrow it. Executable defaults are allow and audit"
+        )));
+    }
+    for rule in &fx.runtime.rules {
+        if matches!(rule.action, RuntimeAction::Kill | RuntimeAction::Isolate)
+            && rule.syscalls.is_empty()
+            && rule.match_on.comm_in.is_empty()
+            && rule.match_on.path_prefix.is_empty()
+            && rule.match_on.path_suffix.is_empty()
+        {
+            return Err(FerrumError::Compile(format!(
+                "rule '{}' kill/isolate without match is kill-all",
+                rule.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Second gate on the same invariant as `ferrum_policy::validate_rule_syscalls`.
+/// The validator is advisory — a bundle can be produced by anything that calls
+/// the compiler — so the encoder refuses to emit a rule the datapath can never
+/// observe. A signed bundle that cannot fire is worse than a rejected compile.
+fn reject_unobservable_syscalls(fx: &Effects<'_>) -> Result<()> {
+    for rule in &fx.runtime.rules {
+        for syscall in &rule.syscalls {
+            let name = syscall.trim();
+            if !ferrum_ids::is_datapath_syscall(name) {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': syscall '{name}' is not hooked by the datapath; the rule can never fire. Observed: {}",
+                    rule.id,
+                    ferrum_ids::DATAPATH_SYSCALLS.join(", ")
+                )));
+            }
+        }
+        if let Some((listed, missing)) = ferrum_ids::uncovered_equivalent_syscall(&rule.syscalls) {
+            let arches = ferrum_ids::arch_restricted_syscall(missing)
+                .or_else(|| ferrum_ids::arch_restricted_syscall(listed))
+                .map(|r| r.arches.join(", "))
+                .unwrap_or_else(|| "every arch".to_string());
+            return Err(FerrumError::Compile(format!(
+                "rule '{}': syscall '{listed}' named without '{missing}'; they are one kernel operation and {arches} serves both, so one signed bundle for the whole cluster must name both or the other form walks past the rule",
+                rule.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The other half of "a rule that can never fire", for what a rule matches on
+/// rather than which syscall it names. `comm` is capped by the kernel at
+/// TASK_COMM_LEN and the path buffer is finite, so a longer literal is dead
+/// weight the moment it is signed.
+fn reject_unobservable_predicates(fx: &Effects<'_>) -> Result<()> {
+    for rule in &fx.runtime.rules {
+        if let Some((comm, len)) = ferrum_ids::unobservable_comm(&rule.match_on.comm_in) {
+            return Err(FerrumError::Compile(format!(
+                "rule '{}': comm '{comm}' is {len} bytes; the kernel reports at most {}, so the rule can never match",
+                rule.id,
+                ferrum_ids::COMM_MATCH_MAX
+            )));
+        }
+        for (field, patterns) in [
+            ("pathPrefix", &rule.match_on.path_prefix),
+            ("pathSuffix", &rule.match_on.path_suffix),
+        ] {
+            if let Some((pattern, len)) = ferrum_ids::unobservable_path_pattern(patterns) {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': {field} '{pattern}' is {len} bytes; the datapath path buffer carries at most {}, so the rule can never match",
+                    rule.id,
+                    ferrum_ids::PATH_MATCH_MAX
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Third gate of the same family, on the verb rather than on the match:
+/// the runtime plane executes exactly Allow / Audit / Kill. `Deny` it decides
+/// and never carries out — the tracepoint fires after the syscall has already
+/// run, so there is nothing left to refuse; deny is admission's verb
+/// (`admit.deny`). `Isolate` has no implementation in any plane. A rule with
+/// either action compiles, is signed and matches, and then does nothing.
+///
+/// `ferrum_policy::validate_rule_action` says the same thing, and every
+/// current caller runs it first. That is exactly why this exists: the
+/// validator is advisory, and a bundle reaching the encoder by another route
+/// must not lose the invariant on the way.
+fn reject_unexecutable_actions(fx: &Effects<'_>) -> Result<()> {
+    if fx.runtime.default_action == RuntimeAction::Deny {
+        return Err(FerrumError::Compile(
+            "runtime.defaultAction deny: the runtime plane does not execute it — the tracepoint fires after the syscall. Deny is admission's verb (admit.deny); allow and audit are executable defaults".into(),
+        ));
+    }
+    for rule in &fx.runtime.rules {
+        match rule.action {
+            RuntimeAction::Deny => {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': action=deny is not executed by the runtime plane — the tracepoint fires after the syscall, there is nothing left to cancel. Deny is admission's verb (admit.deny); runtime executes allow, audit, kill",
+                    rule.id
+                )));
+            }
+            RuntimeAction::Isolate => {
+                return Err(FerrumError::Compile(format!(
+                    "rule '{}': action=isolate has no implementation; the rule would match and do nothing. Runtime executes allow, audit, kill",
+                    rule.id
+                )));
+            }
+            RuntimeAction::Allow | RuntimeAction::Audit | RuntimeAction::Kill => {}
+        }
+    }
+    Ok(())
 }
 
 /// Canonical bytes hashed into `CompiledBundle.digest`.
@@ -231,8 +364,11 @@ mod tests {
             ebpf.runtime.rules[1].match_on.path_suffix,
             vec!["docker.sock", "containerd.sock", "crio.sock"]
         );
+        assert!(ebpf.runtime.rules[1].match_on.container_only);
         assert_eq!(ebpf.runtime.rules[2].id, "no-module");
-        assert_eq!(ebpf.runtime.rules[2].action, RuntimeAction::Deny);
+        // audit, not deny: the runtime plane's tracepoint fires after the
+        // syscall has run, so `deny` would encode a verdict nothing executes.
+        assert_eq!(ebpf.runtime.rules[2].action, RuntimeAction::Audit);
         assert!(ebpf.runtime.rules[2].match_on.not_agent_self);
     }
 
@@ -267,6 +403,59 @@ mod tests {
         assert_validation_no_bundle(compile_cluster_policy(&spec));
     }
 
+    fn syscall_rule_spec(syscalls: &[&str]) -> ClusterSecurityPolicySpec {
+        ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                rules: vec![RuntimeRule {
+                    id: "probe".into(),
+                    syscalls: syscalls.iter().map(|s| (*s).to_string()).collect(),
+                    match_on: RuntimeMatch {
+                        comm_in: vec!["gdb".into()],
+                        ..Default::default()
+                    },
+                    action: RuntimeAction::Kill,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unobservable_syscall_does_not_compile() {
+        // The validator refuses first; the compiler's own gate has to hold on
+        // its own, so assert it directly as well.
+        assert!(compile_cluster_policy(&syscall_rule_spec(&["ptrace"])).is_err());
+        let spec = syscall_rule_spec(&["ptrace"]);
+        let fx = Effects::from(&spec);
+        match reject_unobservable_syscalls(&fx) {
+            Err(FerrumError::Compile(msg)) => {
+                assert!(msg.contains("probe") && msg.contains("ptrace"), "{msg}");
+            }
+            other => panic!("expected Compile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn half_named_open_class_does_not_compile() {
+        // Both directions: 'open' alone is dead on aarch64, 'openat' alone is
+        // walked past by open(2) on x86_64. The compiler's gate is asserted
+        // directly too — the validator is not the only way into it.
+        for named in [&["open"][..], &["openat"][..]] {
+            assert!(compile_cluster_policy(&syscall_rule_spec(named)).is_err());
+            let spec = syscall_rule_spec(named);
+            let fx = Effects::from(&spec);
+            match reject_unobservable_syscalls(&fx) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("open") && msg.contains("openat"), "{msg}");
+                    assert!(msg.contains("x86_64"), "{msg}");
+                }
+                other => panic!("expected Compile, got {other:?}"),
+            }
+        }
+        compile_cluster_policy(&syscall_rule_spec(&["open", "openat"])).expect("portable pair");
+    }
+
     #[test]
     fn unsigned_without_trust_roots_does_not_compile() {
         for supply in [
@@ -297,6 +486,191 @@ mod tests {
             ..Default::default()
         };
         assert_validation_no_bundle(compile_namespaced_policy(&spec));
+    }
+
+    /// The compiler is the second gate on the same invariant the validator
+    /// checks: a bundle can be produced by anything that calls the compiler, so
+    /// a predicate no record can carry must not reach a signed artifact.
+    #[test]
+    fn an_unobservable_predicate_does_not_compile() {
+        let over_comm = "kubectl-exec-helper".to_string();
+        let over_path = "p".repeat(ferrum_ids::PATH_MATCH_MAX + 1);
+        let cases = [
+            (
+                RuntimeMatch {
+                    comm_in: vec![over_comm.clone()],
+                    ..Default::default()
+                },
+                over_comm.clone(),
+                ferrum_ids::COMM_MATCH_MAX,
+            ),
+            (
+                RuntimeMatch {
+                    path_prefix: vec![over_path.clone()],
+                    ..Default::default()
+                },
+                over_path.clone(),
+                ferrum_ids::PATH_MATCH_MAX,
+            ),
+            (
+                RuntimeMatch {
+                    path_suffix: vec![over_path.clone()],
+                    ..Default::default()
+                },
+                over_path.clone(),
+                ferrum_ids::PATH_MATCH_MAX,
+            ),
+        ];
+        for (match_on, literal, bound) in cases {
+            let spec = ClusterSecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    rules: vec![RuntimeRule {
+                        id: "too-long".into(),
+                        syscalls: vec![],
+                        match_on,
+                        action: RuntimeAction::Deny,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // The validator refuses first; the compiler's own gate has to hold
+            // on its own, so assert it directly as well.
+            assert!(compile_cluster_policy(&spec).is_err());
+            let fx = Effects::from(&spec);
+            match reject_unobservable_predicates(&fx) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("too-long"), "{msg}");
+                    // The message names the length and the bound.
+                    assert!(msg.contains(&literal.len().to_string()), "{msg}");
+                    assert!(msg.contains(&bound.to_string()), "{msg}");
+                }
+                other => panic!("expected Compile, got {other:?}"),
+            }
+        }
+    }
+
+    /// The encoder's own copy of the rule-action invariant. Every current
+    /// caller runs `validate_*` first, so this reaches `emit_bundle` directly:
+    /// going through `compile_cluster_policy` would prove only that the
+    /// validator still works, and the second gate exists precisely because the
+    /// first one may not be in the path.
+    #[test]
+    fn an_unexecutable_action_does_not_encode() {
+        fn action_spec(action: RuntimeAction) -> ClusterSecurityPolicySpec {
+            ClusterSecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    rules: vec![RuntimeRule {
+                        id: "no-shell".into(),
+                        syscalls: vec!["execve".into()],
+                        match_on: RuntimeMatch {
+                            comm_in: vec!["sh".into()],
+                            ..Default::default()
+                        },
+                        action,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        for (action, needle) in [
+            (RuntimeAction::Deny, "deny"),
+            (RuntimeAction::Isolate, "isolate"),
+        ] {
+            let spec = action_spec(action);
+            match emit_bundle(Effects::from(&spec)) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("no-shell"), "{msg}");
+                    assert!(msg.contains(needle), "{msg}");
+                    assert!(msg.contains("allow, audit, kill"), "{msg}");
+                }
+                other => panic!("expected Compile, got {other:?}"),
+            }
+        }
+
+        // The same rule with an executable verb still encodes, so the gate
+        // refuses the action and not the rule around it.
+        emit_bundle(Effects::from(&action_spec(RuntimeAction::Audit))).expect("audit encodes");
+
+        // The default carries the same invariant: a verdict on every event
+        // that the plane never executes.
+        let spec = ClusterSecurityPolicySpec {
+            runtime: RuntimeSpec {
+                default_action: RuntimeAction::Deny,
+                rules: vec![],
+            },
+            ..Default::default()
+        };
+        match emit_bundle(Effects::from(&spec)) {
+            Err(FerrumError::Compile(msg)) => {
+                assert!(msg.contains("defaultAction deny"), "{msg}");
+            }
+            other => panic!("expected Compile, got {other:?}"),
+        }
+    }
+
+    /// The kill-all half of the same family, also straight at `emit_bundle`:
+    /// going through `compile_cluster_policy` would only re-prove the
+    /// validator. Both halves of the invariant are exercised — the rule the
+    /// encoder used not to hold at all, and the default it held under the
+    /// wrong error kind.
+    #[test]
+    fn kill_all_does_not_encode() {
+        for action in [RuntimeAction::Kill, RuntimeAction::Isolate] {
+            let spec = ClusterSecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    rules: vec![RuntimeRule {
+                        id: "oops".into(),
+                        syscalls: vec![],
+                        match_on: RuntimeMatch::default(),
+                        action,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            match emit_bundle(Effects::from(&spec)) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("oops"), "{msg}");
+                    assert!(msg.contains("kill-all"), "{msg}");
+                }
+                other => panic!("expected Compile for rule {action:?}, got {other:?}"),
+            }
+
+            // A match rescues the same verb, so the gate refuses the missing
+            // match and not the action. Isolate is refused all the same, by
+            // the action gate — a different invariant, and it must be that one.
+            let mut matched = spec.clone();
+            matched.runtime.rules[0].match_on.comm_in = vec!["sh".into()];
+            let encoded = emit_bundle(Effects::from(&matched));
+            if action == RuntimeAction::Kill {
+                encoded.expect("a matched kill encodes");
+            } else {
+                match encoded {
+                    Err(FerrumError::Compile(msg)) => {
+                        assert!(msg.contains("isolate has no implementation"), "{msg}")
+                    }
+                    other => panic!("expected the action gate, got {other:?}"),
+                }
+            }
+
+            let default_spec = ClusterSecurityPolicySpec {
+                runtime: RuntimeSpec {
+                    default_action: action,
+                    rules: vec![],
+                },
+                ..Default::default()
+            };
+            match emit_bundle(Effects::from(&default_spec)) {
+                Err(FerrumError::Compile(msg)) => {
+                    assert!(msg.contains("defaultAction"), "{msg}");
+                    assert!(msg.contains("kill-all"), "{msg}");
+                }
+                other => panic!("expected Compile for defaultAction {action:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

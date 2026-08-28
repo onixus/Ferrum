@@ -1,0 +1,323 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: securitypolicies.ferrum.io
+spec:
+  group: ferrum.io
+  names:
+    kind: SecurityPolicy
+    listKind: SecurityPolicyList
+    plural: securitypolicies
+    singular: securitypolicy
+    shortNames:
+      - sp
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Mode
+          type: string
+          jsonPath: .spec.mode
+        - name: Ready
+          type: boolean
+          jsonPath: .status.compile.ready
+        - name: Digest
+          type: string
+          jsonPath: .status.compile.bundleDigest
+        - name: Generation
+          type: integer
+          jsonPath: .status.observedGeneration
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              x-kubernetes-validations:
+                - rule: "!(has(self.disabled) && self.disabled && has(self.mode) && self.mode == 'enforce')"
+                  message: "disabled=true together with mode=enforce"
+                - rule: "!has(self.runtime) || !has(self.runtime.defaultAction) || !(self.runtime.defaultAction in ['kill', 'isolate'])"
+                  message: "runtime.defaultAction kill/isolate is kill-all, not a policy"
+                - rule: "!has(self.runtime) || !has(self.runtime.defaultAction) || !(self.runtime.defaultAction in ['deny'])"
+                  message: "runtime.defaultAction deny: the runtime plane never executes it, a tracepoint fires after the syscall has already run; deny is admission's verb (admit.deny)"
+                - rule: "!has(self.runtime) || !has(self.runtime.rules) || self.runtime.rules.all(r, !has(r.action) || !(r.action in ['kill', 'isolate']) || (has(r.syscalls) && size(r.syscalls) > 0) || (has(r.match) && ((has(r.match.commIn) && size(r.match.commIn) > 0) || (has(r.match.pathPrefix) && size(r.match.pathPrefix) > 0) || (has(r.match.pathSuffix) && size(r.match.pathSuffix) > 0))))"
+                  message: "runtime rule with action kill/isolate needs syscalls or match, otherwise it is kill-all"
+                - rule: "!has(self.runtime) || !has(self.runtime.rules) || self.runtime.rules.all(r, !has(r.action) || !(r.action in ['deny', 'isolate']))"
+                  message: "runtime rule action deny/isolate: the runtime plane executes allow/audit/kill only, deny is admission's verb (admit.deny) and isolate has no implementation"
+                - rule: "!has(self.supply) || !((has(self.supply.requireSigned) && self.supply.requireSigned) || (has(self.supply.denyUnsigned) && self.supply.denyUnsigned)) || (has(self.supply.trustRoots) && size(self.supply.trustRoots) > 0)"
+                  message: "requireSigned/denyUnsigned without trustRoots: trust roots ride in the bundle"
+                - rule: "!has(self.admit) || !has(self.admit.failurePolicy) || self.admit.failurePolicy != 'Ignore'"
+                  message: "namespaced SecurityPolicy cannot set failurePolicy=Ignore"
+              properties:
+                mode:
+                  type: string
+                  enum: [observe, audit, enforce]
+                priority:
+                  type: integer
+                  format: int32
+                disabled:
+                  type: boolean
+                selector:
+                  type: object
+                  properties:
+                    clusterSelector:
+                      type: object
+                      properties:
+                        matchLabels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        matchExpressions:
+                          type: array
+                          items:
+                            type: object
+                            required: [key, operator]
+                            properties:
+                              key:
+                                type: string
+                              operator:
+                                type: string
+                              values:
+                                type: array
+                                items:
+                                  type: string
+                    namespaceSelector:
+                      type: object
+                      properties:
+                        matchLabels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        matchExpressions:
+                          type: array
+                          items:
+                            type: object
+                            required: [key, operator]
+                            properties:
+                              key:
+                                type: string
+                              operator:
+                                type: string
+                              values:
+                                type: array
+                                items:
+                                  type: string
+                    workloadSelector:
+                      type: object
+                      properties:
+                        matchLabels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        matchExpressions:
+                          type: array
+                          items:
+                            type: object
+                            required: [key, operator]
+                            properties:
+                              key:
+                                type: string
+                              operator:
+                                type: string
+                              values:
+                                type: array
+                                items:
+                                  type: string
+                    serviceAccountSelector:
+                      type: object
+                      properties:
+                        matchLabels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        matchExpressions:
+                          type: array
+                          items:
+                            type: object
+                            required: [key, operator]
+                            properties:
+                              key:
+                                type: string
+                              operator:
+                                type: string
+                              values:
+                                type: array
+                                items:
+                                  type: string
+                    image:
+                      type: object
+                      properties:
+                        registriesAllow:
+                          type: array
+                          items:
+                            type: string
+                        requireDigest:
+                          type: boolean
+                supply:
+                  type: object
+                  properties:
+                    requireSigned:
+                      type: boolean
+                    denyUnsigned:
+                      type: boolean
+                    denyLatestTag:
+                      type: boolean
+                    trustRoots:
+                      type: array
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name:
+                            type: string
+                          keylessIssuerAllow:
+                            type: array
+                            items:
+                              type: string
+                          publicKeys:
+                            type: array
+                            items:
+                              # Ed25519 verifying key, hex. ferrum-policy
+                              # refuses anything else, so a key that reaches
+                              # the compiler in any other shape is a policy the
+                              # API server admitted and nothing can build.
+                              type: string
+                              pattern: "^[0-9a-fA-F]{64}$"
+                admit:
+                  type: object
+                  properties:
+                    failurePolicy:
+                      type: string
+                      enum: [Fail, Ignore]
+                    pss:
+                      type: string
+                      enum: [privileged, baseline, restricted, custom]
+                    deny:
+                      type: object
+                      properties:
+                        privileged:
+                          type: boolean
+                        hostPID:
+                          type: boolean
+                        hostIPC:
+                          type: boolean
+                        hostNetwork:
+                          type: boolean
+                        hostPath:
+                          type: boolean
+                        allowPrivilegeEscalation:
+                          type: boolean
+                        runAsRoot:
+                          type: boolean
+                        wildcardsRbac:
+                          type: boolean
+                        clusterAdminBind:
+                          type: boolean
+                        addedCapabilities:
+                          type: array
+                          items:
+                            type: string
+                    mutate:
+                      type: object
+                      properties:
+                        injectSeccompRuntimeDefault:
+                          type: boolean
+                        dropAllCapabilities:
+                          type: boolean
+                        readOnlyRootFilesystem:
+                          type: boolean
+                runtime:
+                  type: object
+                  properties:
+                    defaultAction:
+                      type: string
+                      enum: [allow, audit, deny, kill, isolate]
+                    rules:
+                      type: array
+                      # Rule ids are the names exceptions and audit records
+                      # refer to, so two rules may not share one. A list-map
+                      # key is the API server's own uniqueness check and costs
+                      # no CEL budget, unlike a quadratic exists_one().
+                      x-kubernetes-list-type: map
+                      x-kubernetes-list-map-keys: [id]
+                      items:
+                        type: object
+                        required: [id]
+                        properties:
+                          id:
+                            type: string
+                            minLength: 1
+                            # Not merely non-empty: ferrum-policy trims before
+                            # it decides, so a blank id is no id either.
+                            pattern: "\\S"
+                          syscalls:
+                            type: array
+                            items:
+                              type: string
+                          match:
+                            type: object
+                            properties:
+                              commIn:
+                                type: array
+                                items:
+                                  # ferrum_ids::COMM_MATCH_MAX: the kernel
+                                  # copies at most TASK_COMM_LEN bytes with the
+                                  # NUL, so a longer literal never matches.
+                                  type: string
+                                  maxLength: 15
+                              containerOnly:
+                                type: boolean
+                              pathPrefix:
+                                type: array
+                                items:
+                                  # ferrum_ids::PATH_MATCH_MAX: the datapath
+                                  # path buffer minus the NUL. A longer
+                                  # fragment cannot be contained in anything
+                                  # the datapath reports.
+                                  type: string
+                                  maxLength: 255
+                              pathSuffix:
+                                type: array
+                                items:
+                                  # ferrum_ids::PATH_MATCH_MAX: the datapath
+                                  # path buffer minus the NUL. A longer
+                                  # fragment cannot be contained in anything
+                                  # the datapath reports.
+                                  type: string
+                                  maxLength: 255
+                              notAgentSelf:
+                                type: boolean
+                          action:
+                            type: string
+                            enum: [allow, audit, deny, kill, isolate]
+            status:
+              type: object
+              properties:
+                observedGeneration:
+                  type: integer
+                  format: int64
+                compile:
+                  type: object
+                  properties:
+                    ready:
+                      type: boolean
+                    bundleDigest:
+                      type: string
+                    compilerVersion:
+                      type: string
+                    message:
+                      type: string
+                rollout:
+                  type: object
+                  properties:
+                    clustersReady:
+                      type: integer
+                      format: int32
+                    clustersDegraded:
+                      type: integer
+                      format: int32

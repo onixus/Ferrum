@@ -9,21 +9,30 @@ mod key;
 mod watch;
 
 pub use apply::{
-    bundle_secret, plan_apply, secret_name, status_patch, ApplyPlan, DEFAULT_NAMESPACE,
+    bundle_secret, bundle_secret_named, exceptions_fsig, exceptions_json, exceptions_secret_patch,
+    namespaced_secret_name, persist_exceptions, plan_apply, plan_apply_named,
+    plan_apply_namespaced, secret_name, status_patch, ApplyPlan, DEFAULT_NAMESPACE,
+    EXCEPTIONS_FSIG_KEY, EXCEPTIONS_JSON_KEY,
 };
-pub use bundle::{verify_signed_bundle, SignedBundle, SIGNED_FORMAT, SIGNED_MAGIC};
+pub use bundle::{
+    decode_fsig_envelope, encode_fsig_envelope, verify_fsig_envelope, verify_signed_bundle,
+    SignedBundle, SIGNED_FORMAT, SIGNED_MAGIC,
+};
 pub use key::{
     hex_decode, hex_encode, load_seed, load_seed_file, parse_public_key_hex, parse_seed_bytes,
     parse_seed_hex, SEED_ENV, SEED_FILE_ENV,
 };
 pub use watch::{
-    cluster_security_policy_gvk, cluster_security_policy_resource, observe_policy, run_watch,
+    cluster_security_policy_gvk, cluster_security_policy_resource, observe_exception,
+    observe_namespaced_policy, observe_policy, policy_exception_gvk, policy_exception_resource,
+    run_watch, security_policy_gvk, security_policy_resource,
 };
 
 use bundle::parse_framb_abis;
 use ferrum_api::{
-    ClusterSecurityPolicySpec, CompileStatus, PolicyLibrarySpec, PolicyMode, PolicyStatus,
-    RolloutStatus, RuntimeProfileSpec, RuntimeProfileStatus,
+    ClusterSecurityPolicySpec, CompileStatus, PolicyExceptionSpec, PolicyExceptionStatus,
+    PolicyLibrarySpec, PolicyMode, PolicyStatus, RolloutStatus, RuntimeProfileSpec,
+    RuntimeProfileStatus, SecurityPolicySpec,
 };
 use ferrum_common::{FerrumError, Result};
 use ferrum_compiler::CompiledBundle;
@@ -38,6 +47,16 @@ pub fn compile_and_sign(
     secret_key: &[u8],
 ) -> Result<SignedBundle> {
     let compiled = ferrum_compiler::compile_cluster_policy(spec)?;
+    sign_compiled(&compiled, secret_key)
+}
+
+/// Namespaced SecurityPolicy compile+sign. `compile_namespaced_policy` already
+/// enforces the failurePolicy=Ignore ban before any bundle exists.
+pub fn compile_and_sign_namespaced(
+    spec: &SecurityPolicySpec,
+    secret_key: &[u8],
+) -> Result<SignedBundle> {
+    let compiled = ferrum_compiler::compile_namespaced_policy(spec)?;
     sign_compiled(&compiled, secret_key)
 }
 
@@ -172,6 +191,24 @@ pub struct ObservedPolicy {
     pub spec: ClusterSecurityPolicySpec,
 }
 
+/// Namespaced SecurityPolicy fields read from a DynamicObject.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedNamespacedPolicy {
+    pub name: String,
+    pub namespace: String,
+    pub generation: i64,
+    pub resource_version: String,
+    pub spec: SecurityPolicySpec,
+}
+
+/// PolicyException fields read from a DynamicObject.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservedException {
+    pub name: String,
+    pub namespace: String,
+    pub spec: PolicyExceptionSpec,
+}
+
 /// Live-watch inputs. Cluster list is CLI/static — kubeconfigSecretRef is never opened.
 #[derive(Debug, Clone)]
 pub struct WatchConfig {
@@ -232,6 +269,75 @@ pub fn reconcile(input: ReconcileInput<'_>) -> ReconcileOutcome {
             rollout: RolloutStatus::default(),
         }),
     }
+}
+
+pub struct NamespacedReconcileInput<'a> {
+    pub spec: &'a SecurityPolicySpec,
+    pub observed_generation: i64,
+    pub secret_key: &'a [u8],
+    pub library: Option<&'a PolicyLibrarySpec>,
+    pub clusters: &'a [ClusterAbi],
+}
+
+/// Namespaced twin of `reconcile`. failurePolicy=Ignore fails here, before any
+/// Secret is planned — the reject lands in status, never in a bundle.
+pub fn reconcile_namespaced(input: NamespacedReconcileInput<'_>) -> ReconcileOutcome {
+    match compile_and_sign_namespaced(input.spec, input.secret_key) {
+        Ok(bundle) => {
+            let plan = plan_rollout(&bundle, input.library, input.clusters);
+            let status = PolicyStatus {
+                observed_generation: input.observed_generation,
+                compile: compile_status_ok(&bundle),
+                rollout: plan.status,
+            };
+            ReconcileOutcome::Applied(ReconcileApplied {
+                bundle,
+                status,
+                mode: input.spec.mode,
+                profile_status: None,
+                deliver: plan.deliver,
+                keep_lkg: plan.keep_lkg,
+            })
+        }
+        Err(err) => ReconcileOutcome::Failed(PolicyStatus {
+            observed_generation: input.observed_generation,
+            compile: compile_status_err(&err),
+            rollout: RolloutStatus::default(),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExceptionReconcile {
+    pub status: PolicyExceptionStatus,
+    /// Present only for exceptions that pass ferrum-policy invariants;
+    /// only these are signed into `exceptions.fsig`.
+    pub live: Option<PolicyExceptionSpec>,
+}
+
+/// Gate one PolicyException through ferrum-policy invariants (mandatory
+/// expiresAt, <= 90 days, non-empty scope). Rejects go to status only.
+pub fn reconcile_exception(spec: &PolicyExceptionSpec) -> ExceptionReconcile {
+    match ferrum_policy::validate_exception(spec) {
+        Ok(()) => ExceptionReconcile {
+            status: PolicyExceptionStatus {
+                active: true,
+                message: "exception is live".into(),
+            },
+            live: Some(spec.clone()),
+        },
+        Err(err) => ExceptionReconcile {
+            status: PolicyExceptionStatus {
+                active: false,
+                message: err.to_string(),
+            },
+            live: None,
+        },
+    }
+}
+
+pub fn exception_status_patch(status: &PolicyExceptionStatus) -> serde_json::Value {
+    serde_json::json!({ "status": status })
 }
 
 #[cfg(test)]
