@@ -314,15 +314,16 @@ pub struct KernelHandle {
     /// Mirror of what this handle actually wrote into `ferrum_cgroups`; the
     /// next plan is diffed against it, so a failed sync is not forgotten.
     container_cgroups: BTreeSet<u64>,
-    /// Syscalls with no tracepoint on this arch, hence unhooked here.
+    /// Syscalls with no tracepoint on this arch or in this kernel's tracefs,
+    /// hence unhooked here.
     unhooked_syscalls: Vec<&'static str>,
 }
 
 #[cfg(feature = "attach")]
 impl KernelHandle {
     /// Load a compiled `ferrum-ebpf-progs` ELF and attach every tracepoint
-    /// this host's arch has. A missing program or a failed attach still
-    /// aborts the whole handle.
+    /// this host has. A missing program or a failed attach still aborts the
+    /// whole handle.
     ///
     /// The map definitions are checked against [`REQUIRED_MAPS`] *before*
     /// the ELF is loaded: an ELF whose maps disagree with this userspace is
@@ -336,20 +337,36 @@ impl KernelHandle {
         Self::attach_for_arch(elf, arch)
     }
 
-    /// Attach the tracepoints that exist on `arch`.
+    /// Attach the tracepoints that exist on `arch` *and* on this kernel.
     ///
-    /// A syscall that arch does not have (`open` on aarch64) has no
-    /// tracepoint to attach to, and treating that as fatal left the node with
-    /// no hooks at all — the whole runtime plane dead. It is skipped and
-    /// reported by [`Self::unhooked_syscalls`]. Every other attach failure is
-    /// still fatal: "the tracepoint is not there" must not widen into
-    /// "swallow attach errors".
+    /// Two different absences, one answer. A syscall the arch does not have
+    /// (`open` on aarch64) has no tracepoint to attach to; so does a syscall
+    /// this kernel was built without — no `CONFIG_MODULES` means no
+    /// `init_module`/`finit_module` and no tracepoint for either, which was
+    /// measured on a Firecracker microVM where the arch table said the
+    /// syscalls exist and the whole attach failed. Either way the hook is
+    /// skipped and reported by [`Self::unhooked_syscalls`]; treating it as
+    /// fatal left the node with no hooks at all, the whole runtime plane dead.
+    ///
+    /// Absence is established from tracefs *before* anything is loaded, never
+    /// inferred from a failure. Every other attach failure is still fatal, and
+    /// a host with no tracefs to read skips nothing: "the tracepoint is not
+    /// there" must not widen into "swallow attach errors".
     pub fn attach_for_arch(elf: &[u8], arch: SyscallArch) -> Result<Self> {
         verify_map_defs(elf)?;
-        let wanted = crate::tracepoints_for_arch(arch);
+        let mut unhooked = crate::tracepoints_absent_on_arch(arch);
+        let mut wanted = crate::tracepoints_for_arch(arch);
+        wanted.retain(|tp| {
+            if crate::tracepoint_in_tracefs(tp.1, tp.2) != Some(false) {
+                return true;
+            }
+            unhooked.push(crate::tracepoint_syscall(tp).unwrap_or(tp.2));
+            false
+        });
         if wanted.is_empty() {
             return Err(FerrumError::Degraded(format!(
-                "no datapath tracepoint exists on {}; the runtime plane would be blind",
+                "no datapath tracepoint on this node: {unhooked:?} are absent from {} or \
+                 from this kernel; the runtime plane would be blind",
                 arch.as_str()
             )));
         }
@@ -368,13 +385,13 @@ impl KernelHandle {
         Ok(Self {
             bpf,
             container_cgroups: BTreeSet::new(),
-            unhooked_syscalls: crate::tracepoints_absent_on_arch(arch),
+            unhooked_syscalls: unhooked,
         })
     }
 
-    /// Datapath syscalls with no hook on this node's arch. Non-empty means
-    /// rules naming them are dead here, which is a Degraded fact, not a
-    /// healthy one.
+    /// Datapath syscalls with no hook on this node — absent from the arch, or
+    /// from this kernel's tracefs. Non-empty means rules naming them are dead
+    /// here, which is a Degraded fact, not a healthy one.
     pub fn unhooked_syscalls(&self) -> &[&'static str] {
         &self.unhooked_syscalls
     }

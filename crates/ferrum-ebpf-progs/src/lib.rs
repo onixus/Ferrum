@@ -37,11 +37,26 @@ pub const PATH_LEN: usize = 256;
 pub const EVENT_FLAG_CONTAINER: u8 = 1 << 0;
 pub const EVENT_FLAG_AGENT_SELF: u8 = 1 << 1;
 /// The `path` buffer does not hold the whole argument: the string did not fit
-/// in `PATH_LEN` (`-E2BIG`, head kept), or the pointer could not be read at
-/// all (`-EFAULT`, buffer left empty). One flag for both, because either way
-/// the bytes present are not the argument; userspace separates the two by
-/// whether the buffer is empty, and must not decide any path predicate against
-/// an empty one.
+/// in `PATH_LEN` (head kept), or the pointer could not be read at all
+/// (`-EFAULT`, buffer left empty). One flag for both, because either way the
+/// bytes present are not the argument; userspace separates the two by whether
+/// the buffer is empty, and must not decide any path predicate against an
+/// empty one.
+///
+/// Truncation is NOT an error return. `bpf_probe_read_user_str` truncates and
+/// reports the buffer size, which is inside the bounds `aya_ebpf`'s wrapper
+/// checks, so the wrapper answers `Ok` — measured on Linux 6.18/x86_64, a
+/// 384-byte `openat` pathname arrived as a 255-byte head with this flag
+/// unset. The datapath therefore sets it on a read that filled the buffer,
+/// not only on one that failed.
+///
+/// An object built before that fix sets nothing, and userspace cannot tell
+/// its record from an honest 255-byte path without deriving truncation from
+/// the buffer shape — the helper spends the last byte on a terminator, so a
+/// string with nowhere to put one did not fit. That derivation is not made
+/// (see `ferrum_ebpf::syscall_event`), so a node still running such an object
+/// after a rolling upgrade stays fail-open on a path over `PATH_LEN` until
+/// its image is replaced.
 pub const EVENT_FLAG_PATH_TRUNCATED: u8 = 1 << 2;
 
 /// Layout stamp carried by every ring record in `Event::_pad`.

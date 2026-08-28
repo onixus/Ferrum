@@ -21,7 +21,7 @@ mod progs {
     };
     use ferrum_ebpf_progs::{
         Event, ACTION_AUDIT, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, EVENT_FLAG_AGENT_SELF,
-        EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED,
+        EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, PATH_LEN,
     };
 
     // The `#[map(name = ...)]` literals must stay equal to the MAP_* /
@@ -114,11 +114,23 @@ mod progs {
             // empty. Either way the recorded bytes are not the argument.
             // Straight-line code only — no extra branching on the pointer, no
             // loops.
-            let read_ok = match unsafe { ctx.read_at::<*const u8>(offset) } {
-                Ok(ptr) => unsafe { bpf_probe_read_user_str_bytes(ptr, &mut event.path) }.is_ok(),
+            //
+            // Truncation is not an Err. `bpf_probe_read_user_str` truncates
+            // and returns the buffer size, which is inside the bounds aya's
+            // wrapper checks, so it answers Ok with a PATH_LEN-1 byte slice —
+            // measured on 6.18/x86_64, a 384-byte pathname came back as a
+            // 255-byte head and nothing was flagged. So the length decides:
+            // anything that reached the last usable byte did not fit.
+            let read_len = match unsafe { ctx.read_at::<*const u8>(offset) } {
+                Ok(ptr) => unsafe { bpf_probe_read_user_str_bytes(ptr, &mut event.path) }
+                    .map(|read| read.len()),
+                Err(err) => Err(err),
+            };
+            let fits = match read_len {
+                Ok(len) => len < PATH_LEN - 1,
                 Err(_) => false,
             };
-            if !read_ok {
+            if !fits {
                 event.flags |= EVENT_FLAG_PATH_TRUNCATED;
             }
         }
