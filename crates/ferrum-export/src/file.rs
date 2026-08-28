@@ -44,6 +44,16 @@ impl SinkContext {
         self.inner.degraded.store(degraded, Ordering::Relaxed);
     }
 
+    /// The node this agent runs on, as stamped on every envelope. Read by the
+    /// node status file so the file and the envelopes name the same node.
+    pub fn node(&self) -> &str {
+        &self.inner.node
+    }
+
+    pub fn agent_role(&self) -> &str {
+        &self.inner.agent_role
+    }
+
     pub fn set_bundle_digest(&self, digest: Option<Digest>) {
         *self
             .inner

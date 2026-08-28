@@ -21,3 +21,19 @@ attach ignores the flag and reports Degraded.
 The respond ClusterRole grants pods delete only. pods/eviction and
 networkpolicies were there for Isolate, which the agent does not implement and
 refuses; they come back when it does.
+
+Node state is a file, not a port: the agent rewrites status.json in
+--export-dir (/var/log/ferrum) on every reload tick, beside events.jsonl, with
+every counter it keeps, whether it is Degraded and the reasons for it. Read it
+with the same cat as the events. It is written whole (temp file + rename), so a
+reader never sees a partial one. There is no listening port and no probe on
+these DaemonSets by design: the surface reports, it never acts, and a liveness
+probe wired to the degraded state would restart a node through cold caches and
+loop forever on a genuinely wrong ELF.
+
+--policy-name must name the policy the mounted bundle Secret is named for
+(ferrum-bundle-cluster-<policy>). The FRMB carries no policy name, so nothing
+at runtime can prove that join: a mismatch loads every PolicyException on the
+node and applies none. `ferrumctl lint-deploy` FD024 checks it here, and the
+agent says so in status.json (waiversUnjoined) if it holds waivers that name
+another policy.

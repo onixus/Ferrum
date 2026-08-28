@@ -8,6 +8,7 @@ mod pump;
 mod respond;
 mod ring;
 mod source;
+mod status;
 
 use chrono::{DateTime, Utc};
 use ferrum_api::PolicyExceptionSpec;
@@ -17,7 +18,7 @@ use ferrum_export::EventSink;
 use ferrum_ids::{Digest, PolicyId, RuleId};
 use ferrum_k8smeta::{PodMetadataSource, PodRecord, SharedCgroupIndex, WorkloadIdentity};
 use ferrum_proto::{EnforcementEvent, WaiverRef};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -101,9 +102,87 @@ pub const DECODE_FAILURE_RUN_MAX: u64 = 64;
 pub const SELF_TGID_UNPUBLISHED: &str =
     "agent self tgid not published: not in the host pid namespace, so notAgentSelf rules \
      cannot be honoured on this node";
+/// The reasons `is_degraded` can give, in the words the operator reads in
+/// `status.json` and in the transition line. Constants rather than literals:
+/// the file and the log line are a surface, and a reason that changes wording
+/// between them is a reason nobody can alert on.
+pub const DEG_CONTROL_PLANE_DOWN: &str =
+    "control plane down: enforcing last-known-good, no bundle updates";
+pub const DEG_LOADER: &str = "bundle loader degraded: see the reload error on stderr";
+pub const DEG_NOT_ATTACHED: &str = "no kernel attach: nothing feeds the decision path on this node";
+pub const DEG_DATAPATH: &str =
+    "datapath degraded: a record carried a syscall nr this build cannot name";
+pub const DEG_CGROUP_INDEX_EMPTY: &str =
+    "cgroup index empty: every namespaced selector misses, whatever the policy says";
+pub const DEG_CONTAINER_MAP: &str =
+    "container map not ready: EVENT_FLAG_CONTAINER cannot be trusted, so containerOnly rules miss";
+pub const DEG_EXPORT_DEAD: &str = "export writer dead: enforcement runs and nothing records it";
+pub const DEG_EXPORT_LOSSY: &str = "export lost events recently: a kill may have left no record";
+pub const DEG_DECODE_FAILURES: &str = "records failed to decode recently: no rule saw them";
+pub const DEG_LABELS_UNKNOWN: &str =
+    "labels unknown recently: selectors were resolved fail-closed against caches with nothing in \
+     them";
+pub const DEG_RING_DROPS: &str = "in-kernel ring drops recently: records no rule ever saw";
+pub const DEG_PATH_TRUNCATED: &str =
+    "paths truncated recently: a suffix rule was decided without the bytes it names";
+pub const DEG_IDENTITY_UNKNOWN: &str = "identity unknown recently: a cgroup the index cannot name";
+pub const DEG_LKG_PARTIAL: &str =
+    "last-known-good partial: enforcing a subset of the snapshot that was signed";
+pub const DEG_CONTAINER_FLAG: &str =
+    "container flag disagreement outlived its publish window: the datapath is not flagging \
+     containers the index knows";
+/// Every waiver on this node names a policy this node is not running.
+pub const WAIVERS_UNJOINED: &str =
+    "waivers do not join this agent's policy: they are signed, verified, in scope and apply to \
+     nothing here";
+
 /// Bound on the per-cgroup disagreement window map. Beyond this the oldest
 /// windows are dropped; a cgroup that keeps disagreeing simply reopens one.
 const CONTAINER_FLAG_TRACKED_MAX: usize = 4096;
+
+/// One cgroup's answer to "has a scan been through since this question was
+/// first asked". `opened` is what decides that; `seen` is what decides which
+/// entries a full map may give up (see `evict_unproven`).
+#[derive(Clone, Copy)]
+struct UnprovenWindow {
+    opened: Instant,
+    seen: Instant,
+}
+
+/// Make room in the unproven window map.
+///
+/// The entries this map exists for are the OLD ones: an entry a sync has
+/// already passed over is the standing proof that its cgroup is a host
+/// process and not a container, and it answers `container_unproven` false for
+/// kubelet, containerd and sshd for as long as it lives. Dropping it and
+/// reinserting at `now` makes those unproven again until the next refresh —
+/// on a node with more than `CONTAINER_FLAG_TRACKED_MAX` distinct unresolved
+/// cgroups, forever, which is the permanent REFUSE_NOT_CONTAINER stream
+/// `containerOnly` was added to stop.
+///
+/// So the entries given up first are the ones that carry no proof yet: no
+/// sync has been through since they opened, and reopening them at `now` loses
+/// nothing they had. Only when every entry is settled is anything proven
+/// dropped, and then the least recently *seen* ones go: a cgroup that keeps
+/// raising records keeps its proof, a dead one ages out.
+///
+/// Not the same policy as `container_flag_window` (`note_container_flag_
+/// disagreement`), where an entry past grace has already been converted into
+/// a fault and removed, so the old entries there are the disposable ones.
+fn evict_unproven(windows: &mut HashMap<u64, UnprovenWindow>, synced_at: Option<Instant>) {
+    let before = windows.len();
+    let proven = |w: &UnprovenWindow| synced_at.is_some_and(|at| at > w.opened);
+    windows.retain(|_, w| proven(w));
+    if windows.len() < before {
+        return;
+    }
+    // Everything here is proven and the map is still full: nothing can be kept
+    // for free. Give up the least recently seen eighth.
+    let mut seen: Vec<Instant> = windows.values().map(|w| w.seen).collect();
+    seen.sort_unstable();
+    let cut = seen[before / 8];
+    windows.retain(|_, w| w.seen > cut);
+}
 
 fn mark_now(slot: &Mutex<Option<Instant>>, now: Instant) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
@@ -117,6 +196,21 @@ fn within(slot: &Mutex<Option<Instant>>, now: Instant, window: Duration) -> bool
 }
 
 pub use clock::{MonotonicFloor, MAX_EXCEPTION_DAYS};
+pub use status::{
+    status_json, write_status, StatusOutput, StatusPublisher, STATUS_NAME, STATUS_TMP_NAME,
+};
+
+/// The degraded state at one instant: whether, why, and — once per change —
+/// the line to log about it.
+#[derive(Debug, Clone)]
+pub struct DegradedState {
+    pub degraded: bool,
+    pub reasons: Vec<String>,
+    /// Some only on a transition into or out of Degraded, and only for the
+    /// first caller to observe that transition.
+    pub transition: Option<String>,
+}
+
 pub use pump::{pump_channel, pump_channel_host, pump_records, pump_records_host, PumpStats};
 pub use respond::{
     host_pid_namespace, host_pid_namespace_at, NoopResponder, ProcCgroupCheck, Responder,
@@ -257,9 +351,10 @@ pub struct Agent {
     container_flag_fault_at: Mutex<Option<Instant>>,
     /// First unflagged event seen per cgroup the index does not resolve, i.e.
     /// when the question "is this a container nobody has scanned yet, or a
-    /// process on the node that never will be one" was first asked about it.
-    /// Bounded by `CONTAINER_FLAG_TRACKED_MAX`.
-    container_unproven_window: Mutex<HashMap<u64, Instant>>,
+    /// process on the node that never will be one" was first asked about it,
+    /// plus when it was last asked. Bounded by `CONTAINER_FLAG_TRACKED_MAX`;
+    /// see `evict_unproven` for which entries a full map gives up.
+    container_unproven_window: Mutex<HashMap<u64, UnprovenWindow>>,
     /// `containerOnly` rules that would have decided a record and were skipped
     /// on a caller the agent could not prove was not a container.
     container_unproven: AtomicU64,
@@ -296,6 +391,10 @@ pub struct Agent {
     /// A fault nothing in this process will undo: the record path, or the
     /// agent-self identity the datapath needs. First reason wins.
     terminal_fault: Mutex<Option<String>>,
+    /// Last degraded state handed to a caller that logs transitions. None
+    /// until the first report, so the first tick always says which state the
+    /// node started in.
+    degraded_reported: Mutex<Option<bool>>,
 }
 
 impl Agent {
@@ -359,6 +458,7 @@ impl Agent {
             export_lost_at: Mutex::new(None),
             terminal_fault: Mutex::new(None),
             self_tgid_unpublished: AtomicBool::new(false),
+            degraded_reported: Mutex::new(None),
         };
         let _ = agent.restore_last_known_good();
         agent
@@ -373,60 +473,203 @@ impl Agent {
     }
 
     pub fn is_degraded(&self) -> bool {
-        self.cp_down
-            || self.loader.is_degraded()
-            || !self.pins_attached()
-            || self.datapath_degraded.load(Ordering::Relaxed)
-            // An empty cgroup index is not "no pods": every lookup misses, so
-            // every namespaced selector silently fails to match.
-            || self.cgroups.is_empty()
-            // The index alone proves nothing about the datapath: until those
-            // cgroups are in `ferrum_cgroups`, EVENT_FLAG_CONTAINER is never
-            // set and every container_only rule (shell, docker.sock) misses.
-            || !self.container_map_ready()
-            || self.export_dead.load(Ordering::Relaxed)
-            // Enforcement that happened and was not written down is the
-            // repudiation case: a full queue or a full disk loses the record
-            // of a kill on a node that would otherwise report healthy.
-            || self.export_lossy_recent()
-            // A record no rule ever saw is the same loss as a ring drop,
-            // whichever side of the ring dropped it.
-            || self.decode_failures_recent()
-            || self.terminal_fault().is_some()
-            // A selector the agent could not resolve is not a non-match: the
-            // rules were applied fail-closed, and that is a Degraded plane
-            // until the label caches catch up.
-            || self.labels_unknown_recent()
-            // An in-kernel drop under flood bounds the CPU cost, not the
-            // policy: the dropped record carried an event no rule ever saw.
-            // That is a missed enforcement, so it is Degraded while it lasts.
-            || self.ring_drops_recent()
-            // A path the datapath could not carry whole is a suffix rule
-            // decided without the bytes it names. The rule still fired, but on
-            // an assertion, and a node making those is Degraded.
-            || self.path_truncated_recent()
-            // A cgroup the index cannot name makes every namespaced selector
-            // answer "no match" for a reason that has nothing to do with the
-            // policy. That is a missed enforcement, not an allow.
-            || self.identity_unknown_recent()
-            // The node is enforcing less than the snapshot it restored. Not
-            // fail-open — the rules that were dropped can match no record —
-            // but the running policy is no longer the one that was signed.
-            || self.lkg_partial.load(Ordering::Relaxed)
-            || self.container_flag_degraded()
-            || self.respond_disabled_reason().is_some()
-            // Under respond only. Without `hostPID` the agent cannot publish
-            // `ferrum_self`, and that is the shipped base install: observe,
-            // no `hostPID`, and `lint-deploy` raises UNNEEDED_HOST_PID if an
-            // operator adds it. Treating it as a fault pinned every node in
-            // the fleet to Degraded from second one, drowning ring drops,
-            // label-unknown, export loss and last-known-good. The consequence
-            // there is one audit label the agent will not claim - the only
-            // `notAgentSelf` rule in the tree is `audit`. Under respond it is
-            // a different thing entirely: a wrong agent-self identity is a
-            // wrong kill target, so the operator who asked for respond must
-            // see it.
-            || (self.role.respond_enabled() && self.self_tgid_unpublished())
+        self.is_degraded_at(Instant::now())
+    }
+
+    pub fn is_degraded_at(&self, now: Instant) -> bool {
+        !self.degraded_reasons_at(now).is_empty()
+    }
+
+    /// Every reason the agent is Degraded, in the words an operator gets in
+    /// `status.json` and in the transition line. `is_degraded` is this list
+    /// being non-empty and nothing else: a signal that cannot be named here
+    /// cannot degrade the node, so no reason can be raised silently.
+    pub fn degraded_reasons_at(&self, now: Instant) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        // Every arm pushes a constant or the fault text it already holds.
+        if self.cp_down {
+            out.push(DEG_CONTROL_PLANE_DOWN.to_string());
+        }
+        if self.loader.is_degraded() {
+            out.push(DEG_LOADER.to_string());
+        }
+        if !self.pins_attached() {
+            out.push(DEG_NOT_ATTACHED.to_string());
+        }
+        if self.datapath_degraded.load(Ordering::Relaxed) {
+            out.push(DEG_DATAPATH.to_string());
+        }
+        // An empty cgroup index is not "no pods": every lookup misses, so
+        // every namespaced selector silently fails to match.
+        if self.cgroups.is_empty() {
+            out.push(DEG_CGROUP_INDEX_EMPTY.to_string());
+        }
+        // The index alone proves nothing about the datapath: until those
+        // cgroups are in `ferrum_cgroups`, EVENT_FLAG_CONTAINER is never
+        // set and every container_only rule (shell, docker.sock) misses.
+        if !self.container_map_ready_at(now) {
+            match self.container_map_error() {
+                Some(err) => out.push(format!("{DEG_CONTAINER_MAP}: {err}")),
+                None => out.push(DEG_CONTAINER_MAP.to_string()),
+            }
+        }
+        if self.export_dead.load(Ordering::Relaxed) {
+            out.push(DEG_EXPORT_DEAD.to_string());
+        }
+        // Enforcement that happened and was not written down is the
+        // repudiation case: a full queue or a full disk loses the record
+        // of a kill on a node that would otherwise report healthy.
+        if self.export_lossy_recent_at(now) {
+            out.push(DEG_EXPORT_LOSSY.to_string());
+        }
+        // A record no rule ever saw is the same loss as a ring drop,
+        // whichever side of the ring dropped it.
+        if self.decode_failures_recent_at(now) {
+            out.push(DEG_DECODE_FAILURES.to_string());
+        }
+        if let Some(fault) = self.terminal_fault() {
+            out.push(fault);
+        }
+        // A selector the agent could not resolve is not a non-match: the
+        // rules were applied fail-closed, and that is a Degraded plane
+        // until the label caches catch up.
+        if self.labels_unknown_recent_at(now) {
+            out.push(DEG_LABELS_UNKNOWN.to_string());
+        }
+        // An in-kernel drop under flood bounds the CPU cost, not the
+        // policy: the dropped record carried an event no rule ever saw.
+        // That is a missed enforcement, so it is Degraded while it lasts.
+        if self.ring_drops_recent_at(now) {
+            out.push(DEG_RING_DROPS.to_string());
+        }
+        // A path the datapath could not carry whole is a suffix rule
+        // decided without the bytes it names. The rule still fired, but on
+        // an assertion, and a node making those is Degraded.
+        if self.path_truncated_recent_at(now) {
+            out.push(DEG_PATH_TRUNCATED.to_string());
+        }
+        // A cgroup the index cannot name makes every namespaced selector
+        // answer "no match" for a reason that has nothing to do with the
+        // policy. That is a missed enforcement, not an allow.
+        if self.identity_unknown_recent_at(now) {
+            out.push(DEG_IDENTITY_UNKNOWN.to_string());
+        }
+        // The node is enforcing less than the snapshot it restored. Not
+        // fail-open — the rules that were dropped can match no record —
+        // but the running policy is no longer the one that was signed.
+        if self.lkg_partial.load(Ordering::Relaxed) {
+            out.push(DEG_LKG_PARTIAL.to_string());
+        }
+        if self.container_flag_degraded_at(now) {
+            out.push(DEG_CONTAINER_FLAG.to_string());
+        }
+        if let Some(reason) = self.respond_disabled_reason() {
+            out.push(reason);
+        }
+        // A node holding waivers that name another policy enforces as if it
+        // held none, and every counter around them still reads healthy.
+        if let Some(reason) = self.waivers_unjoined() {
+            out.push(reason);
+        }
+        // Under respond only. Without `hostPID` the agent cannot publish
+        // `ferrum_self`, and that is the shipped base install: observe,
+        // no `hostPID`, and `lint-deploy` raises UNNEEDED_HOST_PID if an
+        // operator adds it. Treating it as a fault pinned every node in
+        // the fleet to Degraded from second one, drowning ring drops,
+        // label-unknown, export loss and last-known-good. The consequence
+        // there is one audit label the agent will not claim - the only
+        // `notAgentSelf` rule in the tree is `audit`. Under respond it is
+        // a different thing entirely: a wrong agent-self identity is a
+        // wrong kill target, so the operator who asked for respond must
+        // see it.
+        if self.role.respond_enabled() && self.self_tgid_unpublished() {
+            out.push(SELF_TGID_UNPUBLISHED.to_string());
+        }
+        out
+    }
+
+    /// The degraded state, plus the one line to log if it just changed.
+    ///
+    /// Calling this records the state as reported: the transition is returned
+    /// once, to whoever is going to log it. Reports, never acts — see
+    /// `status` for why no probe may be wired to this.
+    pub fn degraded_state_at(&self, now: Instant) -> DegradedState {
+        let reasons = self.degraded_reasons_at(now);
+        let degraded = !reasons.is_empty();
+        let mut last = self
+            .degraded_reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let changed = *last != Some(degraded);
+        *last = Some(degraded);
+        drop(last);
+        let transition = changed.then(|| {
+            serde_json::json!({
+                "event": "degraded_transition",
+                "degraded": degraded,
+                "reasons": reasons,
+            })
+            .to_string()
+        });
+        DegradedState {
+            degraded,
+            reasons,
+            transition,
+        }
+    }
+
+    /// Loaded exceptions whose target names a policy this node is not
+    /// running. Every one of them was signed, verified, counted and logged as
+    /// reloaded, and can waive nothing here.
+    pub fn waivers_unjoined_total(&self) -> u64 {
+        self.exceptions
+            .iter()
+            .filter(|spec| !spec.target.policies.iter().any(|p| *p == self.policy_name))
+            .count() as u64
+    }
+
+    /// "I hold waivers and none of them names my policy."
+    ///
+    /// The FRMB carries no policy name, so nothing joins `--policy-name` to
+    /// the bundle in the mounted Secret: rename the policy, or run a second
+    /// one, and every waiver on the node silently applies to nothing while
+    /// kills a live waiver should have demoted keep firing. That join cannot
+    /// be proven here without a bundle format change, so it is *stated*
+    /// instead — and `lint-deploy` FD024 checks the other end of it, against
+    /// objects already deployed.
+    pub fn waivers_unjoined(&self) -> Option<String> {
+        let held = self.exceptions.len();
+        if held == 0 {
+            return None;
+        }
+        if self
+            .exceptions
+            .iter()
+            .any(|spec| spec.target.policies.iter().any(|p| *p == self.policy_name))
+        {
+            return None;
+        }
+        let named: BTreeSet<&str> = self
+            .exceptions
+            .iter()
+            .flat_map(|spec| spec.target.policies.iter().map(String::as_str))
+            .collect();
+        let named = if named.is_empty() {
+            "none".to_string()
+        } else {
+            named.into_iter().collect::<Vec<_>>().join(", ")
+        };
+        Some(if self.policy_name.is_empty() {
+            format!(
+                "{WAIVERS_UNJOINED}: {held} loaded, and this agent was started without \
+                 --policy-name, so no waiver can ever apply (they name: {named})"
+            )
+        } else {
+            format!(
+                "{WAIVERS_UNJOINED}: {held} loaded, none names policy '{}' (they name: {named})",
+                self.policy_name
+            )
+        })
     }
 
     /// The kernel container map is usable: last sync succeeded and it holds
@@ -574,10 +817,14 @@ impl Agent {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if windows.len() >= CONTAINER_FLAG_TRACKED_MAX && !windows.contains_key(&cgroup_id) {
-            windows
-                .retain(|_, opened| now.saturating_duration_since(*opened) < CONTAINER_FLAG_GRACE);
+            evict_unproven(&mut windows, synced_at);
         }
-        let opened = *windows.entry(cgroup_id).or_insert(now);
+        let entry = windows.entry(cgroup_id).or_insert(UnprovenWindow {
+            opened: now,
+            seen: now,
+        });
+        entry.seen = now;
+        let opened = entry.opened;
         // A scan that resolved after the question was first asked had every
         // container running at that moment in it, this one included.
         !synced_at.is_some_and(|at| at > opened)
@@ -761,13 +1008,20 @@ impl Agent {
     /// alone only covers a writer that is gone; a full queue and a failed
     /// write lose the record of a kill that really happened while every other
     /// signal still reads healthy (RFC-02 §C, repudiation).
-    pub fn note_export_state_at<S: EventSink>(&self, sink: &S, now: Instant) {
+    ///
+    /// All three losses are summed. Leaving `export_writer_lost_total` out
+    /// froze the number an operator reads at the exact moment it matters
+    /// most: after the writer thread dies every further event is counted
+    /// there and nowhere else, so `export_lost_total` stood still while the
+    /// node lost every record it produced.
+    pub fn note_export_state_at<S: EventSink + ?Sized>(&self, sink: &S, now: Instant) {
         if sink.export_writer_dead() {
             self.export_dead.store(true, Ordering::Relaxed);
         }
         let lost = sink
             .export_queue_dropped_total()
-            .saturating_add(sink.export_write_failed_total());
+            .saturating_add(sink.export_write_failed_total())
+            .saturating_add(sink.export_writer_lost_total());
         let seen = self.export_lost_seen.swap(lost, Ordering::Relaxed);
         if lost > seen {
             mark_now(&self.export_lost_at, now);
@@ -1191,6 +1445,11 @@ impl Agent {
         self.lkg_rules_dropped.load(Ordering::Relaxed)
     }
 
+    /// The policy in force is a subset of the snapshot that was signed.
+    pub fn lkg_partial(&self) -> bool {
+        self.lkg_partial.load(Ordering::Relaxed)
+    }
+
     fn persist_fsig(&self, fsig: &[u8], digest: &Digest) -> Result<()> {
         let dir = match &self.lkg_dir {
             Some(dir) => dir,
@@ -1365,7 +1624,17 @@ impl Agent {
             } else {
                 decision.action.as_str().into()
             },
-            image_digest: None,
+            // The one field that joins this record to the supply-chain side of
+            // the same workload. The pod watch fills it and the selector
+            // already matches on it; hardcoding None here made every record
+            // the agent ever wrote unjoinable. Absent (not empty) when the
+            // index has no digest for the cgroup, so "unknown" stays distinct
+            // from "the empty digest".
+            image_digest: if identity.image_digest.is_empty() {
+                None
+            } else {
+                Some(Digest::new(identity.image_digest.clone()))
+            },
             pod: identity.pod,
             namespace: identity.namespace,
             comm: event.comm.into(),
@@ -1633,20 +1902,21 @@ pub fn apply_role(role: AgentRole, action: Action) -> Action {
 /// Uses mtime+len and follows kubelet `..data`; a vanished bundle keeps
 /// last-good. The sibling `exceptions.fsig` rides the same interval; unlike
 /// the bundle, a vanished exceptions file clears waivers (TTL'd data, no LKG).
-/// `export`, when present, tracks the agent's digest/degraded state so every
-/// exported envelope carries the state at emit time.
+/// `out` is where the tick publishes node state: the envelope context so
+/// every exported record carries the state at emit time, the `status.json`
+/// beside the events, and the stderr line on a degraded transition.
 pub fn poll_bundle(
     agent: &mut Agent,
     path: &Path,
     interval: Duration,
-    export: Option<&ferrum_export::SinkContext>,
+    out: &StatusOutput<'_>,
 ) -> ! {
     // Stat the path as given so kubelet `..data` rotates are visible; do not canonicalize.
     // Start with no stamp so a rotation between first load and this thread is not skipped.
     let mut stamps = PollStamps::default();
     loop {
         std::thread::sleep(interval);
-        poll_once(agent, path, &mut stamps, export);
+        poll_once(agent, path, &mut stamps, out);
     }
 }
 
@@ -1657,13 +1927,28 @@ pub fn poll_bundle_shared(
     agent: &std::sync::RwLock<Agent>,
     path: &Path,
     interval: Duration,
-    export: Option<&ferrum_export::SinkContext>,
+    out: &StatusOutput<'_>,
 ) -> ! {
     let mut stamps = PollStamps::default();
     loop {
         std::thread::sleep(interval);
         let mut guard = agent.write().unwrap_or_else(|e| e.into_inner());
-        poll_once(&mut guard, path, &mut stamps, export);
+        poll_once(&mut guard, path, &mut stamps, out);
+    }
+}
+
+/// The state-publish half of a poll tick, for a caller with no bundle to
+/// watch: an agent that never reloads must still say what it is, and must
+/// still notice that its exports are being lost.
+pub fn poll_status(
+    agent: &std::sync::RwLock<Agent>,
+    interval: Duration,
+    out: &StatusOutput<'_>,
+) -> ! {
+    let mut publisher = StatusPublisher::default();
+    loop {
+        std::thread::sleep(interval);
+        publisher.publish(&agent.read().unwrap_or_else(|e| e.into_inner()), out);
     }
 }
 
@@ -1671,14 +1956,10 @@ pub fn poll_bundle_shared(
 struct PollStamps {
     bundle: Option<source::SourceStamp>,
     exceptions: Option<source::FileStamp>,
+    publisher: StatusPublisher,
 }
 
-fn poll_once(
-    agent: &mut Agent,
-    path: &Path,
-    stamps: &mut PollStamps,
-    export: Option<&ferrum_export::SinkContext>,
-) {
+fn poll_once(agent: &mut Agent, path: &Path, stamps: &mut PollStamps, out: &StatusOutput<'_>) {
     if let Some(next) = source::source_stamp(path) {
         if Some(next) != stamps.bundle {
             stamps.bundle = Some(next);
@@ -1703,10 +1984,7 @@ fn poll_once(
         }
     }
     agent.clock().persist();
-    if let Some(ctx) = export {
-        ctx.set_bundle_digest(agent.last_good_digest().cloned());
-        ctx.set_degraded(agent.is_degraded());
-    }
+    stamps.publisher.publish(agent, out);
 }
 
 fn lkg_present(dir: &Path) -> bool {
@@ -1770,6 +2048,15 @@ impl Agent {
 
     fn policy_degraded(&self) -> bool {
         self.loader.is_degraded()
+    }
+
+    /// The bound on the unproven window map is part of what `evict_unproven`
+    /// promises, so a test has to be able to see it.
+    fn unproven_window_len(&self) -> usize {
+        self.container_unproven_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -4633,5 +4920,343 @@ mod tests {
         ));
         fs::create_dir_all(&dir).expect("tmpdir");
         dir
+    }
+
+    /// A5. The digest is what joins a runtime kill to a supply-chain finding
+    /// about the same image, and it was hardcoded `None` on every record the
+    /// agent ever wrote.
+    #[test]
+    fn the_record_carries_the_image_digest_the_index_resolved() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, pci_identity());
+        agent.set_container_map_synced(1);
+
+        let sink = MemorySink::new();
+        agent.handle_event(7, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+        let event = &sink.events()[0];
+        assert_eq!(
+            event.image_digest.as_ref().map(Digest::as_str),
+            Some("sha256:abc"),
+            "the pod watch resolved a digest and the record must carry it"
+        );
+
+        // An index entry with no digest stays absent, not empty: "unknown" and
+        // "the empty digest" are different answers.
+        agent.insert_cgroup(8, identity("pod-b"));
+        agent.handle_event(8, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+        assert_eq!(sink.events()[1].image_digest, None);
+    }
+
+    /// A7. The window map keeps the entries that make an answer "proven": a
+    /// settled host cgroup evicted and reopened at `now` is unproven again,
+    /// and on a node past `CONTAINER_FLAG_TRACKED_MAX` that repeats forever —
+    /// kubelet, containerd and sshd flipping back to REFUSE_NOT_CONTAINER
+    /// every couple of seconds with `is_degraded()` false throughout.
+    #[test]
+    fn a_settled_host_cgroup_survives_a_flood_of_unproven_cgroups() {
+        const HOST: u64 = 42;
+        let agent = healthy_agent();
+        let base = Instant::now();
+        agent.set_container_map_synced_at(1, base);
+
+        // First question about the host cgroup: nothing has scanned since, so
+        // the honest answer is "unproven".
+        assert!(agent.container_unproven(HOST, base));
+        // A scan that resolved after the question settles it: not a container,
+        // and not one for as long as the entry lives.
+        agent.set_container_map_synced_at(1, base + Duration::from_secs(1));
+        assert!(!agent.container_unproven(HOST, base + Duration::from_secs(2)));
+
+        // A node whose distinct unresolved-cgroup count crosses the bound,
+        // long enough after the host entry opened that an eviction by age
+        // would take it.
+        let late = base + Duration::from_secs(10);
+        agent.set_container_map_synced_at(1, base + Duration::from_secs(9));
+        for cgroup in 0..(CONTAINER_FLAG_TRACKED_MAX as u64 + 64) {
+            assert!(agent.container_unproven(1_000 + cgroup, late));
+        }
+
+        assert!(
+            !agent.container_unproven(HOST, late + Duration::from_secs(1)),
+            "an old entry here is a settled host cgroup, not a stale one"
+        );
+        assert!(agent.unproven_window_len() <= CONTAINER_FLAG_TRACKED_MAX);
+    }
+
+    /// The bound holds even when every entry is proven and none can be given
+    /// up for free.
+    #[test]
+    fn the_unproven_window_stays_bounded_when_every_entry_is_proven() {
+        let agent = healthy_agent();
+        let base = Instant::now();
+        agent.set_container_map_synced_at(1, base);
+        for cgroup in 0..(CONTAINER_FLAG_TRACKED_MAX as u64 * 2) {
+            // Each entry opens, then a later sync settles it before the next.
+            agent.container_unproven(cgroup, base + Duration::from_millis(cgroup));
+            agent.set_container_map_synced_at(1, base + Duration::from_millis(cgroup + 1));
+        }
+        assert!(agent.unproven_window_len() <= CONTAINER_FLAG_TRACKED_MAX);
+    }
+
+    /// A8. Waivers that name another policy are signed, verified, in scope,
+    /// counted, logged as reloaded — and apply to nothing. The join cannot be
+    /// proven here (the FRMB carries no policy name), so it is stated.
+    #[test]
+    fn waivers_that_name_another_policy_are_reported_not_silently_ignored() {
+        let mut agent = Agent::new(cfg_respond_named("prod-restricted"));
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.set_attached(true);
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_container_map_synced(1);
+        assert!(!agent.is_degraded());
+
+        agent.set_exceptions(vec![waiver("ns", "prod-restricted", &["no-runtime-sock"])]);
+        assert_eq!(agent.waivers_unjoined(), None);
+        assert_eq!(agent.waivers_unjoined_total(), 0);
+        assert!(!agent.is_degraded());
+
+        // The policy was renamed, or a second one runs on this node: the
+        // waiver still loads, and now waives nothing.
+        agent.set_exceptions(vec![waiver("ns", "prod-strict", &["no-runtime-sock"])]);
+        let reason = agent.waivers_unjoined().expect("unjoined waivers");
+        assert!(reason.contains(WAIVERS_UNJOINED), "{reason}");
+        assert!(reason.contains("prod-restricted"), "{reason}");
+        assert!(reason.contains("prod-strict"), "{reason}");
+        assert_eq!(agent.waivers_unjoined_total(), 1);
+        assert!(agent.is_degraded());
+        assert!(agent
+            .degraded_reasons_at(Instant::now())
+            .iter()
+            .any(|r| r.contains(WAIVERS_UNJOINED)));
+
+        // The kill the waiver would have demoted still fires, which is why
+        // this has to be said out loud.
+        let sink = MemorySink::new();
+        let d = agent.handle_event_at(
+            7,
+            &ev("openat", "app", "/var/run/docker.sock", true, false),
+            &sink,
+            fixed_now(),
+        );
+        assert_eq!(d.action, Action::Kill);
+    }
+
+    /// An empty `--policy-name` is the same defect with no rename involved:
+    /// `waiver_applies` returns None on the first line.
+    #[test]
+    fn an_agent_with_no_policy_name_says_its_waivers_can_never_apply() {
+        let mut agent = Agent::new(cfg());
+        agent.set_exceptions(vec![waiver("ns", "prod-restricted", &["no-runtime-sock"])]);
+        let reason = agent.waivers_unjoined().expect("unjoined waivers");
+        assert!(reason.contains("--policy-name"), "{reason}");
+        assert_eq!(agent.waivers_unjoined_total(), 1);
+    }
+
+    /// A9, the counter half: after the export writer dies every further event
+    /// is counted as a writer loss and nowhere else. Leaving that counter out
+    /// froze `export_lost_total` at the moment it mattered most.
+    #[test]
+    fn a_dead_writer_keeps_moving_the_export_loss_counter() {
+        struct DeadWriter {
+            lost: AtomicU64,
+        }
+        impl EventSink for DeadWriter {
+            fn emit(&self, _event: &EnforcementEvent) {
+                self.lost.fetch_add(1, Ordering::Relaxed);
+            }
+            fn export_writer_lost_total(&self) -> u64 {
+                self.lost.load(Ordering::Relaxed)
+            }
+            fn export_writer_dead(&self) -> bool {
+                self.lost.load(Ordering::Relaxed) > 0
+            }
+        }
+
+        let agent = healthy_agent();
+        let sink = DeadWriter {
+            lost: AtomicU64::new(0),
+        };
+        let t0 = Instant::now();
+        agent.note_export_state_at(&sink, t0);
+        assert_eq!(agent.export_lost_total(), 0);
+
+        sink.emit(&sample_event());
+        sink.emit(&sample_event());
+        agent.note_export_state_at(&sink, t0);
+        assert_eq!(
+            agent.export_lost_total(),
+            2,
+            "every record lost after the writer died must be counted"
+        );
+        assert!(agent.export_writer_dead());
+        assert!(agent.export_lossy_recent_at(t0));
+    }
+
+    fn sample_event() -> EnforcementEvent {
+        EnforcementEvent {
+            policy: PolicyId::new("p"),
+            rule: RuleId::new("r"),
+            action: "kill".into(),
+            image_digest: None,
+            pod: "web".into(),
+            namespace: "ns".into(),
+            comm: "sh".into(),
+            syscall: "execve".into(),
+            pid: 1,
+            tgid: 1,
+            executed: false,
+            respond_error: None,
+            labels_unknown: false,
+            path_unknown: false,
+            container_unknown: false,
+            waiver: None,
+        }
+    }
+
+    /// A9. Eight cycles of counters had exactly one consumer: a bool on each
+    /// envelope. This is the reader — a file beside the events, written whole
+    /// or not at all, plus one line per transition. It reports; it never acts.
+    #[test]
+    fn the_poll_tick_publishes_a_whole_status_file_and_logs_transitions() {
+        let dir = temp_dir("status");
+        let agent = healthy_agent();
+        let sink = MemorySink::new();
+        let ctx = ferrum_export::SinkContext::new("node-1", "observe");
+        let out = StatusOutput {
+            ctx: Some(&ctx),
+            sink: Some(&sink),
+            status_dir: Some(&dir),
+        };
+        let mut publisher = StatusPublisher::default();
+
+        let first = publisher.publish(&agent, &out);
+        assert!(!first.degraded);
+        let line = first.transition.expect("the first tick names the state");
+        assert!(line.contains("\"degraded\":false"), "{line}");
+
+        let raw = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("whole JSON object");
+        assert_eq!(value["node"], "node-1");
+        assert_eq!(value["degraded"], false);
+        assert_eq!(
+            value["degradedReasons"].as_array().expect("reasons").len(),
+            0
+        );
+        // The counters that had no reader at all.
+        for key in [
+            "respondKillTotal",
+            "respondRefusedTotal",
+            "respondRoleSkippedTotal",
+            "respondFailedTotal",
+            "respondStaleTargetTotal",
+            "exportLostTotal",
+            "exportWriterLostTotal",
+            "containerFlagDisagreementTotal",
+            "containerUnprovenTotal",
+            "labelsUnknownTotal",
+            "identityUnknownTotal",
+            "eventsDroppedTotal",
+            "recordsDecodeFailedTotal",
+            "decodeFailureRun",
+            "datapathAbiMismatchTotal",
+            "unknownSyscallTotal",
+            "pathTruncatedTotal",
+            "exceptionsReloadFailedTotal",
+            "lkgRulesDroppedTotal",
+            "clockRollbackTotal",
+            "waiversUnjoinedTotal",
+        ] {
+            assert!(value[key].is_u64(), "status.json carries no {key}");
+        }
+
+        // A steady state is not a transition: only a change gets a line.
+        assert!(publisher.publish(&agent, &out).transition.is_none());
+
+        agent.record_drop_at(3, Instant::now());
+        let degraded = publisher.publish(&agent, &out);
+        assert!(degraded.degraded);
+        let line = degraded.transition.expect("entering Degraded is a line");
+        assert!(line.contains(DEG_RING_DROPS), "{line}");
+        let raw = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("whole JSON object");
+        assert_eq!(value["degraded"], true);
+        assert_eq!(value["eventsDroppedTotal"], 3);
+        assert!(value["degradedReasons"]
+            .as_array()
+            .expect("reasons")
+            .iter()
+            .any(|r| r == DEG_RING_DROPS));
+        // Nothing is left behind for a reader to trip over.
+        assert!(!dir.join(STATUS_TMP_NAME).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The timer is the second caller of `note_export_state_at`: a node that
+    /// stops receiving events must not stop noticing that its exports are
+    /// being lost.
+    #[test]
+    fn the_status_tick_reads_export_losses_with_no_events_at_all() {
+        let dir = temp_dir("status-export");
+        let agent = healthy_agent();
+        let sink = MemorySink::new();
+        sink.record_drop(5);
+        let out = StatusOutput {
+            ctx: None,
+            sink: Some(&sink),
+            status_dir: Some(&dir),
+        };
+        let state = StatusPublisher::default().publish(&agent, &out);
+        assert!(state.degraded);
+        assert!(state.reasons.iter().any(|r| r == DEG_EXPORT_LOSSY));
+        assert_eq!(agent.export_lost_total(), 5);
+        let raw = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("JSON");
+        assert_eq!(value["exportWriteFailedTotal"], 5);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Written whole or not at all: the publish is a rename inside the same
+    /// directory, so a reader never sees a partial file and a crash mid-write
+    /// cannot truncate the published one.
+    #[test]
+    fn status_is_published_by_rename_over_a_complete_previous_file() {
+        let dir = temp_dir("status-atomic");
+        let agent = healthy_agent();
+        let out = StatusOutput {
+            ctx: None,
+            sink: None,
+            status_dir: Some(&dir),
+        };
+        let mut publisher = StatusPublisher::default();
+        publisher.publish(&agent, &out);
+        let first = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+
+        // A leftover temp file from a crashed write is overwritten, never
+        // appended to, and never becomes the published file by itself.
+        fs::write(dir.join(STATUS_TMP_NAME), b"{\"truncated\":").expect("write tmp");
+        agent.record_drop_at(1, Instant::now());
+        publisher.publish(&agent, &out);
+        let second = fs::read_to_string(dir.join(STATUS_NAME)).expect("status.json");
+        assert_ne!(first, second);
+        serde_json::from_str::<serde_json::Value>(&second).expect("whole JSON object");
+        assert!(!dir.join(STATUS_TMP_NAME).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that cannot be written is said once, not once a tick, and
+    /// never stops the agent: the surface reports, it does not act.
+    #[test]
+    fn an_unwritable_status_dir_does_not_stop_the_tick() {
+        let agent = healthy_agent();
+        let out = StatusOutput {
+            ctx: None,
+            sink: None,
+            status_dir: Some(Path::new("/proc/ferrum-does-not-exist")),
+        };
+        let mut publisher = StatusPublisher::default();
+        assert!(!publisher.publish(&agent, &out).degraded);
+        assert!(!publisher.publish(&agent, &out).degraded);
     }
 }
