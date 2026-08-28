@@ -2620,3 +2620,222 @@ mod build_closure {
         );
     }
 }
+
+/// The one file the SAST stage does not scan, and the reason that is not a hole.
+///
+/// `deploy-bad-private-key/ca.key` exists so FD023 has something to fire on: a
+/// PEM header inside a tree that gets committed. semgrep's secret rule reads
+/// the same header and calls it a leaked key, so the two gates were each
+/// other's failure — the SAST stage denied every build on the fixture that
+/// proves the deploy lint works, and it denied it first, so nothing below it
+/// ran at all.
+///
+/// An exclusion nobody watches is the more expensive of the two failures. This
+/// module is the watcher, and it holds three things, none of which semgrep can
+/// hold for itself: the stage excludes exactly this one path, the file it
+/// excludes is not key material, and the lint that owns the fixture still
+/// calls it a finding. Break any one and this gate fails — a second
+/// `--exclude`, a fixture quietly replaced by a real key, or an FD023 that
+/// stopped firing.
+mod scan_exclusions {
+    use ferrum_cli::lint_deploy::lint_deploy_dir;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// Every path the pipeline is allowed to hide from the secret scanner.
+    /// Adding an entry is a deliberate act: it fails this gate until it is
+    /// written here, and then it has to survive the checks below.
+    const EXCLUDED: [&str; 1] = ["crates/ferrum-testkit/fixtures/deploy-bad-private-key/ca.key"];
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    /// Every `--exclude='…'` the pipeline passes to semgrep, from any stage.
+    /// Deliberately not scoped to `SAST (semgrep)`: an exclusion added to some
+    /// other stage would be exactly as unwatched.
+    fn pipeline_exclusions() -> BTreeSet<String> {
+        let text = std::fs::read_to_string(repo_root().join("Jenkinsfile")).expect("Jenkinsfile");
+        text.lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("--exclude=")?;
+                let rest = rest.strip_prefix('\'')?;
+                let (path, _) = rest.split_once('\'')?;
+                Some(path.to_string())
+            })
+            .collect()
+    }
+
+    /// The first byte of a PEM block's payload.
+    ///
+    /// Every DER-encoded private key — SEC1, PKCS#1, PKCS#8 alike — opens with
+    /// a SEQUENCE tag, `0x30`. A fixture that only has to carry the header can
+    /// put anything after it, and this is what tells the two apart without a
+    /// parser and without a base64 crate in this graph.
+    fn pem_payload_first_byte(text: &str) -> u8 {
+        let payload = text
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("-----BEGIN "))
+            .skip(1)
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("-----END"))
+            .expect("PEM payload");
+        let quad: Vec<u8> = payload
+            .trim()
+            .bytes()
+            .take(4)
+            .map(|c| {
+                B64.iter()
+                    .position(|&a| a == c)
+                    .unwrap_or_else(|| panic!("not base64: {c:?}")) as u8
+            })
+            .collect();
+        assert_eq!(quad.len(), 4, "PEM payload shorter than one base64 quad");
+        (quad[0] << 2) | (quad[1] >> 4)
+    }
+
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    #[test]
+    fn the_scanner_skips_exactly_the_files_this_gate_vouches_for() {
+        let expected: BTreeSet<String> = EXCLUDED.iter().map(|p| p.to_string()).collect();
+        assert_eq!(
+            pipeline_exclusions(),
+            expected,
+            "an --exclude this gate does not vouch for is a file nothing scans"
+        );
+    }
+
+    #[test]
+    fn every_excluded_file_is_a_fixture_that_only_looks_like_a_key() {
+        for rel in EXCLUDED {
+            assert!(
+                rel.starts_with("crates/") && rel.contains("/fixtures/"),
+                "{rel}: only a fixture may be hidden from the scanner"
+            );
+            let text = std::fs::read_to_string(repo_root().join(rel))
+                .unwrap_or_else(|err| panic!("{rel}: {err}"));
+            assert!(
+                text.lines()
+                    .any(|l| l.trim_start().starts_with("-----BEGIN ")
+                        && l.trim_end().trim_end_matches('-').ends_with("PRIVATE KEY")),
+                "{rel}: excluded from the secret scanner but carries no PEM private-key \
+                 header — then it was excluded for some other reason, and this gate does \
+                 not know what it is"
+            );
+            assert_ne!(
+                pem_payload_first_byte(&text),
+                0x30,
+                "{rel}: payload opens with a DER SEQUENCE, which is what real key material \
+                 does. This is not a fixture any more, and the scanner is being told to \
+                 ignore a key"
+            );
+        }
+    }
+
+    /// The direction the exclusion could rot in: FD023 stops firing, the
+    /// fixture stops being checked by anything at all, and both gates are
+    /// green.
+    #[test]
+    fn the_excluded_fixture_is_still_a_finding_for_the_lint_that_owns_it() {
+        for rel in EXCLUDED {
+            let dir = repo_root()
+                .join(rel)
+                .parent()
+                .expect("fixture dir")
+                .to_path_buf();
+            let err = lint_deploy_dir(&dir)
+                .expect_err("a private key in the deploy tree must still fail the lint");
+            assert!(err.to_string().contains("violated"), "{err}");
+        }
+    }
+}
+
+/// The image is a claim about a platform, and until this gate the claim was
+/// made by the machine that happened to run `docker build`.
+///
+/// Every binary in these images is linked for `x86_64-unknown-linux-musl` —
+/// the stand the kernel rows are measured on. `docker build` on an arm64 node
+/// stamps the image `linux/arm64` anyway, because the platform comes from the
+/// daemon and not from the payload. The result is an image that runs nowhere:
+/// wrong architecture on an arm64 node, wrong manifest on an x86_64 one. None
+/// of the checks *inside* the Dockerfiles can see it — they read the binary,
+/// and the binary is correct; what is wrong is the manifest around it.
+///
+/// The two halves have to agree, so both are read here: the builder stage
+/// stays on `$BUILDPLATFORM` (compile natively, cross to the target), and the
+/// build command names the target platform explicitly.
+mod image_platform {
+    use std::path::{Path, PathBuf};
+
+    /// The triple the linking stages build, and the platform its images must
+    /// declare. One is the Rust spelling and the other is Docker's; they are
+    /// written here side by side because nothing else in the tree joins them.
+    const TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
+    const TARGET_PLATFORM: &str = "linux/amd64";
+
+    const DOCKERFILES: [&str; 3] = [
+        "Dockerfile",
+        "Dockerfile.admission",
+        "Dockerfile.controller",
+    ];
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> String {
+        let path = repo_root().join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    #[test]
+    fn every_docker_build_names_the_platform_its_binaries_are_linked_for() {
+        let jenkinsfile = read("Jenkinsfile");
+        let builds: Vec<&str> = jenkinsfile
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("docker build"))
+            .collect();
+        assert_eq!(
+            builds.len(),
+            DOCKERFILES.len(),
+            "one `docker build` per shipped image, no more and no fewer: {builds:?}"
+        );
+        for line in builds {
+            assert!(
+                line.contains(&format!("--platform={TARGET_PLATFORM}")),
+                "`{line}` does not name --platform={TARGET_PLATFORM}, so the image it \
+                 produces is stamped with whatever architecture the node happens to have"
+            );
+        }
+    }
+
+    #[test]
+    fn every_builder_stage_compiles_on_the_machine_it_runs_on() {
+        for file in DOCKERFILES {
+            let text = read(file);
+            let from = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("FROM") && l.contains("AS build"))
+                .unwrap_or_else(|| panic!("{file}: no builder stage"));
+            assert!(
+                from.contains("--platform=$BUILDPLATFORM"),
+                "{file}: `{from}` would run the whole build under emulation on a node of \
+                 another architecture, and rustc does not survive that"
+            );
+            assert!(
+                text.contains(TARGET_TRIPLE),
+                "{file}: builds no {TARGET_TRIPLE} binary, so the platform this gate \
+                 requires of its image is not the platform of what is inside it"
+            );
+        }
+    }
+}

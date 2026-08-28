@@ -38,25 +38,35 @@ ARG RUST_IMAGE=rust:1.75-bookworm
 ARG TARGET=x86_64-unknown-linux-musl
 ARG BPF_ELF=dist/ferrum-ebpf-progs.bpf.o
 
-FROM ${RUST_IMAGE} AS build
+# --platform=$BUILDPLATFORM: собирать натив, а образ помечать целевой
+# платформой. Без этого `docker build` на arm64-ноде клеймит образ
+# linux/arm64, а внутри лежит x86_64-бинарь — образ, который не
+# запустится ни там, ни там, и ни одна проверка внутри него этого не
+# видит: они читают сам файл, а не манифест вокруг него.
+FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS build
 ARG TARGET
 ARG BPF_ELF
 
-# musl, not gnu: AGENTS.md requires it of userspace, and a static agent is one
-# fewer thing that has to match the node's libc. ring compiles C, so the musl
-# target needs its own cc as well as the Rust std.
+# musl, not gnu, и цель x86_64 берётся кроссом, а не архитектурой демона:
+# `docker build` идёт на ноде, а нода здесь arm64. musl-tools дал бы musl-gcc
+# родной архитектуры, который не понимает -m64 в C-половине ring; линкует
+# rust-lld тем musl, который везёт rustup. `rustup target add` стоит ниже COPY
+# намеренно: rust-toolchain.toml пинит тулчейн, и до появления исходников цель
+# ставится не тому, который потом собирает.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends musl-tools \
- && rm -rf /var/lib/apt/lists/* \
- && rustup target add "${TARGET}"
+ && apt-get install -y --no-install-recommends \
+        gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
 
 # --locked: the image is a release artefact, and a build that may resolve a
 # different dependency set than CI tested is not one.
-RUN CC_x86_64_unknown_linux_musl=musl-gcc \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+RUN rustup target add "${TARGET}" \
+ && CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+    RUSTFLAGS="-C link-self-contained=yes" \
     cargo build --release --locked --target "${TARGET}" \
         -p ferrum-agent --features attach,apiserver \
  && cp "target/${TARGET}/release/ferrum-agent" /ferrum-agent

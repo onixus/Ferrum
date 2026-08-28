@@ -64,11 +64,23 @@
 
 Ссылка `Jenkinsfile::<стадия>` утверждает ровно одно: стадия с таким именем
 есть в поставляемом `Jenkinsfile`. Это единственное, что проверяет гейт, и
-это меньше, чем читается. Она **не** утверждает, что стадию исполнял Jenkins:
-ни один Jenkins этот файл не запускал ни разу. `U` на такой строке — слово
-автора о том, что команды стадии были прогнаны руками на этом дереве. Поэтому
-`Agent image` в «Делает» не цитируется нигде: её собственная команда —
-`docker build`, а демона здесь нет, и она не исполнялась ни Jenkins, ни руками.
+это меньше, чем читается. Она **не** утверждает, что стадию исполнял Jenkins,
+и гейт этого проверить не может: между «стадия есть» и «стадия зелёная» он не
+различает.
+
+Что известно про исполнение на 2026-08-28, и известно из логов билдов, а не из
+этого абзаца: локальный Jenkins прогнал этот `Jenkinsfile`, и шестнадцать
+стадий из девятнадцати прошли — всё, кроме группы `Datapath`. Три её стадии
+(`BPF attach`, `BPF join`, `BPF join mutations`) на той ноде не исполнялись
+вовсе: ядро в LinuxKit VM без tracefs, eBPF-карту создать нельзя, и
+`FERRUM_BPF_ELF_REQUIRED` превращает пропуск в падение — стадия отказывается
+пройти, не исполнившись. Всё с меткой `K` в этом документе измерено на другом
+стенде и по-прежнему только там.
+
+Эта нода — не стенд `K`: она arm64, и цель `x86_64-unknown-linux-musl` берётся
+на ней кросс-компиляцией. Прошедшая стадия `Agent binary` говорит, что
+продуктовая комбинация линкуется и не несёт интерпретатора; она не говорит,
+что этот бинарь запускали.
 
 Колонка «Метка» — множество меток строки, отсортированное и слитое через `+`.
 Слова «частично доказано» здесь нет намеренно: это честное слово, и это ровно
@@ -192,6 +204,7 @@
 | Набор строк-доказательств, которых требует стадия стыка, задан вне файла, который она читает: выпотрошенная kill-половина любого §D-теста — падение, а не молчаливо укоротившийся набор | U | U `join_evidence.rs::every_required_kill_still_reaches_a_confirmed_sigkill` · U `join_evidence.rs::the_join_prints_exactly_the_evidence_lines_this_file_requires` · U `join_evidence.rs::every_required_kill_is_a_row_the_boundary_document_cites` · U `join_evidence.rs::the_body_reader_finds_one_test_and_notices_a_gutted_one` · U `Jenkinsfile::BPF join` |
 | Мутаций ровно шесть, и harness отказывается измерять набор, который не совпадает с этим списком: удалить пять из шести — падение под обычным `cargo test`, а не зелёная стадия, измерившая одну | U | U `mutation_manifest.rs::the_mutation_set_is_the_one_the_gate_is_measured_against` · U `mutation_manifest.rs::every_mutation_targets_a_file_that_still_exists` · U `mutation_manifest.rs::the_runner_derives_its_floor_from_this_file` · U `Jenkinsfile::BPF join mutations` |
 | Каждый образ, который называет манифест, собирается этим pipeline, собирается из Dockerfile, который линкует одноимённый crate, и содержит именно его бинарь: `COPY --from` в финальной стадии прослежен до `cargo build`, а комментарии обоих языков не считаются сборкой | U | U `deploy_gate.rs::every_image_a_manifest_names_is_built_by_the_pipeline` · U `deploy_gate.rs::each_image_is_built_from_a_dockerfile_that_links_its_own_crate` · U `deploy_gate.rs::the_payload_trace_refuses_an_image_that_ships_another_crates_binary` · U `deploy_gate.rs::a_groovy_block_comment_is_a_comment_and_a_shell_glob_is_not` · U `deploy_gate.rs::the_scan_counts_a_link_and_refuses_to_count_a_clippy_run` |
+| Образ объявляет ту платформу, под которую слинковано его содержимое: сборка идёт на `$BUILDPLATFORM`, а `docker build` называет целевую платформу явно — иначе образ клеймится архитектурой ноды, а внутри лежит бинарь другой | U | U `deploy_gate.rs::every_docker_build_names_the_platform_its_binaries_are_linked_for` · U `deploy_gate.rs::every_builder_stage_compiles_on_the_machine_it_runs_on` · U `Jenkinsfile::Agent image` |
 | Продуктовая комбинация `attach,apiserver` линкуется под musl и не несёт program interpreter | U | U `Jenkinsfile::Agent binary` |
 | Оба поставляемых DaemonSet монтируют tracefs как hostPath типа `Directory`, и attach-манифест без такого монтирования — находка FD026, а не предупреждение; правило нормализует обе стороны, так что завершающий слэш в `mountPath` или `hostPath.path` не превращает корректный манифест в находку | U | U `Jenkinsfile::Validate policies` · U `lint_deploy.rs::an_attach_build_without_tracefs_is_a_finding` · U `lint_deploy.rs::an_emptydir_where_tracefs_belongs_is_still_a_finding` · U `lint_deploy.rs::a_tracefs_hostpath_kubelet_would_create_is_still_a_finding` · U `lint_deploy.rs::the_tracefs_fixture_fails_on_that_rule_and_no_other` · U `lint_deploy.rs::a_trailing_slash_on_the_tracefs_mount_is_not_a_missing_mount` |
 | Манифест, называющий корень доверия дважды, — находка, а не молчаливое last-wins | U | U `lint_deploy.rs::a_trust_root_named_twice_is_a_finding` |
@@ -199,6 +212,7 @@
 | `libc` есть в графе `ferrum-ebpf` только под `attach`, и детектор доказан в обе стороны | U | U `Jenkinsfile::Crate boundary` |
 | `rcgen` и `x509-parser` не попадают в графы admission и agent, и детектор доказан на `ferrum-cli` | U | U `Jenkinsfile::Crate boundary` |
 | Оба arch дают один вердикт на одних логических событиях, из записанных байтов | U | U `replay.rs::both_arches_reach_the_same_verdicts_on_the_same_logical_events` · U `replay.rs::recorded_fixture_records_still_produce_the_acceptance_verdicts` |
+| Секретный сканер не пропускает ничего, за что не поручился гейт: исключён ровно один путь, это фикстура, чьё тело не является ключевым материалом (payload не открывается DER SEQUENCE), и FD023 по-прежнему называет её находкой | U | U `deploy_gate.rs::the_scanner_skips_exactly_the_files_this_gate_vouches_for` · U `deploy_gate.rs::every_excluded_file_is_a_fixture_that_only_looks_like_a_key` · U `deploy_gate.rs::the_excluded_fixture_is_still_a_finding_for_the_lint_that_owns_it` · U `Jenkinsfile::SAST (semgrep)` |
 | Prefilter-образ поставляемой политики — тот, который утверждает ручная копия в `ferrum-ebpf` | U | U `deploy_gate.rs::the_prefilter_image_of_the_shipped_policy_is_the_one_its_unit_test_asserts` |
 | Контейнер, называющий apiserver-watch, и спроецированный SA-токен — одна связка, и обе её половины читает FD027; поставляемое дерево падало на этом правиле до правки манифестов | U | U `lint_deploy.rs::an_apiserver_watch_without_a_projected_token_is_a_finding` · U `lint_deploy.rs::the_agents_pod_watch_needs_the_same_token` · U `lint_deploy.rs::a_selector_bearing_policy_with_no_label_source_is_a_finding` · U `lint_deploy.rs::a_policy_without_a_selector_needs_no_label_source` · U `lint_deploy.rs::the_token_fixture_fails_on_that_rule_and_no_other` · U `lint_deploy.rs::deploy_tree_is_clean` |
 | FD027 читает токен по пути, а не по факту automount: явная `projected` проекция, смонтированная туда, откуда её читает код, — не находка, а смонтированная в другое место — находка | U | U `lint_deploy.rs::a_projected_token_where_the_code_reads_it_is_not_a_finding` · U `lint_deploy.rs::a_projected_token_mounted_somewhere_else_is_still_a_finding` · U `lint_deploy.rs::a_projected_token_no_container_mounts_is_still_a_finding` |
@@ -604,16 +618,17 @@ watcher релистит и передаёт **каждый** объект за�
 
 Плоские утверждения. Каждое проверено по дереву на этом коммите.
 
-- **Ни одного образа контейнера здесь не собиралось.** `Dockerfile` и стадия
-  `Agent image` теперь есть, но `docker build` не запускался ни разу: демона
-  в этом контейнере нет, а достать его снаружи означало бы смонтировать
-  `/var/run/docker.sock` — тот самый hostPath, на который FD006 даёт находку,
-  а runtime-правила убивают. Команды *внутри* `Dockerfile` прогонялись руками
-  по отдельности — кроме проверки интерпретатора на `/ferrum-agent`,
-  добавленной в этом цикле: она читает бинарь, который существует только
-  внутри `docker build`. «Образ собирается» — не то утверждение, которое это
-  дерево может сделать. `deploy/**` по-прежнему ссылается на
-  `ghcr.io/ferrum/*:v0.1.0`, которых никто не публиковал.
+- **Образы собираются, но никуда не едут.** Все три стадии образов прошли на
+  локальном Jenkins 2026-08-28: `docker build` исполняется на ноде, а не внутри
+  контейнера сборки — доставать демона оттуда означало бы смонтировать
+  `/var/run/docker.sock`, тот самый hostPath, на который FD006 даёт находку, а
+  runtime-правила убивают. Проверки *внутри* `Dockerfile` — интерпретатор,
+  `apiserver` в бинаре вебхука, `elf_inspect` над BPF-объектом — исполняются
+  вместе с ними. Чего по-прежнему нет: `docker push` не делал никто, тег
+  существует только на демоне, который его собрал, а `deploy/**` ссылается на
+  `ghcr.io/ferrum/*:v0.1.0`, которых никто не публиковал. И ни один из этих
+  образов не запускали: то, что он собрался и объявляет `linux/amd64`, не
+  утверждение о том, что он стартует на узле.
 - **Замыкание «манифест ↔ pipeline» закрыто по репозиторию и открыто по
   тегу.** `every_image_a_manifest_names_is_built_by_the_pipeline` сравнивает
   только репозиторий, потому что стадии тегируют
@@ -760,7 +775,7 @@ watcher релистит и передаёт **каждый** объект за�
 
 | Утверждение | Чем закрывается | Статус |
 |---|---|---|
-| Образ действительно собирается из этого `Dockerfile` | `docker build` с настоящим демоном — то есть стадия `Agent image` на узле | Не исполнено. `Dockerfile` и стадия есть, команды внутри `Dockerfile` прогонялись руками поштучно, сам `docker build` — ни разу |
+| Собранный образ стартует на узле | запуск контейнера из этого образа на настоящем узле | Не исполнено. `docker build` теперь исполняется — три стадии образов прошли на локальном Jenkins 2026-08-28, — но запускать полученный образ не пробовал никто, и `docker push` тоже не делал никто |
 | Собранный продуктовый бинарь аттачится на узле, а не только линкуется | Стадия, которая запускает слинкованный musl-бинарь и читает его `status.json` | В слайсе A это делали руками: бинарь написал `"attached": true`, а на испорченной релокации — причину в `containerMapError` и `degradedReasons`. В дереве нет ничего, что бы это повторило |
 | Поднятие memlock что-то решает на ядрах, куда это едет | Измерение на 5.8–5.10, где лимит ещё считает BPF-память | Не начато, и на этом хосте невозможно: soft = hard = 8 MiB, а с 5.11 память учитывается memcg. Манифест объявляет пол «ядро >= 5.8», и 5.8–5.10 — ровно тот диапазон, где лимит решает, загрузится ли datapath |
 | API server отвергает `PolicyException` без `expiresAt` | envtest или kind с применённым CRD: применить объект и потребовать отказ | Не начато. Ближайшее исполненное — `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode`: он читает CRD из дерева, а не ответ apiserver |

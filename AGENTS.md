@@ -7,8 +7,15 @@ Admission + runtime, подписанный PolicyBundle, last-known-good вме
 Каталог CRD: `docs/crd/README.md`.
 
 Control plane собран: controller → compile → Secret → admission/agent, LKG на диске.
-Датаплейна нет: aya-ebpf требует nightly, kernel attach отдаёт `Degraded`.
-Отсутствующий datapath не называть работающим runtime enforcement.
+Датаплейн есть и исполнен на настоящем ядре: запись из kernel доходит до правила
+подписанного bundle и до настоящего `SIGKILL` (стадии `BPF attach` и `BPF join`,
+Linux 6.18.44, x86_64). Стенд один, и это не мелочь — всё с меткой `K` в границе
+измерено там и больше нигде.
+
+В сборке по умолчанию датапейса нет: фичи `attach` и `apiserver` выключены.
+Продуктовая комбинация — `attach,apiserver`. Сборку без них не называть
+работающим runtime enforcement; что именно исполнено, а что нет, —
+`docs/MVP-1-BOUNDARY.md`, и это единственный источник, который держит гейт.
 
 ## Toolchain
 
@@ -31,10 +38,25 @@ Control plane собран: controller → compile → Secret → admission/agen
   После коммита в `main` джоба стартует сама (post-commit hook + поллинг раз в 2 минуты).
 - API-токена нет, UI недоступен: лог билда читать из
   `/Users/onixus/jenkins_home/jobs/ferrum/builds/<N>/log`, артефакты — в `.../archive/`.
-- Функциональные стадии: `Test`, `Validate policies` (в ней же негативные кейсы),
-  плюс стадии сборки бинарей, образов и BPF. Имена стадий цитирует
-  `docs/MVP-1-BOUNDARY.md`, и `crates/ferrum-testkit/tests/boundary_gate.rs` роняет
-  сборку на переименовании — стадию не переименовывать в одиночку.
+- Функциональные стадии: `Format`, `Clippy`, `Test`, `Validate policies` (в ней же
+  негативные кейсы), `Crate boundary`, сборка бинарей (`Agent binary`,
+  `Admission binary`, `Controller binary`), датапейс (`BPF ELF`, `BPF attach`,
+  `BPF join`, `BPF join mutations`) и образы (`Agent image`, `Admission image`,
+  `Controller image`). Разложены по исполнителям: нода (docker CLI), группы
+  `Build`, `Checks` и `Datapath` в rust-контейнере родной архитектуры и группа
+  `Link`, где цель musl берётся кросс-компиляцией, а не эмуляцией — под QEMU
+  падает сам rustc. Цель из архитектуры ноды не выводить: стенд ядра x86_64. `Datapath` стоит последней: ей нужно ядро с tracefs,
+  и на ноде без него она падает честно, никого за собой не унося. Пропускать её
+  по условию нельзя — гейт, умеющий себя пропустить, это тот самый дефект.
+  Имена стадий цитирует `docs/MVP-1-BOUNDARY.md`, и
+  `crates/ferrum-testkit/tests/boundary_gate.rs` роняет сборку на переименовании —
+  стадию не переименовывать в одиночку.
+- Ни одна стадия текущего `Jenkinsfile` в Jenkins ещё не проходила: билд №17
+  упал на `SAST (semgrep)` (`docker: not found` — стадия с `agent any` всё равно
+  исполняется внутри rust-образа, JENKINS-30600), остальные восемнадцать
+  пропущены. `U` на строке `Jenkinsfile::<стадия>` в границе означает «команды
+  прогнаны руками на этом дереве», и записывать туда «зелено в CI» до первого
+  настоящего прогона — ровно тот дефект, от которого этот документ есть.
 - Стадии security: `SAST (semgrep)`, `Security: policy invariants`,
   `Security: MVP acceptance` (приёмка из раздела MVP-1),
   `Security: supply chain` (cargo-deny + cargo-audit).
@@ -53,6 +75,9 @@ Control plane собран: controller → compile → Secret → admission/agen
 | `ferrum-admission` | исполнение уже собранного bundle | compiler, CAP_BPF, Rekor на каждый Pod |
 | `ferrum-agent` | eBPF + last-known-good | compiler, cluster-admin SA |
 | `ferrum-ebpf-progs` | aya-ebpf datapath | tokio, kube, `String` на syscall path |
+| `ferrum-ebpf` | userspace loader, prefilter, декодер kernel-записей | compiler, kube client, сеть |
+| `ferrum-k8smeta` | cgroup→pod индекс, watch Pod/NS/SA, label cache | датапейс, вывод наблюдённости из пустоты |
+| `ferrum-export` | JSONL-сток, ограниченная очередь | блокирующая запись на hot path, тихая потеря записи |
 | `ferrum-controller` | reconcile + compile + rollout | datapath, CAP_BPF |
 | `ferrum-crypto` | подпись/проверка bundle, mTLS material (ring, rustls-webpki) | openssl-sys, выпуск CA, сеть, фейковый `Ok` |
 | `ferrum-cli` | `ferrumctl` offline | живой кластер в MVP-1 |
