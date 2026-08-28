@@ -25,9 +25,10 @@ def rust(String image, String script) {
             'CARGO_TARGET_DIR=/build-target',
             'CARGO_TERM_COLOR=never',
             'CARGO_INSTALL_ROOT=/cargo-tools',
-            'PATH+FERRUM_TOOLS=/cargo-tools/bin',
         ]) {
-            sh script
+            // PATH через withEnv('PATH+…') до шелла внутри контейнера не доезжает
+            // (билд #12): cargo-deny стоял, но `cargo deny` его не находил.
+            sh 'export PATH=/cargo-tools/bin:$PATH\n' + script
         }
     }
 }
