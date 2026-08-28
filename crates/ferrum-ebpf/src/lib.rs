@@ -17,7 +17,7 @@ pub use eval::{
 };
 pub use event::{
     abi_stamp_mismatch, decode_event, encode_event, event_meta, path_truncated, syscall_event,
-    syscall_name, SyscallArch, EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
+    syscall_name, SyscallArch, EVENT_FLAGS_OFFSET, EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
 };
 pub use ferrum_ebpf_progs::{
     Event, CGROUPS_MAX_ENTRIES, COMM_LEN, DATAPATH_ABI, EVENTS_DROPPED_TOTAL, EVENTS_RING_BYTES,

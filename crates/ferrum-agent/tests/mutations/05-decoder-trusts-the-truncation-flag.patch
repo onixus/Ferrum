@@ -1,0 +1,37 @@
+# Mutation: the decoder trusts `EVENT_FLAG_PATH_TRUNCATED` on its own and stops
+# reading the shape of the buffer that arrived.
+#
+# Must fail: `a_kernel_record_stripped_of_the_flag_is_still_read_as_truncated`.
+#
+# This is the other half of what 04 aims at, from the consumer's side. Cycle 8
+# closed one fail-open twice: `emit()` now sets the flag from the length the
+# helper returned, and `ferrum_ebpf::path_truncated` derives the same answer
+# from the bytes. The second half exists only for an object already deployed —
+# an ELF built before the fix writes a buffer-filling head and no flag, and a
+# rolling upgrade puts the new agent in front of exactly that. No new kernel
+# flag can reach it; only the decoder can.
+#
+# 04 cannot measure that half and its header says why: the raw-flag assertion in
+# `a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted`
+# runs before the verdict, so the run stops there. This patch reaches it from
+# the other direction — the flag is left alone and the derivation is deleted —
+# against a test that takes the record *this kernel wrote* and clears the one
+# bit in the bytes. Measured on Linux 6.18.44: the join reports
+# `FAILED. 4 passed; 1 failed`, and the failure is the shape of the original
+# defect, not an assertion about a flag — `expected exactly one no-runtime-sock
+# verdict, got [("default", "openat", "audit")]`. A §D kill rule silently
+# downgraded to an audit on a path the buffer could not carry whole.
+diff --git a/crates/ferrum-ebpf/src/event.rs b/crates/ferrum-ebpf/src/event.rs
+--- a/crates/ferrum-ebpf/src/event.rs
++++ b/crates/ferrum-ebpf/src/event.rs
+@@ -180,7 +180,9 @@
+ /// and the datapath makes it identically, because the helper's return value
+ /// cannot separate those two cases either.
+ pub fn path_truncated(event: &Event) -> bool {
+-    event.path_truncated() || path_bytes(&event.path).len() >= PATH_LEN - 1
++    // MUTATION: the flag is trusted on its own, so a record written by an ELF
++    // that predates the flag is read as a path that arrived whole.
++    event.path_truncated()
+ }
+
+ /// Bridge a decoded record to the policy-evaluation view. Unknown syscall nrs

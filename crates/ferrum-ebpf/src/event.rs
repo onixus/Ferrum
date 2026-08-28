@@ -69,6 +69,17 @@ pub fn syscall_name(arch: SyscallArch, nr: u32) -> Option<&'static str> {
     }
 }
 
+/// Byte offset of `flags` inside a wire record.
+///
+/// Public because of the one thing that cannot be done any other way honestly:
+/// building the record an ELF predating cycle 8 writes for an over-long path.
+/// Re-encoding an `Event` with the bit dropped produces a *synthesised* record
+/// and proves nothing about a producer, so the join takes the record this
+/// kernel wrote and clears the bit in the bytes. That needs the offset, and
+/// this is it — the same one [`decode_event`] reads `flags` from, so the two
+/// cannot drift apart.
+pub const EVENT_FLAGS_OFFSET: usize = 21;
+
 /// Decode one ring record. Anything but exactly `EVENT_WIRE_LEN` bytes is
 /// Integrity: a partial record must never become a half-parsed event.
 ///
@@ -97,7 +108,7 @@ pub fn decode_event(bytes: &[u8]) -> Result<Event> {
     event.tgid = u32::from_ne_bytes(bytes[12..16].try_into().expect("4 bytes"));
     event.syscall_nr = u32::from_ne_bytes(bytes[16..20].try_into().expect("4 bytes"));
     event.action = bytes[20];
-    event.flags = bytes[21];
+    event.flags = bytes[EVENT_FLAGS_OFFSET];
     event._pad = u16::from_ne_bytes(bytes[22..24].try_into().expect("2 bytes"));
     event.comm.copy_from_slice(&bytes[24..24 + COMM_LEN]);
     event
@@ -485,6 +496,41 @@ mod tests {
         let back = decode_event(&encode_event(&flagged)).expect("decode");
         assert!(syscall_event(&back, SyscallArch::X86_64).path_truncated);
         assert!(event_meta(&back).path_truncated);
+    }
+
+    /// `EVENT_FLAGS_OFFSET` names the byte the decoder reads `flags` from, and
+    /// `attach_join.rs` reaches into a live ring record at that offset to
+    /// produce what a pre-fix ELF writes without rebuilding the record from
+    /// parts. An offset that drifted would silently clear some other field —
+    /// the low byte of `_pad`, which is the ABI stamp — and the join would then
+    /// be proving something about a record no producer emits. So it is pinned
+    /// here against the encoder: masking that one byte changes `flags` and
+    /// nothing else.
+    #[test]
+    fn the_flags_offset_addresses_flags_and_nothing_else() {
+        let mut event = sample();
+        event.flags =
+            ferrum_ebpf_progs::EVENT_FLAG_CONTAINER | ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED;
+        let wire = encode_event(&event);
+
+        let mut cleared = wire.clone();
+        cleared[EVENT_FLAGS_OFFSET] &= !ferrum_ebpf_progs::EVENT_FLAG_PATH_TRUNCATED;
+        assert_eq!(
+            wire.iter().zip(&cleared).filter(|(a, b)| a != b).count(),
+            1,
+            "clearing the bit at EVENT_FLAGS_OFFSET touched more than one byte"
+        );
+
+        let back = decode_event(&cleared).expect("decode");
+        assert_eq!(back.flags, ferrum_ebpf_progs::EVENT_FLAG_CONTAINER);
+        assert_eq!(back.cgroup_id, event.cgroup_id);
+        assert_eq!(back.pid, event.pid);
+        assert_eq!(back.tgid, event.tgid);
+        assert_eq!(back.syscall_nr, event.syscall_nr);
+        assert_eq!(back.action, event.action);
+        assert_eq!(back._pad, event._pad, "the ABI stamp survived");
+        assert_eq!(back.comm, event.comm);
+        assert_eq!(back.path, event.path);
     }
 
     /// The derivation is the datapath's own comparison restated, so it must
