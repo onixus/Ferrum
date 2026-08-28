@@ -38,7 +38,12 @@ ARG RUST_IMAGE=rust:1.75-bookworm
 ARG TARGET=x86_64-unknown-linux-musl
 ARG BPF_ELF=dist/ferrum-ebpf-progs.bpf.o
 
-FROM ${RUST_IMAGE} AS build
+# --platform=$BUILDPLATFORM: собирать натив, а образ помечать целевой
+# платформой. Без этого `docker build` на arm64-ноде клеймит образ
+# linux/arm64, а внутри лежит x86_64-бинарь — образ, который не
+# запустится ни там, ни там, и ни одна проверка внутри него этого не
+# видит: они читают сам файл, а не манифест вокруг него.
+FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS build
 ARG TARGET
 ARG BPF_ELF
 

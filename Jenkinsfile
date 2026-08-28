@@ -487,7 +487,7 @@ pipeline {
                 sh '''
                     set -eu
                     test -f dist/ferrum-ebpf-progs.bpf.o
-                    docker build \
+                    docker build --platform=linux/amd64 \
                         --build-arg BPF_ELF=dist/ferrum-ebpf-progs.bpf.o \
                         -t "ghcr.io/ferrum/ferrum-agent:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
                 '''
@@ -507,7 +507,7 @@ pipeline {
                 unstash 'image-context'
                 sh '''
                     set -eu
-                    docker build -f Dockerfile.admission \
+                    docker build --platform=linux/amd64 -f Dockerfile.admission \
                         -t "ghcr.io/ferrum/ferrum-admission:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
                 '''
             }
@@ -520,7 +520,7 @@ pipeline {
                 unstash 'image-context'
                 sh '''
                     set -eu
-                    docker build -f Dockerfile.controller \
+                    docker build --platform=linux/amd64 -f Dockerfile.controller \
                         -t "ghcr.io/ferrum/ferrum-controller:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
                 '''
             }

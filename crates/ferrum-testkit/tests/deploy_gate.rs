@@ -2753,3 +2753,89 @@ mod scan_exclusions {
         }
     }
 }
+
+/// The image is a claim about a platform, and until this gate the claim was
+/// made by the machine that happened to run `docker build`.
+///
+/// Every binary in these images is linked for `x86_64-unknown-linux-musl` —
+/// the stand the kernel rows are measured on. `docker build` on an arm64 node
+/// stamps the image `linux/arm64` anyway, because the platform comes from the
+/// daemon and not from the payload. The result is an image that runs nowhere:
+/// wrong architecture on an arm64 node, wrong manifest on an x86_64 one. None
+/// of the checks *inside* the Dockerfiles can see it — they read the binary,
+/// and the binary is correct; what is wrong is the manifest around it.
+///
+/// The two halves have to agree, so both are read here: the builder stage
+/// stays on `$BUILDPLATFORM` (compile natively, cross to the target), and the
+/// build command names the target platform explicitly.
+mod image_platform {
+    use std::path::{Path, PathBuf};
+
+    /// The triple the linking stages build, and the platform its images must
+    /// declare. One is the Rust spelling and the other is Docker's; they are
+    /// written here side by side because nothing else in the tree joins them.
+    const TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
+    const TARGET_PLATFORM: &str = "linux/amd64";
+
+    const DOCKERFILES: [&str; 3] = [
+        "Dockerfile",
+        "Dockerfile.admission",
+        "Dockerfile.controller",
+    ];
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> String {
+        let path = repo_root().join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    #[test]
+    fn every_docker_build_names_the_platform_its_binaries_are_linked_for() {
+        let jenkinsfile = read("Jenkinsfile");
+        let builds: Vec<&str> = jenkinsfile
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("docker build"))
+            .collect();
+        assert_eq!(
+            builds.len(),
+            DOCKERFILES.len(),
+            "one `docker build` per shipped image, no more and no fewer: {builds:?}"
+        );
+        for line in builds {
+            assert!(
+                line.contains(&format!("--platform={TARGET_PLATFORM}")),
+                "`{line}` does not name --platform={TARGET_PLATFORM}, so the image it \
+                 produces is stamped with whatever architecture the node happens to have"
+            );
+        }
+    }
+
+    #[test]
+    fn every_builder_stage_compiles_on_the_machine_it_runs_on() {
+        for file in DOCKERFILES {
+            let text = read(file);
+            let from = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("FROM") && l.contains("AS build"))
+                .unwrap_or_else(|| panic!("{file}: no builder stage"));
+            assert!(
+                from.contains("--platform=$BUILDPLATFORM"),
+                "{file}: `{from}` would run the whole build under emulation on a node of \
+                 another architecture, and rustc does not survive that"
+            );
+            assert!(
+                text.contains(TARGET_TRIPLE),
+                "{file}: builds no {TARGET_TRIPLE} binary, so the platform this gate \
+                 requires of its image is not the platform of what is inside it"
+            );
+        }
+    }
+}
