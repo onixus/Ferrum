@@ -183,11 +183,61 @@ pipeline {
                 steps {
                     sh '''
                         set -eu
+                        # /cargo-tools — именованный том, и bpf-linker ставится туда.
+                        # Без этой строки `command -v` его не находил, стадия
+                        # пересобирала линкер каждый билд и тянула LLVM каждый билд.
+                        export PATH=/cargo-tools/bin:$PATH
                         rustup toolchain install nightly --profile minimal --component rust-src
-                        # bpf-linker (default rust-llvm feature) links -lLLVM from the
-                        # nightly rustc; the image ships no plain libLLVM.so, so shim
-                        # the versioned one and keep the sysroot on rpath.
                         if ! command -v bpf-linker >/dev/null 2>&1; then
+                            # bpf-linker 0.11 просит llvm-sys-23 с `no-llvm-linking`:
+                            # линковать LLVM он не будет, символы даёт libLLVM самого
+                            # рустца. Но его build.rs ищет llvm-config, чтобы решить,
+                            # какой llvm-sys-XX включить, и без него стадия падает,
+                            # ничего не собрав. Фича `rust-llvm`, под которую здесь
+                            # раньше стоял один шим, существовала последний раз в
+                            # 0.9.10.
+                            #
+                            # LLVM ставится настоящий и ровно той версии, которую
+                            # несёт nightly: расхождение мажора — это ABI, по которому
+                            # линкер сойдётся при сборке и разойдётся в работе.
+                            llvm_major=23
+                            have=$(rustc +nightly --version --verbose \
+                                   | awk '/^LLVM version:/{split($3, v, "."); print v[1]}')
+                            if [ "$have" != "$llvm_major" ]; then
+                                echo "nightly несёт LLVM $have, стадия ставит $llvm_major:" \
+                                     "поднимите llvm_major вместе с репозиторием ниже" >&2
+                                exit 1
+                            fi
+                            if ! command -v llvm-config >/dev/null 2>&1; then
+                                apt-get update
+                                apt-get install -y --no-install-recommends \
+                                    curl gnupg ca-certificates
+                                # Ключ пинится по отпечатку, а не «как отдал сервер»:
+                                # иначе подменённый ключ подписал бы подменённый LLVM,
+                                # и apt на это не пожалуется.
+                                curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+                                    -o /tmp/llvm.asc
+                                fpr=$(gpg --show-keys --with-colons /tmp/llvm.asc \
+                                      | awk -F: '/^fpr/{print $10; exit}')
+                                if [ "$fpr" != 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421 ]; then
+                                    echo "ключ apt.llvm.org не тот: $fpr" >&2
+                                    exit 1
+                                fi
+                                gpg --dearmor < /tmp/llvm.asc \
+                                    > /usr/share/keyrings/ferrum-llvm.gpg
+                                echo "deb [signed-by=/usr/share/keyrings/ferrum-llvm.gpg]" \
+                                     "https://apt.llvm.org/bookworm/" \
+                                     "llvm-toolchain-bookworm-$llvm_major main" \
+                                    > /etc/apt/sources.list.d/ferrum-llvm.list
+                                apt-get update
+                                apt-get install -y --no-install-recommends \
+                                    "llvm-$llvm_major-dev"
+                                ln -sf "/usr/lib/llvm-$llvm_major/bin/llvm-config" \
+                                    /usr/local/bin/llvm-config
+                            fi
+                            # Линковку берёт на себя рустец: образ не несёт простого
+                            # libLLVM.so, поэтому версионный шимится, а сисрут едет
+                            # на rpath.
                             sysroot="$(rustc +nightly --print sysroot)"
                             shim=/tmp/ferrum-llvm-shim
                             mkdir -p "$shim"
