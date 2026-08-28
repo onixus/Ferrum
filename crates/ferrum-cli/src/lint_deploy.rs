@@ -626,10 +626,13 @@ fn mounted_host_path(
 /// Both halves are that same join, and neither is repairable at runtime:
 ///
 /// - A container that names a watch (`--apiserver`, or `--node` with a node
-///   name) while automount is off. `ApiserverConfig::in_cluster` reads only
-///   `KUBERNETES_SERVICE_HOST`, which is always set, so construction succeeds
-///   and the watcher spawns; `token()` then fails on every connect, forever,
-///   behind a backoff. For admission that leaves `WatchedLabels::is_warm()`
+///   name) while automount is off. `ApiserverConfig::in_cluster` used to read
+///   only `KUBERNETES_SERVICE_HOST`, which is always set, so construction
+///   succeeded and the watcher spawned; `token()` then failed on every
+///   connect, forever, behind a backoff. It now refuses at construction,
+///   naming the token file — but that is a startup error on a node, and this
+///   rule is what keeps the manifest from being applied at all. For admission
+///   the old behaviour left `WatchedLabels::is_warm()`
 ///   false permanently and `review` denies every Pod a selector-bearing policy
 ///   selects — deny-everything, not fail-open, which is why it survives an
 ///   audit that looks for the other direction. For the agent the same missing

@@ -480,7 +480,7 @@ fn degraded_reasons_body(lib: &str) -> &str {
 /// A reason nobody wrote down is a reason nobody reads, which is how twenty-two
 /// counters spent eight cycles without one.
 ///
-/// Two scans, because `DEG_*` is a convention and not a mechanism. The
+/// Three scans, because `DEG_*` is a convention and not a mechanism. The
 /// convention is scanned for its own sake — a reason declared and not yet
 /// wired is still a reason someone will wire — and then the body of
 /// `degraded_reasons_at` is read for the constants it actually pushes,
@@ -489,6 +489,15 @@ fn degraded_reasons_body(lib: &str) -> &str {
 /// `TARGET_NEVER_PROVEN`), which are deliberately outside the `DEG_*` family
 /// because under observe the guard they speak for is never reached — a naming
 /// decision that is defensible and that a name-shaped gate cannot follow.
+///
+/// The third scan reads the arguments of `mark_terminal_fault`. A terminal
+/// fault reaches `degraded_reasons_at` as the *text it already holds* — the
+/// arm is `if let Some(fault) = self.terminal_fault()`, so the constant naming
+/// the fault is nowhere in that body and is not in the `DEG_*` family either.
+/// Four reasons the agent latches this way went undocumented behind both of
+/// the scans above, which is the same one-directional rot the header of this
+/// file describes, one level in: a gate that reads only where reasons are
+/// *pushed* cannot see the reasons that are pushed as data.
 #[test]
 fn every_degraded_reason_the_agent_can_raise_is_named_in_the_document() {
     let doc = document();
@@ -528,7 +537,21 @@ fn every_degraded_reason_the_agent_can_raise_is_named_in_the_document() {
          written, so the scan is broken rather than the agent: {pushed:?}",
         pushed.len()
     );
+    // The mechanism, second half: reasons that reach the list as the text a
+    // terminal fault already holds, so they appear in no arm and carry no
+    // `DEG_` prefix.
+    let mut latched = terminal_fault_constants(&src, &declared);
+    latched.sort_unstable();
+    latched.dedup();
+    assert!(
+        latched.len() >= 4,
+        "found {} constants passed to `mark_terminal_fault`; it found four when this floor was \
+         written, so the scan is broken rather than the agent: {latched:?}",
+        latched.len()
+    );
+
     constants.extend(pushed.iter().map(|s| (*s).to_string()));
+    constants.extend(latched);
     constants.sort();
     constants.dedup();
 
@@ -548,6 +571,36 @@ fn every_degraded_reason_the_agent_can_raise_is_named_in_the_document() {
         "degradation reasons the agent can raise and the boundary document does not name: \
          {unnamed:#?}"
     );
+}
+
+/// Constants handed to `mark_terminal_fault` anywhere in the crate.
+///
+/// Read from the call site rather than from the declaration: a `&str` constant
+/// beside the reasons proves nothing about whether anything latches it, and the
+/// whole point of this scan is what the agent can actually raise. The window is
+/// the call and the two lines after it, which is what rustfmt gives a
+/// `format!("{CONST} (...)")` argument that does not fit on one line.
+fn terminal_fault_constants(src: &Path, declared: &BTreeMap<String, PathBuf>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut files = Vec::new();
+    rs_files(src, &mut files);
+    for file in files {
+        let text = fs::read_to_string(&file).expect("read a source file");
+        let lines: Vec<&str> = text.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            if !line.contains("mark_terminal_fault(") {
+                continue;
+            }
+            let window = lines[n..(n + 3).min(lines.len())].join("\n");
+            out.extend(
+                window
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|token| declared.contains_key(*token))
+                    .map(str::to_string),
+            );
+        }
+    }
+    out
 }
 
 #[cfg(test)]

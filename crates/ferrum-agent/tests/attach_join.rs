@@ -62,9 +62,11 @@ mod gate {
     use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
 
+    use ferrum_agent::TargetCheck;
     use ferrum_agent::{
         encode_fsig, pump_records, Agent, AgentConfig, AgentRole, ProcCgroupCheck, SignalResponder,
-        DEGRADED_RECOVERY, DEG_PATH_TRUNCATED, REFUSE_STALE_TARGET,
+        DEGRADED_RECOVERY, DEG_PATH_TRUNCATED, REFUSE_STALE_TARGET, RESPOND_SIGNAL_FAILING,
+        RESPOND_SIGNAL_FAILING_MIN, TARGET_CHECK_UNPROVABLE, TARGET_NEVER_PROVEN,
     };
     use ferrum_api::PolicyMode;
     use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
@@ -1022,5 +1024,207 @@ mod gate {
         assert_eq!(agent.respond_kill_total(), 0);
         assert_eq!(agent.respond_stale_target_total(), 1);
         probe.assert_alive("stale target");
+    }
+
+    /// The step after the guard: the signal was made and the kernel refused it.
+    ///
+    /// This is the one path in `react` that is a reaction *failing* rather than
+    /// being refused, and until this cycle it was the one path with no reason.
+    /// A respond DaemonSet whose `capabilities.add` lost `KILL` gets `EPERM`
+    /// from every `kill(2)`; the guards all pass, `executed=false` rides the
+    /// export, `respond_failed_total` climbs, and the node reports healthy.
+    ///
+    /// Getting a real refusal out of this kernel needs care, because the
+    /// harness is root and root can signal nearly everything. The errno used
+    /// here is `ESRCH` from a tgid that **cannot** name a process: one past
+    /// `/proc/sys/kernel/pid_max`. That is deliberate and it is a safety
+    /// property, not a convenience — a test that signalled a *reaped* pid to
+    /// get `ESRCH` would race pid reuse and eventually SIGKILL an unrelated
+    /// process on the node.
+    ///
+    /// What stays the kernel's:
+    ///
+    /// - The record. It is the one this kernel wrote for the probe's `openat`,
+    ///   with four bytes rewritten to carry the phantom tgid — asserted, by
+    ///   re-decoding, to be the only field that moved, the same idiom as
+    ///   `a_kernel_record_stripped_of_the_flag_is_still_read_as_truncated`.
+    /// - The verdict. The signed `prod-restricted` bundle, in enforce.
+    /// - The syscall. `SignalResponder` makes a real `kill(2)` and the errno
+    ///   comes back from this kernel.
+    /// - The guard. `ProcCgroupCheck` with its production derivation, over a
+    ///   copy of this node's own `mountinfo`, resolving to this node's real
+    ///   cgroup directory by `stat`. Only the `/proc/<tgid>` entry is
+    ///   synthetic, because the tgid is.
+    ///
+    /// And the interaction that made the defect invisible is asserted here as
+    /// well: the guard is satisfied every time, so `respond_target_confirmed`
+    /// is non-zero and `TARGET_NEVER_PROVEN` is permanently disarmed on the
+    /// step before the failure. Nothing else in the agent can see this.
+    #[test]
+    fn a_kill_this_kernel_refuses_is_degraded_and_named() {
+        let _serial = serialized();
+        let Some(mut live) = live("eperm") else {
+            return;
+        };
+        let arch = live.arch;
+
+        // One past pid_max: no process can hold it, so `kill(2)` on it is
+        // ESRCH from this kernel and reaches nothing.
+        let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .expect("read /proc/sys/kernel/pid_max")
+            .trim()
+            .parse()
+            .expect("pid_max is a number");
+        let phantom = pid_max + 1;
+        let rc = unsafe { libc::kill(libc::pid_t::try_from(phantom).expect("pid"), 0) };
+        assert_eq!(rc, -1, "pid {phantom} exists on this node; it must not");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "signalling pid {phantom} did not fail with ESRCH, so this test would be aiming a \
+             SIGKILL at something real"
+        );
+
+        let target = format!("/tmp/ferrum-join-eperm-{}/docker.sock", std::process::id());
+        let c_target = CString::new(target.clone()).expect("no NUL");
+        let mut probe = live.spawn_probe(move || unsafe {
+            libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
+        });
+        let tgid = probe.tgid();
+
+        let wanted = target.clone();
+        let records = live.records_of(tgid, "openat of a docker.sock path", move |event, arch| {
+            syscall_name(arch, event.syscall_nr) == Some("openat")
+                && nul_trimmed(&event.path) == wanted.as_bytes()
+        });
+
+        // Four bytes, in the bytes off the ring, and nothing else. Re-decoding
+        // is the check that the offset still addresses `tgid`: every other
+        // field must come back identical.
+        let mut aimed: Vec<Vec<u8>> = Vec::with_capacity(records.len());
+        for bytes in &records {
+            let mut moved = bytes.clone();
+            moved[12..16].copy_from_slice(&phantom.to_ne_bytes());
+            let before = decode_event(bytes).expect("decode the ring record");
+            let after = decode_event(&moved).expect("decode the re-aimed record");
+            assert_eq!(after.tgid, phantom, "the tgid field is not at bytes 12..16");
+            assert_eq!(after.cgroup_id, before.cgroup_id);
+            assert_eq!(after.pid, before.pid);
+            assert_eq!(after.syscall_nr, before.syscall_nr);
+            assert_eq!(after.flags, before.flags);
+            assert_eq!(after.path, before.path, "the kernel's bytes are untouched");
+            assert_eq!(after.comm, before.comm);
+            aimed.push(moved);
+        }
+
+        // A `/proc` for a tgid that does not exist, and nothing else fictional:
+        // the mountinfo is this node's own, so the derivation below is the
+        // production one answering about the production hierarchy, and the
+        // cgroup line names the directory this probe really ran in.
+        let fake_proc = std::env::temp_dir().join(format!(
+            "ferrum-join-eperm-proc-{}-{}",
+            std::process::id(),
+            phantom
+        ));
+        std::fs::create_dir_all(fake_proc.join("self")).expect("fake /proc/self");
+        std::fs::copy(
+            "/proc/self/mountinfo",
+            fake_proc.join("self").join("mountinfo"),
+        )
+        .expect("copy this node's mountinfo");
+        std::fs::create_dir_all(fake_proc.join(phantom.to_string())).expect("fake /proc/<tgid>");
+        let rel = live
+            .cgroup
+            .dir
+            .strip_prefix(&live.cgroup.root)
+            .expect("the probe cgroup is under the derived root");
+        std::fs::write(
+            fake_proc.join(phantom.to_string()).join("cgroup"),
+            format!("0::/{}\n", rel.display()),
+        )
+        .expect("write the target's cgroup line");
+
+        let mut agent = join_agent(&live);
+        let check = ProcCgroupCheck::with_proc_root(&fake_proc);
+        assert_eq!(
+            check.cgroup_root(),
+            Ok(live.cgroup.root.as_path()),
+            "the production derivation over this node's own mountinfo named another hierarchy"
+        );
+        assert_eq!(
+            check.cgroup_id(phantom),
+            Some(live.cgroup.id),
+            "the guard does not resolve the phantom target to the cgroup the kernel recorded, so \
+             the reaction would refuse before ever reaching the syscall and this test would be \
+             measuring the wrong refusal"
+        );
+        assert!(check.unprovable().is_none());
+        agent.set_target_check(Box::new(check));
+
+        let sink = MemorySink::new();
+        for _ in 0..RESPOND_SIGNAL_FAILING_MIN {
+            pump_records(&agent, arch, aimed.clone(), &sink);
+        }
+        std::fs::remove_dir_all(&fake_proc).ok();
+
+        assert_eq!(
+            agent.respond_kill_total(),
+            0,
+            "a signal this kernel refused was counted as delivered"
+        );
+        assert!(
+            agent.respond_failed_total() >= RESPOND_SIGNAL_FAILING_MIN,
+            "only {} reactions reached the syscall",
+            agent.respond_failed_total()
+        );
+        // The guard passed every time: this is why no other reason can see it.
+        assert!(agent.respond_target_confirmed_total() >= RESPOND_SIGNAL_FAILING_MIN);
+        assert_eq!(agent.respond_stale_target_total(), 0);
+        assert_eq!(agent.respond_refused_total(), 0);
+
+        let events = sink.events();
+        let refused = events
+            .iter()
+            .filter(|e| e.rule.as_str() == "no-runtime-sock")
+            .collect::<Vec<_>>();
+        assert!(
+            !refused.is_empty(),
+            "no no-runtime-sock verdict: {:?}",
+            events
+                .iter()
+                .map(|e| (e.rule.as_str(), e.action.as_str()))
+                .collect::<Vec<_>>()
+        );
+        for event in &refused {
+            assert_eq!(event.action.as_str(), "kill");
+            assert!(
+                !event.executed,
+                "the agent claimed a kill this kernel refused"
+            );
+            let err = event
+                .respond_error
+                .as_deref()
+                .expect("a failed signal must say so");
+            assert!(
+                err.contains("SIGKILL"),
+                "the export does not name the syscall that failed: {err}"
+            );
+        }
+
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons.iter().any(|r| r == RESPOND_SIGNAL_FAILING),
+            "a node that has decided {} kills and delivered none reports: {reasons:?}",
+            agent.respond_failed_total()
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|r| r == TARGET_NEVER_PROVEN || r.starts_with(TARGET_CHECK_UNPROVABLE)),
+            "the refused syscall is being reported under a target reason's name: {reasons:?}"
+        );
+
+        // Nothing was aimed at the probe, and nothing reached it.
+        probe.assert_alive("a kill this kernel refused");
     }
 }
