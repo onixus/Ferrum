@@ -34,6 +34,35 @@ def RUST_DOCKER_ARGS = '-v ferrum-cargo-home:/usr/local/cargo/registry' +
                        ' -v ferrum-cargo-target:/build-target' +
                        ' -v ferrum-cargo-tools:/cargo-tools'
 
+// Что группе 'Datapath' нужно сверх обычного rust-контейнера, и почему
+// именно это, а не `--privileged`.
+//
+// Четыре цикла эта группа падала здесь, и объяснение в документах было
+// неверным: не «ядро LinuxKit без tracefs», а контейнер без прав. Ядро ноды
+// (6.12.76-linuxkit, aarch64) несёт CONFIG_BPF_SYSCALL, CONFIG_BPF_EVENTS,
+// CONFIG_FTRACE и CONFIG_MODULES, и все пять точек, которые цепляет датапейс
+// — sys_enter_{execve,openat,bpf,init_module,finit_module} — на ней есть.
+// Отказ был EPERM на bpf(BPF_MAP_CREATE): агент запускается с uid 0, но с
+// дефолтным bounding set докера (CapEff 00000000a80425fb), где верхние 32
+// бита нулевые, то есть CAP_BPF (39) и CAP_PERFMON (38) отсутствуют.
+//
+// - `--cap-add=BPF --cap-add=PERFMON`: ровно два бита, которых не хватало.
+//   CAP_SYS_ADMIN сознательно не даётся: он почти root на этой VM, а
+//   контейнер исполняет код репозитория. Монтирование tracefs, которое его
+//   потребовало бы, вынесено в отдельную стадию-однострочник ниже, где
+//   привилегия не встречается с недоверенным кодом.
+// - `-v /sys/kernel/tracing:...:ro`: сам bind-mount прав не требует, и
+//   читать id точек достаточно только на чтение.
+// - `--pid=host`: не удобство. `bpf_get_current_pid_tgid()` отдаёт pid из
+//   init-namespace, а тесты сверяют его со своим `getpid()`; в собственном
+//   PID namespace эти числа разные, и attach_live видел ноль «своих»
+//   записей при полностью исправном датапейсе. Стадия существует, чтобы
+//   смотреть на ядро глазами ядра, и в этом виде обязана делить с ним
+//   пространство pid.
+def DATAPATH_DOCKER_ARGS = RUST_DOCKER_ARGS +
+                           ' -v /sys/kernel/tracing:/sys/kernel/tracing:ro' +
+                           ' --cap-add=BPF --cap-add=PERFMON --pid=host'
+
 pipeline {
     agent none
 
@@ -892,11 +921,38 @@ pipeline {
         // гейт, умеющий себя пропустить, — ровно тот дефект, от которого написан
         // MVP-1-BOUNDARY.md. Они падают честно и красят билд красным на ноде без
         // ядра; всё, что здесь исполнимо, к этому моменту уже исполнено.
+        // tracefs на этой ноде не смонтирован, и смонтировать его изнутри
+        // сборочного контейнера можно только с CAP_SYS_ADMIN. Поэтому монтирует
+        // отдельный одноразовый контейнер, который исполняет одну зашитую
+        // команду и ни строчки кода репозитория: привилегия и недоверенный код
+        // разведены, а сборочный контейнер получает готовый bind-mount и два
+        // узких права (см. DATAPATH_DOCKER_ARGS).
+        //
+        // Идемпотентно и без `|| true`: mount, который не поднялся, обязан
+        // уронить стадию здесь, а не превратиться в «нет tracefs» четырьмя
+        // стадиями ниже, где это читается как свойство ядра.
+        stage('Datapath tracefs') {
+            agent any
+            steps {
+                sh '''
+                    set -eu
+                    docker run --rm --privileged --pid=host alpine:3 \
+                        nsenter -t 1 -m -- sh -c \
+                        'mountpoint -q /sys/kernel/tracing \
+                            || mount -t tracefs tracefs /sys/kernel/tracing'
+                    docker run --rm -v /sys/kernel/tracing:/sys/kernel/tracing:ro \
+                        alpine:3 sh -c \
+                        'test -r /sys/kernel/tracing/events/syscalls/sys_enter_openat/id'
+                    echo "ok: tracefs is mounted on the node and readable through a bind-mount"
+                '''
+            }
+        }
+
         stage('Datapath') {
             agent {
                 docker {
                     image RUST_IMAGE
-                    args RUST_DOCKER_ARGS
+                    args DATAPATH_DOCKER_ARGS
                     reuseNode true
                 }
             }
