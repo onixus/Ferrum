@@ -228,11 +228,18 @@ pub struct CompileStatus {
 /// because absent is legible.
 ///
 /// `None` serialises as an explicit `null` and is not skipped. The status write
-/// is a JSON merge patch, where an omitted key keeps whatever the object
-/// already carries — so skipping would leave a stale `0` from an earlier
-/// version standing forever, which is the failure this type exists to end.
-/// `null` deletes the key, and the CRD schemas mark both fields `nullable` so
-/// the API server accepts it.
+/// is a JSON merge patch (RFC 7386), where an omitted key keeps whatever the
+/// object already carries — so skipping would leave a stale `0` from an earlier
+/// version standing forever, which is the failure this type exists to end. In
+/// that patch `null` is a delete directive: the API server removes the key and
+/// validates the merged object, so the null itself never meets the schema.
+///
+/// The CRD schemas still mark both fields `nullable`, and not for the write
+/// above. Every other way this field can be sent — an update, a server-side
+/// apply, an operator applying a whole object — carries the `null` as a value,
+/// and a structural schema refuses it unless it is nullable. Nothing here does
+/// that today, which is why `deploy_gate.rs` checks the schema rather than
+/// leaving the line to be dropped by someone who tested only the controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RolloutStatus {
