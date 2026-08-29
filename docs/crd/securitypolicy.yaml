@@ -315,9 +315,18 @@ spec:
                 rollout:
                   type: object
                   properties:
+                    # Nullable, and the controller sends `null` rather than
+                    # omitting: a status PATCH is a JSON merge patch, so an
+                    # omitted key would leave a stale count standing. Absent
+                    # means no fleet was declared and nothing was counted;
+                    # `0` means a declared fleet was counted and none of it is
+                    # ready. This kind has no rollout printer column; the
+                    # distinction is read out of the object.
                     clustersReady:
                       type: integer
                       format: int32
+                      nullable: true
                     clustersDegraded:
                       type: integer
                       format: int32
+                      nullable: true

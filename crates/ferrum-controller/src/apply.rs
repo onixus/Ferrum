@@ -733,7 +733,7 @@ mod tests {
             ReconcileOutcome::Applied(a) => {
                 assert!(a.deliver.is_empty());
                 assert_eq!(a.keep_lkg, vec!["old".to_string()]);
-                assert_eq!(a.status.rollout.clusters_degraded, 1);
+                assert_eq!(a.status.rollout.clusters_degraded, Some(1));
             }
             ReconcileOutcome::Failed(s) => panic!("{}", s.compile.message),
         }

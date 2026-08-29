@@ -142,6 +142,15 @@ pub fn abi_compatible(peer_abi: u32, min_abi: u32) -> bool {
 }
 
 /// Incompatible ABI → `keep_lkg`, not a force-load.
+///
+/// An empty `clusters` is not a fleet of zero members that all came back
+/// ready: it is `--cluster` never passed, which is what the shipped
+/// `deploy/controller/deployment.yaml` does, and no member was asked anything.
+/// Those two answer the operator's question differently and used to serialise
+/// the same, so the empty slice returns `RolloutStatus::default()` — both
+/// counts absent — and only a declared fleet produces numbers. A declared fleet
+/// whose every member is incompatible still reports `Some(0)` ready, because
+/// that zero was counted.
 pub fn plan_rollout(
     bundle: &SignedBundle,
     library: Option<&PolicyLibrarySpec>,
@@ -159,11 +168,16 @@ pub fn plan_rollout(
             keep_lkg.push(cluster.name.clone());
         }
     }
+    let status = if clusters.is_empty() {
+        RolloutStatus::default()
+    } else {
+        RolloutStatus {
+            clusters_ready: Some(count_i32(deliver.len())),
+            clusters_degraded: Some(count_i32(keep_lkg.len())),
+        }
+    };
     RolloutPlan {
-        status: RolloutStatus {
-            clusters_ready: count_i32(deliver.len()),
-            clusters_degraded: count_i32(keep_lkg.len()),
-        },
+        status,
         deliver,
         keep_lkg,
     }
@@ -505,8 +519,8 @@ runtime:
         }));
         assert!(out.status.compile.ready);
         assert_eq!(out.status.observed_generation, 7);
-        assert_eq!(out.status.rollout.clusters_ready, 1);
-        assert_eq!(out.status.rollout.clusters_degraded, 1);
+        assert_eq!(out.status.rollout.clusters_ready, Some(1));
+        assert_eq!(out.status.rollout.clusters_degraded, Some(1));
         assert_eq!(out.deliver, vec!["ready".to_string()]);
         assert_eq!(out.keep_lkg, vec!["old-agent".to_string()]);
         assert!(!out.deliver.contains(&"old-agent".to_string()));
@@ -527,8 +541,8 @@ runtime:
         let plan = plan_rollout(&signed, Some(&lib), &clusters);
         assert!(plan.deliver.is_empty());
         assert_eq!(plan.keep_lkg, vec!["current".to_string()]);
-        assert_eq!(plan.status.clusters_ready, 0);
-        assert_eq!(plan.status.clusters_degraded, 1);
+        assert_eq!(plan.status.clusters_ready, Some(0));
+        assert_eq!(plan.status.clusters_degraded, Some(1));
 
         let (min_agent, _) = effective_min_abi(&signed, Some(&lib));
         assert_eq!(min_agent, AGENT_ABI.saturating_add(1));
@@ -558,10 +572,60 @@ runtime:
             library: Some(&lib),
             clusters: &clusters,
         }));
-        assert_eq!(out.status.rollout.clusters_ready, 2);
-        assert_eq!(out.status.rollout.clusters_degraded, 0);
+        assert_eq!(out.status.rollout.clusters_ready, Some(2));
+        assert_eq!(out.status.rollout.clusters_degraded, Some(0));
         assert!(out.keep_lkg.is_empty());
         assert_eq!(out.deliver, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// An undeclared fleet is absent from status, and a declared one that is
+    /// entirely stuck is a counted zero. Both halves, because either alone is
+    /// satisfied by a constant.
+    ///
+    /// The serialised patch is asserted and not just the struct: the status
+    /// write is `Patch::Merge`, so an omitted key keeps whatever the object
+    /// already carries, and a `None` that serialised to nothing would leave the
+    /// stale `clustersReady: 0` this change exists to remove.
+    #[test]
+    fn an_undeclared_fleet_is_absent_from_status_and_a_stuck_one_is_a_counted_zero() {
+        let spec = prod_restricted();
+        let signed = compile_and_sign(&spec, &RFC8032_SK).expect("sign");
+
+        let nobody = plan_rollout(&signed, None, &[]);
+        assert_eq!(nobody.status, RolloutStatus::default());
+        assert_eq!(nobody.status.clusters_ready, None);
+        assert_eq!(nobody.status.clusters_degraded, None);
+        assert!(nobody.deliver.is_empty() && nobody.keep_lkg.is_empty());
+
+        let lib = library(AGENT_ABI.saturating_add(1), ADMISSION_ABI);
+        let stuck = plan_rollout(
+            &signed,
+            Some(&lib),
+            &[ClusterAbi {
+                name: "current".into(),
+                agent_abi: AGENT_ABI,
+                admission_abi: ADMISSION_ABI,
+            }],
+        );
+        assert_eq!(stuck.status.clusters_ready, Some(0));
+        assert_ne!(
+            nobody.status, stuck.status,
+            "nobody counted and everybody stuck must not serialise the same; that they did \
+             is the whole of this finding"
+        );
+
+        let absent = serde_json::to_value(&nobody.status).expect("rollout json");
+        assert_eq!(
+            absent,
+            serde_json::json!({ "clustersReady": null, "clustersDegraded": null }),
+            "an absent count must travel as an explicit null: a merge patch that omits the \
+             key leaves the previous value standing"
+        );
+        let counted = serde_json::to_value(&stuck.status).expect("rollout json");
+        assert_eq!(
+            counted,
+            serde_json::json!({ "clustersReady": 0, "clustersDegraded": 1 })
+        );
     }
 
     /// A policy's mode is the mode its spec carries, and nothing in this
@@ -648,7 +712,7 @@ runtime:
         assert_eq!(out.mode, PolicyMode::Observe);
         assert!(out.status.compile.ready);
         assert_eq!(out.status.compile.bundle_digest, out.bundle.digest.as_str());
-        assert_eq!(out.status.rollout.clusters_ready, 1);
+        assert_eq!(out.status.rollout.clusters_ready, Some(1));
         assert_eq!(out.deliver, vec!["c1".to_string()]);
     }
 

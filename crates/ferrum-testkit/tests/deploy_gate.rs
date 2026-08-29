@@ -1147,8 +1147,12 @@ mod build_closure {
                 .display()
                 .to_string();
             for doc in serde_yaml::Deserializer::from_str(&raw) {
+                // `break`, not `continue`: libyaml does not recover from a
+                // parse error, so asking this iterator for the next document
+                // after one yields the same error again, for ever. A malformed
+                // manifest under deploy/ hung this gate instead of failing it.
                 let Ok(value) = Value::deserialize(doc) else {
-                    continue;
+                    break;
                 };
                 collect_containers(&value, &name, &mut out);
             }
@@ -2836,6 +2840,210 @@ mod image_platform {
                 "{file}: builds no {TARGET_TRIPLE} binary, so the platform this gate \
                  requires of its image is not the platform of what is inside it"
             );
+        }
+    }
+}
+
+/// The fifth place the same invariant is written down, and the one an operator
+/// reads out of `kubectl get`: what the rollout counters mean when nothing was
+/// counted.
+///
+/// The shipped `deploy/controller/deployment.yaml` passes no `--cluster`, so
+/// `plan_rollout` is handed an empty slice on every real install. While the
+/// counters were plain `i32` that produced `clustersReady: 0` forever — the
+/// zero value of a struct nobody filled, printed in the column an operator
+/// reads to decide whether policy landed, and indistinguishable from a declared
+/// fleet that is entirely stuck. Absent and zero now serialise differently, and
+/// both halves of that are checked here rather than only in the crate that
+/// computes them, because the claim spans three files: the manifest that
+/// declares no fleet, the code that answers for one, and the CRD schema that
+/// has to accept the answer.
+mod rollout_accounting {
+    use ferrum_api::RolloutStatus;
+    use ferrum_controller::{compile_and_sign, plan_rollout, ClusterAbi};
+    use ferrum_ids::{ADMISSION_ABI, AGENT_ABI};
+    use ferrum_testkit::prod_restricted;
+    use serde_yaml::Value;
+    use std::path::{Path, PathBuf};
+
+    /// RFC 8032 §7.1 test-1 seed: fixture only, not a prod key.
+    const SK: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+
+    fn repo_path(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel)
+    }
+
+    /// Every `command:` and `args:` entry of every container in the controller
+    /// Deployment.
+    ///
+    /// Both keys, in that order, the way `build_closure::collect_containers`
+    /// reads them: either can carry a flag, and a reader that took only `args`
+    /// would let a `--cluster` moved into `command` past the premise below
+    /// while the `--status-dir` calibration still passed out of `args`.
+    ///
+    /// Flat across containers on purpose: the question is whether this manifest
+    /// declares a fleet anywhere, and a `--cluster` on a sidecar would be a
+    /// declaration this gate must not walk past.
+    fn controller_argv() -> Vec<String> {
+        let raw = std::fs::read_to_string(repo_path("deploy/controller/deployment.yaml"))
+            .expect("controller deployment");
+        let doc: Value = serde_yaml::from_str(&raw).expect("deployment yaml");
+        let containers = doc
+            .get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("spec"))
+            .and_then(|s| s.get("containers"))
+            .and_then(Value::as_sequence)
+            .expect("controller pod spec has containers");
+        let mut argv = Vec::new();
+        for container in containers {
+            for key in ["command", "args"] {
+                let Some(items) = container.get(key).and_then(Value::as_sequence) else {
+                    continue;
+                };
+                argv.extend(
+                    items
+                        .iter()
+                        .map(|item| item.as_str().expect("argv entries are strings").to_string()),
+                );
+            }
+        }
+        argv
+    }
+
+    /// `status.rollout.<name>` in **every** served version of `crd`, by version
+    /// name.
+    ///
+    /// Not `versions[0]`. An operator uses the version they are served, so a
+    /// second version that dropped `nullable` would be the one in the cluster
+    /// while a reader stopping at the first still said the schema was right.
+    fn rollout_properties(crd: &str, name: &str) -> Vec<(String, Value)> {
+        let root: Value = serde_yaml::from_str(crd).expect("crd yaml");
+        let versions = root
+            .get("spec")
+            .and_then(|s| s.get("versions"))
+            .and_then(Value::as_sequence)
+            .expect("crd serves versions");
+        let out: Vec<(String, Value)> = versions
+            .iter()
+            .filter_map(|version| {
+                let property = version
+                    .get("schema")
+                    .and_then(|s| s.get("openAPIV3Schema"))
+                    .and_then(|s| s.get("properties"))
+                    .and_then(|p| p.get("status"))
+                    .and_then(|s| s.get("properties"))
+                    .and_then(|p| p.get("rollout"))
+                    .and_then(|r| r.get("properties"))
+                    .and_then(|p| p.get(name))?;
+                Some((
+                    version
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unnamed>")
+                        .to_string(),
+                    property.clone(),
+                ))
+            })
+            .collect();
+        assert!(
+            !out.is_empty(),
+            "no served version declares status.rollout.{name}, so the assertions on it would \
+             run over nothing"
+        );
+        out
+    }
+
+    #[test]
+    fn the_shipped_controller_declares_no_fleet_so_its_rollout_counts_are_absent_not_zero() {
+        let argv = controller_argv();
+        assert!(
+            !argv.is_empty(),
+            "the controller container passes no args at all, so this gate read the wrong \
+             manifest and its premise is decided by nothing"
+        );
+        assert!(
+            argv.iter().any(|a| a == "--status-dir"),
+            "the flag this reader is calibrated on is gone from {argv:?}"
+        );
+        let declared: Vec<&String> = argv
+            .iter()
+            .filter(|a| *a == "--cluster" || a.starts_with("--cluster="))
+            .collect();
+        assert!(
+            declared.is_empty(),
+            "deploy/controller/deployment.yaml now declares a fleet: {declared:?}. That is \
+             the repair this branch was waiting for, not a break — but the rollout counters \
+             stop being absent on a real install the day it lands, so rewrite the line in \
+             docs/MVP-1-BOUNDARY.md that says they are, and delete this half of the gate."
+        );
+
+        // Given that premise, what the operator reads. `None` and `Some(0)` are
+        // the two answers this gate exists to keep apart, so both are asserted
+        // through the serialised form the API server actually receives.
+        let bundle = compile_and_sign(&prod_restricted().spec, &SK).expect("sign");
+        let nobody = plan_rollout(&bundle, None, &[]);
+        assert_eq!(nobody.status, RolloutStatus::default());
+        assert_eq!(
+            serde_json::to_value(&nobody.status).expect("json"),
+            serde_json::json!({ "clustersReady": null, "clustersDegraded": null }),
+            "an uncounted rollout must travel as an explicit null: the status write is a \
+             merge patch, and an omitted key leaves a stale count from an earlier version \
+             standing forever"
+        );
+
+        let stuck = plan_rollout(
+            &bundle,
+            None,
+            &[ClusterAbi {
+                name: "current".into(),
+                agent_abi: AGENT_ABI.saturating_sub(1),
+                admission_abi: ADMISSION_ABI,
+            }],
+        );
+        assert_eq!(
+            serde_json::to_value(&stuck.status).expect("json"),
+            serde_json::json!({ "clustersReady": 0, "clustersDegraded": 1 }),
+            "a declared fleet that is entirely stuck is a counted zero and must keep saying \
+             so; if this reports null the two states have collapsed again, the other way"
+        );
+    }
+
+    #[test]
+    fn both_rollout_counts_are_nullable_in_every_crd_that_carries_them() {
+        for (kind, crd) in [
+            ("ClusterSecurityPolicy", super::CRD_CLUSTER_SECURITY_POLICY),
+            ("SecurityPolicy", super::CRD_SECURITY_POLICY),
+        ] {
+            for name in ["clustersReady", "clustersDegraded"] {
+                for (version, property) in rollout_properties(crd, name) {
+                    assert_eq!(
+                        property.get("type").and_then(Value::as_str),
+                        Some("integer"),
+                        "{kind}/{version}.status.rollout.{name} is not an integer any more, so \
+                         this gate is reading something else"
+                    );
+                    assert_eq!(
+                        property.get("nullable").and_then(Value::as_bool),
+                        Some(true),
+                        "{kind}/{version}.status.rollout.{name} is not nullable, and the \
+                         controller's own writes are not what needs it: those are JSON merge \
+                         patches, where `null` is a delete directive that never reaches schema \
+                         validation. What needs it is every other way this field is written — \
+                         an update, a server-side apply, an operator's `kubectl apply` of a \
+                         whole object — each of which sends `null` as a value a structural \
+                         schema refuses unless it is nullable. Removing this line would not \
+                         break the controller today, which is exactly why it has to be checked \
+                         rather than left to be noticed."
+                    );
+                }
+            }
         }
     }
 }

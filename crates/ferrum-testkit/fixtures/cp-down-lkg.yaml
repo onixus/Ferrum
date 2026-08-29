@@ -6,8 +6,3 @@ spec:
   kubeconfigSecretRef: ferrum-cluster-prod-eu-1
   labels:
     ferrum.io/zone: pci
-status:
-  connected: false
-  degraded: true
-  agentAbi: 1
-  lastBundleDigest: "8253ce6ea4260821d86f49a49487bd5f032c763a9d63499d8dea0a3f7e3fabd2"

@@ -16,18 +16,23 @@ spec:
     - name: v1
       served: true
       storage: true
-      subresources:
-        status: {}
-      additionalPrinterColumns:
-        - name: Pass
-          type: integer
-          jsonPath: .status.pass
-        - name: Fail
-          type: integer
-          jsonPath: .status.fail
-        - name: Waived
-          type: integer
-          jsonPath: .status.waived
+      # No `subresources: status`, no status columns and no status schema, on
+      # purpose. Nothing in this workspace writes ComplianceSnapshot's status:
+      # no source file under `crates/ferrum-controller/src` builds a
+      # `GroupVersionKind::gvk(…, "ComplianceSnapshot")`, so there is no
+      # ApiResource, no watch and no PATCH, and the RBAC grant that would have
+      # carried one was deleted for the same reason
+      # (`deploy/controller/rbac.yaml`).
+      #
+      # This kind is the sharpest of the four: its entire content was the
+      # status, and `Pass 0 Fail 0 Waived 0` is exactly what a clean audit
+      # looks like. What is left is the `spec.frameworks` an operator declares
+      # and nothing that answers — the honest shape, stated here instead of
+      # implied by three columns of zeroes.
+      #
+      # Restore the subresource, the columns and the schema in the change that
+      # adds the writer, not before
+      # (`boundary_gate.rs::a_status_no_subject_writes_is_not_a_status_this_tree_ships`).
       schema:
         openAPIV3Schema:
           type: object
@@ -45,15 +50,3 @@ spec:
                   items:
                     type: string
                     minLength: 1
-            status:
-              type: object
-              properties:
-                pass:
-                  type: integer
-                  format: int32
-                fail:
-                  type: integer
-                  format: int32
-                waived:
-                  type: integer
-                  format: int32

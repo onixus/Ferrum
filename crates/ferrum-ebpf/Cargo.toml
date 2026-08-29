@@ -19,6 +19,11 @@ ferrum-crypto.workspace = true
 ferrum-ebpf-progs.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+# The wasm slot of every FRMB bundle is signed, and until this cycle both planes
+# skipped it. `accept_bundle_slot` is what decides whether a slot may load; the
+# crate carries no runtime and its whole graph is ferrum-common, so this adds a
+# decision to the loader and nothing to the binary.
+ferrum-wasm-host.workspace = true
 # getrlimit/setrlimit for the RLIMIT_MEMLOCK raise `attach` does before every
 # Bpf::load. Under `attach` this adds nothing to the graph: aya 0.12 already
 # resolves libc there, and this only stops the crate borrowing it. The default

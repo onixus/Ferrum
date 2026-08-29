@@ -631,6 +631,8 @@ dependencies = [
  "ferrum-ids",
  "ferrum-k8smeta",
  "ferrum-policy",
+ "ferrum-wasm-abi",
+ "ferrum-wasm-host",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -654,7 +656,6 @@ dependencies = [
  "ferrum-policy",
  "ferrum-proto",
  "ferrum-testkit",
- "ferrum-wasm-host",
  "libc",
  "serde_json",
  "serde_yaml",
@@ -758,6 +759,7 @@ dependencies = [
  "ferrum-ebpf-progs",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-wasm-host",
  "libc",
 ]
 

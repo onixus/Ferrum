@@ -438,8 +438,9 @@ fn extract_admission_program(raw: &[u8]) -> Result<Vec<u8>> {
     }
     let admission = r.len_prefixed("admission_program")?;
     let _ebpf = r.len_prefixed("ebpf_spec")?;
-    let _wasm = r.len_prefixed("wasm")?;
+    let wasm = r.len_prefixed("wasm")?;
     r.finish()?;
+    ferrum_wasm_host::accept_bundle_slot(&wasm)?;
     if admission.is_empty() {
         return Err(FerrumError::Integrity(
             "bundle admission_program is empty".into(),
@@ -575,7 +576,9 @@ mod tests {
         out.extend_from_slice(&min_admission_abi.to_le_bytes());
         append_len_prefixed(&mut out, admission, "admission_program").unwrap();
         append_len_prefixed(&mut out, b"", "ebpf_spec").unwrap();
-        append_len_prefixed(&mut out, b"", "wasm").unwrap();
+        // What the compiler actually emits. An empty slot was never a bundle
+        // this tree produces, and it is no longer one this tree loads.
+        append_len_prefixed(&mut out, &ferrum_wasm_abi::placeholder_module(), "wasm").unwrap();
         out
     }
 

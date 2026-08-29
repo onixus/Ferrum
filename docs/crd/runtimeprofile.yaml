@@ -16,8 +16,24 @@ spec:
     - name: v1
       served: true
       storage: true
-      subresources:
-        status: {}
+      # No `subresources: status`, no status columns and no status schema, on
+      # purpose. Nothing in this workspace writes RuntimeProfile's status: no
+      # source file under `crates/ferrum-controller/src` builds a
+      # `GroupVersionKind::gvk(…, "RuntimeProfile")`, so there is no
+      # ApiResource, no watch and no PATCH, and the RBAC grant that would have
+      # carried one was deleted for the same reason
+      # (`deploy/controller/rbac.yaml`). `retain_policy_mode` and
+      # `runtime_profile_status`, the two functions that once returned a status
+      # for this kind, went with it.
+      #
+      # A declared status nobody fills is not an empty field. `ReadyForPromote
+      # false` and `Drift 0` on a profile nothing observed read as a
+      # measurement that was taken and came back clean. The `.spec` columns
+      # below stay: they print what the operator wrote.
+      #
+      # Restore the subresource, the columns and the schema in the change that
+      # adds the writer, not before
+      # (`boundary_gate.rs::a_status_no_subject_writes_is_not_a_status_this_tree_ships`).
       additionalPrinterColumns:
         - name: SourcePolicy
           type: string
@@ -25,12 +41,6 @@ spec:
         - name: Window
           type: string
           jsonPath: .spec.window
-        - name: ReadyForPromote
-          type: boolean
-          jsonPath: .status.readyForPromote
-        - name: Drift
-          type: integer
-          jsonPath: .status.driftCount
       schema:
         openAPIV3Schema:
           type: object
@@ -49,13 +59,3 @@ spec:
                 window:
                   type: string
                   minLength: 2
-            status:
-              type: object
-              # Promote is a human action: the controller never flips a profile
-              # into an enforcing policy on its own.
-              properties:
-                readyForPromote:
-                  type: boolean
-                driftCount:
-                  type: integer
-                  format: int32

@@ -215,13 +215,38 @@ pub struct CompileStatus {
     pub message: String,
 }
 
+/// Fleet accounting, and `None` where there is none to report.
+///
+/// Both counts are optional because zero is a number and «nobody counted» is
+/// not, and on every install this tree ships they were the same thing: the
+/// controller Deployment declares no fleet member, `plan_rollout` is handed an
+/// empty slice, and a plain `i32` made that a status reading `clustersReady: 0`
+/// — the printer column an operator reads to decide whether policy landed,
+/// stuck on the zero value of its own struct and indistinguishable from a fleet
+/// that is entirely down. That is the same finding this tree deleted four RBAC
+/// grants for, one field over: a status nobody computed is worse than absent,
+/// because absent is legible.
+///
+/// `None` serialises as an explicit `null` and is not skipped. The status write
+/// is a JSON merge patch (RFC 7386), where an omitted key keeps whatever the
+/// object already carries — so skipping would leave a stale `0` from an earlier
+/// version standing forever, which is the failure this type exists to end. In
+/// that patch `null` is a delete directive: the API server removes the key and
+/// validates the merged object, so the null itself never meets the schema.
+///
+/// The CRD schemas still mark both fields `nullable`, and not for the write
+/// above. Every other way this field can be sent — an update, a server-side
+/// apply, an operator applying a whole object — carries the `null` as a value,
+/// and a structural schema refuses it unless it is nullable. Nothing here does
+/// that today, which is why `deploy_gate.rs` checks the schema rather than
+/// leaving the line to be dropped by someone who tested only the controller.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RolloutStatus {
     #[serde(default)]
-    pub clusters_ready: i32,
+    pub clusters_ready: Option<i32>,
     #[serde(default)]
-    pub clusters_degraded: i32,
+    pub clusters_degraded: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

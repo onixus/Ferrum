@@ -14,6 +14,10 @@ ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ids.workspace = true
 ferrum-policy.workspace = true
+# Same decision the agent's envelope parser makes, on the same signed slot: a
+# wasm module this binary has no executor for must not load. Graph is
+# ferrum-common; there is no wasm runtime in this tree to pull in.
+ferrum-wasm-host.workspace = true
 # Label watch only, and never with the k8smeta default features: the decision
 # path must not grow a second client.
 # Not `workspace = true`: that form cannot turn default features off here.
@@ -29,4 +33,6 @@ apiserver = ["dep:ferrum-k8smeta", "ferrum-k8smeta/apiserver"]
 
 [dev-dependencies]
 ferrum-compiler.workspace = true
+# Test bundles carry the slot the compiler emits, not an empty one.
+ferrum-wasm-abi.workspace = true
 serde_yaml.workspace = true
