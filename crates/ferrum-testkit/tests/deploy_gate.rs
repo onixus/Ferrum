@@ -1147,8 +1147,12 @@ mod build_closure {
                 .display()
                 .to_string();
             for doc in serde_yaml::Deserializer::from_str(&raw) {
+                // `break`, not `continue`: libyaml does not recover from a
+                // parse error, so asking this iterator for the next document
+                // after one yields the same error again, for ever. A malformed
+                // manifest under deploy/ hung this gate instead of failing it.
                 let Ok(value) = Value::deserialize(doc) else {
-                    continue;
+                    break;
                 };
                 collect_containers(&value, &name, &mut out);
             }

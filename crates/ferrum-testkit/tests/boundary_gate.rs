@@ -815,8 +815,15 @@ fn documents(root: &Path) -> Vec<Value> {
     for file in files {
         let body = fs::read_to_string(&file).expect("manifest");
         for doc in serde_yaml::Deserializer::from_str(&body) {
-            if let Ok(value) = Value::deserialize(doc) {
-                out.push(value);
+            // `break`, not `continue`: libyaml does not recover from a parse
+            // error, so asking this iterator for the next document after one
+            // yields the same error again, for ever. Every reader of a
+            // multi-document file in this crate had that shape, and each of
+            // them hung the run instead of failing it — a gate with no verdict
+            // at all, which in CI reads as a wedged node rather than a finding.
+            match Value::deserialize(doc) {
+                Ok(value) => out.push(value),
+                Err(_) => break,
             }
         }
     }
@@ -1780,8 +1787,10 @@ fn controller_container(root: &Path) -> (Value, Value) {
     let body = fs::read_to_string(root.join("deploy/controller/deployment.yaml"))
         .expect("deploy/controller/deployment.yaml");
     for doc in serde_yaml::Deserializer::from_str(&body) {
+        // `break`: see `documents` above. libyaml does not recover, so a
+        // `continue` here spins on the same error.
         let Ok(value) = Value::deserialize(doc) else {
-            continue;
+            break;
         };
         if scalar(&value, "kind") != "Deployment" {
             continue;
