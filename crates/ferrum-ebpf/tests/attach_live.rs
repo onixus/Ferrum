@@ -588,6 +588,21 @@ mod gate {
             let pid = unsafe { libc::fork() };
             if pid == 0 {
                 unsafe {
+                    // Read one byte of the pathname before passing it. Not
+                    // ceremony: `bpf_probe_read_user_str` does not fault, and
+                    // on the aarch64 6.12 node this stage runs on, the page
+                    // holding this string is not reachable to it in a child
+                    // that has done nothing since `fork` — the record then
+                    // arrives with an empty path and
+                    // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
+                    // identifies the child's record by is gone. Faulting it in
+                    // restores the identification without weakening what is
+                    // asserted below, which is about the agent-self flag and
+                    // not about path readability. The behaviour that made this
+                    // necessary is itself gated, one test down, because a
+                    // datapath that reported the same empty path *without* the
+                    // flag would take every path rule out silently.
+                    std::ptr::read_volatile(c_target.as_ptr());
                     libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
                     libc::_exit(0);
                 }
@@ -647,6 +662,108 @@ mod gate {
             "foreign records from tgid {child_tgid}: {}, none flagged agent-self",
             hits.len()
         );
+    }
+
+    /// A path this kernel could not read is never reported as a short one.
+    ///
+    /// Measured on the arm64 node this stage runs on, and it does not happen
+    /// on the x86_64 stand every `K` row in `docs/MVP-1-BOUNDARY.md` was taken
+    /// against: a child that calls `openat` having done nothing since `fork`
+    /// passes a pathname `bpf_probe_read_user_str` cannot reach — the helper
+    /// does not fault, and the page is not there for it yet. Two outcomes are
+    /// therefore legitimate and this test accepts both.
+    ///
+    /// What it refuses is the third: an empty path with no flag. That record
+    /// is indistinguishable from a syscall that carried no path at all, and
+    /// `matched_action` decides the two differently on purpose — an unreadable
+    /// path asserts the match and sets `path_unknown`
+    /// (`lib.rs::an_unreadable_path_still_kills_on_the_runtime_sock_rule`),
+    /// while an honest empty one does not match. So a datapath that dropped
+    /// the flag here would not fail loudly; it would quietly take every
+    /// `pathPrefix` and `pathSuffix` rule out of force for any process in this
+    /// state, on the arch where the state occurs. That is the fail-open this
+    /// test exists to close, and nothing in userspace can close it: whether
+    /// the flag is set is decided in the kernel.
+    #[test]
+    fn a_path_this_kernel_could_not_read_is_never_reported_as_a_short_one() {
+        let _serial = serialized();
+        let Some(mut live) = live() else {
+            return;
+        };
+        let arch = live.arch;
+
+        let target = format!("/tmp/ferrum-attach-live-{}-unfaulted", std::process::id());
+        let c_target = CString::new(target.clone()).expect("path has no NUL");
+        let child = std::cell::Cell::new(-1);
+        let observed = live.observe(|| {
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                unsafe {
+                    // Deliberately not touched first: that is the state under
+                    // test.
+                    libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
+                    libc::_exit(0);
+                }
+            }
+            assert!(pid > 0, "fork failed");
+            child.set(pid);
+            let mut status = 0;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, 0) },
+                pid,
+                "waitpid on the probe child failed"
+            );
+        });
+
+        let child_tgid = u32::try_from(child.get()).expect("child pid");
+        let hits: Vec<&Event> = observed
+            .others
+            .iter()
+            .filter(|e| e.tgid == child_tgid && syscall_name(arch, e.syscall_nr) == Some("openat"))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the child's openat did not reach the ring at all, so this test looked at \
+             nothing: {:?}",
+            observed
+                .others
+                .iter()
+                .map(|e| (e.tgid, syscall_name(arch, e.syscall_nr)))
+                .collect::<Vec<_>>()
+        );
+        let event = hits[0];
+        assert_common_shape(event, arch);
+
+        let path = path_bytes(event);
+        let flagged = event.flags & EVENT_FLAG_PATH_TRUNCATED != 0;
+        if path == target.as_bytes() {
+            assert!(
+                !flagged,
+                "the whole path arrived and is still flagged truncated: the flag would then \
+                 mean nothing, and `path_unknown` would be set on records whose path is known"
+            );
+            println!("unfaulted child path: read whole on {}", arch.as_str());
+        } else {
+            assert!(
+                path.is_empty(),
+                "the path is neither whole nor empty: {:?}. This test knows two outcomes and \
+                 has met a third, which nothing here decides.",
+                String::from_utf8_lossy(path)
+            );
+            assert!(
+                flagged,
+                "the path arrived empty with no EVENT_FLAG_PATH_TRUNCATED. That record is \
+                 indistinguishable from a syscall that carried no path, and matched_action \
+                 decides the two differently: an unreadable path asserts the match, an \
+                 honest empty one does not. Every pathPrefix and pathSuffix rule is out of \
+                 force for this process, silently, on this arch."
+            );
+            println!(
+                "unfaulted child path: unreadable and flagged on {}",
+                arch.as_str()
+            );
+        }
     }
 
     /// `attach_for_arch` raises the soft `RLIMIT_MEMLOCK` it loads under.
