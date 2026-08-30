@@ -627,6 +627,19 @@ mod gate {
                 std::ptr::null(),
             ];
             let envp = [std::ptr::null::<libc::c_char>()];
+            // Same fault-in as the openat probes, and here it decides more
+            // than identification. The datapath reads execve's path from the
+            // first argument slot; unread, the record arrives with an empty
+            // path and `EVENT_FLAG_PATH_TRUNCATED`, and a path rule matching
+            // an unknown path is *asserted*, not skipped — that is the
+            // fail-closed the product is built on. So on a kernel where this
+            // page is missing, the child's own `execve("/bin/sh")` matched the
+            // docker.sock rule and the agent signalled twice for one probe:
+            // once for `no-runtime-sock` on a path it could not read, once for
+            // `no-shell` on the shell's own exec. Nothing about that is wrong
+            // in the agent; the probe was simply handing it a path no rule
+            // could clear.
+            std::ptr::read_volatile(sh.as_ptr());
             libc::execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(98);
         });
@@ -1265,8 +1278,22 @@ mod gate {
         );
         assert!(
             agent.respond_failed_total() >= RESPOND_SIGNAL_FAILING_MIN,
-            "only {} reactions reached the syscall",
-            agent.respond_failed_total()
+            "only {} reactions reached the syscall. A reaction that never got there was \
+             stopped by a guard, and which guard is the whole question: refused {}, of them \
+             stale target {}, killed {}. Verdicts: {:?}",
+            agent.respond_failed_total(),
+            agent.respond_refused_total(),
+            agent.respond_stale_target_total(),
+            agent.respond_kill_total(),
+            sink.events()
+                .iter()
+                .map(|e| (
+                    e.rule.as_str().to_string(),
+                    e.action.as_str().to_string(),
+                    e.executed,
+                    e.respond_error.clone()
+                ))
+                .collect::<Vec<_>>()
         );
         // The guard passed every time: this is why no other reason can see it.
         assert!(agent.respond_target_confirmed_total() >= RESPOND_SIGNAL_FAILING_MIN);
