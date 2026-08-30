@@ -44,16 +44,23 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
   `/Users/onixus/jenkins_home/jobs/ferrum/builds/<N>/log`, артефакты — в `.../archive/`.
 - Функциональные стадии: `Format`, `Clippy`, `Test`, `Validate policies` (в ней же
   негативные кейсы), `Crate boundary`, сборка бинарей (`Agent binary`,
-  `Admission binary`, `Controller binary`), датапейс (`BPF ELF`, `BPF attach`,
-  `BPF join`, `BPF join mutations`) и образы (`Agent image`, `Admission image`,
+  `Admission binary`, `Controller binary`), датапейс (`BPF ELF`,
+  `Datapath tracefs`, `BPF attach`, `Datapath cgroup`, `BPF join`,
+  `BPF join mutations`) и образы (`Agent image`, `Admission image`,
   `Controller image`). Разложены по исполнителям: нода (docker CLI), группы
-  `Build`, `Checks` и `Datapath` в rust-контейнере родной архитектуры и группа
-  `Link`, где цель musl берётся кросс-компиляцией, а не эмуляцией — под QEMU
-  падает сам rustc. Цель из архитектуры ноды не выводить: стенд ядра x86_64. `Datapath` стоит последней: ей нужно
-  ядро с tracefs и права `CAP_BPF`/`CAP_PERFMON`, и на ноде без них она падает
-  честно, никого за собой не унося. Ни то, ни другое не свойство ядра этой
+  `Build`, `Checks` и `Datapath` в rust-контейнере родной архитектуры, группа
+  `Datapath join` — на ноде, контейнер она поднимает сама, — и группа
+  `Link`, где цель musl берётся кросс-компиляцией, а не эмуляцией: под QEMU
+  падает сам rustc. Цель из архитектуры ноды не выводить, и после появления
+  второго стенда причина стала уже, а не исчезла: нода — aarch64, стык же
+  меряется на x86_64, и бинарь под arm64 оставил бы стадию зелёной, а
+  утверждение про продуктовую комбинацию — про то, чего на том стенде не будет.
+  Датапейсные группы стоят в конце: им нужно ядро с tracefs, права
+  `CAP_BPF`/`CAP_PERFMON` и писуемая cgroup2, и на ноде без них они падают
+  честно, никого за собой не унося. Ничто из трёх не свойство ядра этой
   ноды: tracefs монтирует стадия `Datapath tracefs` одноразовым привилегированным
-  контейнером, права даёт `DATAPATH_DOCKER_ARGS`, и `--pid=host` там же —
+  контейнером, права даёт `DATAPATH_DOCKER_ARGS`, запись в cgroup —
+  `Datapath cgroup` тем же приёмом, и `--pid=host` там же —
   датапейс пишет pid из init-namespace, а тесты сверяют их со своим `getpid()`.
   Пропускать стадию
   по условию нельзя — гейт, умеющий себя пропустить, это тот самый дефект.
