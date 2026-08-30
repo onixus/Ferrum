@@ -32,12 +32,17 @@
 покраснеет. Цикл 9 наступил на это дважды.
 
 Механическую форму имеет один случай этого направления, и теперь он держится
-гейтом: каждый `#[test]` в `crates/ferrum-testkit/tests` и
-`crates/ferrum-agent/tests` обязан быть процитирован строкой «Делает» или
-назван в списке исключений с причиной. Эти два каталога выбраны не наугад: в
-них нет ничего, кроме гейтов, поэтому каждый тест там — утверждение о продукте,
-а не о функции. Тридцать пять тестов оказались непроцитированными в момент, когда
-гейт написали, и на все тридцать пять написаны строки; список исключений
+гейтом: каждый `#[test]` в `crates/ferrum-testkit/tests`,
+`crates/ferrum-agent/tests`, `crates/ferrum-admission/tests` и
+`crates/ferrum-ebpf/tests` обязан быть процитирован строкой «Делает» или
+назван в списке исключений с причиной. Эти каталоги выбраны не наугад: в
+них нет ничего, кроме гейтов и приёмки, поэтому каждый тест там — утверждение о
+продукте, а не о функции. Тридцать пять тестов оказались непроцитированными в
+момент, когда гейт написали, и на все тридцать пять написаны строки. Каталоги
+при этом добавлялись по одному, и каждый добавленный находил ещё: семьдесят два
+теста в `ferrum-admission`, шесть в `ferrum-ebpf`. Пока каталог вне списка,
+цитируется он или нет — вопрос прилежания автора строки, и ни одна сборка на
+этот вопрос не отвечает. Список исключений
 приземлился пустым и должен таким оставаться — засеять его тем, что не сходится,
 значит получить зелёное, ничего не проверив.
 
@@ -243,9 +248,11 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 | Половина пары open/openat — мёртвое или обходимое правило, и оно отвергается | U | U `Jenkinsfile::Validate policies` |
 | `lint-deploy` проходит на поставляемом дереве, и плохие фикстуры падают | U | U `Jenkinsfile::Validate policies` |
 | `gen-webhook-pki` выпускает PKI офлайн и отказывается перезаписать выпущенное | U | U `Jenkinsfile::Validate policies` |
-| BPF ELF несёт все программы, карты и счётчики, которые связывает loader | U | U `Jenkinsfile::BPF ELF` |
+| BPF ELF несёт все программы и карты, которые связывает loader: каждый символ программы стоит функцией в своей tracepoint-секции, каждая карта — объектом в `maps`, и объект проходит ту же проверку карт, которой агент отказывает в загрузке перед attach | U | U `elf_inspect.rs::elf_contains_all_tracepoints` · U `elf_inspect.rs::the_shipped_elf_passes_the_attach_time_map_check` · U `Jenkinsfile::BPF ELF` |
+| Определения карт в поставляемом ELF совпадают с userspace ABI, и совпадение читают два независимых разборщика, а не один сам себя: дрейф `ferrum_cgroups` тихо гасит каждое правило `containerOnly`, дрейф `ferrum_events` роняет `take_ring` или роняет записи мимо счётчика потерь, дрейф `ferrum_self` снимает `EVENT_FLAG_AGENT_SELF` и разрешает агенту убить себя | U | U `elf_inspect.rs::cgroups_map_definition_matches_the_userspace_abi` · U `elf_inspect.rs::events_map_definition_matches_the_userspace_abi` · U `elf_inspect.rs::self_map_definition_matches_the_userspace_abi` · U `Jenkinsfile::BPF ELF` |
 | Datapath в настоящем ядре: одна декодируемая запись на syscall, путь из первого слота, нечитаемый указатель помечен пустым буфером | K | K `attach_live.rs::openat_produces_one_decodable_record` · K `attach_live.rs::a_syscall_without_a_path_argument_is_not_flagged` · K `attach_live.rs::unreadable_path_pointer_is_flagged_with_an_empty_buffer` |
 | Карта `ferrum_cgroups` живёт на настоящем handle | K | K `attach_live.rs::cgroup_map_round_trips_on_a_live_handle` |
+| Путь, который это ядро не смогло прочитать, не выдаётся за короткий: запись приходит помеченной `EVENT_FLAG_PATH_TRUNCATED` с пустым буфером, а совпадение по такой записи утверждается с `path_unknown`, то есть правило по пути не обходится молчанием. Флаг ставит ядро, поэтому из userspace эта строка не закрывается | K | K `attach_live.rs::a_path_this_kernel_could_not_read_is_never_reported_as_a_short_one` |
 | Цель, покинувшая cgroup, которая породила запись, сигнала не получает: `REFUSE_STALE_TARGET`, probe жив | K | K `attach_join.rs::a_target_that_left_the_cgroup_is_refused_and_survives` |
 | Корень cgroup2 выводится из `mountinfo`, а не зашит: неоднозначность и нечитаемый `mountinfo` — `Degraded`, а не догадка, и fallback на константу нет ни у guard, ни у индекса | K+U | U `ferrum-agent/src/lib.rs::a_refused_cgroup_root_is_a_named_fault_and_not_a_scan_of_the_default` · U `ferrum-agent/src/lib.rs::the_carrier_has_no_fallback_to_the_hardcoded_cgroup_root` · K `attach_join.rs::a_target_that_left_the_cgroup_is_refused_and_survives` · U `cgroupfs.rs::hybrid_node_resolves_to_the_unified_mount_not_the_tmpfs` · U `cgroupfs.rs::an_ambiguous_or_absent_hierarchy_is_degraded_never_the_default` · U `cgroupfs.rs::several_views_of_one_hierarchy_pick_one_deterministically` · U `cgroupfs.rs::the_derivation_agrees_with_this_node_if_it_has_a_cgroup2_mount` |
 | Стык проходит через продакшн-конструктор `ProcCgroupCheck::new()`, а не через свой вывод корня, и требует, чтобы выведённый корень совпал с тем, в котором создан probe | K | K `attach_join.rs::a_kernel_execve_of_a_shell_is_killed_by_the_signed_bundle` · K `attach_join.rs::a_kernel_openat_of_docker_sock_is_killed_by_the_signed_bundle` · K `attach_join.rs::a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted` · K `attach_join.rs::a_target_that_left_the_cgroup_is_refused_and_survives` · K `attach_join.rs::a_kernel_record_stripped_of_the_flag_is_still_read_as_truncated` · K `attach_join.rs::a_kill_this_kernel_refuses_is_degraded_and_named` |
@@ -582,12 +589,13 @@ watcher релистит и передаёт **каждый** объект за�
 
 ### Гейты этого дерева
 
-Каждый `#[test]` в `crates/ferrum-testkit/tests`, `crates/ferrum-agent/tests` и
-`crates/ferrum-admission/tests` обязан стоять в какой-то строке этого
+Каждый `#[test]` в `crates/ferrum-testkit/tests`, `crates/ferrum-agent/tests`,
+`crates/ferrum-admission/tests` и `crates/ferrum-ebpf/tests` обязан стоять в
+какой-то строке этого
 документа. Это обратное направление гейта: раньше он требовал, чтобы
 процитированное существовало, и не мог потребовать, чтобы существующее было
 процитировано, — то направление, в котором документ гниёт молча. Оно закрыто
-только для этих трёх каталогов, и это не произвол: в них нет ничего, кроме
+только для этих четырёх каталогов, и это не произвол: в них нет ничего, кроме
 гейтов и приёмки, поэтому каждый тест там — утверждение о продукте, а не о
 функции. Тридцать пять тестов были не процитированы в момент, когда гейт
 написали; ниже — строки, которыми на них ответили.
@@ -598,6 +606,21 @@ watcher релистит и передаёт **каждый** объект за�
 включая три из восьми случаев §D, четыре теста кеша меток и три теста
 `MountStat`, — не были видны обратному направлению вообще. Одна строка в
 `CITED_TEST_DIRS`; строки ниже — то, чем за неё заплачено.
+
+Каталог `ferrum-ebpf/tests` вошёл последним, и его отсутствие было самым
+громким из трёх. Там лежит `attach_live.rs` — файл, несущий почти каждую метку
+`K` в этом документе, то есть ровно тот каталог, чьи тесты дороже всего
+переисполнить, был тем, которого обратное направление не видело. Процитирован
+он оказался целиком, но по прилежанию тех, кто писал строки, а не потому, что
+что-то покраснело бы иначе; разница между этими двумя основаниями и есть весь
+смысл гейта. Соседний `elf_inspect.rs` прилежания не получил: пять тестов о
+том, что поставляемый BPF-объект несёт программы и ABI карт, которые связывает
+loader, не были названы ни одной строкой, а единственная строка про этот объект
+цитировала стадию CI — то есть утверждала лишь, что стадия с таким именем есть
+в файле. Шестым нашёлся `a_path_this_kernel_could_not_read_is_never_reported_as_a_short_one`:
+находка прошлого цикла, разобранная абзацем в «Как читать колонку
+„Исполняется“» и не имевшая строки в «Делает» — проза, которую тот же гейт
+правилом `prose_is_not_evidence` доказательством не считает.
 
 | Утверждение | Метка | Исполняется |
 |---|---|---|

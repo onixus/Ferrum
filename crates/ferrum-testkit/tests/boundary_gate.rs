@@ -399,15 +399,26 @@ fn every_claim_in_the_does_section_cites_something_that_exists() {
 /// an implementation detail of a crate, and requiring the boundary document to
 /// name each one would turn it into a test index nobody reads — the failure
 /// mode this file's own header warns about, arrived at from the other side.
-/// These two directories are different: they hold nothing but gates. Every
+/// These directories are different: they hold nothing but gates. Every
 /// file in them exists to establish a claim about the product rather than
 /// about a function, which is exactly the kind of claim this document is a
 /// list of. A test here that no row cites is either a claim the document is
 /// missing or a test that has stopped being about the product.
-const CITED_TEST_DIRS: [&str; 3] = [
+///
+/// `ferrum-ebpf/tests` was the last one outside the rule, and its absence was
+/// the loudest: `attach_live.rs` carries nearly every `K` in the document, so
+/// the one directory whose tests are the hardest to re-execute was the one the
+/// reverse direction could not see. It happened to be fully cited — by the
+/// diligence of whoever wrote the rows, not by anything that would go red.
+/// `elf_inspect.rs` next to it was not: five tests establishing that the
+/// shipped BPF object carries the programs and the map ABI the loader binds
+/// against, none of them named by a row, and the one row about that object
+/// cited the CI stage — which asserts only that a stage of that name exists.
+const CITED_TEST_DIRS: [&str; 4] = [
     "crates/ferrum-testkit/tests",
     "crates/ferrum-agent/tests",
     "crates/ferrum-admission/tests",
+    "crates/ferrum-ebpf/tests",
 ];
 
 /// Tests in those directories that no row cites, each with the reason it is
