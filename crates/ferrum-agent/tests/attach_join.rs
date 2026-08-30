@@ -515,6 +515,33 @@ mod gate {
         agent
     }
 
+    /// Fault in every page the pathname spans, before the kernel reads it.
+    ///
+    /// `bpf_probe_read_user_str` runs with page faults disabled, and on the
+    /// aarch64 6.12 node this stage runs on the pages holding this string are
+    /// not reachable to it in a child that has done nothing since `fork`.
+    /// `attach_live.rs` needs the same for the same reason and says so; the
+    /// join was written on x86_64, where the pages happen to be there, and the
+    /// omission stayed invisible until this stage first ran on a second kernel.
+    ///
+    /// Touching the first byte is not enough, and the difference is not
+    /// theoretical: a pathname that straddles a page boundary is then read up
+    /// to the boundary and stopped, so the record carries a *prefix*. That is
+    /// worse than an empty path — a test matching on a prefix still passes,
+    /// and one matching the whole path fails only when the allocator happens
+    /// to place the string near the end of a page. It arrived exactly that
+    /// way: one exact-match test failing in one build, having passed in the
+    /// two before it.
+    ///
+    /// Faulting the pages in weakens nothing. The truncated-path behaviour has
+    /// its own tests, and one of them deliberately does not touch the page.
+    unsafe fn fault_in_path(path: *const libc::c_char) {
+        let mut i = 0isize;
+        while std::ptr::read_volatile(path.offset(i)) != 0 {
+            i += 1;
+        }
+    }
+
     fn nul_trimmed(bytes: &[u8]) -> &[u8] {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         &bytes[..end]
@@ -629,18 +656,13 @@ mod gate {
             ];
             let envp = [std::ptr::null::<libc::c_char>()];
             // Same fault-in as the openat probes, and here it decides more
-            // than identification. The datapath reads execve's path from the
-            // first argument slot; unread, the record arrives with an empty
-            // path and `EVENT_FLAG_PATH_TRUNCATED`, and a path rule matching
-            // an unknown path is *asserted*, not skipped — that is the
-            // fail-closed the product is built on. So on a kernel where this
-            // page is missing, the child's own `execve("/bin/sh")` matched the
-            // docker.sock rule and the agent signalled twice for one probe:
-            // once for `no-runtime-sock` on a path it could not read, once for
-            // `no-shell` on the shell's own exec. Nothing about that is wrong
-            // in the agent; the probe was simply handing it a path no rule
-            // could clear.
-            std::ptr::read_volatile(sh.as_ptr());
+            // than identification. A path rule matching an unknown path is
+            // *asserted*, not skipped — the fail-closed the product is built
+            // on — so with this page missing the child's own `execve("/bin/sh")`
+            // matched the docker.sock rule and the agent signalled twice for
+            // one probe. Nothing about that is wrong in the agent: the probe
+            // was handing it a path no rule could clear.
+            fault_in_path(sh.as_ptr());
             libc::execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(98);
         });
@@ -715,20 +737,7 @@ mod gate {
         let mut probe = live.spawn_probe(move || unsafe {
             // Must fail: reaching sys_enter is the whole requirement, and a
             // real socket would outlive the test.
-            // Fault the pathname in before handing it to the kernel.
-            // `bpf_probe_read_user_str` does not fault, and on the aarch64
-            // 6.12 node this stage runs on the page holding this string is not
-            // reachable to it in a child that has done nothing since `fork`:
-            // the record arrives with an empty path and
-            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
-            // identifies the probe's record by is gone. `attach_live.rs` needs
-            // the same line for the same reason and says so; the join was
-            // written on x86_64, where the page happens to be there, and the
-            // omission stayed invisible until this stage first ran on a second
-            // kernel. Faulting it in weakens nothing: the truncated-path
-            // behaviour has its own tests, one of which deliberately does not
-            // touch the page.
-            std::ptr::read_volatile(c_target.as_ptr());
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -790,20 +799,7 @@ mod gate {
         target.push_str("/docker.sock");
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
-            // Fault the pathname in before handing it to the kernel.
-            // `bpf_probe_read_user_str` does not fault, and on the aarch64
-            // 6.12 node this stage runs on the page holding this string is not
-            // reachable to it in a child that has done nothing since `fork`:
-            // the record arrives with an empty path and
-            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
-            // identifies the probe's record by is gone. `attach_live.rs` needs
-            // the same line for the same reason and says so; the join was
-            // written on x86_64, where the page happens to be there, and the
-            // omission stayed invisible until this stage first ran on a second
-            // kernel. Faulting it in weakens nothing: the truncated-path
-            // behaviour has its own tests, one of which deliberately does not
-            // touch the page.
-            std::ptr::read_volatile(c_target.as_ptr());
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -912,20 +908,7 @@ mod gate {
         target.push_str("/docker.sock");
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
-            // Fault the pathname in before handing it to the kernel.
-            // `bpf_probe_read_user_str` does not fault, and on the aarch64
-            // 6.12 node this stage runs on the page holding this string is not
-            // reachable to it in a child that has done nothing since `fork`:
-            // the record arrives with an empty path and
-            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
-            // identifies the probe's record by is gone. `attach_live.rs` needs
-            // the same line for the same reason and says so; the join was
-            // written on x86_64, where the page happens to be there, and the
-            // omission stayed invisible until this stage first ran on a second
-            // kernel. Faulting it in weakens nothing: the truncated-path
-            // behaviour has its own tests, one of which deliberately does not
-            // touch the page.
-            std::ptr::read_volatile(c_target.as_ptr());
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -1067,20 +1050,7 @@ mod gate {
         let target = format!("/tmp/ferrum-join-stale-{}/docker.sock", std::process::id());
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
-            // Fault the pathname in before handing it to the kernel.
-            // `bpf_probe_read_user_str` does not fault, and on the aarch64
-            // 6.12 node this stage runs on the page holding this string is not
-            // reachable to it in a child that has done nothing since `fork`:
-            // the record arrives with an empty path and
-            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
-            // identifies the probe's record by is gone. `attach_live.rs` needs
-            // the same line for the same reason and says so; the join was
-            // written on x86_64, where the page happens to be there, and the
-            // omission stayed invisible until this stage first ran on a second
-            // kernel. Faulting it in weakens nothing: the truncated-path
-            // behaviour has its own tests, one of which deliberately does not
-            // touch the page.
-            std::ptr::read_volatile(c_target.as_ptr());
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -1197,20 +1167,7 @@ mod gate {
         let target = format!("/tmp/ferrum-join-eperm-{}/docker.sock", std::process::id());
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
-            // Fault the pathname in before handing it to the kernel.
-            // `bpf_probe_read_user_str` does not fault, and on the aarch64
-            // 6.12 node this stage runs on the page holding this string is not
-            // reachable to it in a child that has done nothing since `fork`:
-            // the record arrives with an empty path and
-            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
-            // identifies the probe's record by is gone. `attach_live.rs` needs
-            // the same line for the same reason and says so; the join was
-            // written on x86_64, where the page happens to be there, and the
-            // omission stayed invisible until this stage first ran on a second
-            // kernel. Faulting it in weakens nothing: the truncated-path
-            // behaviour has its own tests, one of which deliberately does not
-            // touch the page.
-            std::ptr::read_volatile(c_target.as_ptr());
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
