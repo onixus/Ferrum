@@ -65,8 +65,9 @@ mod gate {
     use ferrum_agent::TargetCheck;
     use ferrum_agent::{
         encode_fsig, pump_records, Agent, AgentConfig, AgentRole, ProcCgroupCheck, SignalResponder,
-        DEGRADED_RECOVERY, DEG_PATH_TRUNCATED, REFUSE_STALE_TARGET, RESPOND_SIGNAL_FAILING,
-        RESPOND_SIGNAL_FAILING_MIN, TARGET_CHECK_UNPROVABLE, TARGET_NEVER_PROVEN,
+        DEGRADED_RECOVERY, DEG_PATH_TRUNCATED, MAX_TGID, REFUSE_STALE_TARGET,
+        RESPOND_SIGNAL_FAILING, RESPOND_SIGNAL_FAILING_MIN, TARGET_CHECK_UNPROVABLE,
+        TARGET_NEVER_PROVEN,
     };
     use ferrum_api::PolicyMode;
     use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
@@ -1158,21 +1159,39 @@ mod gate {
         };
         let arch = live.arch;
 
-        // One past pid_max: no process can hold it, so `kill(2)` on it is
-        // ESRCH from this kernel and reaches nothing.
+        // A tgid nothing holds, and one the agent is willing to signal. Both
+        // halves are load-bearing, and only the first used to be here: the
+        // value was `pid_max + 1`, which on a node whose `pid_max` is already
+        // `PID_MAX_LIMIT` is also at or above `MAX_TGID`, where the reaction
+        // is refused as unsignalable before it ever reaches `kill(2)`. This
+        // test would then be measuring `REFUSE_TGID_RANGE` — a guard doing its
+        // job — while claiming to measure a signal the *kernel* refused, and
+        // `respond_failed_total` would stay 0 with nothing saying why. The
+        // x86_64 stand has a small `pid_max`, so one past it was an ordinary
+        // absent pid and the ambiguity never showed.
         let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
             .expect("read /proc/sys/kernel/pid_max")
             .trim()
             .parse()
             .expect("pid_max is a number");
-        let phantom = pid_max + 1;
-        let rc = unsafe { libc::kill(libc::pid_t::try_from(phantom).expect("pid"), 0) };
-        assert_eq!(rc, -1, "pid {phantom} exists on this node; it must not");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH),
-            "signalling pid {phantom} did not fail with ESRCH, so this test would be aiming a \
-             SIGKILL at something real"
+        let ceiling = pid_max.min(MAX_TGID) - 1;
+        let mut phantom = ceiling;
+        loop {
+            let rc = unsafe { libc::kill(libc::pid_t::try_from(phantom).expect("pid"), 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                phantom > 2,
+                "no unused tgid below {ceiling} on this node; there is nothing to aim at that \
+                 the agent would agree to signal"
+            );
+            phantom -= 1;
+        }
+        assert!(
+            phantom < MAX_TGID,
+            "phantom {phantom} is at or above MAX_TGID: the reaction would be refused as \
+             unsignalable and this test would measure that guard instead of the kernel"
         );
 
         let target = format!("/tmp/ferrum-join-eperm-{}/docker.sock", std::process::id());
