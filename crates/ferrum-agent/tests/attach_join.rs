@@ -651,7 +651,23 @@ mod gate {
         assert_killed(killed, "no-shell", tgid);
         assert_eq!(killed.syscall, "execve");
         assert_eq!(killed.comm, "sh");
-        assert_eq!(agent.respond_kill_total(), 1);
+        assert_eq!(
+            agent.respond_kill_total(),
+            1,
+            "the agent signalled more than the one record this test pumped a verdict for. \
+             Every kill it counted came from some record in this probe's own set, so the \
+             extra one is a second rule matching something else the probe did — name it \
+             rather than guess: {:?}",
+            events
+                .iter()
+                .map(|e| (
+                    e.rule.as_str(),
+                    e.syscall.as_str(),
+                    e.action.as_str(),
+                    e.path_unknown
+                ))
+                .collect::<Vec<_>>()
+        );
 
         // The agent's word, and then the node's.
         let status = probe.wait_for_death("no-shell");
@@ -685,6 +701,20 @@ mod gate {
         let mut probe = live.spawn_probe(move || unsafe {
             // Must fail: reaching sys_enter is the whole requirement, and a
             // real socket would outlive the test.
+            // Fault the pathname in before handing it to the kernel.
+            // `bpf_probe_read_user_str` does not fault, and on the aarch64
+            // 6.12 node this stage runs on the page holding this string is not
+            // reachable to it in a child that has done nothing since `fork`:
+            // the record arrives with an empty path and
+            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
+            // identifies the probe's record by is gone. `attach_live.rs` needs
+            // the same line for the same reason and says so; the join was
+            // written on x86_64, where the page happens to be there, and the
+            // omission stayed invisible until this stage first ran on a second
+            // kernel. Faulting it in weakens nothing: the truncated-path
+            // behaviour has its own tests, one of which deliberately does not
+            // touch the page.
+            std::ptr::read_volatile(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -746,6 +776,20 @@ mod gate {
         target.push_str("/docker.sock");
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
+            // Fault the pathname in before handing it to the kernel.
+            // `bpf_probe_read_user_str` does not fault, and on the aarch64
+            // 6.12 node this stage runs on the page holding this string is not
+            // reachable to it in a child that has done nothing since `fork`:
+            // the record arrives with an empty path and
+            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
+            // identifies the probe's record by is gone. `attach_live.rs` needs
+            // the same line for the same reason and says so; the join was
+            // written on x86_64, where the page happens to be there, and the
+            // omission stayed invisible until this stage first ran on a second
+            // kernel. Faulting it in weakens nothing: the truncated-path
+            // behaviour has its own tests, one of which deliberately does not
+            // touch the page.
+            std::ptr::read_volatile(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -854,6 +898,20 @@ mod gate {
         target.push_str("/docker.sock");
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
+            // Fault the pathname in before handing it to the kernel.
+            // `bpf_probe_read_user_str` does not fault, and on the aarch64
+            // 6.12 node this stage runs on the page holding this string is not
+            // reachable to it in a child that has done nothing since `fork`:
+            // the record arrives with an empty path and
+            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
+            // identifies the probe's record by is gone. `attach_live.rs` needs
+            // the same line for the same reason and says so; the join was
+            // written on x86_64, where the page happens to be there, and the
+            // omission stayed invisible until this stage first ran on a second
+            // kernel. Faulting it in weakens nothing: the truncated-path
+            // behaviour has its own tests, one of which deliberately does not
+            // touch the page.
+            std::ptr::read_volatile(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -995,6 +1053,20 @@ mod gate {
         let target = format!("/tmp/ferrum-join-stale-{}/docker.sock", std::process::id());
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
+            // Fault the pathname in before handing it to the kernel.
+            // `bpf_probe_read_user_str` does not fault, and on the aarch64
+            // 6.12 node this stage runs on the page holding this string is not
+            // reachable to it in a child that has done nothing since `fork`:
+            // the record arrives with an empty path and
+            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
+            // identifies the probe's record by is gone. `attach_live.rs` needs
+            // the same line for the same reason and says so; the join was
+            // written on x86_64, where the page happens to be there, and the
+            // omission stayed invisible until this stage first ran on a second
+            // kernel. Faulting it in weakens nothing: the truncated-path
+            // behaviour has its own tests, one of which deliberately does not
+            // touch the page.
+            std::ptr::read_volatile(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -1093,6 +1165,20 @@ mod gate {
         let target = format!("/tmp/ferrum-join-eperm-{}/docker.sock", std::process::id());
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
+            // Fault the pathname in before handing it to the kernel.
+            // `bpf_probe_read_user_str` does not fault, and on the aarch64
+            // 6.12 node this stage runs on the page holding this string is not
+            // reachable to it in a child that has done nothing since `fork`:
+            // the record arrives with an empty path and
+            // `EVENT_FLAG_PATH_TRUNCATED`, and the pathname this test
+            // identifies the probe's record by is gone. `attach_live.rs` needs
+            // the same line for the same reason and says so; the join was
+            // written on x86_64, where the page happens to be there, and the
+            // omission stayed invisible until this stage first ran on a second
+            // kernel. Faulting it in weakens nothing: the truncated-path
+            // behaviour has its own tests, one of which deliberately does not
+            // touch the page.
+            std::ptr::read_volatile(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
