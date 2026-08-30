@@ -1317,6 +1317,21 @@ pipeline {
                 steps {
                     writeFile file: '.datapath-mutations.sh', text: '''
                         set -eu
+                        # Мутация 04 правит сам датапейс и пересобирает BPF ELF,
+                        # а это build-std под bpf-таргет: нужен nightly с
+                        # rust-src. Контейнер этой группы поднимается с нуля, и
+                        # nightly в образе нет — rustup доставил бы его сам, но
+                        # без rust-src, и build-std падает уже после того, как
+                        # три мутации отработали. bpf-linker доставать неоткуда
+                        # не нужно: он лежит в томе /cargo-tools, куда его
+                        # положила стадия 'BPF ELF'.
+                        #
+                        # Пробел этот не от выноса стыка: контейнер прежней
+                        # docker-группы нёс ровно тот же образ и тоже был без
+                        # nightly. Он просто не мог проявиться, пока
+                        # 'BPF join mutations' ни разу не исполнялась.
+                        export PATH=/cargo-tools/bin:$PATH
+                        rustup toolchain install nightly --profile minimal --component rust-src
                         FERRUM_BPF_ELF="$PWD/dist/ferrum-ebpf-progs.bpf.o" \
                             crates/ferrum-agent/tests/mutations/run.sh
                     '''
