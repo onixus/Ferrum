@@ -43,4 +43,10 @@ ferrum-k8smeta.workspace = true
 # that serves it, rather than from a literal that could drift from it.
 ferrum-metrics.workspace = true
 ferrum-policy.workspace = true
+# The exported record contract itself, and the crate that renders it. The
+# schema gate derives the field inventory by serialising the real type and
+# renders through the real profiles; a copy of either would be the drift it
+# exists to catch.
+ferrum-proto.workspace = true
+ferrum-siem.workspace = true
 serde_json.workspace = true

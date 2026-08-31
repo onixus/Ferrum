@@ -1,0 +1,88 @@
+# Ship enforcement events to the SOC's collector.
+#
+#     kubectl apply -k overlays/siem-syslog
+#
+# The other thing a closed contour has to change, beside the registry. The
+# base install writes `events.jsonl` on each node and nothing leaves the
+# cluster; this overlay adds a second destination to the agent's export
+# fan-out. Second, never instead: the node-local file is what an investigation
+# falls back to when the export counters say records were lost, so it stays.
+#
+# Why this is an overlay and not four lines in `deploy/agent/daemonset.yaml`:
+# the address belongs to the site. A default would be either a name that does
+# not resolve — every event on every node counted as an export failure, every
+# node Degraded, an alarm that means nothing — or a guess about somebody's
+# network. And an export of enforcement records to a system outside the
+# cluster is a decision an operator makes, in the same way respond is; it must
+# not arrive as a consequence of choosing an install.
+#
+# `deploy/kustomization.yaml` therefore does not pull this in, and
+# `event_contract_gate.rs::the_shipped_overlay_configures_the_sink_with_flags_the_binary_parses`
+# holds both halves: that this root really passes flags `ferrum-agent` really
+# parses with values it really accepts, and that the default install does not
+# reach it.
+#
+# Substitute your own collector. Three knobs and nothing else:
+#
+#   --siem-address    host:port of the collector. Prefer an IP or an address
+#                     your node's resolver answers quickly: resolution has no
+#                     timeout in std, and a resolver that hangs stalls the
+#                     export writer thread (not the decision path, and not
+#                     enforcement) for as long as it hangs, once per backoff
+#                     window. `syslog.internal.example` below is a placeholder
+#                     in the same sense `registry.internal.example` is in the
+#                     mirrored-registry overlay: nothing answers there.
+#   --siem-transport  tcp or udp. TCP by default: UDP loses records with
+#                     nothing on either side to say so, which is the failure
+#                     this whole path is written against. UDP stays available
+#                     for a collector that only speaks it.
+#   --siem-profile    rfc5424 | cef | ecs.
+#                       rfc5424 — the standard, whole record in one
+#                                 SD-ELEMENT. Anything that reads syslog parses
+#                                 it. This is the default and the right choice
+#                                 for a collector nobody wrote an integration
+#                                 for.
+#                       cef     — ArcSight CEF 0 inside an RFC 5424 frame, for
+#                                 a site that already has a CEF connector.
+#                       ecs     — Elastic Common Schema, one JSON object per
+#                                 line, for Elastic/OpenSearch and for Splunk
+#                                 with KV_MODE=json.
+#
+# What is NOT here, deliberately: TLS. The transport is plain TCP or UDP, and
+# the record carries pod names, namespaces, process names and the names of the
+# policies this cluster enforces. That is a real exposure and it is not
+# mitigated by anything in this file — put the collector on a network the
+# cluster already trusts, or terminate TLS at a local forwarder (rsyslog,
+# syslog-ng, Vector) that this agent talks to over loopback or a node-local
+# Service. A TLS client in the DaemonSet would put a certificate store, a
+# trust root and a renewal path into the process the threat model calls the
+# second target after the kubelet, and that trade has not been made.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../deploy/agent
+
+patches:
+  - target:
+      kind: DaemonSet
+      name: ferrum-agent
+    patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --siem-address
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: syslog.internal.example:6514
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --siem-transport
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: tcp
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --siem-profile
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: rfc5424

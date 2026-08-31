@@ -67,12 +67,15 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
   Имена стадий цитирует `docs/MVP-1-BOUNDARY.md`, и
   `crates/ferrum-testkit/tests/boundary_gate.rs` роняет сборку на переименовании —
   стадию не переименовывать в одиночку.
-- Текущий `Jenkinsfile` — двадцать две функциональные стадии. С билда #52
+- Текущий `Jenkinsfile` — двадцать три функциональные стадии. С билда #52
   проходили все двадцать одна, что было тогда: пропусков нет,
-  `Finished: SUCCESS`, первый зелёный прогон целиком. Двадцать вторая —
-  `Security: metrics contract` — добавлена после того прогона и на Jenkins не
-  исполнялась ни разу; на этой машине она проходит как
-  `cargo test -p ferrum-testkit --test metrics_gate`, и это не то же самое.
+  `Finished: SUCCESS`, первый зелёный прогон целиком. Двадцать вторая и
+  двадцать третья — `Security: metrics contract` и
+  `Security: event contract` — добавлены после того прогона и на Jenkins не
+  исполнялись ни разу; на этой машине они проходят как
+  `cargo test -p ferrum-testkit --test metrics_gate` и
+  `cargo test -p ferrum-proto && cargo test -p ferrum-siem && cargo test -p
+  ferrum-testkit --test event_contract_gate`, и это не то же самое.
   Из того прогона: `BPF join` — шесть тестов из шести, четыре печатают
   `SIGKILL`, подтверждённый `waitpid`; `BPF join mutations` исполнилась впервые
   и убила все шесть мутаций. Красным пайплайн был с #16 по #51.
@@ -104,6 +107,12 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
   семейства в обе стороны, у каждой причины деградации есть стабильный id,
   порт метрик открыт манифестами и закрыт NetworkPolicy, эндпоинт отвечает
   только на чтение),
+  `Security: event contract` (`event_contract_gate.rs`: инвентарь полей
+  `EventEnvelope` выводится сериализацией самого типа и сходится с
+  замороженным для заявленной версии, записи прошлых версий декодируются этой
+  сборкой, у каждого листа конверта есть написанное решение «уходит наружу или
+  нет», withheld отсутствует во всех трёх профилях, враждебная нагрузка не
+  подделывает запись, и сток исполнён на локальном сокете),
   `Security: supply chain` (cargo-deny + cargo-audit).
 - Новый инвариант или новый пункт приёмки — добавлять тест в security-стадию,
   а не в общий `cargo test`. Красная security-стадия не «флейк»: это нарушенный инвариант.
@@ -122,7 +131,8 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
 | `ferrum-ebpf-progs` | aya-ebpf datapath | tokio, kube, `String` на syscall path |
 | `ferrum-ebpf` | userspace loader, prefilter, декодер kernel-записей | compiler, kube client, сеть |
 | `ferrum-k8smeta` | cgroup→pod индекс, watch Pod/NS/SA, label cache | датапейс, вывод наблюдённости из пустоты |
-| `ferrum-export` | JSONL-сток, ограниченная очередь | блокирующая запись на hot path, тихая потеря записи |
+| `ferrum-export` | JSONL-сток, ограниченная очередь, fan-out по стокам | блокирующая запись на hot path, тихая потеря записи, сеть |
+| `ferrum-siem` | нормализация `EventEnvelope` в CEF/RFC 5424/ECS, неблокирующий сток на `std::net`, учтённая потеря | tokio, TLS, kube client, HTTP-клиент, растущий буфер ретраев, тихая потеря записи, поле без решения в `FIELDS` |
 | `ferrum-metrics` | Prometheus-экспозиция, счётчики/гистограмма на атомиках, read-only `GET /metrics` | зависимости (их ноль), kube client, TLS, исходящая сеть, чтение тела запроса, аллокации на hot path |
 | `ferrum-controller` | reconcile + compile + rollout | datapath, CAP_BPF |
 | `ferrum-crypto` | подпись/проверка bundle, mTLS material (ring, rustls-webpki) | openssl-sys, выпуск CA, сеть, фейковый `Ok` |

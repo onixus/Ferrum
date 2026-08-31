@@ -796,6 +796,16 @@ loader, не были названы ни одной строкой, а един
 | У каждой причины деградации, которую агент может поднять, есть стабильный короткий id для метки — по тем же трём сканам, что и в `boundary_gate.rs`, — и все id публикуются на каждом скрейпе, включая нулевые | U | U `metrics_gate.rs::every_degradation_reason_the_agent_can_raise_has_a_stable_metric_id` |
 | Порт метрик открыт поставляемыми манифестами, назван, находим Service'ом и закрыт NetworkPolicy, которая при этом заново разрешает 8443: иначе это либо код, которого никто не собирает, либо неаутентифицированное чтение здоровья enforcement из любого Pod'а | U | U `metrics_gate.rs::the_shipped_manifests_open_and_govern_every_metrics_port` |
 | Эндпоинт исполнен на настоящем сокете: `GET /metrics` отдаёт экспозицию, `POST` — 405 и тела не читает, другой путь — 404 | U | U `metrics_gate.rs::the_metrics_endpoint_answers_a_read_and_refuses_everything_else` |
+| Записи, выпущенные прошлыми версиями схемы, декодируются этой сборкой: замороженные строки лежат в дереве и разбираются настоящим типом, а не описанием совместимости | U | U `event_contract_gate.rs::every_record_a_released_version_wrote_is_still_readable_by_this_build` |
+| Форма записи, которую пишет эта сборка, — та, что заморожена для заявленной версии, и каждая прошлая версия того же major является её подмножеством без изменений типа, обязательности и nullable; инвентарь выводится сериализацией самого типа, а не списком | U | U `event_contract_gate.rs::this_builds_record_shape_is_the_one_frozen_for_the_version_it_claims` |
+| Контроль на сам вывод инвентаря: удалённое и переименованное по типу поле обязаны быть падением, иначе сверка выше проходит на выводе, который всегда одинаков | U | U `event_contract_gate.rs::the_inventory_derivation_notices_a_removed_and_a_retyped_field` |
+| У каждого листа экспортируемой записи есть написанное решение, уходит он в чужую систему или нет; поле без решения роняет сборку, а заявленная необязательность проверена декодированием записи без него | U | U `event_contract_gate.rs::every_field_that_leaves_this_product_has_a_written_disposition` |
+| Withheld-поле (два человеческих имени с waiver'а) отсутствует во всех трёх профилях по значению, а не по имени ключа; контроль — тикет того же waiver'а в записи присутствует | U | U `event_contract_gate.rs::a_withheld_field_appears_in_no_profile` |
+| Каждое значение, объявленное уходящим наружу, доезжает до каждого профиля: строки и числа — по значению-сентинелу, булевы — переворотом одного флага, и булево без такой пробы роняет гейт | U | U `event_contract_gate.rs::every_emitted_value_reaches_every_profile` |
+| Враждебная нагрузка не подделывает запись: `comm` с переводом строки и `pod` с `"`/`]`/`[` не порождают ни второй записи, ни второго CEF-заголовка, ни второго SD-элемента, ни сломанного JSON — проверено разбором, а не подсчётом подстрок | U | U `event_contract_gate.rs::a_hostile_workload_cannot_forge_a_record_in_any_profile` |
+| Приёмка §D «`exec` + `/bin/sh` → kill» доезжает до локального приёмника через поставляемую цепочку стоков (`QueueSink` → `FanoutSink` → файл + `SyslogSink`), и запись на узле и запись в приёмнике несут одну временную метку | U | U `event_contract_gate.rs::an_enforcement_decision_reaches_a_local_receiver_through_the_shipped_sink_chain` |
+| Недоступный SIEM учтён существующим `export_write_failed_total` и деградирует узел `DEG_EXPORT_LOSSY`; второго счётчика не заведено | U | U `event_contract_gate.rs::an_unreachable_siem_is_counted_by_the_existing_export_loss_and_degrades_the_node` |
+| Сток подключён в поставке: `overlays/siem-syslog` патчит корень агента флагами, которые бинарь действительно читает, значениями, которые его же парсеры принимают, и установка по умолчанию до него не дотягивается | U | U `event_contract_gate.rs::the_shipped_overlay_configures_the_sink_with_flags_the_binary_parses` |
 | Второй апрувер обязателен независимо от `fourEyes`, а минимальная длина `reason` в схеме — константа компилятора | U | U `deploy_gate.rs::a_waiver_without_a_second_approver_is_refused_by_the_schema_too` · U `deploy_gate.rs::the_minimum_reason_length_is_the_same_in_the_schema_and_in_policy` |
 | Пустой и дублированный id правила отвергает и схема: id — то, что waiver освобождает, а audit-запись обвиняет | U | U `deploy_gate.rs::a_blank_or_duplicated_rule_id_is_refused_by_the_schema_too` |
 | Границы длин `commIn`/`pathPrefix`/`pathSuffix` в схеме — границы datapath | U | U `deploy_gate.rs::the_match_length_bounds_in_the_schema_are_the_datapath_bounds` |
@@ -860,6 +870,30 @@ loader, не были названы ни одной строкой, а един
 ## Не делает
 
 Плоские утверждения. Каждое проверено по дереву на этом коммите.
+
+- **Сток событий доезжает до сокета, а не до SIEM.** `ferrum-siem` рендерит
+  CEF, RFC 5424 и ECS и отправляет их по TCP или UDP; всё, что про это
+  исполнено, исполнено против приёмника, который поднял сам тест на
+  `127.0.0.1`, и против бинаря агента, запущенного на этой машине с
+  `--siem-address`. Ни ArcSight, ни Elastic, ни Splunk, ни rsyslog не
+  получали от этого дерева ни одной записи, и ни один их парсер не говорил,
+  что запись разобралась. Формат, который «должен» разбираться, и формат,
+  который разобрался, — разные утверждения, и здесь сделано первое.
+- **У стока нет TLS.** Транспорт — голый TCP или UDP, а запись несёт имена
+  Pod'ов, namespace, имена процессов и имена политик, которые кластер
+  применяет. `overlays/siem-syslog` говорит об этом прямо и отправляет
+  оператора к локальному форвардеру; форвардера в этом дереве нет, и
+  «поставьте коллектор в доверенную сеть» — это перекладывание, а не решение.
+  Клиент TLS внутри DaemonSet'а добавил бы хранилище доверия и путь обновления
+  сертификата в процесс, который threat model называет второй целью после
+  kubelet, и эта сделка не заключена.
+- **Наружу едут только события агента.** Вердикты admission — deny по подписи
+  образа, по privileged, по cluster-admin — в SIEM не уходят: `EventEnvelope`
+  штампует сток агента, а вебхук публикует только `/metrics`. Половина
+  приёмки §D поэтому в SIEM не видна вообще.
+- **Обрамление только LF.** RFC 6587 octet-counting не реализован, и приёмник,
+  настроенный на `octet-counted`, эти записи отбросит у себя — там, где ни
+  один счётчик этого дерева их не увидит.
 
 - **Образы собираются, но никуда не едут.** Все три стадии образов проходят на
   локальном Jenkins в каждом билде начиная с 2026-08-28 и по #44 включительно
