@@ -1,4 +1,4 @@
-# The agent image. Produces ghcr.io/ferrum/ferrum-agent, which deploy/agent
+# The agent image. Produces ghcr.io/onixus/ferrum-agent, which deploy/agent
 # names and which nothing in this repository built until now.
 #
 # Two things this file exists to guarantee, neither of which any other stage of
@@ -32,7 +32,7 @@
 #   cargo +nightly build -p ferrum-ebpf-progs \
 #       --target bpfel-unknown-none -Z build-std=core --release
 #   cp target/bpfel-unknown-none/release/ferrum-ebpf-progs dist/ferrum-ebpf-progs.bpf.o
-#   docker build -t ghcr.io/ferrum/ferrum-agent:v0.1.0 .
+#   docker build -t ghcr.io/onixus/ferrum-agent:v0.1.0 .
 
 ARG RUST_IMAGE=rust:1.75-bookworm
 ARG TARGET=x86_64-unknown-linux-musl

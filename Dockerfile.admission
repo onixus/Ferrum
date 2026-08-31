@@ -1,4 +1,4 @@
-# The webhook image. Produces ghcr.io/ferrum/ferrum-admission, which
+# The webhook image. Produces ghcr.io/onixus/ferrum-admission, which
 # deploy/admission/deployment.yaml names and which nothing in this repository
 # built until now.
 #
@@ -20,7 +20,7 @@
 # Pod CrashLoops on a node: a build-time defect turned into a runtime one.
 #
 #   docker build -f Dockerfile.admission \
-#       -t ghcr.io/ferrum/ferrum-admission:v0.1.0 .
+#       -t ghcr.io/onixus/ferrum-admission:v0.1.0 .
 
 ARG RUST_IMAGE=rust:1.75-bookworm
 ARG TARGET=x86_64-unknown-linux-musl

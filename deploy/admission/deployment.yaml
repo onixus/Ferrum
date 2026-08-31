@@ -40,7 +40,7 @@ spec:
               app.kubernetes.io/name: ferrum-admission
       containers:
         - name: admission
-          image: ghcr.io/ferrum/ferrum-admission:v0.1.0
+          image: ghcr.io/onixus/ferrum-admission:v0.1.0
           args:
             - serve
             - --listen

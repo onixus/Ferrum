@@ -32,7 +32,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: ghcr.io/ferrum/ferrum-controller:v0.1.0
+          image: ghcr.io/onixus/ferrum-controller:v0.1.0
           args:
             - run
             - --seed-file

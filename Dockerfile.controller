@@ -1,4 +1,4 @@
-# The controller image. Produces ghcr.io/ferrum/ferrum-controller, which
+# The controller image. Produces ghcr.io/onixus/ferrum-controller, which
 # deploy/controller/deployment.yaml names and which nothing in this repository
 # built until now.
 #
@@ -15,7 +15,7 @@
 # crate for the target it ships on.
 #
 #   docker build -f Dockerfile.controller \
-#       -t ghcr.io/ferrum/ferrum-controller:v0.1.0 .
+#       -t ghcr.io/onixus/ferrum-controller:v0.1.0 .
 
 ARG RUST_IMAGE=rust:1.75-bookworm
 ARG TARGET=x86_64-unknown-linux-musl
