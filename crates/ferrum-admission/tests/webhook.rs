@@ -1911,3 +1911,75 @@ fn a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map() {
     assert_eq!(reply["response"]["allowed"], false);
     assert!(!deny_msg(&reply).contains("never observed"));
 }
+
+/// The ClusterRoleBinding this repository ships is not refused by the policy
+/// this repository ships, on a webhook whose label cache is cold.
+///
+/// This is the live finding of issue #17 as a test. On a cluster carrying the
+/// applied webhook, applying `deploy/` again was refused with `namespace
+/// selector is set but namespace labels were never observed; fail closed` —
+/// FERRUM rejecting its own re-install, and rejecting it for a reason that was
+/// not true: a ClusterRoleBinding has no namespace whose labels could ever have
+/// been observed. `prod-restricted` carries a `namespaceSelector`, so every
+/// cluster running it had this.
+///
+/// The object is read out of `deploy/admission/rbac.yaml` rather than written
+/// here, because the claim is about the thing that ships. The label source is
+/// the default one, which is cold: a webhook Pod that has just started is the
+/// worst case and it is the one an operator meets while repairing a cluster.
+#[test]
+fn the_shipped_cluster_role_binding_is_not_refused_by_the_shipped_policy() {
+    let yaml = include_str!("../../../policies/examples/prod-restricted.yaml");
+    let mut obj: ClusterSecurityPolicy = serde_yaml::from_str(yaml).expect("example yaml");
+    obj.spec.mode = PolicyMode::Enforce;
+    obj.spec.supply.trust_roots[0].public_keys = vec![pk_hex(&SK)];
+    assert!(
+        !obj.spec
+            .selector
+            .namespace_selector
+            .match_expressions
+            .is_empty()
+            || !obj.spec.selector.namespace_selector.match_labels.is_empty(),
+        "prod-restricted no longer carries a namespaceSelector, so this test no longer \
+         reproduces the condition it exists for"
+    );
+    assert!(
+        obj.spec.admit.deny.cluster_admin_bind,
+        "prod-restricted no longer denies cluster-admin binds"
+    );
+    let (fsig, pk) = make_fsig(obj.spec, &SK);
+    let program = load_ok(&fsig, &pk);
+
+    let rbac = include_str!("../../../deploy/admission/rbac.yaml");
+    let binding = rbac
+        .split("\n---\n")
+        .map(|doc| serde_yaml::from_str::<Value>(doc).expect("rbac yaml document"))
+        .find(|doc| doc["kind"] == "ClusterRoleBinding")
+        .expect("deploy/admission/rbac.yaml ships a ClusterRoleBinding");
+
+    let resp = admit_review(&review(binding, "uid-own-install"), Some(&program), &[]);
+    assert_eq!(
+        resp["response"]["allowed"],
+        true,
+        "the webhook refused the ClusterRoleBinding of its own install: {}",
+        deny_msg(&resp)
+    );
+
+    // The control: what was lifted is the question about labels an object of
+    // this kind cannot have, not the policy. A cluster-admin bind is still
+    // denied by the same program in the same cold state.
+    let denied = admit_review(
+        &review(cluster_admin_bind(), "uid-cluster-admin"),
+        Some(&program),
+        &[],
+    );
+    assert_eq!(
+        denied["response"]["allowed"], false,
+        "a cluster-admin bind was allowed by a policy that denies it"
+    );
+    assert!(
+        deny_msg(&denied).contains("cluster-admin"),
+        "denied, but not for the cluster-admin bind: {}",
+        deny_msg(&denied)
+    );
+}

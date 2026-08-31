@@ -6,7 +6,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 use crate::encoding::b64_encode;
-use crate::eval::{admit, AdmissionDecision, Patch};
+use crate::eval::{admit, cluster_scoped_kind, AdmissionDecision, Patch};
 use crate::labels::{ColdLabels, LabelSource};
 use crate::program::AdmissionProgram;
 use crate::subject::subject_from_object;
@@ -139,8 +139,14 @@ fn handle_with(
     // warmth once and carry its cause into the reply: this message is the only
     // channel admission has, and it reaches the human running kubectl at the
     // moment of the deny.
+    // An object in no namespace is decided without the watch: see
+    // `program_applies`. Asking a cold cache about it would deny every
+    // ClusterRoleBinding for the first minute of every webhook Pod's life —
+    // including the ones an operator applies to repair the cluster — over
+    // labels that would not have been read even on a warm cache.
+    let cluster_scoped = cluster_scoped_kind(&subject.kind);
     let warmth = cfg.labels.warmth();
-    if !warmth.is_warm() && watched_labels_selected(program) {
+    if !warmth.is_warm() && !cluster_scoped && watched_labels_selected(program) {
         return ok_deny(
             &uid,
             &format!("namespace labels unavailable: {}", warmth.reason()),

@@ -31,6 +31,33 @@ pub const RULE_REGISTRY_ALLOW: &str = "registryAllow";
 /// Restricted PSS may add only this capability (drop ALL otherwise).
 const PSS_RESTRICTED_ALLOWED_CAP: &str = "NET_BIND_SERVICE";
 
+/// Kinds that live in no namespace, among the kinds this webhook is registered
+/// for. Everything the shipped `ValidatingWebhookConfiguration` matches must be
+/// classified here or in the namespaced set below it; a resource added to those
+/// rules and not to this list is caught by
+/// `deploy_gate.rs::every_resource_the_webhook_registers_has_a_scope_this_crate_knows`.
+///
+/// `Namespace` is deliberately absent. It is cluster-scoped in the API and is
+/// *not* namespace-less for a selector: for a Namespace object the labels a
+/// `namespaceSelector` asks about are the object's own, which is a third case
+/// and not this one. The webhook registers no rule for it, and adding one
+/// without deciding that case is what the gate above refuses.
+pub const CLUSTER_SCOPED_KINDS: [&str; 2] = ["ClusterRole", "ClusterRoleBinding"];
+
+/// Whether the admitted object is in no namespace at all.
+///
+/// This is not `subject.namespace.is_empty()`, and the difference is the whole
+/// point. An empty namespace on a Pod means the review was malformed or the
+/// caller filled the subject by hand — a state that must keep failing closed.
+/// An empty namespace on a ClusterRoleBinding is the API server telling the
+/// truth about an object that has no namespace to have labels on, and a
+/// selector over namespace labels is then inapplicable rather than unanswered.
+/// Deciding by the emptiness of the string cannot tell those apart, so the kind
+/// decides.
+pub fn cluster_scoped_kind(kind: &str) -> bool {
+    CLUSTER_SCOPED_KINDS.contains(&kind)
+}
+
 /// Kubernetes PSS baseline default add-capabilities allow-list.
 const PSS_BASELINE_ALLOWED_CAPS: &[&str] = &[
     "AUDIT_WRITE",
@@ -229,6 +256,31 @@ fn program_applies(
     if !subject.policy_namespace.is_empty() && subject.namespace != subject.policy_namespace {
         return Ok(false);
     }
+    // An object in no namespace is not selected *or* excluded by a selector
+    // over namespace labels: there is no namespace whose labels could answer
+    // it. So for a cluster-scoped kind those two selectors are not evaluated
+    // and their "never observed" check is not run.
+    //
+    // Which of the three readings this is matters, because the other two are
+    // both wrong and one of them shipped. Reading it as "unobserved" — what
+    // this did until now — denies every ClusterRoleBinding in the cluster the
+    // moment a policy carries a namespaceSelector, with a message about a label
+    // cache, and that is what made a running FERRUM refuse the
+    // ClusterRoleBindings of its own re-install. Reading it as "not selected,
+    // therefore skip the policy" is the opposite defect: `clusterAdminBind` is
+    // a §D acceptance case, and a cluster-wide grant is not confined to the
+    // namespaces the policy did not select — it grants inside the selected ones
+    // too. So a *cluster* policy still decides a cluster-scoped object; the
+    // namespaced-policy branch above already returns "does not apply" for one,
+    // because a SecurityPolicy in a namespace cannot reach outside it.
+    //
+    // `namespaceSelector` on the ValidatingWebhookConfiguration behaves the same
+    // way for the same reason — the API server does not apply it to
+    // cluster-scoped resources — which is why exempting kube-system there is
+    // not an exemption for ClusterRoleBindings, and why that is written down in
+    // deploy/admission/validatingwebhookconfiguration.tmpl.yaml rather than
+    // discovered later.
+    let cluster_scoped = cluster_scoped_kind(&subject.kind);
     // Cluster/namespace/SA labels are not on the admitted object, so each has a
     // "never observed" state — fail closed there, do not skip policy. An
     // observed group holding no labels is not that state: it answers the
@@ -238,32 +290,38 @@ fn program_applies(
         subject.cluster_labels.as_ref(),
         "cluster",
     )?;
-    require_labels_if_selected(
-        &program.selector.namespace_selector,
-        subject.namespace_labels.as_ref(),
-        "namespace",
-    )?;
-    require_labels_if_selected(
-        &program.selector.service_account_selector,
-        subject.service_account_labels.as_ref(),
-        "serviceAccount",
-    )?;
+    if !cluster_scoped {
+        require_labels_if_selected(
+            &program.selector.namespace_selector,
+            subject.namespace_labels.as_ref(),
+            "namespace",
+        )?;
+        require_labels_if_selected(
+            &program.selector.service_account_selector,
+            subject.service_account_labels.as_ref(),
+            "serviceAccount",
+        )?;
+    }
     // Past the check above, every selected group is `Some`. An unselected one
     // is matched against an empty map, which its empty selector accepts.
     let none = BTreeMap::new();
     Ok(label_selector_matches(
         &program.selector.cluster_selector,
         subject.cluster_labels.as_ref().unwrap_or(&none),
-    )? && label_selector_matches(
-        &program.selector.namespace_selector,
-        subject.namespace_labels.as_ref().unwrap_or(&none),
-    )? && label_selector_matches(
-        &program.selector.workload_selector,
-        &subject.workload_labels,
-    )? && label_selector_matches(
-        &program.selector.service_account_selector,
-        subject.service_account_labels.as_ref().unwrap_or(&none),
-    )?)
+    )? && (cluster_scoped
+        || label_selector_matches(
+            &program.selector.namespace_selector,
+            subject.namespace_labels.as_ref().unwrap_or(&none),
+        )?)
+        && label_selector_matches(
+            &program.selector.workload_selector,
+            &subject.workload_labels,
+        )?
+        && (cluster_scoped
+            || label_selector_matches(
+                &program.selector.service_account_selector,
+                subject.service_account_labels.as_ref().unwrap_or(&none),
+            )?))
 }
 
 fn selector_nonempty(selector: &LabelSelector) -> bool {
@@ -728,6 +786,113 @@ mod tests {
         let decision = admit(&program, &signed_subject(), &[], now());
         assert!(!decision.allowed);
         assert!(decision.fail_closed);
+    }
+
+    /// A ClusterRoleBinding is in no namespace, so a namespaceSelector is
+    /// inapplicable to it — not unanswered. It used to be read as unanswered,
+    /// and that read denied every cluster-scoped RBAC object in a cluster
+    /// running any policy with a namespaceSelector, with a message about a
+    /// label cache: it is how a live FERRUM refused the ClusterRoleBindings of
+    /// its own re-install.
+    #[test]
+    fn a_cluster_scoped_object_is_not_denied_over_namespace_labels_it_cannot_have() {
+        let mut program = pss_program(PssProfile::Restricted, PolicyMode::Enforce);
+        program.admit.deny.cluster_admin_bind = true;
+        program
+            .selector
+            .namespace_selector
+            .match_labels
+            .insert("ferrum.io/zone".into(), "pci".into());
+        program
+            .selector
+            .service_account_selector
+            .match_labels
+            .insert("ferrum.io/tier".into(), "app".into());
+
+        for kind in CLUSTER_SCOPED_KINDS {
+            let subject = AdmissionSubject {
+                policy_name: "pss".into(),
+                kind: kind.into(),
+                // Exactly the state that used to fail closed: no namespace, and
+                // a label source that never observed one.
+                namespace: String::new(),
+                namespace_labels: None,
+                service_account_labels: None,
+                ..Default::default()
+            };
+            let decision = admit(&program, &subject, &[], now());
+            assert!(
+                !decision.fail_closed,
+                "{kind} failed closed on namespace labels an object of that kind cannot have: \
+                 {:?}",
+                decision.reasons
+            );
+            assert!(
+                decision.allowed,
+                "{kind} was denied although it breaks no rule: {:?}",
+                decision.reasons
+            );
+        }
+    }
+
+    /// The other half, and it is the half that is easy to lose while fixing the
+    /// first: a cluster-wide grant is not confined to the namespaces the policy
+    /// did not select, so a cluster policy carrying a namespaceSelector still
+    /// decides it. Reading "no namespace" as "not selected" would have turned
+    /// the §D case `cluster-admin bind → deny` into an allow for every shipped
+    /// policy, since `prod-restricted` carries exactly such a selector.
+    #[test]
+    fn a_namespace_selected_policy_still_denies_a_cluster_admin_bind() {
+        let mut program = pss_program(PssProfile::Restricted, PolicyMode::Enforce);
+        program.admit.deny.cluster_admin_bind = true;
+        program
+            .selector
+            .namespace_selector
+            .match_labels
+            .insert("ferrum.io/zone".into(), "pci".into());
+
+        let subject = AdmissionSubject {
+            policy_name: "pss".into(),
+            kind: "ClusterRoleBinding".into(),
+            cluster_admin_bind: true,
+            ..Default::default()
+        };
+        let decision = admit(&program, &subject, &[], now());
+        assert!(!decision.allowed, "a cluster-admin bind was allowed");
+        assert!(!decision.fail_closed, "denied for the wrong reason");
+        assert!(
+            decision
+                .rule_ids
+                .iter()
+                .any(|r| r == RULE_CLUSTER_ADMIN_BIND),
+            "denied, but not by the clusterAdminBind rule: {:?}",
+            decision.rule_ids
+        );
+    }
+
+    /// The exemption is by kind and not by "the namespace string is empty".
+    /// A Pod with no namespace is a malformed review or a hand-built subject,
+    /// and it must keep failing closed: deciding by emptiness would let anyone
+    /// who can omit a field skip every namespace-selected policy.
+    #[test]
+    fn a_namespaced_kind_without_a_namespace_still_fails_closed() {
+        let mut program = pss_program(PssProfile::Restricted, PolicyMode::Enforce);
+        program
+            .selector
+            .namespace_selector
+            .match_labels
+            .insert("ferrum.io/zone".into(), "pci".into());
+        for kind in ["Pod", "RoleBinding", ""] {
+            let mut subject = signed_subject();
+            subject.kind = kind.into();
+            subject.namespace = String::new();
+            subject.namespace_labels = None;
+            let decision = admit(&program, &subject, &[], now());
+            assert!(
+                decision.fail_closed,
+                "kind={kind:?} with no namespace and no observed labels did not fail closed"
+            );
+        }
     }
 
     #[test]
