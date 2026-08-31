@@ -482,7 +482,10 @@ fn the_runbook_states_the_idp_boundary_in_the_words_the_code_states_it() {
         .collect::<Vec<_>>()
         .join(" ");
     let normalised: String = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
-    let expected: String = README_BOUNDARY.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected: String = README_BOUNDARY
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         normalised.contains(&expected),
         "{RUNBOOK} does not carry `ferrum_breakglass::README_BOUNDARY` verbatim:\n{expected}"
@@ -501,7 +504,11 @@ fn the_runbook_states_the_idp_boundary_in_the_words_the_code_states_it() {
 fn the_shipped_overlay_arms_break_glass_with_flags_the_binary_parses() {
     let overlay = read(OVERLAY);
     let main = read("crates/ferrum-admission/src/main.rs");
-    for flag in ["--break-glass", "--break-glass-journal", "--break-glass-root"] {
+    for flag in [
+        "--break-glass",
+        "--break-glass-journal",
+        "--break-glass-root",
+    ] {
         assert!(
             overlay.contains(flag),
             "{OVERLAY} does not pass {flag}; the three are refused unless given together"
@@ -739,13 +746,15 @@ fn a_signed_grant_suspends_a_review_the_shipped_policy_denies() {
     let mount = tmp("suspend");
     let journal_path = mount.join("break-glass.jsonl");
     let pk = public_key_from_secret(&BREAK_GLASS_SK).expect("break-glass public key");
-    let bg = Arc::new(
-        BreakGlass::arm(&mount, &journal_path, pk, "ferrum-admission/gate").expect("arm"),
-    );
+    let bg =
+        Arc::new(BreakGlass::arm(&mount, &journal_path, pk, "ferrum-admission/gate").expect("arm"));
     let state = state_with_break_glass(Arc::clone(&bg));
 
     let (allowed, message) = verdict(&state.handle(&privileged_pod_review("uid-before")));
-    assert!(!allowed, "control: the shipped policy must deny a privileged Pod");
+    assert!(
+        !allowed,
+        "control: the shipped policy must deny a privileged Pod"
+    );
     assert!(
         !message.contains("break-glass"),
         "an unarmed process quoted break-glass in a denial: {message}"
@@ -766,7 +775,10 @@ fn a_signed_grant_suspends_a_review_the_shipped_policy_denies() {
     };
     write_grant(&mount, &grant, &BREAK_GLASS_SK);
     bg.poll(Utc::now());
-    assert!(bg.active(Utc::now()).is_some(), "the grant did not come into force");
+    assert!(
+        bg.active(Utc::now()).is_some(),
+        "the grant did not come into force"
+    );
 
     let (allowed, message) = verdict(&state.handle(&privileged_pod_review("uid-during")));
     assert!(
@@ -807,9 +819,8 @@ fn a_grant_stops_suspending_when_its_window_closes_with_nothing_reloaded() {
     let mount = tmp("expiry");
     let journal_path = mount.join("break-glass.jsonl");
     let pk = public_key_from_secret(&BREAK_GLASS_SK).expect("break-glass public key");
-    let bg = Arc::new(
-        BreakGlass::arm(&mount, &journal_path, pk, "ferrum-admission/gate").expect("arm"),
-    );
+    let bg =
+        Arc::new(BreakGlass::arm(&mount, &journal_path, pk, "ferrum-admission/gate").expect("arm"));
     let state = state_with_break_glass(Arc::clone(&bg));
 
     // A window that is already closing: two seconds wide, issued four seconds
@@ -871,9 +882,8 @@ fn a_grant_signed_with_the_bundle_key_suspends_nothing_and_is_journalled() {
     let mount = tmp("wrongkey");
     let journal_path = mount.join("break-glass.jsonl");
     let pk = public_key_from_secret(&BREAK_GLASS_SK).expect("break-glass public key");
-    let bg = Arc::new(
-        BreakGlass::arm(&mount, &journal_path, pk, "ferrum-admission/gate").expect("arm"),
-    );
+    let bg =
+        Arc::new(BreakGlass::arm(&mount, &journal_path, pk, "ferrum-admission/gate").expect("arm"));
     let state = state_with_break_glass(Arc::clone(&bg));
 
     let now = Utc::now();
@@ -894,9 +904,15 @@ fn a_grant_signed_with_the_bundle_key_suspends_nothing_and_is_journalled() {
     write_grant(&mount, &grant, &SK);
     bg.poll(Utc::now());
 
-    assert!(bg.active(Utc::now()).is_none(), "a foreign key opened the glass");
+    assert!(
+        bg.active(Utc::now()).is_none(),
+        "a foreign key opened the glass"
+    );
     let (allowed, _) = verdict(&state.handle(&privileged_pod_review("uid-forged")));
-    assert!(!allowed, "the privileged Pod was admitted under an unverified grant");
+    assert!(
+        !allowed,
+        "the privileged Pod was admitted under an unverified grant"
+    );
     assert_eq!(bg.admits(), 0);
     assert!(bg.rejections() >= 1);
 

@@ -1024,6 +1024,174 @@ fn an_enforcement_decision_reaches_a_local_receiver_through_the_shipped_sink_cha
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The closing criterion of phase 1, as a test rather than as a claim:
+/// «respond убил не тот процесс» is investigated from the SIEM without access
+/// to the node.
+///
+/// The subject is *data sufficiency*, so the assertion is a walk of the
+/// investigation, question by question, over one record that arrived on a
+/// socket. Nothing here reads the node: no `status.json`, no `events.jsonl`, no
+/// `/metrics`. If a question cannot be answered from the parsed record, this
+/// test fails and the criterion is not closed.
+///
+/// The node is deliberately put in a degraded state first, through the same
+/// `StatusPublisher::tick` the poll loop calls, because that is the half the
+/// walk used to stop at: until schema 1.1 the record said `degraded: true` and
+/// nothing more, and *which* degradation decides whether the attribution in the
+/// record can be trusted at all. `lkg_partial` means the bundle digest names
+/// more rules than were in force; `clock_rollback` means a waiver may have read
+/// as expired; `container_flag_disagreement` and friends mean the cgroup→pod
+/// answer behind `pod` and `namespace` was unreliable. Every one of those lived
+/// in a 0600 file on the node — that is, behind exactly the access the criterion
+/// says must not be needed.
+#[test]
+fn the_wrong_process_investigation_is_answerable_from_one_exported_record() {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let receiver = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .expect("timeout");
+        let mut line = String::new();
+        BufReader::new(stream)
+            .read_line(&mut line)
+            .expect("one record");
+        line
+    });
+
+    // No digest is stamped here: the status tick below takes it from the
+    // bundle the agent actually verified, which is the digest an investigation
+    // would join a rollout on. A placeholder would make step 5 a test of this
+    // file rather than of the product.
+    let ctx = SinkContext::new("node-a", "respond");
+    let sink = QueueSink::new(
+        FanoutSink::new(
+            ctx.clone(),
+            vec![Box::new(SyslogSink::new(SinkConfig {
+                address: addr.to_string(),
+                transport: Transport::Tcp,
+                profile: Profile::Ecs,
+            }))],
+        ),
+        1024,
+    );
+
+    let (agent, killed) = common::replay_agent(None);
+    // The state stamp the poll loop makes, made the way the poll loop makes
+    // it. Setting the fields on the context directly would test this file.
+    let tick = ferrum_agent::StatusPublisher::default().tick(
+        &agent,
+        &ferrum_agent::StatusOutput {
+            ctx: Some(&ctx),
+            sink: None,
+            status_dir: None,
+        },
+    );
+    assert!(
+        tick.state.degraded,
+        "a replay agent that has attached nothing reports healthy, so this test cannot show that \
+         the reasons reach the record"
+    );
+
+    let records = vec![common::wire::RecordBuilder::new("execve")
+        .comm("sh")
+        .cgroup(common::CGROUP_PAYMENTS)
+        .process(common::TGID_WORKLOAD, common::TGID_WORKLOAD)
+        .build(ferrum_ebpf::SyscallArch::X86_64)];
+    let stats =
+        ferrum_agent::pump_records(&agent, ferrum_ebpf::SyscallArch::X86_64, records, &sink);
+    assert_eq!(stats.handled, 1, "the record was not decided: {stats:?}");
+    assert_eq!(
+        killed.lock().expect("killed").as_slice(),
+        &[common::TGID_WORKLOAD],
+        "this is not a kill record, so it is not the incident the criterion names"
+    );
+    sink.close();
+
+    let line = receiver.join().expect("receiver thread");
+    let r: Value = serde_json::from_str(line.trim_end()).expect("valid ECS JSON");
+
+    // 1. Что произошло: реакция была решена и исполнена.
+    assert_eq!(r["event"]["action"], Value::String("kill".into()));
+    assert_eq!(r["ferrum"]["executed"], Value::Bool(true));
+    // 2. Кого убили — структурная личность процесса, а не описание.
+    assert_eq!(
+        r["ferrum"]["tgid"],
+        Value::Number(common::TGID_WORKLOAD.into())
+    );
+    assert!(r["process"]["pid"].is_number());
+    assert_eq!(r["process"]["name"], Value::String("sh".into()));
+    // 3. Где: узел и рабочая нагрузка.
+    assert_eq!(r["host"]["name"], Value::String("node-a".into()));
+    assert_eq!(
+        r["orchestrator"]["namespace"],
+        Value::String("payments".into())
+    );
+    assert!(r["orchestrator"]["resource"]["name"].is_string());
+    // 4. Почему: правило и политика — то, ради чего issue-19 их выпустил.
+    assert_eq!(r["rule"]["id"], Value::String("no-shell".into()));
+    assert!(r["rule"]["ruleset"].is_string());
+    // 5. По какой выкатке и в какой роли.
+    let digest = r["ferrum"]["bundleDigest"]
+        .as_str()
+        .expect("bundleDigest is not a string on the exported record");
+    assert_eq!(
+        Some(digest.to_string()),
+        agent.last_good_digest().map(|d| d.as_str().to_string()),
+        "the record names a bundle other than the one this node verified, so an investigation \
+         would reconstruct the wrong policy from it"
+    );
+    assert!(
+        digest.len() >= 32 && digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "bundleDigest is not a content hash: {digest}"
+    );
+    assert_eq!(r["ferrum"]["agentRole"], Value::String("respond".into()));
+    // 6. Насколько обоснованно решали — три флага на самой записи.
+    for flag in ["labelsUnknown", "pathUnknown", "containerUnknown"] {
+        assert!(
+            r["ferrum"][flag].is_boolean(),
+            "{flag} is not on the record; without it a match taken on unobserved input cannot be \
+             told from a resolved one"
+        );
+    }
+    // 7. В каком состоянии был узел — и это та половина, на которой путь
+    //    расследования обрывался.
+    assert_eq!(r["ferrum"]["degraded"], Value::Bool(true));
+    let reasons = r["ferrum"]["degradedReasons"]
+        .as_array()
+        .expect("degradedReasons is not an array on the exported record");
+    assert!(
+        !reasons.is_empty(),
+        "the node was degraded and the record names no reason: the investigation has to go to \
+         status.json on the node, which is the access this criterion says must not be needed"
+    );
+    let known: BTreeSet<&str> = ferrum_agent::DEGRADED_REASON_IDS
+        .iter()
+        .map(|(_, id)| *id)
+        .collect();
+    for reason in reasons {
+        let id = reason.as_str().expect("reason id is a string");
+        assert!(
+            known.contains(id),
+            "the record carries a degradation id {id:?} that the agent's own table does not \
+             know; a consumer cannot look it up anywhere"
+        );
+    }
+    // 8. Схема называет себя, поэтому получатель знает, что он читает.
+    assert_eq!(
+        r["ferrum"]["schema"],
+        Value::String(EVENT_SCHEMA.to_string())
+    );
+    assert_eq!(
+        r["ferrum"]["schemaVersion"],
+        Value::String(EVENT_SCHEMA_VERSION.to_string())
+    );
+}
+
 /// A SIEM that is not there is counted, and the count reaches the agent's own
 /// degraded state — through the counter that already existed.
 ///

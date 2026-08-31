@@ -67,15 +67,21 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
   Имена стадий цитирует `docs/MVP-1-BOUNDARY.md`, и
   `crates/ferrum-testkit/tests/boundary_gate.rs` роняет сборку на переименовании —
   стадию не переименовывать в одиночку.
-- Текущий `Jenkinsfile` — двадцать три функциональные стадии. С билда #52
+- Текущий `Jenkinsfile` — двадцать пять функциональных стадий. С билда #52
   проходили все двадцать одна, что было тогда: пропусков нет,
-  `Finished: SUCCESS`, первый зелёный прогон целиком. Двадцать вторая и
-  двадцать третья — `Security: metrics contract` и
-  `Security: event contract` — добавлены после того прогона и на Jenkins не
-  исполнялись ни разу; на этой машине они проходят как
-  `cargo test -p ferrum-testkit --test metrics_gate` и
+  `Finished: SUCCESS`, первый зелёный прогон целиком. Четыре добавлены после
+  того прогона и на Jenkins не исполнялись **ни разу**:
+  `Security: metrics contract`, `Security: admission latency`,
+  `Security: event contract` и `Security: break-glass`. На этой машине они
+  проходят как `cargo test -p ferrum-testkit --test metrics_gate`,
+  `cargo test --release -p ferrum-testkit --test latency_gate`,
   `cargo test -p ferrum-proto && cargo test -p ferrum-siem && cargo test -p
-  ferrum-testkit --test event_contract_gate`, и это не то же самое.
+  ferrum-testkit --test event_contract_gate` и
+  `cargo test -p ferrum-breakglass && cargo test -p ferrum-testkit --test
+  break_glass_gate`, и это не то же самое. Предыдущая редакция этого пункта
+  говорила «двадцать три» и называла двумя последними стадии metrics и event:
+  она отстала на `Security: admission latency`, добавленную циклом раньше, —
+  то самое занижение, от которого есть `docs/MVP-1-BOUNDARY.md`.
   Из того прогона: `BPF join` — шесть тестов из шести, четыре печатают
   `SIGKILL`, подтверждённый `waitpid`; `BPF join mutations` исполнилась впервые
   и убила все шесть мутаций. Красным пайплайн был с #16 по #51.
@@ -113,6 +119,13 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
   сборкой, у каждого листа конверта есть написанное решение «уходит наружу или
   нет», withheld отсутствует во всех трёх профилях, враждебная нагрузка не
   подделывает запись, и сток исполнён на локальном сокете),
+  `Security: break-glass` (`break_glass_gate.rs`: подписанный grant
+  приостанавливает review, который поставляемая политика отвергает, и перестаёт
+  после `expiresAt` без единой перезагрузки; ключ подписи bundle grant'ом не
+  является; бессрочного окна выразить нечем и потолок туже потолка waiver'а;
+  установка по умолчанию break-glass не армирует; и `docs/runbooks/README.md`
+  держится за дерево — пути, имена метрик, id причин деградации, числа радиуса
+  поражения и дословная строка про внешний IdP),
   `Security: supply chain` (cargo-deny + cargo-audit).
 - Новый инвариант или новый пункт приёмки — добавлять тест в security-стадию,
   а не в общий `cargo test`. Красная security-стадия не «флейк»: это нарушенный инвариант.
@@ -134,6 +147,7 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
 | `ferrum-export` | JSONL-сток, ограниченная очередь, fan-out по стокам | блокирующая запись на hot path, тихая потеря записи, сеть |
 | `ferrum-siem` | нормализация `EventEnvelope` в CEF/RFC 5424/ECS, неблокирующий сток на `std::net`, учтённая потеря | tokio, TLS, kube client, HTTP-клиент, растущий буфер ретраев, тихая потеря записи, поле без решения в `FIELDS` |
 | `ferrum-metrics` | Prometheus-экспозиция, счётчики/гистограмма на атомиках, read-only `GET /metrics` | зависимости (их ноль), kube client, TLS, исходящая сеть, чтение тела запроса, аллокации на hot path |
+| `ferrum-breakglass` | формат подписанного grant'а, потолок окна, хеш-цепочка журнала | kube client, сеть (в том числе обращение к IdP), tokio, бессрочный grant, журнал, который можно не писать |
 | `ferrum-controller` | reconcile + compile + rollout | datapath, CAP_BPF |
 | `ferrum-crypto` | подпись/проверка bundle, mTLS material (ring, rustls-webpki) | openssl-sys, выпуск CA, сеть, фейковый `Ok` |
 | `ferrum-cli` | `ferrumctl` offline | живой кластер в MVP-1 |
@@ -163,7 +177,17 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
 
 - cgroup→pod + mTLS **и** подпись bundle;
 - LSM на pin path; self-watch не в том же процессе;
-- journal + IdP на break-glass;
+- journal + IdP на break-glass. Половина исполнена: `ferrum-breakglass` —
+  подписанный в своём домене grant (кто/когда/на какой срок/тикет), обязательный
+  `expiresAt` с потолком в четыре часа и хеш-цепочка журнала, в которую пишут
+  активации, истечения, отзывы и **отказы**; журнал, в который нельзя писать,
+  не даёт grant'у вступить в силу, а армирование без писуемого журнала роняет
+  старт процесса. Scope один — `admission`; роль `respond` у агента этим
+  механизмом не снимается. Вторая половина внешняя и такой останется: проверка
+  отвечает «держатель ключа K это утверждал», а что `subject` — живой
+  уполномоченный человек, знает только IdP или PKI, которых в этом дереве нет
+  и которые не должны быть на пути (break-glass, падающий вместе с
+  недоступным IdP, падает ровно в том отказе, ради которого он есть);
 - in-kernel drop, CPU cgroup, `events_dropped_total`;
 - два SA: observe и respond; respond выключен по умолчанию;
 - CP down ≤ 2ч → last-known-good, `Degraded=true`, не fail-open.

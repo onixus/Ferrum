@@ -127,6 +127,36 @@ counter `status.json`, `/metrics` and `DEG_EXPORT_LOSSY` already read, not a
 new one — and the node reports Degraded. What that counter does not say is
 *which* destination failed; the agent's stderr says it, once per transition.
 
+The emergency lever: overlays/break-glass
+-----------------------------------------
+
+    kubectl apply -k overlays/break-glass
+
+Arms the webhook to honour a signed, time-bounded grant that suspends policy
+evaluation, and to journal every activation, expiry, revocation and refusal
+into a hash chain. It does not suspend anything: arming and breaking glass are
+two acts, and the second one is dropping a signed grant into Secret
+`ferrum-break-glass` during an incident. The procedure is in
+docs/runbooks/README.md §5.
+
+Apply it on a quiet afternoon, not during the outage. `ferrum-admission`
+refuses to start when break-glass is configured and the journal cannot be
+written — a suspension nobody can account for afterwards is worse than no
+suspension — so a broken arming fails `kubectl rollout status` here instead of
+failing at 03:00. Check `ferrum_admission_break_glass_configured` is 1 on every
+replica afterwards.
+
+The key is yours and is deliberately not the bundle signing key: the signature
+domains are separate, so a signature the policy publisher made cannot be
+replayed as a grant. Issue it to named people from whatever directory the site
+already runs — that binding is the part this tree cannot do, and the runbook
+says so in the words the code states it in.
+
+Two limits, both in the overlay file at length. The journal is an emptyDir and
+dies with the Pod, so the durable copies are the container log and the metric
+carrying the chain head; and the only scope this build honours is `admission`,
+so the agent's respond role is still suspended by hand.
+
 Why kustomize and not Helm
 --------------------------
 
