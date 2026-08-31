@@ -64,6 +64,16 @@
   разу, и всё, что цитирует `attach_join.rs`, было меряно только руками на
   x86_64-стенде;
 - `U` — исполнено в userspace; приёмочные строки — против настоящего подписанного bundle, стадии CI — против дерева, которое поставляется;
+- `A` — исполнено против **настоящего apiserver**: объект подан
+  `kubectl apply`, решение приняла установка из `deploy/`, и доказательство —
+  ответ apiserver, а не возврат функции. Метка новая, и появилась она потому,
+  что `U` тянула два разных утверждения. «Исполнено в userspace» значило и «мы
+  позвали `admit()` со структурой, которую сами собрали», и — до этого цикла
+  никогда — «кластер отказал в Pod». Первый же прогон `e2e_cluster.rs` показал,
+  насколько это разные вещи: два CRD из семи проходили каждый читающий текст
+  гейт этого дерева и отвергались apiserver целиком. Стенд один — kind
+  v1.36.1 (kindest/node) на aarch64, docker на этой машине, — и, как и с `K`,
+  метка говорит «против настоящего apiserver», а не «против вашего»;
 - `—` — не исполнено ничем.
 
 `K` больше не наследует один стенд, и это первый цикл, когда это так. Стендов
@@ -216,14 +226,14 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 
 | Случай §D | Плоскость | Метка | Исполняется |
 |---|---|---|---|
-| unsigned image -> deny | admission | U | U `acceptance.rs::unsigned_image_is_denied` |
-| privileged -> deny | admission | U | U `acceptance.rs::privileged_pod_is_denied` |
+| unsigned image -> deny | admission | A+U | U `acceptance.rs::unsigned_image_is_denied` · A `e2e_cluster.rs::an_unsigned_image_is_denied_by_the_real_apiserver` |
+| privileged -> deny | admission | A+U | U `acceptance.rs::privileged_pod_is_denied` · A `e2e_cluster.rs::a_privileged_pod_is_denied_by_the_real_apiserver` |
 | cluster-admin bind -> deny | admission | U | U `acceptance.rs::cluster_admin_bind_is_denied` |
 | exception without TTL -> API reject | admission | — | — |
 | kubectl exec + /bin/sh -> kill | runtime | K+U | U `acceptance.rs::exec_shell_in_container_is_killed` · U `replay.rs::replay_exec_shell_kill` · K `attach_live.rs::execve_path_comes_from_the_first_argument_slot` · K `attach_join.rs::a_kernel_execve_of_a_shell_is_killed_by_the_signed_bundle` |
 | docker.sock -> kill | runtime | K+U | U `acceptance.rs::docker_sock_access_is_killed` · U `replay.rs::replay_docker_sock_kill` · K `attach_live.rs::a_long_path_arrives_as_a_flagged_head` · K `attach_join.rs::a_kernel_openat_of_docker_sock_is_killed_by_the_signed_bundle` · K `attach_join.rs::a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted` · K `attach_join.rs::a_kernel_record_stripped_of_the_flag_is_still_read_as_truncated` |
 | bpf() not from the agent -> deny | runtime | K+U | U `acceptance.rs::bpf_not_from_agent_is_denied` · U `replay.rs::replay_bpf_not_from_agent_deny` · K `attach_live.rs::a_foreign_record_is_not_flagged_agent_self` |
-| CP down -> last-known-good | runtime | U | U `acceptance.rs::cp_down_keeps_last_known_good_not_fail_open` |
+| CP down -> last-known-good | runtime | A+U | U `acceptance.rs::cp_down_keeps_last_known_good_not_fail_open` · A `e2e_cluster.rs::a_control_plane_that_is_gone_keeps_the_webhook_on_last_known_good` |
 
 Что эти строки не говорят, и это важнее того, что они говорят:
 
@@ -285,11 +295,48 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
   ловит мутация 05, и обе нужны.
   Ни один из прогонов Jenkins не делал: стадии `BPF join` и
   `BPF join mutations` существуют, а прогонялись руками.
-- **`exception without TTL` стоит `—` намеренно.** Субъект утверждения —
-  API server, а API server здесь не запускался ни разу. `serde` отказывается
-  декодировать объект без `expiresAt`, и CRD в дереве несёт `required` и CEL —
-  это исполнено (см. следующую таблицу), но отказ библиотеки не есть отказ
-  apiserver.
+- **Три случая §D теперь решены настоящим apiserver, и это первый цикл, когда
+  хоть один решён.** `e2e_cluster.rs` разворачивает `deploy/controller` и
+  `deploy/admission` в kind, применяет `policies/examples/prod-restricted.yaml`,
+  ждёт, пока **контроллер** скомпилирует и подпишет bundle (Secret пишет он, а
+  не тест: `status.compile.message == "compiled and signed"`), выпускает PKI
+  тем же `ferrumctl gen-webhook-pki`, который описан в README каталога, и
+  подаёт Pod. Отказ читается из ответа apiserver и обязан назваться отказом
+  `policy.ferrum.io` с причиной: под `failurePolicy: Fail` недоступный webhook
+  отвергает Pod ровно так же, и тест, проверяющий только «Pod не создан»,
+  прочитал бы мёртвый webhook как работающий. Чего эти три строки **не**
+  говорят: агента в этой установке нет (см. ниже), а `A` на строке `CP down` —
+  это admission-плоскость. Диск агента, LKG-снапшот и `Degraded=true`
+  по-прежнему меряет только `acceptance.rs`.
+- **`CP down` в кластере — это удалённый control plane, а не флаг.**
+  Контроллер отмасштабирован в ноль, `ClusterSecurityPolicy` удалён из
+  apiserver, Secret с bundle удалён вместе с ним; webhook продолжает отказывать
+  своей причиной, и тест сверяет, что отвечают **те же Pod'ы** — по именам и
+  счётчикам рестартов, а не по сумме: перезапущенный процесс перечитал бы
+  монтирование на старте, и тогда прогон не сказал бы ничего о процессе,
+  держащем bundle, чей источник исчез.
+- **Установка нашла три дефекта, которых не видел ни один гейт этого дерева, и
+  все три — в поставляемых файлах.** Два CRD apiserver отвергал целиком:
+  `clustersecuritypolicy`/`securitypolicy` — по бюджету стоимости CEL
+  (`estimated rule cost exceeds budget by factor of 1.344083x`), потому что
+  массив `runtime.rules` не имел объявленной границы; `policyexception` — по
+  `now()`, которого в CEL валидации CRD нет и не будет, так как валидация
+  обязана быть детерминированной. Это значит, что PolicyException не
+  устанавливался вообще, а все остальные правила того файла были инертны — и
+  держал их тест, читавший те же строки из того же файла. Третий: `Dockerfile*`
+  умели собирать только цель x86_64, и образ под ноду kind на arm64 собрать
+  было нечем. Ни один из трёх не виден изнутри процесса.
+- **`exception without TTL` стоит `—`, и с этого цикла это уже не граница, а
+  долг.** Субъект утверждения — API server, и раньше здесь стояло, что API
+  server не запускался ни разу; это перестало быть правдой. `serde`
+  отказывается декодировать объект без `expiresAt`, CRD несёт `required` — и
+  теперь установлен в настоящем apiserver, — но отказ библиотеки по-прежнему не
+  есть отказ apiserver, а Pod'ов этот случай не подаёт: `e2e_cluster.rs` его не
+  делает, и говорит об этом в `NOT_COVERED_HERE` своими словами. Цитировать
+  здесь нечего до тех пор, пока кто-нибудь не подаст `PolicyException` без TTL
+  настоящему apiserver и не прочтёт его ответ. Две CEL-строки, которые этот
+  пункт раньше засчитывал себе в актив, apiserver отверг вместе со всем файлом,
+  см. абзац выше.
 - **`CP down` — это `mark_control_plane_down()`.** Ни один control plane не
   падал. Проверено, что при этом состоянии подделанный FSIG не подменяет
   last-known-good, снапшот переживает рестарт с диска и `execve` `/bin/sh`
@@ -306,7 +353,7 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 | Подписанный bundle: FSIG-кодек в четырёх копиях (controller, agent, admission, CLI) сходится на одних байтах | U | U `acceptance.rs::controller_signed_exceptions_are_accepted_by_agent_and_admission` |
 | С mount принимаются только подписанные exception | U | U `acceptance.rs::only_signed_exceptions_are_accepted_from_the_mount` |
 | Exception бьёт deny только в своём scope и до `expiresAt` | U | U `acceptance.rs::docker_sock_kill_is_waived_only_in_scope` · U `acceptance.rs::exception_without_ttl_is_rejected_and_scoped_exception_waives` |
-| CRD требует `expiresAt` и держит потолок 90 дней — в схеме и в `ferrum-policy` | U | U `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode` · U `deploy_gate.rs::exception_ttl_ceiling_is_ninety_days_in_cel_and_in_policy` |
+| CRD требует `expiresAt`; потолок 90 дней держит `ferrum-policy`, и схема его держать не может — в CEL валидации CRD нет часов | A+U | U `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode` · U `deploy_gate.rs::exception_ttl_ceiling_is_ninety_days_in_policy_and_no_schema_may_claim_it` · A `e2e_cluster.rs::the_shipped_crds_are_accepted_by_a_real_apiserver` |
 | Kill/Isolate без match отвергается схемой и политикой (это kill-all) | U | U `deploy_gate.rs::kill_without_match_is_rejected_in_cel_and_in_policy` |
 | Namespaced policy не может `failurePolicy=Ignore` | U | U `deploy_gate.rs::namespaced_policy_cannot_ignore_in_cel_and_in_policy` |
 | Правило, называющее syscall, которого datapath не цепляет, не валидируется | U | U `deploy_gate.rs::a_rule_naming_an_unhooked_syscall_does_not_validate` · U `Jenkinsfile::Validate policies` |
@@ -692,6 +739,9 @@ loader, не были названы ни одной строкой, а един
 | Утверждение | Метка | Исполняется |
 |---|---|---|
 | Набор §D закрыт с обеих сторон: случай нельзя уронить, оставив его без приёмочного теста или без сценария реплея | U | U `acceptance.rs::every_acceptance_case_has_a_test` · U `replay.rs::every_runtime_acceptance_case_has_a_replay_scenario` |
+| Случай §D нельзя уронить из кластерного гейта, промолчав: покрытые и непокрытые вместе обязаны быть ровно `AcceptanceCase::ALL`, и у каждого непокрытого — причина | U | U `e2e_cluster.rs::the_uncovered_cases_are_named_not_omitted` |
+| Кластерный гейт нельзя обезвредить, собрав его без фичи: `FERRUM_E2E_REQUIRED` на сборке без `--features e2e` — отказ, а не пустой зелёный прогон | U | U `e2e_cluster.rs::the_cluster_gate_must_not_be_compiled_out` |
+| Поставляемые CRD устанавливаются в настоящий apiserver: правило схемы, которое apiserver отвергает, делает инертным весь файл, и текстовый гейт этого не видит | A | A `e2e_cluster.rs::the_shipped_crds_are_accepted_by_a_real_apiserver` |
 | Каждый runtime-случай §D переигрывается из записанных байтов на обеих arch | U | U `replay.rs::runtime_acceptance_cases_replay_from_recorded_bytes` |
 | Освобождает агента от реакции на собственный `bpf()` флаг записи, а не строка `comm`: workload, назвавшийся `ferrum-agent`, освобождения не получает | U | U `replay.rs::agent_self_bpf_is_neither_denied_nor_signalled` |
 | Bundle с действием, которого runtime-плоскость не исполняет, грузится, и каждый матч экспортируется как неисполненное решение с причиной; `defaultAction: deny` тоже грузится | U | U `replay.rs::a_pre_gate_deny_bundle_loads_and_every_match_is_recorded` · U `action_gate.rs::a_signed_deny_default_still_installs` |
@@ -701,7 +751,6 @@ loader, не были названы ни одной строкой, а един
 | Loader отвергает kill-all и на живом пути, и на восстановлении LKG, и отказ не стирает уже работающую политику | U | U `action_gate.rs::the_loader_refuses_every_kill_all_and_keeps_the_inert_deny` · U `action_gate.rs::a_kill_all_default_refuses_the_snapshot_on_the_restore_path_too` · U `action_gate.rs::a_signed_kill_all_default_does_not_install_and_keeps_last_known_good` |
 | Self-approve waiver отвергают и CEL, и `ferrum-policy` | U | U `deploy_gate.rs::self_approve_is_rejected_in_cel_and_in_policy` |
 | Второй апрувер обязателен независимо от `fourEyes`, а минимальная длина `reason` в схеме — константа компилятора | U | U `deploy_gate.rs::a_waiver_without_a_second_approver_is_refused_by_the_schema_too` · U `deploy_gate.rs::the_minimum_reason_length_is_the_same_in_the_schema_and_in_policy` |
-| Потолок TTL в CEL — та же константа `ferrum-policy`, переведённая в часы, а не число, переписанное в YAML | U | U `deploy_gate.rs::the_cel_ttl_ceiling_is_the_policy_constant_in_hours` |
 | Пустой и дублированный id правила отвергает и схема: id — то, что waiver освобождает, а audit-запись обвиняет | U | U `deploy_gate.rs::a_blank_or_duplicated_rule_id_is_refused_by_the_schema_too` |
 | Границы длин `commIn`/`pathPrefix`/`pathSuffix` в схеме — границы datapath | U | U `deploy_gate.rs::the_match_length_bounds_in_the_schema_are_the_datapath_bounds` |
 | Ключ trust root, не являющийся 64 hex-символами Ed25519, отвергает и схема | U | U `deploy_gate.rs::a_public_key_that_is_not_ed25519_hex_is_refused_by_the_schema_too` |
@@ -977,8 +1026,17 @@ loader, не были названы ни одной строкой, а един
   утверждение, которому понадобился бы собственный гейт. Разбор и fail-closed
   обеих плоскостей остались для байтов, которых этот компилятор не
   производил.
-- **Ничто и никогда не обращалось к API server.** Ни webhook под нагрузкой
-  admission, ни watch, ни запись status.
+- **Обращение к API server перестало быть нулём, и это первый цикл, когда так.**
+  Здесь стояло «ничто и никогда не обращалось к API server» — про webhook под
+  нагрузкой admission, про watch и про запись status. Первого больше нет:
+  `e2e_cluster.rs` подаёт Pod настоящему apiserver, тот зовёт webhook, и
+  webhook отказывает своей причиной. Второе тоже: контроллер в kind поднимает
+  watch на три Kind и по нему компилирует и подписывает bundle — Secret в
+  кластере написал он. Что **не** изменилось: нагрузки не было (счёт Pod'ов
+  здесь идёт на единицы), запись `status` меряна только тем, что тест прочитал
+  `status.compile.message` у одного объекта, а агент к apiserver в кластере не
+  обращался ни разу — его DaemonSet на этом рантайме не стартует, см. строку в
+  «Верим, но не доказано».
 
 ## Верим, но не доказано
 
@@ -987,10 +1045,11 @@ loader, не были названы ни одной строкой, а един
 
 | Утверждение | Чем закрывается | Статус |
 |---|---|---|
-| Собранный образ стартует на узле | запуск контейнера из этого образа на настоящем узле | Не исполнено. `docker build` теперь исполняется — три стадии образов проходят в каждом билде по #44 включительно, — но запускать полученный образ не пробовал никто, и `docker push` тоже не делал никто |
+| Собранный образ стартует на узле | запуск контейнера из этого образа на настоящем узле | **Исполнено для двух образов из трёх, и опровергнуто для третьего.** `ferrum-controller` и `ferrum-admission` стартуют на узле kind и делают работу: `e2e_cluster.rs` доводит оба Deployment до Ready и читает их результат. Образ агента там же не стартует, и не по своей вине — см. следующую строку. `docker push` по-прежнему не делал никто, а сборка под arm64 до этого цикла была невозможна: `Dockerfile*` знали одну цель |
+| `deploy/agent/daemonset.yaml` разворачивается на настоящем узле | DaemonSet, дошедший до Ready на узле с tracefs и `CAP_BPF` | **Механизм исполнен, и утверждение им опровергнуто.** На containerd (kind, aarch64) Pod не стартует: манифест монтирует hostPath в `/sys/fs/bpf/ferrum`, runc обязан создать эту точку монтирования внутри собственного sysfs контейнера, а sysfs только для чтения — `mkdirat …/rootfs/sys/fs/bpf/ferrum: no such file or directory`. Образ, ELF и права тут ни при чём: ELF собран из этого дерева и все одиннадцать символов на месте. Починка — правка монтирования pin path, и в ней сидит вопрос threat model: смонтировать `/sys/fs/bpf` целиком значит отдать агенту весь bpffs узла. Пока этой строки нет, ни один runtime-случай §D в кластере не исполняется |
 | Собранный продуктовый бинарь аттачится на узле, а не только линкуется | Стадия, которая запускает слинкованный musl-бинарь и читает его `status.json` | В слайсе A это делали руками: бинарь написал `"attached": true`, а на испорченной релокации — причину в `containerMapError` и `degradedReasons`. В дереве нет ничего, что бы это повторило |
 | Поднятие memlock что-то решает на ядрах, куда это едет | Измерение на 5.8–5.10, где лимит ещё считает BPF-память | Не начато, и на этом хосте невозможно: soft = hard = 8 MiB, а с 5.11 память учитывается memcg. Манифест объявляет пол «ядро >= 5.8», и 5.8–5.10 — ровно тот диапазон, где лимит решает, загрузится ли datapath |
-| API server отвергает `PolicyException` без `expiresAt` | envtest или kind с применённым CRD: применить объект и потребовать отказ | Не начато. Ближайшее исполненное — `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode`: он читает CRD из дерева, а не ответ apiserver |
+| API server отвергает `PolicyException` без `expiresAt` | kind с применённым CRD: применить объект и потребовать отказ | Не исполнено, но механизм с этого цикла есть и стоит в дереве: `e2e_cluster.rs` разворачивает kind и применяет `docs/crd/`, где CRD с `required: expiresAt` теперь устанавливается (до этого цикла он не устанавливался вовсе). Не хватает ровно одного `kubectl apply` объекта без TTL и чтения ответа; `NOT_COVERED_HERE` в том файле называет это своими словами |
 | Агент сам обнаруживает падение CP и переходит на last-known-good | Тест на watch-клиент с оборванным соединением, не `mark_control_plane_down()` | Не начато |
 | `--policy-name` действительно джойнит waiver с политикой | Имя политики в FRMB — смена формата, бамп ABI и bundle, который откажется грузить каждый развёрнутый агент | **Заявлено, не закрыто.** Агент объявляет себя Degraded, если держит waiver, ни один из которых не называет его политику, а FD024 проверяет развёрнутые объекты. Джойн в рантайме остаётся недоказанным |
 | Разбор argv в этом дереве — одна грамматика | Поднять разбор в `ferrum-common` и оставить одну копию | **Заявлено, не закрыто, и прежняя формулировка этой строки была неверна в трёх местах.** (1) «Стоит зависимости в графе каждого crate» — платить нечем: `ferrum-common` уже существует и уже стоит в зависимостях `ferrum-agent`, `ferrum-admission` **и** `ferrum-controller`. (2) «Две копии дословные» — нет: admission собирает позиционные аргументы для `review <file>` и несёт второе поле в `Flags`; совпадает только ветка флагов. (3) Грамматик не три, а четыре: `ferrum-controller/src/main.rs::parse_run` — не last-wins вовсе (`--cluster` накапливается, флаг на месте значения — ошибка, а не пустая строка, разбор возвращает `Result`, а не карту), при этом FD027 читает argv контроллера через `container_flag`, то есть семантикой агента. Сам рефакторинг всё равно не работа этого цикла: за ним не стоит дефекта, FD025 делает удвоенный флаг находкой раньше, а копия, которая имела бы значение, — в `ferrum-cli`, который от `ferrum-common` не зависит |
