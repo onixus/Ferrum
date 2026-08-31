@@ -158,13 +158,42 @@ Toolchain — 1.97.1 (`rust-toolchain.toml`), kube 1.x + k8s-openapi 0.25.
 `optional-respond.yaml` с hostPID и `CAP_KILL`). Два ServiceAccount у агента,
 respond выключен по умолчанию.
 
-Дерево не документ, а вход гейта: `ferrumctl lint-deploy` проверяет его на
-инварианты threat model (приватный ключ в дереве, `caBundle`-заглушка,
-hostPID без respond, спроецированный токен под apiserver-watch и прочее), а
-`crates/ferrum-testkit/tests/deploy_gate.rs` роняет сборку, если дерево
-перестало быть устанавливаемым. Serving PKI выпускается офлайн:
-`ferrumctl gen-webhook-pki`, ротация — под тем же CA, которому кластер уже
-доверяет.
+Ставится оно одной командой, и `deploy/README` — про то, что именно она делает
+и чего не делает:
+
+```
+kubectl apply -k deploy
+```
+
+kustomize, а не Helm: `kubectl apply -k` не требует второго бинаря, чарта в
+репозитории и ещё одной цепочки поставки через воздушный зазор, а манифесты
+остаются теми же файлами, которые читают все гейты этого дерева. Умолчания —
+restricted, и второй копии этой позиции нет: values-файла не существует, любое
+послабление — отдельный набранный руками `apply`. Единственное, что закрытому
+контуру придётся поменять, — реестр образов; для этого есть
+`overlays/mirrored-registry`, четыре строки, переносящие установку в тот
+реестр, который разрешает `prod-restricted`.
+
+Вне установки по умолчанию остаются трое, и у каждого причина в
+`deploy/README`: `deploy/agent` (отдельный корень — его Pod не стартует на узле
+без bpffs на `/sys/fs/bpf`), `deploy/agent/optional-respond.yaml` (hostPID и
+`CAP_KILL` включаются набранной командой, а не наследуются) и
+`validatingwebhookconfiguration.yaml` (появляется только после
+`ferrumctl gen-webhook-pki` и применяется последним — с `failurePolicy=Fail`
+он начинает отказывать в Pod'ах в момент появления).
+
+Дерево не документ, а вход трёх разных гейтов, и они утверждают разное.
+`ferrumctl lint-deploy` проверяет манифесты на инварианты threat model
+(приватный ключ в дереве, `caBundle`-заглушка, hostPID без respond,
+спроецированный токен под apiserver-watch и прочее).
+`crates/ferrum-testkit/tests/deploy_gate.rs` читает текст — какие файлы ставит
+какой корень, restricted ли умолчания, — и называется читающим текст, потому
+что прошлый цикл показал цену обратного: два CRD из семи проходили здесь всё и
+отвергались настоящим apiserver целиком. Про устанавливаемость утверждает
+только `crates/ferrum-testkit/tests/install_gate.rs`: он ставит `-k deploy` в
+настоящий kind на кластер, который FERRUM не видел, и ждёт, пока workload'ы
+поднимутся. Serving PKI выпускается офлайн: `ferrumctl gen-webhook-pki`,
+ротация — под тем же CA, которому кластер уже доверяет.
 
 Образы: `Dockerfile`, `Dockerfile.admission`, `Dockerfile.controller`. Собираются
 они в каждом билде на ноде локального Jenkins, а публикуются — релизным
