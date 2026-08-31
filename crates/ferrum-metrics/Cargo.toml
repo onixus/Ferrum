@@ -1,0 +1,15 @@
+[package]
+name = "ferrum-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Prometheus text exposition and a read-only GET listener. Forbidden: kube client, TLS, outbound net, request bodies, allocation on the datapath."
+
+# Deliberately empty. Every metrics library in the ecosystem brings a global
+# registry, a lazy_static and — through one feature or another — an HTTP stack;
+# this crate is linked by the DaemonSet that the threat model calls the second
+# target after the kubelet, so its dependency list is the one place where that
+# is cheapest to refuse. std::sync::atomic and std::net are the whole of it.
+[dependencies]

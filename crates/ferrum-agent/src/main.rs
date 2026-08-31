@@ -186,6 +186,13 @@ fn main() {
     install_signal_handlers();
     spawn_shutdown_watcher(Arc::clone(&sink));
 
+    // Bound here, before anything claims to be running: a metrics port that
+    // cannot be bound is a target that never comes up, and discovering that
+    // from the scraper's side is discovering it hours later. Absent flag means
+    // absent port — the endpoint is opt-in, because a listening socket on a
+    // DaemonSet is a cost the operator has to choose.
+    let metrics_listener = bind_metrics(&flags);
+
     run(
         agent,
         sink,
@@ -195,7 +202,23 @@ fn main() {
         reload_ms,
         &flags,
         cgroup_rx,
+        metrics_listener,
     )
+}
+
+/// `--metrics-listen host:port`, or nothing.
+fn bind_metrics(flags: &Flags) -> Option<std::net::TcpListener> {
+    let listen = flags.map.get("metrics-listen").filter(|s| !s.is_empty())?;
+    match std::net::TcpListener::bind(listen.as_str()) {
+        Ok(listener) => {
+            eprintln!(
+                "ferrum-agent: metrics on {listen}{}",
+                ferrum_metrics::METRICS_PATH
+            );
+            Some(listener)
+        }
+        Err(err) => die(&format!("bind --metrics-listen {listen}: {err}")),
+    }
 }
 
 /// Fills the cgroup→pod index and publishes its key set to whoever owns the
@@ -328,6 +351,7 @@ fn run(
     reload_ms: u64,
     flags: &Flags,
     cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
+    metrics_listener: Option<std::net::TcpListener>,
 ) -> ! {
     use ferrum_ebpf::{plan_cgroup_sync, KernelHandle, SyscallArch};
     use std::sync::mpsc::sync_channel;
@@ -353,6 +377,14 @@ fn run(
         sink: Some(sink.as_ref()),
         status_dir: export_dir.as_deref(),
     };
+    if let Some(listener) = metrics_listener {
+        ferrum_agent::spawn_metrics(
+            listener,
+            Arc::clone(&agent),
+            ctx.clone(),
+            std::sync::Arc::clone(&sink),
+        );
+    }
     let mut handle = match KernelHandle::attach_for_arch(&elf, arch) {
         Ok(handle) => {
             if !handle.unhooked_syscalls().is_empty() {
@@ -548,7 +580,7 @@ fn park_degraded(
 #[cfg(not(feature = "attach"))]
 #[allow(clippy::too_many_arguments)]
 fn run(
-    mut agent: Agent,
+    agent: Agent,
     sink: std::sync::Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>,
     ctx: SinkContext,
     bundle_path: Option<PathBuf>,
@@ -556,28 +588,37 @@ fn run(
     reload_ms: u64,
     _flags: &Flags,
     _cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
+    metrics_listener: Option<std::net::TcpListener>,
 ) -> ! {
     eprintln!(
         "ferrum-agent: built without the attach feature: no kernel datapath, \
          no syscall events, no reaction. Degraded."
     );
     ctx.set_degraded(true);
+    // Shared rather than owned, and in this build too: the metrics thread is a
+    // second reader of the same agent, and a build whose only difference from
+    // the shipped one is that its state is unreadable would be the harder of
+    // the two to debug. The poll loops are the `_shared` forms for the same
+    // reason the attach build uses them.
+    let agent = std::sync::Arc::new(std::sync::RwLock::new(agent));
     let out = ferrum_agent::StatusOutput {
         ctx: Some(&ctx),
         sink: Some(sink.as_ref()),
         status_dir: export_dir.as_deref(),
     };
+    if let Some(listener) = metrics_listener {
+        ferrum_agent::spawn_metrics(
+            listener,
+            std::sync::Arc::clone(&agent),
+            ctx.clone(),
+            std::sync::Arc::clone(&sink),
+        );
+    }
     match bundle_path {
         Some(path) => {
-            ferrum_agent::poll_bundle(&mut agent, &path, Duration::from_millis(reload_ms), &out)
+            ferrum_agent::poll_bundle_shared(&agent, &path, Duration::from_millis(reload_ms), &out)
         }
-        None => {
-            let mut publisher = ferrum_agent::StatusPublisher::default();
-            loop {
-                std::thread::sleep(Duration::from_millis(reload_ms));
-                publisher.publish(&agent, &out);
-            }
-        }
+        None => ferrum_agent::poll_status(&agent, Duration::from_millis(reload_ms), &out),
     }
 }
 

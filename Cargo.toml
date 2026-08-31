@@ -17,6 +17,7 @@ members = [
     "crates/ferrum-agent",
     "crates/ferrum-controller",
     "crates/ferrum-export",
+    "crates/ferrum-metrics",
     "crates/ferrum-cli",
     "crates/ferrum-testkit",
 ]
@@ -42,6 +43,7 @@ ferrum-ebpf = { path = "crates/ferrum-ebpf" }
 ferrum-ebpf-progs = { path = "crates/ferrum-ebpf-progs" }
 ferrum-k8smeta = { path = "crates/ferrum-k8smeta" }
 ferrum-export = { path = "crates/ferrum-export" }
+ferrum-metrics = { path = "crates/ferrum-metrics" }
 ferrum-testkit = { path = "crates/ferrum-testkit" }
 
 anyhow = "1.0"

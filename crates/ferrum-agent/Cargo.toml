@@ -25,6 +25,11 @@ ferrum-ebpf.workspace = true
 ferrum-export.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+# Prometheus text rendering and the read-only GET listener behind
+# `--metrics-listen`. No dependencies of its own; what it adds to this graph is
+# `std::net` and nothing else. See `src/metrics.rs` for why the port exists at
+# all on a DaemonSet.
+ferrum-metrics.workspace = true
 ferrum-policy.workspace = true
 ferrum-proto.workspace = true
 # kill(2) for the respond role; no other syscall wrapper is used.

@@ -653,6 +653,7 @@ dependencies = [
  "ferrum-export",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-metrics",
  "ferrum-policy",
  "ferrum-proto",
  "ferrum-testkit",
@@ -795,6 +796,10 @@ dependencies = [
  "rustls",
  "serde_json",
 ]
+
+[[package]]
+name = "ferrum-metrics"
+version = "0.1.0"
 
 [[package]]
 name = "ferrum-policy"
