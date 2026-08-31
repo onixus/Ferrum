@@ -65,8 +65,9 @@ mod gate {
     use ferrum_agent::TargetCheck;
     use ferrum_agent::{
         encode_fsig, pump_records, Agent, AgentConfig, AgentRole, ProcCgroupCheck, SignalResponder,
-        DEGRADED_RECOVERY, DEG_PATH_TRUNCATED, REFUSE_STALE_TARGET, RESPOND_SIGNAL_FAILING,
-        RESPOND_SIGNAL_FAILING_MIN, TARGET_CHECK_UNPROVABLE, TARGET_NEVER_PROVEN,
+        DEGRADED_RECOVERY, DEG_PATH_TRUNCATED, MAX_TGID, REFUSE_STALE_TARGET,
+        RESPOND_SIGNAL_FAILING, RESPOND_SIGNAL_FAILING_MIN, TARGET_CHECK_UNPROVABLE,
+        TARGET_NEVER_PROVEN,
     };
     use ferrum_api::PolicyMode;
     use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
@@ -514,6 +515,33 @@ mod gate {
         agent
     }
 
+    /// Fault in every page the pathname spans, before the kernel reads it.
+    ///
+    /// `bpf_probe_read_user_str` runs with page faults disabled, and on the
+    /// aarch64 6.12 node this stage runs on the pages holding this string are
+    /// not reachable to it in a child that has done nothing since `fork`.
+    /// `attach_live.rs` needs the same for the same reason and says so; the
+    /// join was written on x86_64, where the pages happen to be there, and the
+    /// omission stayed invisible until this stage first ran on a second kernel.
+    ///
+    /// Touching the first byte is not enough, and the difference is not
+    /// theoretical: a pathname that straddles a page boundary is then read up
+    /// to the boundary and stopped, so the record carries a *prefix*. That is
+    /// worse than an empty path — a test matching on a prefix still passes,
+    /// and one matching the whole path fails only when the allocator happens
+    /// to place the string near the end of a page. It arrived exactly that
+    /// way: one exact-match test failing in one build, having passed in the
+    /// two before it.
+    ///
+    /// Faulting the pages in weakens nothing. The truncated-path behaviour has
+    /// its own tests, and one of them deliberately does not touch the page.
+    unsafe fn fault_in_path(path: *const libc::c_char) {
+        let mut i = 0isize;
+        while std::ptr::read_volatile(path.offset(i)) != 0 {
+            i += 1;
+        }
+    }
+
     fn nul_trimmed(bytes: &[u8]) -> &[u8] {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         &bytes[..end]
@@ -627,6 +655,14 @@ mod gate {
                 std::ptr::null(),
             ];
             let envp = [std::ptr::null::<libc::c_char>()];
+            // Same fault-in as the openat probes, and here it decides more
+            // than identification. A path rule matching an unknown path is
+            // *asserted*, not skipped — the fail-closed the product is built
+            // on — so with this page missing the child's own `execve("/bin/sh")`
+            // matched the docker.sock rule and the agent signalled twice for
+            // one probe. Nothing about that is wrong in the agent: the probe
+            // was handing it a path no rule could clear.
+            fault_in_path(sh.as_ptr());
             libc::execve(sh.as_ptr(), argv.as_ptr(), envp.as_ptr());
             libc::_exit(98);
         });
@@ -651,7 +687,23 @@ mod gate {
         assert_killed(killed, "no-shell", tgid);
         assert_eq!(killed.syscall, "execve");
         assert_eq!(killed.comm, "sh");
-        assert_eq!(agent.respond_kill_total(), 1);
+        assert_eq!(
+            agent.respond_kill_total(),
+            1,
+            "the agent signalled more than the one record this test pumped a verdict for. \
+             Every kill it counted came from some record in this probe's own set, so the \
+             extra one is a second rule matching something else the probe did — name it \
+             rather than guess: {:?}",
+            events
+                .iter()
+                .map(|e| (
+                    e.rule.as_str(),
+                    e.syscall.as_str(),
+                    e.action.as_str(),
+                    e.path_unknown
+                ))
+                .collect::<Vec<_>>()
+        );
 
         // The agent's word, and then the node's.
         let status = probe.wait_for_death("no-shell");
@@ -685,6 +737,7 @@ mod gate {
         let mut probe = live.spawn_probe(move || unsafe {
             // Must fail: reaching sys_enter is the whole requirement, and a
             // real socket would outlive the test.
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -746,6 +799,7 @@ mod gate {
         target.push_str("/docker.sock");
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -854,6 +908,7 @@ mod gate {
         target.push_str("/docker.sock");
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -995,6 +1050,7 @@ mod gate {
         let target = format!("/tmp/ferrum-join-stale-{}/docker.sock", std::process::id());
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -1073,26 +1129,45 @@ mod gate {
         };
         let arch = live.arch;
 
-        // One past pid_max: no process can hold it, so `kill(2)` on it is
-        // ESRCH from this kernel and reaches nothing.
+        // A tgid nothing holds, and one the agent is willing to signal. Both
+        // halves are load-bearing, and only the first used to be here: the
+        // value was `pid_max + 1`, which on a node whose `pid_max` is already
+        // `PID_MAX_LIMIT` is also at or above `MAX_TGID`, where the reaction
+        // is refused as unsignalable before it ever reaches `kill(2)`. This
+        // test would then be measuring `REFUSE_TGID_RANGE` — a guard doing its
+        // job — while claiming to measure a signal the *kernel* refused, and
+        // `respond_failed_total` would stay 0 with nothing saying why. The
+        // x86_64 stand has a small `pid_max`, so one past it was an ordinary
+        // absent pid and the ambiguity never showed.
         let pid_max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
             .expect("read /proc/sys/kernel/pid_max")
             .trim()
             .parse()
             .expect("pid_max is a number");
-        let phantom = pid_max + 1;
-        let rc = unsafe { libc::kill(libc::pid_t::try_from(phantom).expect("pid"), 0) };
-        assert_eq!(rc, -1, "pid {phantom} exists on this node; it must not");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH),
-            "signalling pid {phantom} did not fail with ESRCH, so this test would be aiming a \
-             SIGKILL at something real"
+        let ceiling = pid_max.min(MAX_TGID) - 1;
+        let mut phantom = ceiling;
+        loop {
+            let rc = unsafe { libc::kill(libc::pid_t::try_from(phantom).expect("pid"), 0) };
+            if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                phantom > 2,
+                "no unused tgid below {ceiling} on this node; there is nothing to aim at that \
+                 the agent would agree to signal"
+            );
+            phantom -= 1;
+        }
+        assert!(
+            phantom < MAX_TGID,
+            "phantom {phantom} is at or above MAX_TGID: the reaction would be refused as \
+             unsignalable and this test would measure that guard instead of the kernel"
         );
 
         let target = format!("/tmp/ferrum-join-eperm-{}/docker.sock", std::process::id());
         let c_target = CString::new(target.clone()).expect("no NUL");
         let mut probe = live.spawn_probe(move || unsafe {
+            fault_in_path(c_target.as_ptr());
             libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY);
         });
         let tgid = probe.tgid();
@@ -1179,8 +1254,22 @@ mod gate {
         );
         assert!(
             agent.respond_failed_total() >= RESPOND_SIGNAL_FAILING_MIN,
-            "only {} reactions reached the syscall",
-            agent.respond_failed_total()
+            "only {} reactions reached the syscall. A reaction that never got there was \
+             stopped by a guard, and which guard is the whole question: refused {}, of them \
+             stale target {}, killed {}. Verdicts: {:?}",
+            agent.respond_failed_total(),
+            agent.respond_refused_total(),
+            agent.respond_stale_target_total(),
+            agent.respond_kill_total(),
+            sink.events()
+                .iter()
+                .map(|e| (
+                    e.rule.as_str().to_string(),
+                    e.action.as_str().to_string(),
+                    e.executed,
+                    e.respond_error.clone()
+                ))
+                .collect::<Vec<_>>()
         );
         // The guard passed every time: this is why no other reason can see it.
         assert!(agent.respond_target_confirmed_total() >= RESPOND_SIGNAL_FAILING_MIN);

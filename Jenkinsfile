@@ -1069,6 +1069,90 @@ pipeline {
                 }
             }
 
+            }
+        }
+
+        // Стык вынесен из docker-группы, и это не перестановка ради вкуса.
+        //
+        // Шесть тестов `attach_join.rs` создают собственные cgroup — `mkdir` под
+        // корнем cgroup2 и запись pid в `cgroup.procs`, — а Docker монтирует
+        // cgroupfs внутрь контейнера на чтение: суперблок `rw`, монтирование
+        // `ro`. Отсюда `mkdir /sys/fs/cgroup/ferrum-join-…: Read-only file
+        // system (os error 30)` в билдах #38-#41 и красная 'BPF join' во всех.
+        // Ядро ноды тут ни при чём: cgroup v2 оно несёт.
+        //
+        // Лечится это remount'ом изнутри mount namespace сборочного контейнера,
+        // который делает одноразовый привилегированный контейнер снаружи — тот
+        // же приём, что у 'Datapath tracefs', и по той же причине: сам remount
+        // требует CAP_SYS_ADMIN, а этому контейнеру его не дают, он исполняет
+        // код репозитория.
+        //
+        // Но снаружи нужен docker CLI, а вложенная в `agent { docker }` стадия
+        // с `agent any` всё равно исполняется launcher'ом контейнера, где его
+        // нет: JENKINS-30600, `docker: not found` — билд #42 упал именно так и
+        // унёс за собой зелёную 'BPF attach'. Тот же дефект в своё время увёл
+        // отсюда 'SAST (semgrep)'. Поэтому контейнер стыка поднимает и
+        // останавливает сама группа, а тела стадий идут в него `docker exec`.
+        // 'BPF attach' осталась в docker-группе нетронутой: она зелёная с
+        // билда #39, и переносить её вместе со стыком значило бы рискнуть
+        // единственным, что на этой ноде уже доказано.
+        //
+        // Что здесь измерено на этой ноде, а не выведено рассуждением:
+        // писуемым становится собственное поддерево контейнера, а не иерархия
+        // узла (у настоящего корня узла нет `cgroup.events`, у этого есть, а
+        // `/sys/fs/cgroup/../..` упирается в `/sys`), и `remount` не меняет
+        // поле root в mountinfo, поэтому продуктовый `detect_cgroup2_root()`
+        // этот корень принимает. Bind-mount хостового дерева запись бы дал, но
+        // поле root у него не `/`, вывод корня вернул бы Degraded, и стадия
+        // осталась бы красной по новой причине.
+        stage('Datapath join') {
+            agent any
+            environment {
+                DATAPATH_IMAGE = "${RUST_IMAGE}"
+                DATAPATH_ARGS = "${DATAPATH_DOCKER_ARGS}"
+            }
+            stages {
+            // Поднимает контейнер стыка и делает его cgroup2 писуемой.
+            //
+            // Проверяет `docker exec`, а не `nsenter`, и это не стилистика:
+            // поле root в mountinfo относительно cgroup namespace читателя —
+            // снаружи та же строка читается как `/../<id контейнера>`, изнутри
+            // как `/`. Первое `detect_cgroup2_root()` отвергло бы, второе
+            // принимает, и решает именно второе, потому что код идёт внутри
+            // контейнера. Проверка обязана смотреть с той же точки, что и
+            // проверяемое.
+            //
+            // Без `|| true` и без условного пропуска, как и у tracefs: remount,
+            // который не поднялся, обязан уронить стадию здесь, а не
+            // превратиться в прежний EROFS стадией ниже. И проверка — не
+            // `mount | grep rw`, а настоящие `mkdir`/`rmdir` в том самом
+            // namespace: «смонтировано rw» и «сюда можно писать» различает
+            // только попытка записи.
+            stage('Datapath cgroup') {
+                steps {
+                    // dist/ приезжает стэшем: у этой группы свой воркспейс,
+                    // и 'BPF ELF' в него ничего не клала.
+                    unstash 'image-context'
+                    sh '''
+                        set -eu
+                        docker rm -f "$(cat .datapath-cid 2>/dev/null || true)" >/dev/null 2>&1 || true
+                        cid=$(docker run -d --rm -u 0:0 \
+                                -v "$WORKSPACE":"$WORKSPACE" -w "$WORKSPACE" \
+                                $DATAPATH_ARGS "$DATAPATH_IMAGE" sleep 7200)
+                        echo "$cid" > .datapath-cid
+                        pid=$(docker inspect -f '{{.State.Pid}}' "$cid")
+                        docker run --rm --privileged --pid=host alpine:3 \
+                            nsenter -t "$pid" -m -- mount -o remount,rw /sys/fs/cgroup
+                        docker exec "$cid" sh -c \
+                            'grep -qE " / /sys/fs/cgroup rw," /proc/self/mountinfo \
+                                || { echo "cgroup2 is not rw, or its mountinfo root is no longer /" >&2; exit 1; }
+                             mkdir /sys/fs/cgroup/ferrum-cgroup-rw-probe
+                             rmdir /sys/fs/cgroup/ferrum-cgroup-rw-probe'
+                        echo "ok: cgroup2 is writable in the datapath container and its mountinfo root is still /"
+                    '''
+                }
+            }
+
             // The join: a record this kernel wrote, through a signed bundle, to a
             // real SIGKILL. `BPF attach` proves the datapath writes the record the
             // decoder reads and links no agent; `cargo test --workspace` proves the
@@ -1100,7 +1184,7 @@ pipeline {
             // stdout visible to that check.
             stage('BPF join') {
                 steps {
-                    sh '''
+                    writeFile file: '.datapath-join.sh', text: '''
                         set -eu
                         elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
                         test -f "$elf"
@@ -1196,6 +1280,14 @@ pipeline {
                         # line, which links nothing and executes nothing.
                         cargo test -p ferrum-agent --features attach,apiserver --lib
                     '''
+                    sh '''
+                        set -eu
+                        docker exec -w "$WORKSPACE" \
+                            -e CARGO_TARGET_DIR=/build-target \
+                            -e CARGO_TERM_COLOR=never \
+                            -e CARGO_INSTALL_ROOT=/cargo-tools \
+                            "$(cat .datapath-cid)" sh .datapath-join.sh
+                    '''
                 }
             }
 
@@ -1223,13 +1315,41 @@ pipeline {
             // commit, kernel or no kernel.
             stage('BPF join mutations') {
                 steps {
-                    sh '''
+                    writeFile file: '.datapath-mutations.sh', text: '''
                         set -eu
+                        # Мутация 04 правит сам датапейс и пересобирает BPF ELF,
+                        # а это build-std под bpf-таргет: нужен nightly с
+                        # rust-src. Контейнер этой группы поднимается с нуля, и
+                        # nightly в образе нет — rustup доставил бы его сам, но
+                        # без rust-src, и build-std падает уже после того, как
+                        # три мутации отработали. bpf-linker доставать неоткуда
+                        # не нужно: он лежит в томе /cargo-tools, куда его
+                        # положила стадия 'BPF ELF'.
+                        #
+                        # Пробел этот не от выноса стыка: контейнер прежней
+                        # docker-группы нёс ровно тот же образ и тоже был без
+                        # nightly. Он просто не мог проявиться, пока
+                        # 'BPF join mutations' ни разу не исполнялась.
+                        export PATH=/cargo-tools/bin:$PATH
+                        rustup toolchain install nightly --profile minimal --component rust-src
                         FERRUM_BPF_ELF="$PWD/dist/ferrum-ebpf-progs.bpf.o" \
                             crates/ferrum-agent/tests/mutations/run.sh
                     '''
+                    sh '''
+                        set -eu
+                        docker exec -w "$WORKSPACE" \
+                            -e CARGO_TARGET_DIR=/build-target \
+                            -e CARGO_TERM_COLOR=never \
+                            -e CARGO_INSTALL_ROOT=/cargo-tools \
+                            "$(cat .datapath-cid)" sh .datapath-mutations.sh
+                    '''
                 }
             }
+            }
+            post {
+                always {
+                    sh 'docker rm -f "$(cat .datapath-cid 2>/dev/null || true)" >/dev/null 2>&1 || true'
+                }
             }
         }
     }
