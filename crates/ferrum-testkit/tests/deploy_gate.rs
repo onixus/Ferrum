@@ -3037,7 +3037,7 @@ mod actions_parity {
     /// Стадии `Jenkinsfile`, которые обязаны быть в публичном воркфлоу с тем
     /// же телом. Это ровно userspace: группа `Build` без `BPF ELF` и группа
     /// `Checks` целиком.
-    const MIRRORED: [&str; 8] = [
+    const MIRRORED: [&str; 9] = [
         "Format",
         "Clippy",
         "Test",
@@ -3045,6 +3045,7 @@ mod actions_parity {
         "Validate policies",
         "Security: policy invariants",
         "Security: MVP acceptance",
+        "Security: metrics contract",
         "Security: supply chain",
     ];
 

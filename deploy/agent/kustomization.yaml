@@ -32,3 +32,6 @@ resources:
   - serviceaccount-respond.yaml
   - rbac.yaml
   - daemonset.yaml
+  # Headless, so the scrape is per node rather than load-balanced across the
+  # fleet. See the file for why that distinction is not cosmetic here.
+  - metrics-service.yaml

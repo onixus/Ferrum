@@ -405,6 +405,11 @@ jobs:
         run: |
           set -eu
           cargo test -p ferrum-admission --test mvp
+      - name: "Security: metrics contract"
+        run: |
+          set -eu
+          cargo test -p ferrum-metrics
+          cargo test -p ferrum-testkit --test metrics_gate
       - name: "Security: supply chain"
         run: |
           set -eu

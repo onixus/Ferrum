@@ -841,6 +841,7 @@ dependencies = [
  "ferrum-export",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-metrics",
  "ferrum-policy",
  "serde",
  "serde_json",

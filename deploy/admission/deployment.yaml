@@ -17,6 +17,20 @@ spec:
       labels:
         app.kubernetes.io/name: ferrum-admission
         app.kubernetes.io/part-of: ferrum
+      annotations:
+        # For an annotation-driven scrape config, which is the one shape that
+        # needs nothing installed on our side. A Prometheus running the
+        # ServiceMonitor CRD reads the Service instead; both find the same
+        # port. What decides who may reach it is neither of these — it is
+        # deploy/observability/networkpolicy.yaml.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9102"
+        prometheus.io/path: /metrics
+        # Plain HTTP on purpose. The scrape must not need the caBundle the API
+        # server pins for 8443: that would make the offline webhook PKI a
+        # monitoring dependency and every serving-cert rotation a monitoring
+        # outage. See crates/ferrum-admission/src/metrics.rs.
+        prometheus.io/scheme: http
     spec:
       serviceAccountName: ferrum-admission
       # --apiserver below opens the namespace/ServiceAccount label watch, and
@@ -60,6 +74,11 @@ spec:
             # Without this the namespace/SA label cache stays cold, and a
             # policy carrying a namespaceSelector denies every Pod.
             - --apiserver
+            # Read-only GET /metrics, on its own listener and its own port.
+            # Never on 8443: that port is the API server's, is served with the
+            # pinned certificate, and answers POST only.
+            - --metrics-listen
+            - 0.0.0.0:9102
           env:
             - name: FERRUM_TRUST_ROOT
               valueFrom:
@@ -69,6 +88,8 @@ spec:
           ports:
             - name: https
               containerPort: 8443
+            - name: metrics
+              containerPort: 9102
           # The server answers POST only; a GET probe would read as 405, so
           # readiness is a TCP connect.
           readinessProbe:

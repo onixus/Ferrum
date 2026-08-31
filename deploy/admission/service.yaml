@@ -14,3 +14,12 @@ spec:
       port: 443
       targetPort: 8443
       protocol: TCP
+    # The scrape target. On this Service and not a second one because the
+    # selector would be identical, and two Services over one set of Pods is two
+    # places to forget. `targetPort: metrics` by name: the NetworkPolicy that
+    # governs this port names it the same way, so a port number changed in the
+    # Deployment moves both without touching either.
+    - name: metrics
+      port: 9102
+      targetPort: metrics
+      protocol: TCP

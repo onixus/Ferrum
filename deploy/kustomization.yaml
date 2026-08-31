@@ -13,7 +13,8 @@
 #     rejected as an unknown type;
 #   * the namespace, labelled webhook-exempt so a cold cluster cannot deadlock
 #     on the admission Pod that has not started;
-#   * the controller and the webhook workloads.
+#   * the controller and the webhook workloads;
+#   * the NetworkPolicy governing what may reach their ports.
 #
 # What it deliberately does not install, each with a gate that keeps it out:
 #
@@ -50,3 +51,8 @@ resources:
   - namespace.yaml
   - controller
   - admission
+  # The NetworkPolicy in front of the metrics ports. Installed by default, and
+  # by the same root as the workloads that open those ports: a restriction that
+  # ships separately from the thing it restricts is a restriction half the
+  # installs will not have.
+  - observability

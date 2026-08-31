@@ -1,0 +1,78 @@
+# Who may reach the ports FERRUM listens on.
+#
+# The metrics endpoint is unauthenticated by design — the alternatives are a
+# shared secret in every namespace that wants to scrape, or the webhook's
+# offline CA as a monitoring dependency, and both are worse. So what limits
+# reach is the network, written down as an object an operator can read rather
+# than as a check inside a binary.
+#
+# What is on the other side of that port is not neutral telemetry. It says
+# whether a node is attached to the kernel at all, whether the container map is
+# ready, whether records are being dropped before any rule sees them, and which
+# bundle digest is in force. Read together those answer "is this node currently
+# enforcing, and if not, for how long" — which is reconnaissance for whoever is
+# already inside the cluster, and it is the single most useful thing an
+# attacker could learn from this product. Hence a default-deny in front of it
+# rather than an annotation and a hope.
+#
+# ## A NetworkPolicy is only as real as the CNI
+#
+# This object is inert on a cluster whose CNI does not enforce NetworkPolicy —
+# kind's default kindnet is exactly such a CNI, so on the install gate's own
+# cluster this file is applied and enforces nothing. That is stated here rather
+# than left for someone to discover: on a cluster without a policy-enforcing
+# CNI, the metrics ports are reachable from every Pod in the cluster, and the
+# operator's options are a CNI that enforces (Calico, Cilium) or not passing
+# `--metrics-listen` at all. `status.json` and `events.jsonl` need no port and
+# are the fallback that has always been there.
+#
+# ## Why one object and not two
+#
+# A NetworkPolicy that selects a Pod takes over ingress for that Pod entirely:
+# from the moment one matches, everything not explicitly allowed is denied. So
+# the webhook's own port has to be re-allowed here, in the same object, or
+# installing this file would stop the API server reaching 8443 — and with
+# `failurePolicy: Fail` that is every Pod in the cluster refused. Splitting
+# this into "a metrics policy" and "a webhook policy" would put those two
+# halves in two files where one can be applied without the other.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ferrum-ingress
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/part-of: ferrum
+spec:
+  # Everything this product runs in the namespace: the webhook, the controller,
+  # and — when its own root is applied — the node agent. By part-of rather than
+  # by name, so a workload added later is covered by default instead of being
+  # the one nobody remembered to select.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: ferrum
+  policyTypes:
+    - Ingress
+  ingress:
+    # The API server calling the webhook. Unrestricted by source, and it has to
+    # be: the API server is not a Pod, has no labels to select, and reaches the
+    # Service from a node or control-plane address that differs per cluster and
+    # changes with the cluster. Narrowing this by ipBlock would be a guess that
+    # fails closed on the one path whose failure is a cluster-wide outage.
+    - ports:
+        - port: 8443
+          protocol: TCP
+    # The scrape. Only from Pods in a namespace the operator has labelled for
+    # it — a deliberate act, taken once, on the namespace that runs Prometheus:
+    #
+    #     kubectl label namespace monitoring ferrum.io/metrics-scrape=true
+    #
+    # By named port, so the number lives in one place (the workload manifests)
+    # and moving it does not silently leave this rule pointing at a port
+    # nothing listens on.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              ferrum.io/metrics-scrape: "true"
+      ports:
+        - port: metrics
+          protocol: TCP
