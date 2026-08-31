@@ -17,6 +17,14 @@
 # и только там. По той же причине нет стадий образов и 'SAST (semgrep)':
 # они исполняются docker CLI ноды.
 #
+# Чего здесь есть и нет в Jenkinsfile: джоба 'Install'. Она ставит
+# `kubectl apply -k deploy` в настоящий kind и ждёт, пока workload'ы
+# поднимутся. Стадии-близнеца у неё нет и не должно быть: на ноде локального
+# Jenkins kind отсутствует, и стадия там была бы либо вечно красной, либо под
+# `when`, то есть гейтом, умеющим себя пропустить. Раннер kind несёт.
+# Направление «шаг без близнеца обязан быть назван таковым» держит
+# `deploy_gate.rs::actions_parity::every_step_here_is_mirrored_or_named_as_workflow_only`.
+#
 # Ни `continue-on-error`, ни `if:` на шагах, ни `|| true`: красная стадия
 # обязана красить прогон.
 
@@ -413,3 +421,55 @@ jobs:
               cat "$WORKSPACE/cargo-audit.json" >&2
               exit 1
           }
+
+  # Устанавливаемость. Единственная джоба здесь, у которой нет одноимённой
+  # стадии в Jenkinsfile, и это не упущение: на ноде локального Jenkins нет
+  # kind — выяснилось в issue #13, — а стадия, которая на своей ноде не может
+  # исполниться, бывает либо всегда красной, либо со `when`, то есть тем самым
+  # гейтом, умеющим себя пропустить. Раннер ubuntu-latest kind несёт, поэтому
+  # эта половина живёт здесь и только здесь. Обратное направление —
+  # `deploy_gate.rs::actions_parity::every_step_here_is_mirrored_or_named_as_workflow_only`:
+  # шаг без стадии-близнеца обязан быть назван таковым, иначе расхождение
+  # двух CI снова становится молчаливым.
+  #
+  # Ставится ровно то, что `deploy/README` велит набрать оператору:
+  # `kubectl apply -k deploy`. Ни `--dry-run`, ни `kubectl kustomize`, ни
+  # разбор YAML — прошлый цикл показал, чего стоит гейт, читающий тот же
+  # текст, о котором он утверждает: два CRD из семи проходили здесь всё и
+  # отвергались настоящим apiserver целиком.
+  #
+  # Образы собираются тут же, а не берутся из ghcr: в `ghcr.io/onixus/` пока
+  # пусто, и установка, ждущая опубликованного образа, проверяла бы публикацию,
+  # которой не было. Цель — x86_64-musl, потому что раннер amd64, и образ под
+  # чужую архитектуру не стартует на его же узле kind.
+  install:
+    name: Install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Install: images"
+        run: |
+          set -eu
+          docker build --build-arg TARGET=x86_64-unknown-linux-musl \
+              -f Dockerfile.controller \
+              -t ghcr.io/onixus/ferrum-controller:v0.1.0 .
+          docker build --build-arg TARGET=x86_64-unknown-linux-musl \
+              -f Dockerfile.admission \
+              -t ghcr.io/onixus/ferrum-admission:v0.1.0 .
+      - name: "Install: cluster"
+        run: |
+          set -eu
+          # kind и kubectl предустановлены в образе раннера. Проверяются
+          # явно: раннер, который их однажды выкинет, обязан уронить джобу,
+          # а не увести её в ветку без кластера.
+          command -v kind
+          command -v kubectl
+          kind create cluster --name ferrum-install --wait 120s
+          kind load docker-image --name ferrum-install \
+              ghcr.io/onixus/ferrum-controller:v0.1.0 \
+              ghcr.io/onixus/ferrum-admission:v0.1.0
+      - name: "Install: gate"
+        run: |
+          set -eu
+          FERRUM_INSTALL_REQUIRED=1 FERRUM_INSTALL_CONTEXT=kind-ferrum-install \
+              cargo test -p ferrum-testkit --features e2e --test install_gate

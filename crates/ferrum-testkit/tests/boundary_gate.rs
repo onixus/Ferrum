@@ -1624,6 +1624,16 @@ impl CrdStatusSurface {
 fn crd_status_surfaces(root: &Path) -> (Vec<CrdStatusSurface>, Vec<String>) {
     let mut files = Vec::new();
     yaml_files(&root.join("docs/crd"), &mut files);
+    // The one file here that is not a CRD and never will be: the kustomization
+    // root that installs the seven that are. It is dropped by exact name and
+    // not by a shape test, because "a document that is not a
+    // CustomResourceDefinition" is precisely what the `unread` half below
+    // exists to report, and softening that check would let a real CRD file
+    // that stopped being one pass unnoticed. That this root names every CRD
+    // beside it is a separate claim, held by
+    // `deploy_gate.rs::the_crd_kustomization_installs_every_crd_this_repository_ships`,
+    // so a CRD cannot leave the install by being dropped here either.
+    files.retain(|path| path.file_name().and_then(|n| n.to_str()) != Some("kustomization.yaml"));
     files.sort();
     let mut out = Vec::new();
     let mut unread = Vec::new();

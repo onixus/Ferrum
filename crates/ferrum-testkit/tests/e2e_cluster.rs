@@ -286,7 +286,14 @@ mod gate {
 
             // 1. The CRDs, from docs/crd. `the_shipped_crds_are_accepted_by_a_real_apiserver`
             //    is the test that makes this step a claim rather than a step.
-            apply(&["docs/crd/"]);
+            //
+            //    `-k` and not `-f`: that directory is a kustomization root
+            //    now, and it is the same root `deploy` names, so this step
+            //    installs exactly the CRDs the shipped install installs rather
+            //    than whatever YAML happens to be in the directory. `-f` would
+            //    also try to apply the kustomization file itself, which the API
+            //    server has no kind for.
+            kubectl_ok(&["apply", "-k", "docs/crd"]);
             apply(&["deploy/namespace.yaml"]);
 
             // 2. The signing key the controller compiles with, and the trust
@@ -687,7 +694,7 @@ mod gate {
     #[test]
     fn the_shipped_crds_are_accepted_by_a_real_apiserver() {
         let _lock = serialized();
-        let run = kubectl(&["apply", "--dry-run=server", "-f", "docs/crd/"]);
+        let run = kubectl(&["apply", "--dry-run=server", "-k", "docs/crd"]);
         assert!(
             run.ok(),
             "the API server refused a CRD this repository ships. Every schema \

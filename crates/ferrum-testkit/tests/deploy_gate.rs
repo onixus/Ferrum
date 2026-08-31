@@ -3031,6 +3031,7 @@ mod rollout_accounting {
 /// GitHub. Как и `Jenkinsfile::<стадия>` в границе, он говорит только про
 /// содержимое поставляемого файла.
 mod actions_parity {
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
     /// Стадии `Jenkinsfile`, которые обязаны быть в публичном воркфлоу с тем
@@ -3061,6 +3062,22 @@ mod actions_parity {
         "Controller image",
         "SAST (semgrep)",
     ];
+
+    /// Шаги воркфлоу, у которых стадии-близнеца в `Jenkinsfile` нет и не
+    /// должно быть.
+    ///
+    /// Ровно один сюжет на сегодня: установка чарта в kind. Датапейс живёт на
+    /// Jenkins, потому что раннеру не дают ядра; установка живёт здесь по
+    /// зеркальной причине — на ноде Jenkins нет kind, и стадия там была бы
+    /// либо всегда красной, либо под `when`, то есть тем самым гейтом, умеющим
+    /// себя пропустить.
+    ///
+    /// Список нужен не ради этих трёх строк, а ради направления, которого до
+    /// него не было: пока каждый шаг обязан быть либо зеркальным, либо
+    /// названным здесь, шаг, тихо дописанный в один из двух CI, роняет гейт.
+    /// Без этого расхождение двух CI видно только тому, кто читает оба файла
+    /// рядом.
+    const WORKFLOW_ONLY: [&str; 3] = ["Install: images", "Install: cluster", "Install: gate"];
 
     const WORKFLOW: &str = ".github/workflows/ci.yml";
 
@@ -3217,6 +3234,45 @@ mod actions_parity {
                 "{WORKFLOW} carries a step named {stage:?}. That stage needs a real kernel or \
                  the node's docker CLI; a green step of that name on a hosted runner is a gate \
                  that skipped itself and reads as one that ran."
+            );
+        }
+    }
+
+    /// Каждый шаг воркфлоу либо зеркалит стадию, либо назван таким, у которого
+    /// близнеца нет.
+    ///
+    /// Обратное направление к `every_mirrored_stage_runs_the_same_script_here_and_in_jenkins`.
+    /// Тот требует, чтобы названное совпадало, и ничего не говорит про шаг,
+    /// которого в списке нет: до этой проверки в публичный CI можно было
+    /// дописать что угодно, и два вердикта об одном дереве расходились бы
+    /// молча — ровно то направление, в котором гниют документы этого
+    /// репозитория.
+    #[test]
+    fn every_step_here_is_mirrored_or_named_as_workflow_only() {
+        let workflow = read(WORKFLOW);
+        let known: BTreeSet<&str> = MIRRORED.into_iter().chain(WORKFLOW_ONLY).collect();
+        let mut seen = BTreeSet::new();
+        for line in workflow.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("- name: \"") else {
+                continue;
+            };
+            let name = rest.trim_end_matches('"');
+            assert!(
+                known.contains(name),
+                "{WORKFLOW} has a step {name:?} that neither mirrors a \
+                 Jenkinsfile stage nor is named in WORKFLOW_ONLY. A step that \
+                 belongs to one CI and not the other is fine; a step nobody \
+                 wrote down as belonging to one CI is how the two verdicts \
+                 drift apart in silence."
+            );
+            seen.insert(name.to_string());
+        }
+        for name in WORKFLOW_ONLY {
+            assert!(
+                seen.contains(name),
+                "WORKFLOW_ONLY names {name:?}, and {WORKFLOW} has no such step: \
+                 the entry excuses nothing"
             );
         }
     }
@@ -4318,5 +4374,695 @@ mod first_release {
             "{SECURITY} does not say whether `main` is supported. Until the first tag exists it \
              is the only thing anybody can be running."
         );
+    }
+}
+
+/// Устанавливаемость, читающая текст — и говорящая об этом вслух.
+///
+/// `install_gate.rs` ставит `deploy` в настоящий apiserver и ждёт, пока
+/// workload'ы поднимутся; вот там утверждение про установку. Здесь — только
+/// про файлы, и разница ровно та, на которой прошлый цикл поймал это дерево:
+/// два CRD из семи проходили каждый читающий текст гейт и отвергались
+/// apiserver целиком. Поэтому ни один тест ниже не называется
+/// «устанавливается».
+///
+/// Чего эта половина всё-таки не даёт сделать:
+///
+///  * забыть манифест. Файл в `deploy/`, который не ставит ни один корень и не
+///    назван исключением с причиной, — это объект, который получатель не
+///    применит и о котором ничего не покраснеет;
+///  * унаследовать respond. `optional-respond.yaml` меняет DaemonSet на тот,
+///    что несёт `hostPID` и `CAP_KILL`; попасть он должен ровно одним способом
+///    — руками набранным `kubectl apply -f`;
+///  * применить нерендеренный вебхук. В шаблоне стоит
+///    `caBundle: REPLACE_WITH_PEM_CA_BUNDLE_BASE64`, а `failurePolicy: Fail`
+///    начинает отказывать в Pod'ах в момент появления объекта: установка,
+///    затянувшая его за собой, — это отказ всему кластеру;
+///  * подменить умолчания на удобные. Значения по умолчанию — это то, что
+///    ставится одной командой, и держатся они здесь, а не в values-файле,
+///    которого нет.
+mod kustomize_roots {
+    use serde::Deserialize;
+    use serde_yaml::Value;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+
+    const KUSTOMIZATION: &str = "kustomization.yaml";
+    /// Корень, который ставит `kubectl apply -k deploy`.
+    const DEFAULT_INSTALL: &str = "deploy";
+    /// Корень агента: отдельный, и `deploy/README` объясняет почему.
+    const AGENT_INSTALL: &str = "deploy/agent";
+    const CRD_INSTALL: &str = "docs/crd";
+    const MIRRORED_OVERLAY: &str = "overlays/mirrored-registry";
+    const POLICY: &str = "policies/examples/prod-restricted.yaml";
+
+    /// Манифесты `deploy/`, которые не ставит ни один корень, и причина у
+    /// каждого.
+    ///
+    /// Список, а не прозаический комментарий: файл может выпасть из установки
+    /// по недосмотру, и единственная разница между недосмотром и решением —
+    /// написанная причина. Короткая строка причины ниже — падение.
+    const NOT_INSTALLED_BY_ANY_ROOT: [(&str, &str); 2] = [
+        (
+            "deploy/admission/validatingwebhookconfiguration.tmpl.yaml",
+            "шаблон, а не манифест: в нём стоит \
+             `caBundle: REPLACE_WITH_PEM_CA_BUNDLE_BASE64`, и CA, который его \
+             заменит, не существует, пока не отработал `ferrumctl \
+             gen-webhook-pki`. Применённый как есть, он ставит вебхук, до \
+             которого apiserver не дозвонится, а с `failurePolicy: Fail` это \
+             отказ в каждом Pod'е вне ferrum/kube-system. Отрендеренный файл \
+             применяется руками и последним — deploy/admission/README, шаг 3",
+        ),
+        (
+            "deploy/agent/optional-respond.yaml",
+            "не часть базовой установки по построению: этот файл заменяет \
+             DaemonSet на тот, что несёт hostPID и CAP_KILL, то есть \
+             превращает kill из записанного решения в действие. Такое \
+             включается набранным `kubectl apply -f`, а не наследуется из \
+             overlay, который кто-то однажды выбрал",
+        ),
+    ];
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read_yaml(path: &Path) -> Value {
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        serde_yaml::from_str(&text).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// Путь относительно корня репозитория, слэшами и без `./`.
+    fn rel(path: &Path) -> String {
+        path.strip_prefix(repo_root())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Корень kustomize: то, что в нём написано, без интерпретации.
+    struct Root {
+        dir: PathBuf,
+        doc: Value,
+    }
+
+    impl Root {
+        fn open(rel_dir: &str) -> Root {
+            let dir = repo_root().join(rel_dir);
+            let file = dir.join(KUSTOMIZATION);
+            assert!(
+                file.is_file(),
+                "{rel_dir} is not a kustomization root: no {KUSTOMIZATION} in it"
+            );
+            Root {
+                doc: read_yaml(&file),
+                dir,
+            }
+        }
+
+        fn strings(&self, key: &str) -> Vec<String> {
+            self.doc
+                .get(key)
+                .and_then(Value::as_sequence)
+                .map(|seq| {
+                    seq.iter()
+                        .map(|v| {
+                            v.as_str()
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "{}/{KUSTOMIZATION}: {key} holds a non-string",
+                                        rel(&self.dir)
+                                    )
+                                })
+                                .to_string()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        fn keys(&self) -> BTreeSet<String> {
+            self.doc
+                .as_mapping()
+                .expect("kustomization is a mapping")
+                .keys()
+                .map(|k| k.as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+    }
+
+    /// Всё, что корень в итоге ставит: файлы манифестов, разрешённые
+    /// рекурсивно через вложенные корни.
+    ///
+    /// Разрешение, а не чтение одного файла: `deploy/kustomization.yaml` не
+    /// называет ни одного манифеста напрямую, и гейт, читающий только его,
+    /// не увидел бы ничего.
+    fn installed_files(rel_dir: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        collect(rel_dir, &mut out, &mut seen);
+        out
+    }
+
+    fn collect(rel_dir: &str, out: &mut BTreeSet<String>, seen: &mut BTreeSet<String>) {
+        if !seen.insert(rel_dir.to_string()) {
+            return;
+        }
+        let root = Root::open(rel_dir);
+        for entry in root.strings("resources") {
+            let path = root
+                .dir
+                .join(&entry)
+                .canonicalize()
+                .unwrap_or_else(|err| panic!("{rel_dir}: resource {entry:?}: {err}"));
+            if path.is_dir() {
+                collect(&rel(&path), out, seen);
+            } else {
+                assert!(
+                    out.insert(rel(&path)),
+                    "{rel_dir}: {entry:?} is installed twice by this root"
+                );
+            }
+        }
+    }
+
+    /// Каждый корень kustomize в дереве. Найденные, а не перечисленные: корень,
+    /// добавленный и не вписанный сюда, — ровно то, что проверки ниже должны
+    /// увидеть.
+    fn every_root() -> Vec<String> {
+        let mut out = Vec::new();
+        walk(&repo_root(), &mut |path: &Path| {
+            if path.file_name().and_then(|n| n.to_str()) == Some(KUSTOMIZATION) {
+                out.push(rel(path.parent().expect("file has a parent")));
+            }
+        });
+        out.sort();
+        assert!(
+            out.len() >= 4,
+            "found {} kustomization roots; this tree has at least four \
+             (deploy, deploy/agent, docs/crd, overlays/mirrored-registry) and \
+             the walk that found fewer is reading the wrong directory",
+            out.len()
+        );
+        out
+    }
+
+    fn walk(dir: &Path, visit: &mut impl FnMut(&Path)) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, visit);
+            } else {
+                visit(&path);
+            }
+        }
+    }
+
+    fn yaml_files_under(rel_dir: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(&repo_root().join(rel_dir), &mut |path: &Path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name == KUSTOMIZATION {
+                return;
+            }
+            if name.ends_with(".yaml") || name.ends_with(".yml") {
+                out.push(rel(path));
+            }
+        });
+        out.sort();
+        out
+    }
+
+    /// Документы одного файла: манифесты этого дерева многодокументные.
+    fn documents(rel_path: &str) -> Vec<Value> {
+        let path = repo_root().join(rel_path);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{rel_path}: {err}"));
+        serde_yaml::Deserializer::from_str(&text)
+            .map(|doc| Value::deserialize(doc).unwrap_or_else(|err| panic!("{rel_path}: {err}")))
+            .filter(|doc| !doc.is_null())
+            .collect()
+    }
+
+    /// Все объекты, которые ставит корень.
+    fn installed_objects(rel_dir: &str) -> Vec<(String, Value)> {
+        installed_files(rel_dir)
+            .into_iter()
+            .flat_map(|file| {
+                documents(&file)
+                    .into_iter()
+                    .map(move |doc| (file.clone(), doc))
+            })
+            .collect()
+    }
+
+    fn pod_specs(objects: &[(String, Value)]) -> Vec<(String, &Value)> {
+        objects
+            .iter()
+            .filter_map(|(file, doc)| {
+                doc.get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                    .map(|spec| (file.clone(), spec))
+            })
+            .collect()
+    }
+
+    fn containers(pod: &Value) -> Vec<&Value> {
+        pod.get("containers")
+            .and_then(Value::as_sequence)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Реестр из ссылки на образ: всё до первого `/`.
+    fn registry_of(reference: &str) -> String {
+        reference
+            .split('/')
+            .next()
+            .expect("split yields one element")
+            .to_string()
+    }
+
+    /// Ссылка без тега и без digest.
+    fn repo_of(reference: &str) -> String {
+        let without_digest = reference.split('@').next().unwrap_or(reference);
+        match without_digest.rsplit_once(':') {
+            Some((repo, _)) => repo.to_string(),
+            None => without_digest.to_string(),
+        }
+    }
+
+    fn images_installed_by(rel_dir: &str) -> BTreeSet<String> {
+        let objects = installed_objects(rel_dir);
+        let mut out = BTreeSet::new();
+        for (_, pod) in pod_specs(&objects) {
+            for container in containers(pod) {
+                if let Some(image) = container.get("image").and_then(Value::as_str) {
+                    out.insert(image.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Каждый манифест `deploy/` ставится ровно одним корнем — или назван
+    /// неустанавливаемым, с причиной.
+    ///
+    /// Направление, в котором дерево гниёт молча: манифест добавляют, корень
+    /// не трогают, `kubectl apply -k deploy` его не ставит, и не краснеет
+    /// ничего — получатель просто не получает объект. Обратное направление
+    /// (корень называет несуществующий файл) ловит сам kustomize, и оно
+    /// шумное.
+    #[test]
+    fn every_manifest_in_the_deploy_tree_is_installed_by_a_root_or_excused() {
+        let installed: BTreeSet<String> = installed_files(DEFAULT_INSTALL)
+            .into_iter()
+            .chain(installed_files(AGENT_INSTALL))
+            .collect();
+        let excused: BTreeMap<&str, &str> = NOT_INSTALLED_BY_ANY_ROOT.into_iter().collect();
+
+        for (file, reason) in &excused {
+            assert!(
+                repo_root().join(file).is_file(),
+                "{file} is excused from every kustomization root, and it does not \
+                 exist: the entry is about nothing"
+            );
+            assert!(
+                reason.len() > 40,
+                "{file} is excused by {reason:?}, which is not a reason"
+            );
+            assert!(
+                !installed.contains(*file),
+                "{file} is both installed by a kustomization root and listed as \
+                 not installed by any. If it became installable, delete the \
+                 entry; if it did not, delete the resource."
+            );
+        }
+
+        for file in yaml_files_under(DEFAULT_INSTALL) {
+            assert!(
+                installed.contains(&file) || excused.contains_key(file.as_str()),
+                "{file} is a manifest no kustomization root installs and no entry \
+                 in NOT_INSTALLED_BY_ANY_ROOT excuses. `kubectl apply -k deploy` \
+                 does not deliver it, and nothing in this tree would go red for \
+                 that — the receiver simply would not have the object."
+            );
+        }
+    }
+
+    /// Корень CRD ставит каждый CRD, который это дерево поставляет.
+    ///
+    /// Не три, которые смотрит контроллер, и не «те, что вспомнили». Не
+    /// установленный CRD — это тип, которого apiserver не знает: объект,
+    /// который оператор пишет, отвергается как неизвестный, и ни в одном файле
+    /// нет строки о том, что тип оставили снаружи намеренно.
+    #[test]
+    fn the_crd_kustomization_installs_every_crd_this_repository_ships() {
+        let shipped: BTreeSet<String> = yaml_files_under(CRD_INSTALL).into_iter().collect();
+        let installed = installed_files(CRD_INSTALL);
+        assert!(
+            shipped.len() >= 7,
+            "found {} CRD files under {CRD_INSTALL}; the catalogue has seven, so \
+             this walk is reading the wrong directory",
+            shipped.len()
+        );
+        assert_eq!(
+            installed, shipped,
+            "{CRD_INSTALL}/{KUSTOMIZATION} and the files beside it disagree. A CRD \
+             this repository ships and this root does not install is a type the \
+             API server never learns."
+        );
+    }
+
+    /// Ни один корень не тянет respond и ни один не тянет нерендеренный вебхук.
+    ///
+    /// Проверяется по всем корням дерева, а не по двум ожидаемым: смысл в том,
+    /// что этих двух файлов нельзя получить *никак*, кроме набранного руками
+    /// `kubectl apply -f`. Корень, добавленный завтра, попадает сюда сам.
+    ///
+    /// Плюс запрет на `secretGenerator`: seed подписи и serving-ключ — не
+    /// манифесты, и генератор для них либо кладёт ключ в git, либо выпускает
+    /// новый на каждый apply.
+    #[test]
+    fn no_kustomization_root_installs_the_respond_variant_or_the_unrendered_webhook() {
+        for root in every_root() {
+            let installed = installed_files(&root);
+            for (file, _) in NOT_INSTALLED_BY_ANY_ROOT {
+                assert!(
+                    !installed.contains(file),
+                    "kustomization root {root} installs {file}. \
+                     `optional-respond.yaml` hands the agent hostPID and \
+                     CAP_KILL, and the webhook template hands the API server a \
+                     caBundle placeholder under failurePolicy: Fail. Neither may \
+                     arrive as a consequence of choosing an overlay."
+                );
+            }
+            let keys = Root::open(&root).keys();
+            for forbidden in ["secretGenerator", "helmCharts"] {
+                assert!(
+                    !keys.contains(forbidden),
+                    "kustomization root {root} carries `{forbidden}`. A generated \
+                     Secret is either a key in git or a new key on every apply, \
+                     and a chart pulled at install time is the supply chain this \
+                     product exists to refuse."
+                );
+            }
+        }
+    }
+
+    /// Умолчания — restricted, а не удобные.
+    ///
+    /// «Значения по умолчанию» здесь буквально то, что ставится одной командой:
+    /// values-файла нет, и второй копии этой позиции тоже. Каждое утверждение
+    /// ниже — про объекты, которые вернул разбор корня `deploy`, а не про
+    /// конкретный файл, так что послабление, приехавшее новым манифестом,
+    /// падает здесь так же, как правка старого.
+    #[test]
+    fn the_default_install_is_the_restricted_one() {
+        let objects = installed_objects(DEFAULT_INSTALL);
+        let pods = pod_specs(&objects);
+        assert_eq!(
+            pods.len(),
+            2,
+            "the default install has {} workloads; it is supposed to be exactly \
+             two — the controller and the webhook. A third one appearing here \
+             has to be argued for, and the agent is not it (deploy/README says \
+             why it is a root of its own).",
+            pods.len()
+        );
+
+        for (file, pod) in &pods {
+            for field in ["hostPID", "hostIPC", "hostNetwork"] {
+                assert!(
+                    pod.get(field).is_none(),
+                    "{file}: the default install sets {field}. \
+                     `policies/examples/prod-restricted.yaml` denies all three \
+                     (`admit.deny`), so this install would be refused by the \
+                     policy it ships with."
+                );
+            }
+            let security = pod
+                .get("securityContext")
+                .unwrap_or_else(|| panic!("{file}: workload has no pod securityContext"));
+            assert_eq!(
+                security.get("runAsNonRoot").and_then(Value::as_bool),
+                Some(true),
+                "{file}: the default install does not require runAsNonRoot"
+            );
+            assert_eq!(
+                security
+                    .get("seccompProfile")
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str),
+                Some("RuntimeDefault"),
+                "{file}: the default install does not set the RuntimeDefault \
+                 seccomp profile"
+            );
+
+            let containers = containers(pod);
+            assert!(!containers.is_empty(), "{file}: workload has no containers");
+            for container in containers {
+                let name = container
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unnamed>");
+                let sc = container
+                    .get("securityContext")
+                    .unwrap_or_else(|| panic!("{file}: container {name} has no securityContext"));
+                assert_eq!(
+                    sc.get("readOnlyRootFilesystem").and_then(Value::as_bool),
+                    Some(true),
+                    "{file}: container {name} has a writable root filesystem in \
+                     the default install"
+                );
+                assert_eq!(
+                    sc.get("allowPrivilegeEscalation").and_then(Value::as_bool),
+                    Some(false),
+                    "{file}: container {name} allows privilege escalation in the \
+                     default install"
+                );
+                assert_ne!(
+                    sc.get("privileged").and_then(Value::as_bool),
+                    Some(true),
+                    "{file}: container {name} is privileged in the default install"
+                );
+                let dropped: BTreeSet<&str> = sc
+                    .get("capabilities")
+                    .and_then(|c| c.get("drop"))
+                    .and_then(Value::as_sequence)
+                    .map(|s| s.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                assert!(
+                    dropped.contains("ALL"),
+                    "{file}: container {name} does not drop ALL capabilities"
+                );
+                let added: BTreeSet<&str> = sc
+                    .get("capabilities")
+                    .and_then(|c| c.get("add"))
+                    .and_then(Value::as_sequence)
+                    .map(|s| s.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                assert!(
+                    added.is_empty(),
+                    "{file}: container {name} adds {added:?} in the default \
+                     install. The control plane needs no capability at all; the \
+                     one component that does (the agent, BPF and PERFMON) is a \
+                     root of its own."
+                );
+
+                let args: Vec<&str> = container
+                    .get("args")
+                    .and_then(Value::as_sequence)
+                    .map(|s| s.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if let Some(at) = args.iter().position(|a| *a == "--policy-name") {
+                    assert_eq!(
+                        args.get(at + 1),
+                        Some(&"prod-restricted"),
+                        "{file}: container {name} is installed against a policy \
+                         that is not prod-restricted"
+                    );
+                }
+            }
+        }
+
+        // Один экземпляр вебхука под failurePolicy=Fail — это отказ всему
+        // кластеру при первом же вытеснении, а не «менее доступно».
+        let replicas = objects
+            .iter()
+            .find(|(_, doc)| {
+                doc.get("kind").and_then(Value::as_str) == Some("Deployment")
+                    && doc
+                        .get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(Value::as_str)
+                        == Some("ferrum-admission")
+            })
+            .and_then(|(_, doc)| doc.get("spec"))
+            .and_then(|spec| spec.get("replicas"))
+            .and_then(Value::as_u64)
+            .expect("the default install carries a ferrum-admission Deployment");
+        assert!(
+            replicas >= 2,
+            "the default install runs {replicas} webhook replica(s) under \
+             failurePolicy=Fail: a single eviction is then a cluster-wide outage"
+        );
+
+        // Respond не только не ставится файлом — его identity не связана.
+        for (file, doc) in &objects {
+            if doc.get("kind").and_then(Value::as_str) == Some("ClusterRoleBinding") {
+                let name = doc
+                    .get("metadata")
+                    .and_then(|m| m.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert_ne!(
+                    name, "ferrum-agent-respond",
+                    "{file}: the default install binds the respond ServiceAccount"
+                );
+            }
+        }
+    }
+
+    /// Overlay для зеркала меняет имена образов и больше ничего.
+    ///
+    /// Overlay, который «заодно» правит что-то ещё, — это вторая копия
+    /// установки, расходящаяся с первой молча: гейты этого дерева читают
+    /// `deploy/**`, и то, что дописано в overlay, не читает ни один.
+    #[test]
+    fn the_mirrored_overlay_changes_image_names_and_nothing_else() {
+        let overlay = Root::open(MIRRORED_OVERLAY);
+        assert_eq!(
+            overlay.keys(),
+            ["apiVersion", "images", "kind", "resources"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>(),
+            "{MIRRORED_OVERLAY}/{KUSTOMIZATION} carries a key beyond the image \
+             rewrite. Anything else here is a second copy of the install that no \
+             gate in this tree reads."
+        );
+        assert_eq!(
+            overlay.strings("resources"),
+            vec![format!("../../{DEFAULT_INSTALL}")],
+            "{MIRRORED_OVERLAY} is an overlay over something other than the \
+             default install"
+        );
+
+        let entries = overlay
+            .doc
+            .get("images")
+            .and_then(Value::as_sequence)
+            .expect("the overlay carries an images list");
+        let mut rewritten = BTreeSet::new();
+        for entry in entries {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("image entry names an image");
+            assert!(
+                entry.get("newName").and_then(Value::as_str).is_some(),
+                "{MIRRORED_OVERLAY}: entry for {name} rewrites no registry"
+            );
+            for forbidden in ["newTag", "digest"] {
+                assert!(
+                    entry.get(forbidden).is_none(),
+                    "{MIRRORED_OVERLAY}: entry for {name} sets `{forbidden}`. The \
+                     tag is pinned once, in the manifests, and joined to the \
+                     release that can publish it by \
+                     `the_tag_the_manifests_pin_is_one_the_release_can_publish`. \
+                     A second pin here is a second thing to forget."
+                );
+            }
+            rewritten.insert(name.to_string());
+        }
+
+        let installed: BTreeSet<String> = images_installed_by(DEFAULT_INSTALL)
+            .iter()
+            .map(|image| repo_of(image))
+            .collect();
+        assert_eq!(
+            rewritten, installed,
+            "{MIRRORED_OVERLAY} rewrites a different set of images than the \
+             default install pulls. An entry matching nothing is silently \
+             ignored by kustomize, so an image left out of this list is an image \
+             that goes on being pulled from the internet in a contour that has \
+             none."
+        );
+    }
+
+    /// Overlay переносит установку в тот реестр, который разрешает
+    /// поставляемая политика — а база стоит вне него.
+    ///
+    /// Обе половины утверждения нужны. Без первой overlay мог бы указывать
+    /// куда угодно; без второй он был бы декорацией — если бы база уже стояла
+    /// в разрешённом реестре, переносить было бы нечего, и незамеченным
+    /// осталось бы то, что установка по умолчанию тянет образы из интернета.
+    #[test]
+    fn the_mirrored_overlay_moves_the_install_into_the_registry_the_shipped_policy_allows() {
+        let policy = documents(POLICY);
+        let allowed: BTreeSet<String> = policy
+            .first()
+            .and_then(|doc| doc.get("spec"))
+            .and_then(|spec| spec.get("selector"))
+            .and_then(|sel| sel.get("image"))
+            .and_then(|img| img.get("registriesAllow"))
+            .and_then(Value::as_sequence)
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .expect("prod-restricted names the registries it allows");
+        assert!(
+            !allowed.is_empty(),
+            "{POLICY} allows no registry at all, so nothing below is a comparison"
+        );
+
+        for image in images_installed_by(DEFAULT_INSTALL) {
+            assert!(
+                !allowed.contains(&registry_of(&image)),
+                "the default install pulls {image}, which {POLICY} already \
+                 allows. That would make {MIRRORED_OVERLAY} decoration — it \
+                 exists because the shipped install comes from the internet and \
+                 the shipped policy does not permit that registry."
+            );
+        }
+
+        let overlay = Root::open(MIRRORED_OVERLAY);
+        let entries = overlay
+            .doc
+            .get("images")
+            .and_then(Value::as_sequence)
+            .expect("the overlay carries an images list");
+        for entry in entries {
+            let new_name = entry
+                .get("newName")
+                .and_then(Value::as_str)
+                .expect("entry rewrites a registry");
+            assert!(
+                allowed.contains(&registry_of(new_name)),
+                "{MIRRORED_OVERLAY} rewrites an image to {new_name}, whose \
+                 registry {POLICY} does not allow. The overlay's whole job is to \
+                 make the install and the policy agree."
+            );
+        }
     }
 }
