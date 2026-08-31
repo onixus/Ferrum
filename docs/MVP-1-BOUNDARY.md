@@ -351,6 +351,9 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 | `libc` есть в графе `ferrum-ebpf` только под `attach`, и детектор доказан в обе стороны | U | U `Jenkinsfile::Crate boundary` |
 | `rcgen` и `x509-parser` не попадают в графы admission и agent, и детектор доказан на `ferrum-cli` | U | U `Jenkinsfile::Crate boundary` |
 | Публичный воркфлоу `.github/workflows/ci.yml` исполняет ровно userspace-стадии `Jenkinsfile` и побуквенно те же скрипты: `Format`, `Clippy`, `Test` и группа `Checks` целиком, сверенные на равенство строк, а не «по духу». Датапейсной стадии и стадии образов в нём нет по именам, и ни один шаг не может себя пропустить: ни `continue-on-error`, ни условия на шаге, ни подавления кода возврата. Про исполнение на GitHub эта строка не говорит ничего — гейт, как и `Jenkinsfile::<стадия>`, читает поставляемый файл | U | U `deploy_gate.rs::every_mirrored_stage_runs_the_same_script_here_and_in_jenkins` · U `deploy_gate.rs::the_comparison_notices_a_script_that_drifted` · U `deploy_gate.rs::the_public_workflow_claims_no_stage_it_cannot_execute` · U `deploy_gate.rs::no_step_in_the_public_workflow_can_skip_itself` |
+| Версия у этого дерева одна, и это та, которую называет релизный тег: `[workspace.package]` несёт `0.1.0`, все восемнадцать crate берут её через `version.workspace`, ни один не объявляет свою, и каждый `image:` под `deploy/` в `ghcr.io/onixus/` закреплён на `v` + эта версия. Про существование такого тега строка не говорит ничего: гейт читает файлы, а не `git tag` и не реестр | U | U `deploy_gate.rs::the_version_this_workspace_carries_is_the_tag_its_manifests_pin` · U `deploy_gate.rs::every_crate_takes_its_version_from_the_workspace` |
+| Раздел README про первый релиз называет каждый образ, который публикует `.github/workflows/release.yml`: описание, перечисляющее меньше артефактов, чем выпускает тег, учит получателя проверить меньше подписей, чем есть | U | U `deploy_gate.rs::the_first_release_section_names_every_image_that_release_publishes` |
+| `SECURITY.md` называет ровно тот канал раскрытия, который у этого репозитория есть — приватный advisory GitHub, — и не заводит ни одного, которого нет: ни почтового адреса, ни PGP-блока, ни отпечатка. Поддерживаемая линия версий в нём — та, которую несёт `[workspace.package]`, плюс `main`, пока тегов нет. Про то, включён ли приём advisory в настройках репозитория, строка не говорит: это состояние GitHub, а не дерева | U | U `deploy_gate.rs::the_security_policy_names_a_channel_this_repository_actually_has` · U `deploy_gate.rs::the_security_policy_supports_the_version_this_tree_carries` |
 | Оба arch дают один вердикт на одних логических событиях, из записанных байтов | U | U `replay.rs::both_arches_reach_the_same_verdicts_on_the_same_logical_events` · U `replay.rs::recorded_fixture_records_still_produce_the_acceptance_verdicts` |
 | Секретный сканер не пропускает ничего, за что не поручился гейт: исключён ровно один путь, это фикстура, чьё тело не является ключевым материалом (payload не открывается DER SEQUENCE), и FD023 по-прежнему называет её находкой | U | U `deploy_gate.rs::the_scanner_skips_exactly_the_files_this_gate_vouches_for` · U `deploy_gate.rs::every_excluded_file_is_a_fixture_that_only_looks_like_a_key` · U `deploy_gate.rs::the_excluded_fixture_is_still_a_finding_for_the_lint_that_owns_it` · U `Jenkinsfile::SAST (semgrep)` |
 | Prefilter-образ поставляемой политики — тот, который утверждает ручная копия в `ferrum-ebpf` | U | U `deploy_gate.rs::the_prefilter_image_of_the_shipped_policy_is_the_one_its_unit_test_asserts` |
@@ -805,6 +808,21 @@ loader, не были названы ни одной строкой, а един
   проверить на дереве: множества образов сходятся, подпись не заводит ключа,
   ни один шаг не может себя пропустить, инструкция получателю совпадает с тем,
   что воркфлоу делает. «Умеет» и «сделал» — разные слова, и второго тут нет.
+- **Релиза нет.** Тега `v0.1.0` в этом репозитории не существует: он не
+  проставлен, GitHub Release под ним не создан, `release.yml` по нему не
+  запускался. Появилось описание того, что этим тегом будет выпущено — раздел
+  README «Первый релиз» — и три конца версии сведены гейтом: `Cargo.toml`,
+  `deploy/**` и фильтр триггера больше не могут разъехаться молча. Всё это —
+  утверждения о файлах. Тег ставит человек, и до тех пор строки «выпущено»
+  здесь нет.
+- **Приватный приём сообщений об уязвимостях в настройках репозитория не
+  подтверждён.** `SECURITY.md` появился и отправляет к
+  `security/advisories/new`; работает эта ссылка, только если private
+  vulnerability reporting включён в настройках GitHub, а настройки — не файл в
+  дереве, и ни один гейт их не видит. Пока это не проверено человеком,
+  единственный названный канал раскрытия остаётся непроверенным, и это ровно
+  тот разрыв, ради которого в самом файле сказано «нет ответа за 14 дней —
+  раскрывайте публично».
 - **Замыкание «манифест ↔ pipeline» по тегу закрыто наполовину, и это первый
   цикл, когда оно закрыто хоть на сколько-то.** Прежде тег сравнивать было не с
   чем: стадии Jenkins тегируют `dev-$BUILD_NUMBER`, манифесты закрепляют

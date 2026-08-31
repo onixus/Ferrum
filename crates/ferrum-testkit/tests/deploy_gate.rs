@@ -3936,3 +3936,388 @@ mod release_supply_chain {
         }
     }
 }
+
+/// Первый релиз: версия, тег и файлы, которые про них говорят.
+///
+/// `release_supply_chain` выше держит подпись и происхождение образа — то, что
+/// получатель проверяет, уже имея артефакт. Здесь другая половина: артефакта
+/// ещё нет, и единственное, что может разойтись до его появления, — четыре
+/// написания одной и той же версии. Она стоит в `[workspace.package]`, в теге,
+/// который ставит человек, в фильтре триггера `release.yml` и в `image:`
+/// каждого манифеста `deploy/**`. Три из четырёх лежат в дереве, четвёртое
+/// выводится из первого по правилу `v` + версия, и разъехаться они могут молча:
+/// `cargo` не читает `deploy/**`, `deploy/**` не читает `Cargo.toml`, а фильтр
+/// тега не читает ни того, ни другого. Разъехавшись, они дают ровно тот отказ,
+/// от которого написан `every_image_a_manifest_names_is_built_by_the_pipeline`,
+/// — `ImagePullBackOff` на плоскости, решающей admission, — только теперь не по
+/// имени образа, а по его тегу.
+///
+/// Ни один тест здесь не утверждает, что релиз состоялся. Тега `v0.1.0` в этом
+/// репозитории нет, и гейт, читающий дерево, узнать о нём не может: он читает
+/// файлы, а не `git tag` и не реестр.
+mod first_release {
+    use std::path::{Path, PathBuf};
+
+    const README: &str = "README.md";
+    const SECURITY: &str = "SECURITY.md";
+    const MANIFEST: &str = "Cargo.toml";
+    const WORKFLOW: &str = ".github/workflows/release.yml";
+
+    /// Приватный канал GitHub, единственный, который у этого репозитория есть.
+    const ADVISORY_URL: &str = "https://github.com/onixus/Ferrum/security/advisories/new";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> String {
+        let path = repo_root().join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// Версия из `[workspace.package]` корневого манифеста.
+    ///
+    /// Читается именно эта секция, а не первое `version =` в файле: в
+    /// `[workspace.dependencies]` их два десятка, и `version` любого из них
+    /// прошёл бы вместо версии продукта.
+    fn workspace_version() -> String {
+        let manifest = read(MANIFEST);
+        let mut in_section = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_section = line == "[workspace.package]";
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("version") {
+                let value = rest
+                    .trim_start()
+                    .strip_prefix('=')
+                    .unwrap_or_else(|| {
+                        panic!("{MANIFEST}: [workspace.package] version line is {line:?}")
+                    })
+                    .trim()
+                    .trim_matches('"');
+                assert!(
+                    !value.is_empty(),
+                    "{MANIFEST}: [workspace.package] declares an empty version"
+                );
+                return value.to_string();
+            }
+        }
+        panic!(
+            "{MANIFEST} has no version in [workspace.package]. Every crate here inherits its \
+             version from there; without it there is no single version this tree carries, and \
+             nothing below can be compared with a tag."
+        );
+    }
+
+    /// Имя git-тега, которым выпускается эта версия.
+    fn release_tag() -> String {
+        format!("v{}", workspace_version())
+    }
+
+    /// Манифесты crate вместе с именами их каталогов, отсортированные, чтобы
+    /// сообщение об ошибке не плавало от прогона к прогону.
+    fn crate_manifests() -> Vec<(String, String)> {
+        let crates = repo_root().join("crates");
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&crates)
+            .expect("crates/")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.join(MANIFEST).is_file())
+            .collect();
+        dirs.sort();
+        let out: Vec<(String, String)> = dirs
+            .iter()
+            .map(|dir| {
+                let name = dir
+                    .file_name()
+                    .expect("crate directory name")
+                    .to_string_lossy()
+                    .to_string();
+                let text = std::fs::read_to_string(dir.join(MANIFEST))
+                    .unwrap_or_else(|err| panic!("{}/{MANIFEST}: {err}", dir.display()));
+                (name, text)
+            })
+            .collect();
+        assert!(
+            !out.is_empty(),
+            "no crate manifest was found under crates/, so this gate sees no version at all and \
+             every comparison below is satisfied by finding nothing"
+        );
+        out
+    }
+
+    /// Все `image:` под `deploy/`, вместе с файлом, который их называет.
+    ///
+    /// Свой обход, а не `release_supply_chain::deploy_images`: там путь до файла
+    /// теряется, а сообщение «версия разъехалась» без имени файла заставляет
+    /// искать его руками по четырём манифестам.
+    fn deploy_image_references() -> Vec<(String, String)> {
+        let root = repo_root();
+        let mut files = Vec::new();
+        collect_yaml(&root.join("deploy"), &mut files);
+        files.sort();
+        let mut out = Vec::new();
+        for path in files {
+            let raw = std::fs::read_to_string(&path).expect("manifest");
+            let shown = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed.strip_prefix("image:") else {
+                    continue;
+                };
+                let image = rest.trim().trim_matches('"').trim_matches('\'');
+                if image.is_empty() {
+                    continue;
+                }
+                out.push((shown.clone(), image.to_string()));
+            }
+        }
+        out
+    }
+
+    fn collect_yaml(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
+        {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                collect_yaml(&path, out);
+            } else if path.extension().is_some_and(|e| e == "yaml") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Одна версия на дерево, и она — та, которую называет тег.
+    ///
+    /// Тег ставит человек, а не воркфлоу, поэтому вывести его из файла нельзя;
+    /// вывести можно правило, по которому он строится, и проверить, что все
+    /// написания версии в дереве этому правилу отвечают. `deploy/**` закрепляет
+    /// `v0.1.0`, `[workspace.package]` несёт `0.1.0`, и разница между ними —
+    /// одна буква, которую до этого теста не проверял никто.
+    ///
+    /// `release_supply_chain::the_tag_the_manifests_pin_is_one_the_release_can_publish`
+    /// проверяет другое и меньшее: что закреплённый тег вообще попадает в фильтр
+    /// триггера. Под `v9.9.9` в манифестах он проходит — фильтр такой тег
+    /// пропускает, — а собрано из этого дерева будет `0.1.0`.
+    #[test]
+    fn the_version_this_workspace_carries_is_the_tag_its_manifests_pin() {
+        let tag = release_tag();
+        let readme = read(README);
+        assert!(
+            readme.contains(&tag),
+            "{README} never names {tag}, the tag this tree's version produces. The section \
+             describing the first release has to name the version it releases, or it describes \
+             some other one."
+        );
+
+        let mut seen = 0usize;
+        for (path, image) in deploy_image_references() {
+            let Some(colon) = image.rfind(':') else {
+                panic!(
+                    "{path} names the image {image:?} with no tag at all: the cluster would be \
+                     asked for `latest`, which is whatever was pushed last"
+                );
+            };
+            let (repo, pinned) = image.split_at(colon);
+            let pinned = &pinned[1..];
+            if !repo.starts_with("ghcr.io/onixus/") {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(
+                pinned,
+                tag,
+                "{path} pins {image:?}, but this workspace carries version {} and releases it as \
+                 {tag}. One of the two was bumped without the other, and the cluster would be \
+                 asked for an image no tag of this repository produces.",
+                workspace_version()
+            );
+        }
+        assert!(
+            seen > 0,
+            "no manifest under deploy/ names an image in ghcr.io/onixus/, so this gate compared \
+             nothing and passed for it"
+        );
+    }
+
+    /// Ни один crate не объявляет собственную версию.
+    ///
+    /// Тег один, а версий было бы восемнадцать. Crate, отставший на своей
+    /// строке, поедет в образ под тегом, который называет чужую версию, и
+    /// узнать об этом можно будет только развернув образ: `cargo` на такое
+    /// расхождение не жалуется — своя версия у члена workspace совершенно
+    /// законна.
+    #[test]
+    fn every_crate_takes_its_version_from_the_workspace() {
+        for (name, manifest) in crate_manifests() {
+            let mut in_package = false;
+            let mut declared: Option<String> = None;
+            for line in manifest.lines() {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    in_package = line == "[package]";
+                    continue;
+                }
+                if !in_package {
+                    continue;
+                }
+                if line.starts_with("version.workspace") {
+                    declared = Some(String::new());
+                    break;
+                }
+                if line.starts_with("version") {
+                    declared = Some(line.to_string());
+                    break;
+                }
+            }
+            match declared {
+                Some(line) if line.is_empty() => {}
+                Some(line) => panic!(
+                    "crates/{name}/{MANIFEST} declares its own version ({line}). This tree \
+                     releases one tag for all of them; a crate carrying a different number ships \
+                     inside an image whose tag says otherwise, and nothing but this test looks."
+                ),
+                None => panic!(
+                    "crates/{name}/{MANIFEST} declares no version in [package] at all, so what \
+                     the tag {} names for this crate is undefined",
+                    release_tag()
+                ),
+            }
+        }
+    }
+
+    /// Раздел про первый релиз называет каждый образ, который релиз публикует.
+    ///
+    /// Иначе появившийся четвёртый образ выйдет под тем же тегом и не будет
+    /// назван нигде, кроме воркфлоу: получатель, читающий README, проверит три
+    /// подписи из четырёх и решит, что проверил всё.
+    #[test]
+    fn the_first_release_section_names_every_image_that_release_publishes() {
+        let readme = read(README);
+        let heading = "### Первый релиз";
+        let start = readme.find(heading).unwrap_or_else(|| {
+            panic!(
+                "{README} has no {heading:?} section. What a tag produces would then be named \
+                 nowhere but the workflow file, which is not where a recipient looks."
+            )
+        });
+        let section = &readme[start..];
+        let end = section[heading.len()..]
+            .find("\n## ")
+            .map_or(section.len(), |offset| offset + heading.len());
+        let section = &section[..end];
+
+        let workflow = read(WORKFLOW);
+        let mut crates: Vec<&str> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- crate: "))
+            .map(str::trim)
+            .collect();
+        crates.sort();
+        assert!(
+            !crates.is_empty(),
+            "{WORKFLOW} publishes no image this gate can see, so the section was compared \
+             against nothing"
+        );
+        for name in crates {
+            assert!(
+                section.contains(name),
+                "{README}: the first-release section does not name {name:?}, which {WORKFLOW} \
+                 publishes under this tag. A release describing fewer artefacts than it produces \
+                 teaches the recipient to verify fewer."
+            );
+        }
+    }
+
+    /// SECURITY.md называет канал, который у этого репозитория есть, и не
+    /// заводит ни одного, которого нет.
+    ///
+    /// Выдуманный канал раскрытия хуже отсутствующего: адрес, который никто не
+    /// читает, и отпечаток, которого нет ни у одного ключа, превращают
+    /// сообщение об обходе enforcement в письмо в никуда, а отправитель считает
+    /// себя сообщившим. Поэтому проверяются обе стороны: приватный advisory
+    /// назван, а почты и PGP в файле нет вовсе.
+    #[test]
+    fn the_security_policy_names_a_channel_this_repository_actually_has() {
+        let text = read(SECURITY);
+        assert!(
+            text.contains(ADVISORY_URL),
+            "{SECURITY} does not name {ADVISORY_URL}. GitHub private vulnerability reporting is \
+             the only confidential channel this repository has; a policy without it sends the \
+             reporter to a public issue."
+        );
+
+        assert!(
+            !text.contains("BEGIN PGP"),
+            "{SECURITY} carries a PGP block. This project publishes no key; a block here is a \
+             key nobody holds, and everything encrypted to it is lost."
+        );
+        for (index, line) in text.lines().enumerate() {
+            let number = index + 1;
+            if let Some(word) = line.split_whitespace().find(|word| {
+                let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                word.len() == 40 && word.chars().all(|c| c.is_ascii_hexdigit())
+            }) {
+                panic!(
+                    "{SECURITY}:{number}: {word:?} reads as a key fingerprint. This project has \
+                     no key and no fingerprint to publish, and one written here would be a trust \
+                     anchor nothing in this tree can back."
+                );
+            }
+            if let Some(word) = line.split_whitespace().find(|word| {
+                let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '@');
+                match word.split_once('@') {
+                    Some((user, host)) => {
+                        !user.is_empty() && host.contains('.') && !host.ends_with('.')
+                    }
+                    None => false,
+                }
+            }) {
+                panic!(
+                    "{SECURITY}:{number}: {word:?} reads as an e-mail address. No mailbox for \
+                     this project is confirmed, and a reporting address nobody reads is worse \
+                     than none: the reporter believes they have reported."
+                );
+            }
+        }
+    }
+
+    /// SECURITY.md поддерживает ту версию, которую это дерево несёт.
+    ///
+    /// Политика, называющая поддерживаемой линию, которой в дереве нет, — это
+    /// занижение и завышение сразу: сообщивший против `main` не знает, примут ли
+    /// его, а сообщивший против несуществующей `0.2.x` считает себя покрытым.
+    #[test]
+    fn the_security_policy_supports_the_version_this_tree_carries() {
+        let text = read(SECURITY);
+        let version = workspace_version();
+        let (major, rest) = version
+            .split_once('.')
+            .unwrap_or_else(|| panic!("{MANIFEST}: version {version:?} has no minor component"));
+        let minor = rest.split('.').next().expect("minor component");
+        let line = format!("{major}.{minor}.x");
+        assert!(
+            text.contains(&line),
+            "{SECURITY} says nothing about {line}, the line this tree builds. A reporter cannot \
+             tell whether the version they are running is one this project answers for."
+        );
+        assert!(
+            text.contains("main"),
+            "{SECURITY} does not say whether `main` is supported. Until the first tag exists it \
+             is the only thing anybody can be running."
+        );
+    }
+}
