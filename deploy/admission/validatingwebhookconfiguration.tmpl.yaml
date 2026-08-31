@@ -19,7 +19,33 @@ webhooks:
     # unreachable. Pair this with >=2 replicas and the namespace exclusions
     # below, otherwise a cold cluster cannot start the webhook that gates it.
     failurePolicy: Fail
+    # Five seconds, against a p99 the process measures in tens of
+    # microseconds. That gap is not slack for the decision; it is the socket,
+    # the TLS handshake and a scheduler that may have descheduled the replica.
+    # The budget the code claims and the gate enforces is
+    # `ferrum_admission::REVIEW_LATENCY_BUDGET_SECONDS`, and it is a budget on
+    # `handle()`, not on this timeout — see crates/ferrum-admission/src/lib.rs.
     timeoutSeconds: 5
+    # Two exemptions, and they exist for one reason: with failurePolicy=Fail a
+    # webhook that gates the namespaces holding its own Pods and the cluster's
+    # own control plane cannot be restarted after it stops answering.
+    #
+    # `kubernetes.io/metadata.name` and not a label of ours: the API server
+    # stamps this key on every namespace and enforces its value (since 1.21),
+    # so no namespace can award itself the exemption. A `ferrum.io/*` opt-out
+    # label would be an exemption anyone with edit rights on a namespace could
+    # grant themselves, which in a policy engine is the whole policy.
+    #
+    # **This selector does not exempt anything in the second rule below.** The
+    # API server does not apply namespaceSelector to cluster-scoped resources,
+    # so every ClusterRoleBinding in the cluster reaches this webhook whatever
+    # is written here — a `kube-system` ClusterRoleBinding included, since it
+    # is not in kube-system at all; it is in no namespace. That is a property
+    # of Kubernetes, not a setting, and the thing it demands is on the other
+    # side: `ferrum-admission` must decide such an object without asking about
+    # namespace labels it cannot have (`eval.rs::cluster_scoped_kind`), which
+    # is exactly what it failed to do until issue #20 — it refused the
+    # ClusterRoleBindings of its own re-install.
     namespaceSelector:
       matchExpressions:
         - key: kubernetes.io/metadata.name

@@ -11,8 +11,8 @@
 #
 #   * the CRDs, from docs/crd, because an operator's first object must not be
 #     rejected as an unknown type;
-#   * the namespace, labelled webhook-exempt so a cold cluster cannot deadlock
-#     on the admission Pod that has not started;
+#   * the namespace, which the webhook configuration excludes by name so a cold
+#     cluster cannot deadlock on the admission Pod that has not started;
 #   * the controller and the webhook workloads;
 #   * the NetworkPolicy governing what may reach their ports.
 #

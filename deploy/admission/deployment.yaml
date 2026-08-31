@@ -45,13 +45,35 @@ spec:
         runAsUser: 65532
         seccompProfile:
           type: RuntimeDefault
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: ferrum-admission
+      # Two replicas on one node are two replicas that one node failure takes.
+      # This is the half of HA that a PodDisruptionBudget cannot do: the budget
+      # governs evictions, and a node that dies asks nobody.
+      #
+      # `preferred` and not `required`, and that is a real trade rather than
+      # caution. Required anti-affinity on a single-node cluster leaves the
+      # second replica Pending forever — kind is a single-node cluster, and so
+      # is every cluster `install_gate.rs` and the public workflow install into,
+      # so `required` would make the shipped install one that does not come up
+      # on the cluster its own gate uses. It would also, on a two-node cluster
+      # losing a node, refuse to reschedule the replica that node carried:
+      # under `failurePolicy: Fail` a Pod that will not schedule is worse than a
+      # Pod sharing a node. Weight 100 is the whole weight there is, so on any
+      # cluster with two schedulable nodes the scheduler separates them.
+      #
+      # One mechanism and not two: this replaced a `topologySpreadConstraints`
+      # with `maxSkew: 1, whenUnsatisfiable: ScheduleAnyway`, which expressed
+      # the same preference over the same topology key. Two scheduler inputs
+      # saying one thing drift apart silently — the pair that ships is this rule
+      # and pdb.yaml, and they say different things on purpose.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ferrum-admission
       containers:
         - name: admission
           image: ghcr.io/onixus/ferrum-admission:v0.1.0

@@ -24,3 +24,8 @@ resources:
   - rbac.yaml
   - service.yaml
   - deployment.yaml
+  # Ships with the Deployment and never separately: a disruption budget that
+  # arrives in a second, optional apply is a budget half the installs do not
+  # have, and the half without it is the half where a node drain is a
+  # cluster-wide admission outage.
+  - pdb.yaml

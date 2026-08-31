@@ -353,7 +353,7 @@
       "id": 19,
       "type": "timeseries",
       "title": "Review latency inside the process",
-      "description": "p50/p90/p99 of the span the API server is blocked on in this process. The socket and the TLS handshake are outside it deliberately: a budget stated on a number that includes the network is one nobody can act on.",
+      "description": "p50/p90/p99 of the span the API server is blocked on in this process. The socket and the TLS handshake are outside it deliberately: a budget stated on a number that includes the network is one nobody can act on. The red step is the declared budget, 5 ms — the same number ferrum_admission::REVIEW_LATENCY_BUDGET_SECONDS holds and latency_gate.rs measures against; a panel whose threshold disagreed with the code would draw a line nobody could act on either.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
       "targets": [
         {
@@ -372,7 +372,19 @@
           "legendFormat": "p99"
         }
       ],
-      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.005 }
+            ]
+          }
+        },
+        "overrides": []
+      }
     },
     {
       "id": 20,

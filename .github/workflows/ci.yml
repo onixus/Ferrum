@@ -410,6 +410,10 @@ jobs:
           set -eu
           cargo test -p ferrum-metrics
           cargo test -p ferrum-testkit --test metrics_gate
+      - name: "Security: admission latency"
+        run: |
+          set -eu
+          cargo test --release -p ferrum-testkit --test latency_gate
       - name: "Security: event contract"
         run: |
           set -eu

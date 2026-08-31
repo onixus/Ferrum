@@ -3037,7 +3037,7 @@ mod actions_parity {
     /// Стадии `Jenkinsfile`, которые обязаны быть в публичном воркфлоу с тем
     /// же телом. Это ровно userspace: группа `Build` без `BPF ELF` и группа
     /// `Checks` целиком.
-    const MIRRORED: [&str; 10] = [
+    const MIRRORED: [&str; 11] = [
         "Format",
         "Clippy",
         "Test",
@@ -3046,6 +3046,7 @@ mod actions_parity {
         "Security: policy invariants",
         "Security: MVP acceptance",
         "Security: metrics contract",
+        "Security: admission latency",
         "Security: event contract",
         "Security: supply chain",
     ];
@@ -5064,6 +5065,410 @@ mod kustomize_roots {
                 "{MIRRORED_OVERLAY} rewrites an image to {new_name}, whose \
                  registry {POLICY} does not allow. The overlay's whole job is to \
                  make the install and the policy agree."
+            );
+        }
+    }
+}
+
+/// Вебхук с `failurePolicy: Fail` — единственная точка отказа кластера, и
+/// доступность здесь свойство поставляемых манифестов, а не эксплуатации.
+///
+/// Что читает этот модуль: реплик больше одной, вытеснение не может забрать
+/// обе, реплики предпочитают разные узлы, а исключение из-под вебхука решается
+/// меткой, которую namespace не может выдать себе сам. Каждое из четырёх — то,
+/// чего нет в коде и нельзя проверить прогоном: это текст, который применит
+/// оператор.
+mod high_availability {
+    use serde_yaml::Value;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    const DEPLOYMENT: &str = "deploy/admission/deployment.yaml";
+    const PDB: &str = "deploy/admission/pdb.yaml";
+    const WEBHOOK_TMPL: &str = "deploy/admission/validatingwebhookconfiguration.tmpl.yaml";
+    const ADMISSION_ROOT: &str = "deploy/admission/kustomization.yaml";
+    /// Метка, по которой Deployment собирает свои Pod'ы. Всё в этом модуле —
+    /// про то, что PDB и anti-affinity говорят о тех же Pod'ах.
+    const APP_LABEL: &str = "app.kubernetes.io/name";
+    const APP_NAME: &str = "ferrum-admission";
+    /// Ключ, который apiserver проставляет и контролирует на каждом namespace
+    /// с 1.21. Единственный, по которому исключение не может быть выдано
+    /// самому себе.
+    const OWNED_LABEL: &str = "kubernetes.io/metadata.name";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> Value {
+        let path = repo_root().join(rel);
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        serde_yaml::from_str(&text).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    fn pod_spec(deployment: &Value) -> &Value {
+        deployment
+            .get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("spec"))
+            .expect("the webhook Deployment carries a pod template")
+    }
+
+    /// Реплик больше одной, и вытеснение не может забрать их все разом.
+    ///
+    /// Две половины, и по отдельности каждая бесполезна. Две реплики без
+    /// бюджета — это две реплики, которые `kubectl drain` одного узла снимает
+    /// одной командой, а с `failurePolicy: Fail` пауза между «сняли» и
+    /// «поднялись» — это отказ в создании Pod'ов по всему кластеру. Бюджет без
+    /// второй реплики — это запрет на любое вытеснение вообще: drain повисает
+    /// навсегда, и обновление узлов кластера останавливается на этом объекте.
+    /// Поэтому число реплик и число из бюджета читаются вместе, а не порознь.
+    #[test]
+    fn the_webhook_is_a_pair_that_a_drain_cannot_take_at_once() {
+        let deployment = read(DEPLOYMENT);
+        let replicas = deployment
+            .get("spec")
+            .and_then(|s| s.get("replicas"))
+            .and_then(Value::as_u64)
+            .expect("the webhook Deployment states its replica count");
+        assert!(
+            replicas >= 2,
+            "{DEPLOYMENT} runs {replicas} replica(s) under failurePolicy=Fail: одно вытеснение — \
+             отказ всему кластеру"
+        );
+
+        let pdb = read(PDB);
+        assert_eq!(
+            pdb.get("kind").and_then(Value::as_str),
+            Some("PodDisruptionBudget"),
+            "{PDB} is not a PodDisruptionBudget"
+        );
+        assert_eq!(
+            pdb.get("metadata")
+                .and_then(|m| m.get("namespace"))
+                .and_then(Value::as_str),
+            deployment
+                .get("metadata")
+                .and_then(|m| m.get("namespace"))
+                .and_then(Value::as_str),
+            "{PDB} is in a different namespace from {DEPLOYMENT}, so it governs no Pod of it"
+        );
+
+        // Селектор бюджета обязан выбирать те Pod'ы, что поднимает Deployment.
+        // Бюджет с чужим селектором — объект, который применяется, ничего не
+        // защищает и читается как защита.
+        let selector = pdb
+            .get("spec")
+            .and_then(|s| s.get("selector"))
+            .and_then(|s| s.get("matchLabels"))
+            .and_then(Value::as_mapping)
+            .expect("{PDB} selects Pods by matchLabels");
+        let template_labels = deployment
+            .get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("metadata"))
+            .and_then(|m| m.get("labels"))
+            .and_then(Value::as_mapping)
+            .expect("the pod template carries labels");
+        for (key, want) in selector {
+            assert_eq!(
+                template_labels.get(key),
+                Some(want),
+                "{PDB} selects on {key:?}={want:?}, which the Pods {DEPLOYMENT} creates do not \
+                 carry: the budget governs nothing"
+            );
+        }
+        assert_eq!(
+            selector.get(Value::from(APP_LABEL)),
+            Some(&Value::from(APP_NAME)),
+            "{PDB} does not select the webhook by {APP_LABEL}"
+        );
+
+        let spec = pdb.get("spec").expect("pdb spec");
+        let max_unavailable = spec.get("maxUnavailable").and_then(Value::as_u64);
+        let min_available = spec.get("minAvailable").and_then(Value::as_u64);
+        match (max_unavailable, min_available) {
+            (Some(max), None) => {
+                assert!(
+                    max >= 1,
+                    "{PDB} allows {max} unavailable: every voluntary eviction is refused, and a \
+                     node drain hangs on this object forever"
+                );
+                assert!(
+                    max < replicas,
+                    "{PDB} allows {max} of {replicas} replicas unavailable at once, which is all \
+                     of them: the budget permits exactly the outage it exists to prevent"
+                );
+            }
+            (None, Some(min)) => {
+                assert!(
+                    min >= 1,
+                    "{PDB} requires {min} available, so a drain may take every replica"
+                );
+                assert!(
+                    min < replicas,
+                    "{PDB} requires {min} of {replicas} available: no eviction is ever permitted \
+                     and a node drain hangs on this object forever"
+                );
+            }
+            _ => panic!(
+                "{PDB} states neither exactly one of maxUnavailable and minAvailable; the API \
+                 rejects both together and decides nothing with neither"
+            ),
+        }
+
+        // И бюджет обязан ставиться тем же корнем, что и Deployment: правило,
+        // приезжающее отдельным apply, — правило, которого нет у половины
+        // установок.
+        let root = read(ADMISSION_ROOT);
+        let resources: BTreeSet<String> = root
+            .get("resources")
+            .and_then(Value::as_sequence)
+            .expect("the admission root lists resources")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(
+            resources.contains("pdb.yaml") && resources.contains("deployment.yaml"),
+            "{ADMISSION_ROOT} installs {resources:?}: the budget and the Deployment it governs \
+             must arrive together"
+        );
+    }
+
+    /// Реплики предпочитают разные узлы, и предпочтение не умеет оставить одну
+    /// висеть.
+    ///
+    /// Бюджет выше — про добровольные вытеснения; узел, который умер, никого не
+    /// спрашивает, и против этого работает только anti-affinity. Но требование
+    /// `required` на одноузловом кластере оставляет вторую реплику в Pending
+    /// навсегда — а именно одноузловой кластер поднимает `install_gate.rs` и
+    /// публичный воркфлоу, то есть поставлялась бы установка, не поднимающаяся
+    /// на том кластере, которым её же и проверяют. Поэтому здесь проверяется
+    /// обратное обычному: правило есть **и** оно мягкое.
+    #[test]
+    fn the_two_replicas_prefer_different_nodes_and_the_preference_cannot_strand_one() {
+        let deployment = read(DEPLOYMENT);
+        let anti = pod_spec(&deployment)
+            .get("affinity")
+            .and_then(|a| a.get("podAntiAffinity"))
+            .expect(
+                "the webhook Deployment declares no podAntiAffinity: two replicas the scheduler \
+                 is free to put on one node are two replicas one node failure takes",
+            );
+        assert!(
+            anti.get("requiredDuringSchedulingIgnoredDuringExecution")
+                .is_none(),
+            "{DEPLOYMENT} requires anti-affinity. On a single-node cluster — which is what kind \
+             is, and what install_gate.rs and the public workflow install into — the second \
+             replica stays Pending forever, so the shipped install would be one that does not \
+             come up on the cluster its own gate uses."
+        );
+        let preferred = anti
+            .get("preferredDuringSchedulingIgnoredDuringExecution")
+            .and_then(Value::as_sequence)
+            .expect("the anti-affinity is stated as a preference");
+        let term = preferred
+            .iter()
+            .find(|t| {
+                t.get("podAffinityTerm")
+                    .and_then(|t| t.get("topologyKey"))
+                    .and_then(Value::as_str)
+                    == Some("kubernetes.io/hostname")
+            })
+            .expect(
+                "no anti-affinity term over kubernetes.io/hostname: a preference over some other \
+                 topology says nothing about two replicas on one node",
+            );
+        assert_eq!(
+            term.get("weight").and_then(Value::as_u64),
+            Some(100),
+            "the anti-affinity carries less than the full weight, so any other preference can \
+             outvote it and the two replicas land together anyway"
+        );
+        let labels = term
+            .get("podAffinityTerm")
+            .and_then(|t| t.get("labelSelector"))
+            .and_then(|s| s.get("matchLabels"))
+            .and_then(Value::as_mapping)
+            .expect("the term selects the Pods it is about");
+        assert_eq!(
+            labels.get(Value::from(APP_LABEL)),
+            Some(&Value::from(APP_NAME)),
+            "the anti-affinity term selects Pods other than this webhook's, so the scheduler is \
+             separating the wrong thing"
+        );
+    }
+
+    /// Из-под вебхука исключены ровно два namespace, и решает это метка,
+    /// которую apiserver проставляет сам.
+    ///
+    /// Исключения нужны: с `failurePolicy: Fail` вебхук, гейтящий namespace
+    /// собственных Pod'ов и namespace плоскости управления кластера, нельзя
+    /// перезапустить после того, как он перестал отвечать. Но ключ, по
+    /// которому исключение решается, — это и есть политика: любой
+    /// `ferrum.io/*`-опт-аут был бы исключением, которое namespace выдаёт себе
+    /// сам, а в продукте про enforcement это вся политика целиком.
+    #[test]
+    fn the_webhook_exemption_is_decided_by_a_label_the_api_server_owns() {
+        let webhook = read(WEBHOOK_TMPL);
+        let hook = webhook
+            .get("webhooks")
+            .and_then(Value::as_sequence)
+            .and_then(|w| w.first())
+            .expect("the template carries a webhook");
+        let selector = hook
+            .get("namespaceSelector")
+            .expect("the webhook states a namespaceSelector");
+        assert!(
+            selector.get("matchLabels").is_none(),
+            "{WEBHOOK_TMPL} exempts by matchLabels: an equality selector cannot say NotIn, so \
+             this either gates nothing or gates one namespace"
+        );
+        let expressions = selector
+            .get("matchExpressions")
+            .and_then(Value::as_sequence)
+            .expect("the selector is stated as matchExpressions");
+        let mut exempt: BTreeSet<String> = BTreeSet::new();
+        for expr in expressions {
+            let key = expr
+                .get("key")
+                .and_then(Value::as_str)
+                .expect("expression names a key");
+            assert_eq!(
+                key, OWNED_LABEL,
+                "{WEBHOOK_TMPL} decides the exemption on {key:?}. Only {OWNED_LABEL} is set and \
+                 enforced by the API server; on any other key a namespace exempts itself from \
+                 the policy by labelling itself."
+            );
+            assert_eq!(
+                expr.get("operator").and_then(Value::as_str),
+                Some("NotIn"),
+                "the exemption is not stated as NotIn, so it is a list of namespaces the webhook \
+                 *does* gate — everything else in the cluster is then ungated"
+            );
+            exempt.extend(
+                expr.get("values")
+                    .and_then(Value::as_sequence)
+                    .expect("NotIn carries values")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        assert!(
+            exempt.contains("kube-system"),
+            "{WEBHOOK_TMPL} gates kube-system. With failurePolicy=Fail that is a cluster whose \
+             control plane cannot restart while this webhook is down; exempt {exempt:?} does not \
+             include it"
+        );
+        assert!(
+            exempt.contains("ferrum"),
+            "{WEBHOOK_TMPL} gates the namespace holding this webhook's own Pods, so a cold \
+             cluster deadlocks on the replica that has not started yet; exempt is {exempt:?}"
+        );
+        // И ровно эти два: каждый лишний — namespace, в котором политика не
+        // действует и об этом знает только этот файл.
+        assert_eq!(
+            exempt,
+            ["ferrum", "kube-system"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>(),
+            "the webhook exempts more than the two namespaces it must: every extra one is a \
+             namespace where the shipped policy does not apply and nothing else in this tree \
+             says so"
+        );
+    }
+
+    /// У каждого ресурса, который вебхук регистрирует, есть scope, известный
+    /// коду, который его решает.
+    ///
+    /// Это шов, на котором сломался issue #17. `namespaceSelector` выше не
+    /// применяется apiserver к ресурсам уровня кластера, значит для них
+    /// решение целиком за `ferrum-admission`, и он обязан знать, что у такого
+    /// объекта нет namespace, а не спрашивать кеш меток о пустой строке.
+    /// Ресурс, дописанный в `rules` и не разобранный здесь, — второй заход на
+    /// ту же ошибку, поэтому таблица ниже полная, а незнакомый ресурс — падение.
+    #[test]
+    fn every_resource_the_webhook_registers_has_a_scope_this_crate_knows() {
+        /// resource → (Kind, cluster-scoped?). Полная, а не «то, что
+        /// встретилось»: в этом и смысл.
+        const SCOPES: [(&str, &str, bool); 6] = [
+            ("pods", "Pod", false),
+            ("roles", "Role", false),
+            ("rolebindings", "RoleBinding", false),
+            ("clusterroles", "ClusterRole", true),
+            ("clusterrolebindings", "ClusterRoleBinding", true),
+            ("namespaces", "Namespace", true),
+        ];
+
+        let webhook = read(WEBHOOK_TMPL);
+        let hook = webhook
+            .get("webhooks")
+            .and_then(Value::as_sequence)
+            .and_then(|w| w.first())
+            .expect("the template carries a webhook");
+        let mut registered: BTreeSet<String> = BTreeSet::new();
+        for rule in hook
+            .get("rules")
+            .and_then(Value::as_sequence)
+            .expect("the webhook carries rules")
+        {
+            registered.extend(
+                rule.get("resources")
+                    .and_then(Value::as_sequence)
+                    .expect("a rule names resources")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        assert!(
+            !registered.is_empty(),
+            "{WEBHOOK_TMPL} registers no resource at all, so nothing below is about anything"
+        );
+
+        for resource in &registered {
+            let (_, kind, cluster_scoped) = SCOPES
+                .iter()
+                .find(|(name, _, _)| name == resource)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{WEBHOOK_TMPL} registers {resource:?}, whose scope this gate does not \
+                         know. Decide it here and in ferrum_admission::CLUSTER_SCOPED_KINDS \
+                         together: a cluster-scoped resource reaching a policy that carries a \
+                         namespaceSelector is what denied every ClusterRoleBinding in the \
+                         cluster until issue #20, and a namespaced one wrongly listed as \
+                         cluster-scoped would skip the namespace selector entirely."
+                    )
+                });
+            assert_eq!(
+                ferrum_admission::CLUSTER_SCOPED_KINDS.contains(kind),
+                *cluster_scoped,
+                "{WEBHOOK_TMPL} registers {resource:?} ({kind}), which this gate calls \
+                 cluster-scoped={cluster_scoped} and ferrum_admission::CLUSTER_SCOPED_KINDS \
+                 disagrees with. One of the two is wrong, and while they disagree the webhook \
+                 either asks a label cache about an object with no namespace or applies no \
+                 namespace selector to an object that has one."
+            );
+        }
+
+        // Обратное направление: `Namespace` намеренно не в списке crate, и это
+        // держится только тем, что вебхук его не регистрирует. Зарегистрирует —
+        // и `cluster_scoped_kind` начнёт отвечать «нет» на объект, у которого
+        // метки namespace есть, но лежат на нём самом.
+        if registered.contains("namespaces") {
+            panic!(
+                "{WEBHOOK_TMPL} now registers `namespaces`. For a Namespace object the labels a \
+                 namespaceSelector asks about are the object's own — a third case that neither \
+                 cluster_scoped_kind nor program_applies decides today. Decide it before this \
+                 rule ships."
             );
         }
     }

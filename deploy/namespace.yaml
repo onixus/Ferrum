@@ -3,8 +3,19 @@ kind: Namespace
 metadata:
   name: ferrum
   labels:
+    # Set here as well as by the API server, which stamps it on every namespace
+    # since 1.21: this is the key the webhook's namespaceSelector excludes on,
+    # and a manifest that carries the key an exemption is decided by is a
+    # manifest whose exemption is readable without a cluster.
     kubernetes.io/metadata.name: ferrum
     app.kubernetes.io/part-of: ferrum
-    # The webhook must never gate its own namespace: a cluster restart would
-    # deadlock on the admission Pod that has not started yet.
-    ferrum.io/webhook-exempt: "true"
+    # There was a third label here, `ferrum.io/webhook-exempt: "true"`, and
+    # nothing read it. Not the webhook configuration, which excludes this
+    # namespace by name, and not any gate. It stated an exemption that was real
+    # and attributed it to a mechanism that did not exist, which is the shape of
+    # documentation this tree is written against — and worse, it read as an
+    # invitation to make it load-bearing. It must not become load-bearing: a
+    # webhook that exempts whoever labels themselves exempt is a policy anyone
+    # with edit rights on a namespace can leave.
+    # `deploy_gate.rs::the_webhook_exemption_is_decided_by_a_label_the_api_server_owns`
+    # is what keeps the selector on a key a namespace cannot award itself.

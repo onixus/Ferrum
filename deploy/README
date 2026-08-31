@@ -14,8 +14,9 @@ What that command installs
 
   * the seven CRDs from docs/crd — so an operator's first policy object is not
     rejected as an unknown type;
-  * the `ferrum` namespace, labelled webhook-exempt, so a cold cluster cannot
-    deadlock on the admission Pod that has not started yet;
+  * the `ferrum` namespace, which the webhook configuration excludes by name —
+    on `kubernetes.io/metadata.name`, the key the API server owns — so a cold
+    cluster cannot deadlock on the admission Pod that has not started yet;
   * the controller (ServiceAccount, RBAC, Deployment);
   * the webhook (ServiceAccount, RBAC, Service, Deployment).
 
