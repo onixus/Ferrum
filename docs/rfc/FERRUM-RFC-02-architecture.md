@@ -59,8 +59,13 @@ CP down ≤ 2ч → last-known-good, `Degraded=true`, не fail-open.
 Состояние контрмер: подпись bundle и mTLS material — `ferrum-crypto`, trust
 roots caller-supplied, домены `BUNDLE_SIGNATURE_CONTEXT`, `KEY_BIND_MSG` и
 `BREAK_GLASS_CONTEXT` разделены. LKG у агента и fail-closed admission — есть.
-LSM на pin path и in-kernel drop не реализованы: aya-ebpf требует nightly,
-attach отдаёт `Degraded`. Spoofing закрыт только на уровне подписи и
+Пины реализованы и измерены на настоящем ядре (`KernelHandle::pin_at`,
+стадия `BPF pins`): карты и привязки переживают процесс. Зовёт их пока только
+стадия, не агент. LSM на pin path и in-kernel drop не реализованы, и прежняя
+причина здесь — «aya-ebpf требует nightly, attach отдаёт `Degraded`» — больше
+не та: nightly в дереве уже используется (`ferrum-ebpf-progs` собирается им),
+attach давно не `Degraded`, а нода CI сообщает `CONFIG_BPF_LSM=y` и активные
+LSM `capability,bpf,landlock`. Не сделано — значит не начато, а не заблокировано. Spoofing закрыт только на уровне подписи и
 TLS-идентичности, не на уровне ядра.
 
 Строка Repudiation исполнена наполовину, и половины разные по природе.

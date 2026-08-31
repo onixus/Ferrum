@@ -18,6 +18,10 @@ use crate::SyscallArch;
 #[cfg(feature = "attach")]
 use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 #[cfg(feature = "attach")]
+use aya::programs::links::FdLink;
+#[cfg(feature = "attach")]
+use aya::programs::trace_point::TracePointLinkId;
+#[cfg(feature = "attach")]
 use aya::programs::TracePoint;
 #[cfg(feature = "attach")]
 use aya::Bpf;
@@ -28,6 +32,8 @@ use ferrum_ebpf_progs::{
     CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_EVENTS, MAP_SELF,
 };
 use std::collections::BTreeSet;
+#[cfg(feature = "attach")]
+use std::path::{Path, PathBuf};
 
 /// One diff to apply to `ferrum_cgroups`: which cgroup ids gain the container
 /// flag and which lose it.
@@ -440,6 +446,15 @@ pub struct KernelHandle {
     /// Syscalls with no tracepoint on this arch or in this kernel's tracefs,
     /// hence unhooked here.
     unhooked_syscalls: Vec<&'static str>,
+    /// Every attachment this handle owns, kept so it can be pinned later.
+    ///
+    /// `attach_for_arch` used to drop the link ids on the floor, which made the
+    /// attachment unreachable: aya keeps the link inside the program, and
+    /// without the id there is no way to take it out and hand it to bpffs.
+    /// Category and name ride along because a failed pin has to be able to put
+    /// the hook back — see [`Self::pin_at`].
+    #[cfg(feature = "attach")]
+    links: Vec<(&'static str, &'static str, &'static str, TracePointLinkId)>,
 }
 
 #[cfg(feature = "attach")]
@@ -507,6 +522,7 @@ impl KernelHandle {
                 memlock.describe()
             ))
         })?;
+        let mut links = Vec::new();
         for (prog, category, name) in wanted {
             let program = bpf.program_mut(prog).ok_or_else(|| {
                 FerrumError::Degraded(format!("program {prog} missing from eBPF ELF"))
@@ -514,15 +530,166 @@ impl KernelHandle {
             let tracepoint: &mut TracePoint =
                 program.try_into().map_err(|err| degraded(prog, err))?;
             tracepoint.load().map_err(|err| degraded(prog, err))?;
-            tracepoint
+            let id = tracepoint
                 .attach(category, name)
                 .map_err(|err| degraded(prog, err))?;
+            links.push((*prog, *category, *name, id));
         }
         Ok(Self {
             bpf,
             container_cgroups: BTreeSet::new(),
             unhooked_syscalls: unhooked,
+            links,
         })
+    }
+
+    /// Pin this handle's maps and attachments under `root` on bpffs.
+    ///
+    /// Until this existed the whole Tampering row of RFC-02 §C was empty:
+    /// `Loader::attach_pins` returned `Degraded` by construction, so nothing
+    /// was pinned, nothing outlived the process, and there was no object on
+    /// the filesystem for an LSM to protect or for a watcher to miss. Pins are
+    /// the thing the other two counter-measures are *about*, so they come
+    /// first.
+    ///
+    /// What a pin buys, precisely: the link keeps the program attached after
+    /// this process exits, and the maps keep their contents. Without it, every
+    /// hook this handle owns is torn down the moment the agent dies — which is
+    /// indistinguishable, from the node's side, from an attacker who detached
+    /// them.
+    ///
+    /// Refusals, all named rather than swallowed:
+    ///
+    /// - `root` is not on a bpf filesystem. `bpf_obj_pin` would fail with
+    ///   `EINVAL` after the directories were already made, leaving a tree that
+    ///   looks like pins and holds nothing. The check walks up to the first
+    ///   path that exists, because `root` itself is what this call creates.
+    /// - something is already pinned at one of these paths. Replacing it is
+    ///   not an option here: from this side a stale pin left by a previous
+    ///   instance and a pin planted by somebody else look the same, and
+    ///   silently adopting the second is how a tampered pin path becomes the
+    ///   one enforcement runs from. The restart case is real and is *not*
+    ///   solved by this function — see the boundary document.
+    /// - this kernel gives no `bpf_link` for tracepoints (before 5.15). Taking
+    ///   the link out of the program detaches it, so the hook is re-attached
+    ///   before returning: a failed pin must not cost a hook.
+    pub fn pin_at(&mut self, root: &Path) -> Result<Vec<PathBuf>> {
+        let maps_dir = root.join("maps");
+        let links_dir = root.join("links");
+        for dir in [&maps_dir, &links_dir] {
+            std::fs::create_dir_all(dir)
+                .map_err(|err| FerrumError::Degraded(format!("create {}: {err}", dir.display())))?;
+        }
+
+        let mut pinned = Vec::new();
+        // Maps first, and not for tidiness: pinning a map does not touch the
+        // attachment, so everything that can go wrong with the filesystem —
+        // wrong type, no permission, a path already taken — goes wrong here,
+        // while no hook has left its program yet.
+        for name in [MAP_EVENTS, MAP_CGROUPS, MAP_SELF] {
+            let path = maps_dir.join(name);
+            if let Err(err) = refuse_if_occupied(&path) {
+                clean_up(root, &maps_dir, &links_dir);
+                return Err(err);
+            }
+            let Some(map) = self.bpf.map(name) else {
+                clean_up(root, &maps_dir, &links_dir);
+                return Err(FerrumError::Degraded(format!(
+                    "map {name} missing from this handle"
+                )));
+            };
+            if let Err(err) = map.pin(&path) {
+                clean_up(root, &maps_dir, &links_dir);
+                // The filesystem type is not read back here: `ferrum-ebpf`
+                // denies `unsafe`, so there is no `statfs`, and a second copy
+                // of the `mountinfo` parser `ferrum-k8smeta` already owns is
+                // the duplication this tree deleted once already. The syscall
+                // is the check — the same one that would have run anyway — and
+                // its error is reported verbatim instead of being translated
+                // into a guess about the mount.
+                return Err(FerrumError::Degraded(format!(
+                    "pin map {name} at {}: {err}. A pin only works on bpffs; EINVAL here \
+                     usually means {} is an ordinary directory",
+                    path.display(),
+                    root.display()
+                )));
+            }
+            pinned.push(path);
+        }
+
+        for (prog, category, name, id) in std::mem::take(&mut self.links) {
+            let path = links_dir.join(prog);
+            if let Err(err) = refuse_if_occupied(&path) {
+                self.links.push((prog, category, name, id));
+                return Err(err);
+            }
+            let program = self.bpf.program_mut(prog).ok_or_else(|| {
+                FerrumError::Degraded(format!("program {prog} missing from this handle"))
+            })?;
+            let tracepoint: &mut TracePoint =
+                program.try_into().map_err(|err| degraded(prog, err))?;
+            let link = tracepoint
+                .take_link(id)
+                .map_err(|err| degraded(prog, err))?;
+            // From here the hook is off the program. Every exit below either
+            // pins it or puts it back.
+            let fd_link = match FdLink::try_from(link) {
+                Ok(fd_link) => fd_link,
+                Err(err) => {
+                    let reason = format!(
+                        "this kernel gives no bpf_link for tracepoint {category}/{name}, so \
+                         {prog} cannot be pinned: {err}"
+                    );
+                    return Err(self.reattach(prog, category, name, reason));
+                }
+            };
+            match fd_link.pin(&path) {
+                Ok(_pinned) => pinned.push(path),
+                Err(err) => {
+                    let reason = format!("pin {prog} at {}: {err}", path.display());
+                    return Err(self.reattach(prog, category, name, reason));
+                }
+            }
+        }
+        Ok(pinned)
+    }
+
+    /// Put a hook back after a failed pin, and say so in the error.
+    ///
+    /// The failure the caller sees is the pin failure either way; what changes
+    /// is whether the node is still watching that syscall. A re-attach that
+    /// itself fails is the worse fact and replaces the message.
+    fn reattach(
+        &mut self,
+        prog: &'static str,
+        category: &'static str,
+        name: &'static str,
+        reason: String,
+    ) -> FerrumError {
+        let program = match self.bpf.program_mut(prog) {
+            Some(program) => program,
+            None => {
+                return FerrumError::Degraded(format!("{reason}; {prog} is gone from the handle"))
+            }
+        };
+        let tracepoint: &mut TracePoint = match program.try_into() {
+            Ok(tracepoint) => tracepoint,
+            Err(err) => {
+                return FerrumError::Degraded(format!(
+                    "{reason}; and {prog} could not be re-attached: {err}"
+                ))
+            }
+        };
+        match tracepoint.attach(category, name) {
+            Ok(id) => {
+                self.links.push((prog, category, name, id));
+                FerrumError::Degraded(format!("{reason}; {prog} stays attached, unpinned"))
+            }
+            Err(err) => FerrumError::Degraded(format!(
+                "{reason}; and re-attaching {prog} failed, so {category}/{name} is now unhooked \
+                 on this node: {err}"
+            )),
+        }
     }
 
     /// Datapath syscalls with no hook on this node — absent from the arch, or
@@ -679,6 +846,31 @@ fn partial_sync(stats: SyncStats, err: FerrumError) -> FerrumError {
          {err}",
         stats.removed, stats.inserted, stats.entries
     ))
+}
+
+/// Refuse a pin path that is already taken, naming what is there.
+#[cfg(feature = "attach")]
+fn refuse_if_occupied(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Err(FerrumError::Degraded(format!(
+            "{} is already pinned; this process did not create it, and from here a pin left by \
+             a previous instance is indistinguishable from one somebody else planted",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove the directories this call made, so a refused pin leaves no tree that
+/// looks like a pin path and holds nothing.
+///
+/// Best effort by design: a non-empty directory is one somebody else is using,
+/// and `remove_dir` refusing it is the right outcome.
+#[cfg(feature = "attach")]
+fn clean_up(root: &Path, maps_dir: &Path, links_dir: &Path) {
+    let _ = std::fs::remove_dir(links_dir);
+    let _ = std::fs::remove_dir(maps_dir);
+    let _ = std::fs::remove_dir(root);
 }
 
 #[cfg(test)]
