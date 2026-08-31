@@ -17,14 +17,25 @@
 #
 # ## A NetworkPolicy is only as real as the CNI
 #
-# This object is inert on a cluster whose CNI does not enforce NetworkPolicy —
-# kind's default kindnet is exactly such a CNI, so on the install gate's own
-# cluster this file is applied and enforces nothing. That is stated here rather
-# than left for someone to discover: on a cluster without a policy-enforcing
-# CNI, the metrics ports are reachable from every Pod in the cluster, and the
-# operator's options are a CNI that enforces (Calico, Cilium) or not passing
-# `--metrics-listen` at all. `status.json` and `events.jsonl` need no port and
-# are the fallback that has always been there.
+# This object is inert on a cluster whose CNI does not enforce NetworkPolicy,
+# and there is nothing it can do about that: it is a request to the network
+# layer, not a check inside a binary. So an operator has to know which of the
+# two they have, and the answer is not guessable from the fact that the object
+# applied — `kubectl apply` succeeds either way.
+#
+# Measured, not assumed. On kind with `kindest/kindnetd:v20260528-9350166c`,
+# whose log line is `"Starting controller" name="kube-network-policies"`, this
+# policy is enforced: from a Pod in a namespace without the label the metrics
+# port does not connect at all, from a Pod in a labelled namespace it answers
+# 200, and port 8443 answers from both. That was run by hand on
+# `kind-ferrum-install` on 2026-08-31 and nothing in this tree re-runs it, so
+# it is a measurement and not a gate — `docs/MVP-1-BOUNDARY.md` files it under
+# «Верим, но не доказано» rather than under «Делает».
+#
+# Older kindnetd builds carry no policy engine, and on those this file applies
+# and protects nothing. The operator's options there are a CNI that enforces
+# (Calico, Cilium), or not passing `--metrics-listen` at all: `status.json` and
+# `events.jsonl` need no port and are the fallback that has always been there.
 #
 # ## Why one object and not two
 #
