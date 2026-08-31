@@ -825,6 +825,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-siem"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ferrum-export",
+ "ferrum-ids",
+ "ferrum-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "ferrum-testkit"
 version = "0.1.0"
 dependencies = [

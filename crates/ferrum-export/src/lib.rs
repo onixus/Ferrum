@@ -2,19 +2,36 @@
 
 #![deny(unsafe_code)]
 
+mod fanout;
 mod file;
 mod queue;
 
+pub use fanout::FanoutSink;
 pub use file::{EnvelopeWriterSink, RotatingFileSink, SinkContext};
 pub use queue::QueueSink;
 
-use ferrum_proto::EnforcementEvent;
+use ferrum_proto::{EnforcementEvent, EventEnvelope};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 pub trait EventSink {
     fn emit(&self, event: &EnforcementEvent);
+
+    /// Emit a record whose envelope has already been stamped.
+    ///
+    /// Exists so that one event delivered to several destinations is one
+    /// record: `ts`, `degraded` and `bundleDigest` are read from the process
+    /// when the envelope is built, and a sink that built its own would give
+    /// the same enforcement decision two timestamps in two systems. An
+    /// investigation correlating a SIEM alert with `events.jsonl` on the node
+    /// would then be matching on a field that does not match.
+    ///
+    /// The default is for sinks that have no envelope of their own to keep —
+    /// they see the event and nothing is lost that they were storing anyway.
+    fn emit_envelope(&self, envelope: &EventEnvelope) {
+        self.emit(&envelope.event)
+    }
 
     /// Events the sink accepted and could not write out (serialisation, a
     /// full disk, a torn file). Deliberately NOT named `events_dropped_total`:
@@ -49,6 +66,39 @@ pub trait EventSink {
 impl EventSink for Box<dyn EventSink + Send + Sync> {
     fn emit(&self, event: &EnforcementEvent) {
         (**self).emit(event)
+    }
+
+    fn emit_envelope(&self, envelope: &EventEnvelope) {
+        (**self).emit_envelope(envelope)
+    }
+
+    fn export_write_failed_total(&self) -> u64 {
+        (**self).export_write_failed_total()
+    }
+
+    fn export_queue_dropped_total(&self) -> u64 {
+        (**self).export_queue_dropped_total()
+    }
+
+    fn export_writer_lost_total(&self) -> u64 {
+        (**self).export_writer_lost_total()
+    }
+
+    fn export_writer_dead(&self) -> bool {
+        (**self).export_writer_dead()
+    }
+}
+
+/// Lets a caller keep a handle on a sink it also handed to a `FanoutSink` —
+/// the agent reads a destination's own counters that way, and a test reads
+/// what it received.
+impl<S: EventSink + ?Sized> EventSink for std::sync::Arc<S> {
+    fn emit(&self, event: &EnforcementEvent) {
+        (**self).emit(event)
+    }
+
+    fn emit_envelope(&self, envelope: &EventEnvelope) {
+        (**self).emit_envelope(envelope)
     }
 
     fn export_write_failed_total(&self) -> u64 {

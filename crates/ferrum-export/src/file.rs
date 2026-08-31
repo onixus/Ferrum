@@ -64,6 +64,8 @@ impl SinkContext {
 
     pub fn envelope(&self, event: &EnforcementEvent) -> EventEnvelope {
         EventEnvelope {
+            schema: ferrum_proto::SchemaId,
+            schema_version: ferrum_proto::EVENT_SCHEMA_VERSION,
             ts: Utc::now(),
             node: self.inner.node.clone(),
             bundle_digest: self
@@ -234,8 +236,11 @@ impl RotatingFileSink {
 
 impl EventSink for RotatingFileSink {
     fn emit(&self, event: &EnforcementEvent) {
-        let envelope = self.ctx.envelope(event);
-        let mut line = match serde_json::to_vec(&envelope) {
+        self.emit_envelope(&self.ctx.envelope(event))
+    }
+
+    fn emit_envelope(&self, envelope: &EventEnvelope) {
+        let mut line = match serde_json::to_vec(envelope) {
             Ok(bytes) => bytes,
             Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -291,8 +296,11 @@ impl EnvelopeWriterSink<std::io::Stdout> {
 
 impl<W: Write> EventSink for EnvelopeWriterSink<W> {
     fn emit(&self, event: &EnforcementEvent) {
-        let envelope = self.ctx.envelope(event);
-        let mut line = match serde_json::to_vec(&envelope) {
+        self.emit_envelope(&self.ctx.envelope(event))
+    }
+
+    fn emit_envelope(&self, envelope: &EventEnvelope) {
+        let mut line = match serde_json::to_vec(envelope) {
             Ok(bytes) => bytes,
             Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);

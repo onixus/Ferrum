@@ -1,0 +1,22 @@
+[package]
+name = "ferrum-siem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Normalisation of EventEnvelope into CEF / RFC 5424 / ECS and a non-blocking syslog sink. Forbidden: tokio, TLS, kube client, unbounded retry buffers, silent record loss."
+
+# Four, and each one is already on the graph of the binary that links this
+# crate. There is no HTTP client, no TLS stack and no async runtime here: the
+# transport is `std::net`, because a sink that reaches a third-party system
+# from inside the DaemonSet is exactly the wrong place to grow a dependency
+# tree. `ferrum-metrics` refuses dependencies outright for the same reason;
+# this crate cannot, because its whole job is to render a type, and the type
+# and its serialiser are the four below.
+[dependencies]
+chrono.workspace = true
+ferrum-export.workspace = true
+ferrum-ids.workspace = true
+ferrum-proto.workspace = true
+serde_json.workspace = true
