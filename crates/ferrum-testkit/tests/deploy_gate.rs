@@ -1061,8 +1061,9 @@ mod build_closure {
     /// limit rather than a convenience: the pipeline tags with
     /// `${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}` and the manifests pin `v0.1.0`,
     /// so the two tag spaces do not intersect and cannot be made to by reading
-    /// them harder. `the_tag_half_of_the_closure_is_open_and_says_why` states
-    /// what that leaves open and fails the day it becomes closable.
+    /// them harder. The tag half is held elsewhere, against the file that does
+    /// publish under a tag a manifest can pin —
+    /// `release_supply_chain::the_tag_the_manifests_pin_is_one_the_release_can_publish`.
     fn image_repo(reference: &str) -> String {
         let reference = reference.trim().trim_matches('"');
         let last_segment = reference.rfind('/').map_or(0, |i| i + 1);
@@ -1436,13 +1437,14 @@ mod build_closure {
     /// and built by nothing in it, so `kubectl apply -f deploy/` produced two
     /// ImagePullBackOffs and an enforcement plane that admits everything.
     ///
-    /// It closes the repository half of that failure and no more. The tag half
-    /// is open — `image_repo` says why, and
-    /// `the_tag_half_of_the_closure_is_open_and_says_why` holds the reason to
-    /// the tree — so a manifest naming a repository this pipeline builds under
-    /// a tag it never produced still ImagePullBackOffs, and this test passes.
-    /// Reading the doc comment above as covering the whole class is the mistake
-    /// this paragraph exists to stop.
+    /// It closes the repository half of that failure and no more. A manifest
+    /// naming a repository this pipeline builds, under a tag nothing produces,
+    /// still ImagePullBackOffs and this test still passes: `image_repo` says
+    /// why, and the tag half is held by
+    /// `release_supply_chain::the_tag_the_manifests_pin_is_one_the_release_can_publish`
+    /// against the release workflow, which is the only file in this tree that
+    /// publishes anything. Reading the doc comment above as covering the whole
+    /// class is the mistake this paragraph exists to stop.
     #[test]
     fn every_image_a_manifest_names_is_built_by_the_pipeline() {
         let root = repo_root();
@@ -1479,60 +1481,6 @@ mod build_closure {
              existed: the manifest applies, the Pod never starts, and the plane it \
              belongs to enforces nothing.",
             orphans.join("\n")
-        );
-    }
-
-    /// What the closure above does not close, said in the gate's own words, and
-    /// held to the two facts that make it unclosable here.
-    ///
-    /// The decision: the tag half cannot honestly be closed *in this
-    /// repository*. Nothing pushes — no stage in the Jenkinsfile runs
-    /// `docker push` — so the tags the pipeline invents
-    /// (`dev-$BUILD_NUMBER`) exist only in one node's local image store, and a
-    /// manifest pinned to one of them would name an image no cluster can pull
-    /// and would have to be rewritten on every build. Pinning the manifests to
-    /// a tag CI invents is its own defect, not a repair. So the comparison
-    /// stays on the repository, and this test keeps the two premises honest
-    /// instead of the doc comment quietly claiming the whole class:
-    ///
-    ///   * nothing publishes an image, and
-    ///   * every manifest pins a fixed tag rather than a floating one.
-    ///
-    /// The day the first stops being true — a `docker push` appears, and the
-    /// tags become something a cluster can resolve — this test fails, and the
-    /// repair is to close the tag half rather than to delete this. `:latest` in
-    /// a manifest fails it too: that is the one tag whose value cannot be
-    /// checked against anything, on the plane that decides admission.
-    #[test]
-    fn the_tag_half_of_the_closure_is_open_and_says_why() {
-        let root = repo_root();
-        let jenkins = strip_comments(&jenkinsfile(&root), Lang::Groovy);
-        assert!(
-            !jenkins.contains("docker push") && !jenkins.contains("docker image push"),
-            "a stage now publishes an image, so the tags this pipeline produces are \
-             resolvable and the closure gate can compare them. Close the tag half: \
-             `every_image_a_manifest_names_is_built_by_the_pipeline` compares \
-             repositories only, and a manifest pinning a tag nothing pushed is the \
-             ImagePullBackOff that gate exists to refuse."
-        );
-
-        let containers = deploy_containers(&root);
-        assert!(!containers.is_empty(), "no container found under deploy/");
-        let floating: Vec<String> = containers
-            .iter()
-            .filter(|c| {
-                let tag = c.image[image_repo(&c.image).len()..].trim_start_matches(':');
-                tag.is_empty() || tag == "latest"
-            })
-            .map(|c| format!("  {} (named by {})", c.image, c.file))
-            .collect();
-        assert!(
-            floating.is_empty(),
-            "these manifests name a floating tag:\n{}\nNothing in this repository \
-             publishes an image, so the tag is the only part of the reference an \
-             operator controls; `latest` hands it to whoever pushed last, on the \
-             plane that decides admission.",
-            floating.join("\n")
         );
     }
 
@@ -3296,6 +3244,694 @@ mod actions_parity {
             assert!(
                 !line.contains("|| true"),
                 "{WORKFLOW}:{number}: `|| true` swallows the exit code the whole stage is for"
+            );
+        }
+    }
+}
+
+/// Поставка: что релизный воркфлоу публикует, чем подписывает и совпадает ли
+/// это с тем, что дерево просит кластер скачать.
+///
+/// Продукт, который проверяет подпись bundle, а сам едет неподписанным,
+/// требует от получателя ровно того доверия, от которого отучает. Файл
+/// `.github/workflows/release.yml` закрывает эту половину; чего он не
+/// закрывает — того, что запуск был, — не закрывает и этот модуль, и в границе
+/// про него написано то же, что про `ci.yml`: поставленный файл не прогон.
+///
+/// Что здесь держится и почему именно это:
+///
+///  * **множество образов**. Три места называют образы — `deploy/**`,
+///    `Jenkinsfile` и этот воркфлоу, — и расхождение любого из них тихое:
+///    манифест, тянущий репозиторий, который релиз не публикует, — это
+///    `ImagePullBackOff` у получателя и зелёный прогон у нас;
+///  * **домены подписи**. `ferrum-crypto` подписывает bundle Ed25519-seed'ом в
+///    контексте `BUNDLE_SIGNATURE_CONTEXT`. Образ подписывается эфемерным
+///    ключом Fulcio. Общего ключа у них нет и быть не должно, а самый простой
+///    способ его завести — вписать в релиз долгоживущий `--key`;
+///  * **процедура проверки**. Инструкция получателю — часть поставки, и
+///    расходится она молча: команда, называющая идентичность, которой Fulcio не
+///    выпишет, не пройдёт ни у кого, а красным от этого не станет ничего.
+mod release_supply_chain {
+    use serde_yaml::Value;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    const WORKFLOW: &str = ".github/workflows/release.yml";
+    const README: &str = "README.md";
+
+    /// Раздел README, который описывает процедуру получателю.
+    const DELIVERY_HEADING: &str = "## Поставка";
+
+    /// Издатель OIDC-токена, под который Fulcio выписывает сертификат
+    /// GitHub-воркфлоу. Единственное его значение для Actions; получатель обязан
+    /// называть именно его, иначе проверка примет подпись кого угодно с любым
+    /// другим провайдером.
+    const ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> String {
+        let path = repo_root().join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    fn workflow() -> Value {
+        serde_yaml::from_str(&read(WORKFLOW)).expect("release workflow is not valid YAML")
+    }
+
+    fn job<'a>(workflow: &'a Value, name: &str) -> &'a Value {
+        workflow
+            .get("jobs")
+            .and_then(|jobs| jobs.get(name))
+            .unwrap_or_else(|| panic!("{WORKFLOW} has no job {name:?}"))
+    }
+
+    /// Тело `run` шага, чьё имя начинается с `prefix`.
+    ///
+    /// По префиксу, а не по равенству: имя шага несёт `${{ matrix.crate }}`, и
+    /// сравнение с полным именем читало бы шаблон, а не имя.
+    fn step_script(job: &Value, prefix: &str) -> String {
+        let steps = job
+            .get("steps")
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("{WORKFLOW}: a job has no steps"));
+        let mut found: Vec<String> = steps
+            .iter()
+            .filter(|step| {
+                step.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .filter_map(|step| step.get("run").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "{WORKFLOW}: expected exactly one step whose name starts with {prefix:?} and carries \
+             a script; found {}",
+            found.len()
+        );
+        found.remove(0)
+    }
+
+    /// Репозитории образов, которые публикует релиз.
+    ///
+    /// Собираются из двух половин файла, а не из одной строки: имя строится в
+    /// скрипте (`image="<префикс>${{ matrix.crate }}"`), а перебирается
+    /// матрицей. Читать только матрицу значило бы не заметить смену префикса,
+    /// читать только скрипт — не заметить исчезнувший образ.
+    fn published_repos() -> BTreeSet<String> {
+        let workflow = workflow();
+        let publish = job(&workflow, "publish");
+        let script = step_script(publish, "Publish ");
+        assert!(
+            script.contains(r#"docker push "$image:$tag""#),
+            "{WORKFLOW}: the publish step no longer pushes `$image:$tag`, so nothing below can \
+             say what this release puts in a registry"
+        );
+        let marker = "image=";
+        let line = script
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(marker))
+            .unwrap_or_else(|| panic!("{WORKFLOW}: the publish step assigns no `image=`"));
+        let prefix = line
+            .trim_start_matches(marker)
+            .trim_matches('"')
+            .strip_suffix("${{ matrix.crate }}")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{WORKFLOW}: `image=` is {line:?}; this gate reads a fixed prefix followed by \
+                     the matrix crate, and a name built any other way cannot be compared with \
+                     deploy/**"
+                )
+            })
+            .to_string();
+
+        let entries = publish
+            .get("strategy")
+            .and_then(|strategy| strategy.get("matrix"))
+            .and_then(|matrix| matrix.get("include"))
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("{WORKFLOW}: the publish job has no matrix include"));
+        let repos: BTreeSet<String> = entries
+            .iter()
+            .map(|entry| {
+                let name = entry
+                    .get("crate")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("{WORKFLOW}: a matrix entry names no crate"));
+                format!("{prefix}{name}")
+            })
+            .collect();
+        assert!(
+            !repos.is_empty(),
+            "{WORKFLOW}: the publish matrix is empty, so this gate sees nothing published and \
+             every comparison below is satisfied by finding nothing"
+        );
+        repos
+    }
+
+    fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
+        {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                yaml_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "yaml") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn collect_images(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Mapping(map) => {
+                if let Some(Value::String(image)) = map.get(Value::from("image")) {
+                    out.push(image.clone());
+                }
+                for (_, value) in map.iter() {
+                    collect_images(value, out);
+                }
+            }
+            Value::Sequence(items) => items.iter().for_each(|item| collect_images(item, out)),
+            _ => {}
+        }
+    }
+
+    /// `repo:tag` из каждого контейнера в `deploy/`, как манифест его пишет.
+    fn deploy_images() -> Vec<String> {
+        let root = repo_root();
+        let mut files = Vec::new();
+        yaml_files(&root.join("deploy"), &mut files);
+        files.sort();
+        let mut out = Vec::new();
+        for path in files {
+            let raw = std::fs::read_to_string(&path).expect("manifest");
+            for document in raw.split("\n---") {
+                let Ok(value) = serde_yaml::from_str::<Value>(document) else {
+                    continue;
+                };
+                collect_images(&value, &mut out);
+            }
+        }
+        assert!(
+            !out.is_empty(),
+            "no container under deploy/ names an image, so this gate cannot see what the cluster \
+             is asked to pull and proves nothing"
+        );
+        out
+    }
+
+    fn repo_of(reference: &str) -> String {
+        let last = reference.rfind('/').map_or(0, |i| i + 1);
+        match reference[last..].find(':') {
+            Some(colon) => reference[..last + colon].to_string(),
+            None => reference.to_string(),
+        }
+    }
+
+    fn tag_of(reference: &str) -> String {
+        reference[repo_of(reference).len()..]
+            .trim_start_matches(':')
+            .to_string()
+    }
+
+    /// Репозитории, которые собирает `Jenkinsfile`, по строкам `-t`.
+    fn jenkins_repos() -> BTreeSet<String> {
+        let jenkinsfile = read("Jenkinsfile");
+        let out: BTreeSet<String> = jenkinsfile
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter_map(|line| line.split("-t \"").nth(1))
+            // До закрывающей кавычки, и только то, что вообще может быть
+            // ссылкой на образ: `-t` встречается в этом файле и у `nsenter`,
+            // где за ним стоит pid.
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|reference| reference.contains('/') && reference.contains(':'))
+            .map(repo_of)
+            .collect();
+        assert!(
+            !out.is_empty(),
+            "no `docker build -t \"…\"` in the Jenkinsfile: this gate cannot see what the \
+             pipeline produces and proves nothing"
+        );
+        out
+    }
+
+    /// Три места называют образ, и все три обязаны называть один и тот же.
+    ///
+    /// Не подмножество, а равенство. Образ, который релиз публикует, а манифест
+    /// не ставит, — тег, который никто не тянет; образ, который манифест
+    /// ставит, а релиз не публикует, — `ImagePullBackOff` у получателя, зелёный
+    /// прогон у нас и молчание с обеих сторон.
+    #[test]
+    fn the_release_publishes_exactly_the_images_this_tree_installs() {
+        let published = published_repos();
+        let installed: BTreeSet<String> = deploy_images().iter().map(|i| repo_of(i)).collect();
+        let built = jenkins_repos();
+        assert_eq!(
+            published, installed,
+            "the images the release publishes and the images deploy/** installs are different \
+             sets. One of them is a reference nobody can resolve."
+        );
+        assert_eq!(
+            published, built,
+            "the images the release publishes and the images the Jenkinsfile builds are \
+             different sets: two pipelines producing two different products out of one tree"
+        );
+    }
+
+    /// Тег, который закрепляют манифесты, — тот, который релиз способен
+    /// выпустить.
+    ///
+    /// Это вторая половина замыкания образов, и раньше она была открыта по
+    /// причине, которой больше нет: ничто в дереве не публиковало, поэтому тег,
+    /// придуманный CI, жил в локальном сторе одного узла, а сравнивать его с
+    /// закреплённым в манифесте было не с чем. Теперь публикует релизный
+    /// воркфлоу, и публикует он имя git-тега, — значит вопрос «может ли этот
+    /// манифест вообще разрешиться» стал проверяемым.
+    ///
+    /// Чего этот тест по-прежнему **не** утверждает: что образ опубликован.
+    /// Воркфлоу в дереве — не запуск, ровно как `Jenkinsfile::<стадия>` в
+    /// границе не значит «зелено в CI». Здесь проверяется, что закреплённый тег
+    /// принадлежит множеству, которое релиз выпускает, а не что кто-то нажал
+    /// кнопку.
+    ///
+    /// `Jenkinsfile` при этом по-прежнему не публикует, и это отдельная
+    /// посылка: его `dev-$BUILD_NUMBER` — имена, живущие в локальном сторе
+    /// ноды, и манифест, закреплённый на таком имени, был бы дефектом, а не
+    /// починкой.
+    #[test]
+    fn the_tag_the_manifests_pin_is_one_the_release_can_publish() {
+        let jenkinsfile = read("Jenkinsfile");
+        assert!(
+            !jenkinsfile.contains("docker push") && !jenkinsfile.contains("docker image push"),
+            "a Jenkins stage now publishes an image. Its tags are `dev-$BUILD_NUMBER`, which no \
+             manifest can pin without being rewritten every build; if publication has moved \
+             there, the manifests and this gate have to move with it."
+        );
+
+        let workflow = workflow();
+        let triggers = workflow
+            .as_mapping()
+            .expect("workflow mapping")
+            .iter()
+            // `on` — булев литерал YAML 1.1, и разные парсеры дают разный ключ.
+            // Ключ ищется по написанию, а не по типу.
+            .find(|(key, _)| matches!(key, Value::Bool(true)) || key.as_str() == Some("on"))
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("{WORKFLOW} declares no `on:`"));
+        let patterns: Vec<String> = triggers
+            .get("push")
+            .and_then(|push| push.get("tags"))
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("{WORKFLOW} is not triggered by a tag push"))
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !patterns.is_empty(),
+            "{WORKFLOW}: the tag filter is empty, so this gate matches nothing and passes for it"
+        );
+
+        let script = step_script(job(&workflow, "publish"), "Publish ");
+        assert!(
+            script.contains(r#"tag="$GITHUB_REF_NAME""#),
+            "{WORKFLOW}: the publish step no longer tags with the git tag that triggered it. A \
+             tag the run invents is one no manifest can pin, which is the state this gate was \
+             written to leave."
+        );
+
+        for image in deploy_images() {
+            let tag = tag_of(&image);
+            assert!(
+                !tag.is_empty() && tag != "latest",
+                "{image} names a floating tag on the plane that decides admission: `latest` is \
+                 whatever was pushed last"
+            );
+            assert!(
+                patterns.iter().any(|pattern| tag_matches(pattern, &tag)),
+                "{image} pins the tag {tag:?}, and no trigger of {WORKFLOW} ({patterns:?}) \
+                 publishes it. The manifest asks the cluster for something this repository has \
+                 no way of producing."
+            );
+        }
+    }
+
+    /// Глоб-фильтр тегов GitHub Actions, в том объёме, который здесь нужен:
+    /// `*` — любая последовательность без `/`, `[…]` — класс символов, `+`
+    /// после класса — один символ класса или больше, всё прочее — литерал.
+    ///
+    /// Свой, а не regex-crate: `ferrum-testkit` не заводит зависимость ради
+    /// одного сравнения, объём замкнут, а сам сопоставитель проверен
+    /// `the_tag_filter_reader_accepts_and_refuses_the_right_tags`.
+    fn tag_matches(pattern: &str, tag: &str) -> bool {
+        fn in_class(class: &[u8], c: u8) -> bool {
+            let mut i = 0;
+            while i < class.len() {
+                if i + 2 < class.len() && class[i + 1] == b'-' {
+                    if c >= class[i] && c <= class[i + 2] {
+                        return true;
+                    }
+                    i += 3;
+                } else {
+                    if class[i] == c {
+                        return true;
+                    }
+                    i += 1;
+                }
+            }
+            false
+        }
+        fn go(pattern: &[u8], tag: &[u8]) -> bool {
+            let Some(head) = pattern.first().copied() else {
+                return tag.is_empty();
+            };
+            match head {
+                b'*' => (0..=tag.len()).any(|take| {
+                    tag[..take].iter().all(|c| *c != b'/') && go(&pattern[1..], &tag[take..])
+                }),
+                b'[' => {
+                    let Some(close) = pattern.iter().position(|c| *c == b']') else {
+                        return false;
+                    };
+                    let class = &pattern[1..close];
+                    let mut rest = &pattern[close + 1..];
+                    let mut most = 1;
+                    if rest.first() == Some(&b'+') {
+                        rest = &rest[1..];
+                        most = tag.len();
+                    }
+                    (1..=most).any(|take| {
+                        take <= tag.len()
+                            && tag[..take].iter().all(|c| in_class(class, *c))
+                            && go(rest, &tag[take..])
+                    })
+                }
+                literal => tag.first() == Some(&literal) && go(&pattern[1..], &tag[1..]),
+            }
+        }
+        go(pattern.as_bytes(), tag.as_bytes())
+    }
+
+    /// Читатель фильтра — на входах, ответ на которых известен.
+    ///
+    /// Без него «тег манифеста публикуется релизом» одинаково верно и для
+    /// сопоставителя, который говорит «да» на всё, а ровно такой получается из
+    /// опечатки в разборе класса.
+    #[test]
+    fn the_tag_filter_reader_accepts_and_refuses_the_right_tags() {
+        let semver = "v[0-9]+.[0-9]+.[0-9]+";
+        assert!(tag_matches(semver, "v0.1.0"));
+        assert!(tag_matches(semver, "v12.30.4"));
+        assert!(!tag_matches(semver, "v0.1"));
+        assert!(!tag_matches(semver, "0.1.0"));
+        assert!(!tag_matches(semver, "v0.1.0-rc1"));
+        assert!(!tag_matches(semver, "latest"));
+        assert!(tag_matches("v*", "v0.1.0"));
+        assert!(!tag_matches("v*", "w0.1.0"));
+        assert!(!tag_matches("v*", "v0.1/0"));
+    }
+
+    /// Каждый опубликованный образ подписан, и подпись стоит на digest.
+    ///
+    /// Подпись по тегу — это подпись под тем, что по этому тегу лежало в момент
+    /// подписи. Тег переставляется, и назавтра проверка проходит на другом
+    /// образе; digest — единственное имя, которое этого не умеет.
+    ///
+    /// SBOM здесь же и по той же причине: файл, приложенный к релизу, связан с
+    /// образом только словом того, кто его приложил. `cosign attest`
+    /// подписывает предикат той же идентичностью и цепляет его к digest, и
+    /// только эта половина проверяема на стороне получателя.
+    #[test]
+    fn every_published_image_is_signed_and_carries_an_attested_sbom() {
+        let workflow = workflow();
+        let script = step_script(job(&workflow, "publish"), "Publish ");
+        for required in [
+            r#"digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$tag")""#,
+            r#"cosign sign --yes "$digest""#,
+            r#"syft "$digest" -o "spdx-json=$sbom""#,
+            r#"cosign attest --yes --type spdxjson --predicate "$sbom" "$digest""#,
+        ] {
+            assert!(
+                script.contains(required),
+                "{WORKFLOW}: the publish step does not run `{required}`. An image published \
+                 without it is one the consumer cannot tell from any other image wearing the \
+                 same tag."
+            );
+        }
+        for line in script.lines().map(str::trim) {
+            if line.starts_with('#') {
+                continue;
+            }
+            for command in ["cosign sign", "cosign attest", "cosign verify", "syft "] {
+                assert!(
+                    !(line.starts_with(command) && line.contains("$image:$tag")),
+                    "{WORKFLOW}: `{line}` names the image by tag. A tag is repointable, so the \
+                     signature would outlive the bytes it was made over."
+                );
+            }
+        }
+
+        // Релиз несёт SBOM каждого образа, а не какого-нибудь. Проверяется
+        // числом, потому что «загрузили что нашли» — это ровно тот отказ,
+        // который выглядит успехом.
+        let count = job(&workflow, "publish")
+            .get("strategy")
+            .and_then(|strategy| strategy.get("matrix"))
+            .and_then(|matrix| matrix.get("include"))
+            .and_then(Value::as_sequence)
+            .expect("matrix include")
+            .len();
+        let release = step_script(job(&workflow, "release"), "Attach SBOMs");
+        assert!(
+            release.contains(&format!(r#"if [ "$count" -ne {count} ]; then"#)),
+            "{WORKFLOW}: the release step does not require exactly {count} SBOMs — one per \
+             published image. A release carrying two of three says nothing about the third, and \
+             nothing there would go red."
+        );
+    }
+
+    /// Подпись образа не берёт ключ ниоткуда, и в частности не берёт его у
+    /// подписи bundle.
+    ///
+    /// Домены разные по построению: bundle подписывается Ed25519-seed'ом в
+    /// контексте `BUNDLE_SIGNATURE_CONTEXT` и живёт в Secret кластера, образ —
+    /// эфемерным ключом Fulcio, выданным на один запуск под OIDC. Единственный
+    /// способ их смешать — завести в релизе долгоживущий ключ, поэтому здесь
+    /// проверяется отсутствие всякого `--key` и всякого имени, которым в этом
+    /// дереве зовут ключевой материал bundle.
+    ///
+    /// Отсутствие само по себе доказывает мало: его же даёт опечатка в списке.
+    /// Поэтому вторая половина — положительный контроль: `id-token: write`
+    /// обязан стоять (без него keyless не существует), а имена доменов обязаны
+    /// быть настоящими именами из `ferrum-crypto`.
+    #[test]
+    fn the_release_signs_keyless_and_never_touches_the_bundle_signing_domain() {
+        let workflow = workflow();
+        let permissions = job(&workflow, "publish")
+            .get("permissions")
+            .and_then(Value::as_mapping)
+            .unwrap_or_else(|| panic!("{WORKFLOW}: the publish job declares no permissions"));
+        for (key, expected) in [("id-token", "write"), ("packages", "write")] {
+            assert_eq!(
+                permissions.get(Value::from(key)).and_then(Value::as_str),
+                Some(expected),
+                "{WORKFLOW}: the publish job needs `{key}: {expected}` — without id-token there \
+                 is no OIDC token for Fulcio and no keyless signature at all"
+            );
+        }
+
+        for (source, domain) in [
+            (
+                "crates/ferrum-crypto/src/lib.rs",
+                "BUNDLE_SIGNATURE_CONTEXT",
+            ),
+            ("crates/ferrum-crypto/src/mtls.rs", "KEY_BIND_MSG"),
+        ] {
+            assert!(
+                read(source).contains(domain),
+                "{source} no longer names {domain}, so the check below forbids a string that \
+                 means nothing and proves nothing"
+            );
+        }
+
+        let text = read(WORKFLOW);
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            // Комментарии файла называют эти вещи затем, чтобы сказать, что их
+            // здесь нет.
+            if line.starts_with('#') {
+                continue;
+            }
+            let number = number + 1;
+            for forbidden in [
+                "COSIGN_PRIVATE_KEY",
+                "COSIGN_PASSWORD",
+                "cosign generate-key-pair",
+                "--key ",
+                "--seed-file",
+                "BUNDLE_SIGNATURE_CONTEXT",
+                "KEY_BIND_MSG",
+                "ferrumctl sign",
+            ] {
+                assert!(
+                    !line.contains(forbidden),
+                    "{WORKFLOW}:{number}: `{forbidden}`. The image domain signs with an \
+                     ephemeral Fulcio key that dies with the job; a long-lived key here is a \
+                     secret to store, rotate and lose, and if it is the bundle's, the key a \
+                     cluster trusts for policy is a key that lives in CI."
+                );
+            }
+        }
+    }
+
+    /// Ни один шаг релиза не может себя пропустить.
+    ///
+    /// Тот же запрет, что у публичного CI, и здесь он строже по последствиям:
+    /// шаг подписи, пропустивший себя, оставляет в ghcr неподписанный образ под
+    /// зелёным значком — ровно то, что получатель прочтёт как подписанное.
+    #[test]
+    fn no_step_in_the_release_workflow_can_skip_itself() {
+        let text = read(WORKFLOW);
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            let number = number + 1;
+            for softener in ["continue-on-error", "if:"] {
+                assert!(
+                    !line.starts_with(softener),
+                    "{WORKFLOW}:{number}: `{softener}` makes a red gate a green run"
+                );
+            }
+            assert!(
+                !line.contains("|| true"),
+                "{WORKFLOW}:{number}: `|| true` swallows the exit code the step is for"
+            );
+        }
+    }
+
+    /// Инструкция получателю — та же процедура, которую релиз исполняет на
+    /// себе.
+    ///
+    /// Инструкция расходится с воркфлоу молча: `cosign verify` с
+    /// идентичностью, которой Fulcio не выпишет, не проходит ни у кого, и
+    /// красным от этого не становится ничего. Поэтому идентичность в README
+    /// собирается здесь из пути файла воркфлоу и сверяется на равенство: файл
+    /// переименован — строка в README стала ложью, и это падение, а не вопрос
+    /// прилежания автора строки.
+    #[test]
+    fn the_documented_verification_is_the_one_the_release_performs() {
+        let readme = read(README);
+        let at = readme
+            .find(DELIVERY_HEADING)
+            .unwrap_or_else(|| panic!("{README} has no {DELIVERY_HEADING:?} section"));
+        let section = &readme[at..];
+        let section = match section[DELIVERY_HEADING.len()..].find("\n## ") {
+            Some(end) => &section[..DELIVERY_HEADING.len() + end],
+            None => section,
+        };
+
+        let identity = format!("https://github.com/onixus/Ferrum/{WORKFLOW}@refs/tags/$TAG");
+        assert!(
+            section.contains(&identity),
+            "{README} § {DELIVERY_HEADING} does not tell the consumer to verify against \
+             {identity:?}. That string is the subject Fulcio puts in the certificate for this \
+             workflow; any other one either fails for everybody or accepts a signature made by \
+             something else."
+        );
+        assert!(
+            section.contains(ISSUER),
+            "{README} § {DELIVERY_HEADING} names no OIDC issuer. Without \
+             --certificate-oidc-issuer the identity above can be asserted by any provider."
+        );
+        for command in [
+            "cosign verify",
+            "cosign verify-attestation --type spdxjson",
+            "cargo audit bin",
+        ] {
+            assert!(
+                section.contains(command),
+                "{README} § {DELIVERY_HEADING} does not document `{command}`, which is half of \
+                 what the release produces: a signature nobody is told to check is not delivery"
+            );
+        }
+
+        // Тег в инструкции — тот, который закреплён в манифестах. Иначе
+        // получатель проверяет один образ, а ставит другой.
+        let pinned: BTreeSet<String> = deploy_images().iter().map(|i| tag_of(i)).collect();
+        assert_eq!(
+            pinned.len(),
+            1,
+            "deploy/** pins more than one tag ({pinned:?}); the README procedure names one"
+        );
+        let pinned = pinned.into_iter().next().expect("one tag");
+        assert!(
+            section.contains(&format!("TAG={pinned}")),
+            "{README} § {DELIVERY_HEADING} does not set TAG={pinned}, the tag deploy/** pins. A \
+             procedure verifying one tag while the manifests install another checks an image the \
+             cluster will not run."
+        );
+        for repo in published_repos() {
+            assert!(
+                section.contains(&repo),
+                "{README} § {DELIVERY_HEADING} says nothing about {repo}, which the release \
+                 publishes. An image with no documented verification ships unverified."
+            );
+        }
+    }
+
+    /// Бинарь в каждом образе несёт список своих зависимостей.
+    ///
+    /// Образ на `scratch` — это один статический ELF, и SBOM по нему без
+    /// `cargo-auditable` перечисляет ровно ничего: syft видит файл и не видит
+    /// ни одного crate. Такой SBOM хуже отсутствующего — он приложен к релизу и
+    /// читается как ответ на вопрос «что внутри».
+    ///
+    /// Обе половины: линкует `cargo auditable build`, и получившийся бинарь
+    /// проверен на секцию `.dep-v0` в том же Dockerfile. Первая — намерение,
+    /// вторая — результат, и без второй тихо проходит любая сборка, из которой
+    /// инструмент выпал.
+    #[test]
+    fn every_shipped_binary_carries_the_dependency_list_its_sbom_is_made_of() {
+        for (dockerfile, binary) in [
+            ("Dockerfile", "ferrum-agent"),
+            ("Dockerfile.admission", "ferrum-admission"),
+            ("Dockerfile.controller", "ferrum-controller"),
+        ] {
+            let text = read(dockerfile);
+            assert!(
+                text.contains("cargo auditable build --release --locked"),
+                "{dockerfile} links with plain `cargo build`: the binary it ships carries no \
+                 dependency list, and the SBOM of the image would list no crate at all"
+            );
+            assert!(
+                !text.contains("    cargo build --release --locked"),
+                "{dockerfile} still carries a plain `cargo build --release --locked` line; the \
+                 binary that reaches the image must be the auditable one"
+            );
+            assert!(
+                text.contains(&format!("readelf -SW /{binary} | grep -q '\\.dep-v0'")),
+                "{dockerfile} does not check /{binary} for the .dep-v0 section. The cargo line \
+                 above is an intention; this is the only place the result is visible."
+            );
+            assert!(
+                text.contains(
+                    "cargo install --locked \"cargo-auditable@${CARGO_AUDITABLE_VERSION}\""
+                ),
+                "{dockerfile} installs cargo-auditable without a pinned version, in a file whose \
+                 whole subject is provenance"
             );
         }
     }

@@ -166,8 +166,109 @@ hostPID без respond, спроецированный токен под apiserv
 `ferrumctl gen-webhook-pki`, ротация — под тем же CA, которому кластер уже
 доверяет.
 
-Образы: `Dockerfile`, `Dockerfile.admission`, `Dockerfile.controller`. Ни один
-из них ни разу не собирался — демона здесь нет.
+Образы: `Dockerfile`, `Dockerfile.admission`, `Dockerfile.controller`. Собираются
+они в каждом билде на ноде локального Jenkins, а публикуются — релизным
+воркфлоу по тегу; чем именно и как это проверить, ниже.
+
+## Поставка
+
+Образы едут в `ghcr.io/onixus/` релизным воркфлоу
+[.github/workflows/release.yml](.github/workflows/release.yml) — по git-тегу
+вида `v0.1.0`, то есть по тому самому тегу, который закрепляют манифесты
+`deploy/**`. Три образа, каждый подписан cosign и несёт аттестованный SBOM:
+
+- `ghcr.io/onixus/ferrum-agent`
+- `ghcr.io/onixus/ferrum-admission`
+- `ghcr.io/onixus/ferrum-controller`
+
+Подпись keyless: ключа нет ни в дереве, ни в секретах репозитория. Fulcio
+выписывает сертификат на один запуск под OIDC-токен GitHub, приватная половина
+умирает вместе с job, факт подписи уходит в Rekor. Проверяется не «ключ, который
+мы вам дали», а идентичность — этот воркфлоу, этот репозиторий, этот тег.
+
+Это **другой домен подписи**, чем у PolicyBundle, и путать их нельзя. Bundle
+подписывается Ed25519-seed'ом из Secret, который монтирует контроллер, в
+контексте `BUNDLE_SIGNATURE_CONTEXT`; в CI этот ключ не попадает ни в каком
+виде, и ни один ключ между доменами не переиспользуется. Проверка подписи образа
+не заменяет проверку подписи bundle: первая говорит, откуда взялся бинарь,
+вторая — откуда взялась политика, которую он исполняет.
+
+SBOM считается `syft` по **опубликованному образу**, а не по дереву. Образ
+собран на `scratch` и несёт один статический бинарь, поэтому список зависимостей
+внутри него берётся не из репозитория: бинарь слинкован `cargo-auditable`, и
+`.dep-v0` в нём проверяется той же сборкой, которая его кладёт в образ. Тот же
+SBOM прикладывается к GitHub Release файлом — но файл рядом с релизом не
+доказательство, доказательство здесь аттестация.
+
+### Проверка на стороне получателя
+
+Нужны [cosign](https://github.com/sigstore/cosign) ≥ 3.1, `jq`, и для последнего
+шага `cargo install cargo-audit`.
+
+```bash
+TAG=v0.1.0
+IMAGE=ghcr.io/onixus/ferrum-agent   # то же для ferrum-admission и ferrum-controller
+IDENTITY="https://github.com/onixus/Ferrum/.github/workflows/release.yml@refs/tags/$TAG"
+ISSUER=https://token.actions.githubusercontent.com
+```
+
+**1. Подпись и происхождение.** Команда падает, если образ подписан не этим
+воркфлоу, не в этом репозитории, не на этом теге — или не подписан вовсе:
+
+```bash
+cosign verify \
+    --certificate-identity "$IDENTITY" \
+    --certificate-oidc-issuer "$ISSUER" \
+    "$IMAGE:$TAG"
+```
+
+**2. Digest, который подписан.** Тег переставляется, digest — нет. Подписан
+digest, и в кластер надо ставить его, а не тег:
+
+```bash
+DIGEST=$(cosign verify \
+    --certificate-identity "$IDENTITY" \
+    --certificate-oidc-issuer "$ISSUER" \
+    "$IMAGE:$TAG" 2>/dev/null \
+  | jq -r '.[0].critical.image."docker-manifest-digest"')
+echo "$IMAGE@$DIGEST"
+```
+
+**3. SBOM.** Аттестация подписана той же идентичностью и прикреплена к digest,
+поэтому проверяется, а не принимается на слово:
+
+```bash
+cosign verify-attestation --type spdxjson \
+    --certificate-identity "$IDENTITY" \
+    --certificate-oidc-issuer "$ISSUER" \
+    "$IMAGE@$DIGEST" \
+  | jq -r '.payload' | base64 -d | jq '.predicate' > sbom.spdx.json
+```
+
+**4. Что внутри бинаря — из самого бинаря.** Ответ берётся из артефакта, а не из
+репозитория, которому получатель ещё ничего не должен:
+
+```bash
+docker create --name ferrum-check "$IMAGE@$DIGEST"
+docker cp ferrum-check:/usr/local/bin/ferrum-agent ./ferrum-agent
+docker rm ferrum-check
+cargo audit bin ./ferrum-agent
+```
+
+Расхождение README с тем, что воркфлоу делает на самом деле, — тихий отказ:
+инструкция с идентичностью, которой Fulcio не выпишет, не пройдёт ни у кого, и
+красным от этого не станет ничего. Поэтому идентичность, издатель, тег и имена
+образов сверяются с файлом воркфлоу гейтом
+`deploy_gate.rs::the_documented_verification_is_the_one_the_release_performs`, а
+сам релиз исполняет команды **1** и **3** на только что подписанном образе,
+прежде чем закончить.
+
+**Ни один из этих образов ещё не опубликован.** Воркфлоу на GitHub не запускался
+ни разу, в `ghcr.io/onixus/` нет ни одного тега, и ни одна команда выше ещё не
+проходила против настоящего опубликованного артефакта. Пока это так, раздел
+описывает процедуру, а не свидетельствует о ней; в
+[границе](docs/MVP-1-BOUNDARY.md) строки «опубликовано» и «подписано» нет и до
+первого настоящего релиза не будет.
 
 ## Документы
 
