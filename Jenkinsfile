@@ -1447,6 +1447,70 @@ pipeline {
                     '''
                 }
             }
+
+            // Пины: единственное место, где что-то из этого дерева переживает
+            // процесс, который его загрузил.
+            //
+            // До этого цикла строка Tampering из RFC-02 §C была пуста целиком:
+            // `Loader::attach_pins` возвращал `Degraded` по построению, ничего
+            // не пиналось, и потому не существовало объекта, который LSM мог
+            // бы защищать, а watcher — не досчитаться. Пины идут первыми,
+            // потому что две другие контрмеры — про них.
+            //
+            // bpffs монтируется приватно, в mount namespace сборочного
+            // контейнера, тем же одноразовым привилегированным контейнером,
+            // что монтирует tracefs и перемонтирует cgroup. Не bind хостового
+            // `/sys/fs/bpf`: пин, поставленный туда, пережил бы не только
+            // процесс, но и билд, и остался бы на узле висеть программой,
+            // которой никто не владеет. Здесь он умирает вместе с контейнером.
+            //
+            // Стадия требует строку-доказательство, а не только ненулевой
+            // счётчик passed: она печатается лишь после того, как пин был
+            // переоткрыт при уже уничтоженном handle, то есть с дальнего конца
+            // того единственного утверждения, ради которого стадия есть.
+            stage('BPF pins') {
+                steps {
+                    writeFile file: '.datapath-pins.sh', text: '''
+                        set -eu
+                        elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
+                        test -f "$elf"
+                        out=/tmp/ferrum-attach-pins.out
+                        if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
+                            FERRUM_BPF_PIN_ROOT=/run/ferrum-bpffs \
+                            cargo test -p ferrum-ebpf --features attach \
+                            --test attach_pins -- --show-output > "$out" 2>&1
+                        then
+                            cat "$out"
+                            exit 1
+                        fi
+                        cat "$out"
+                        if ! grep -q "pins outlived the handle:" "$out"; then
+                            echo "BPF pins passed without printing the line a test emits only after re-opening a pin with the handle dropped: nothing here proved a pin outlived anything" >&2
+                            exit 1
+                        fi
+                        if ! grep -q "^test result: ok[.] 3 passed" "$out"; then
+                            echo "BPF pins did not run all three kernel tests; a filtered or ignored one leaves a refusal path unmeasured" >&2
+                            exit 1
+                        fi
+                    '''
+                    sh '''
+                        set -eu
+                        cid=$(cat .datapath-cid)
+                        pid=$(docker inspect -f '{{.State.Pid}}' "$cid")
+                        docker exec "$cid" mkdir -p /run/ferrum-bpffs
+                        docker run --rm --privileged --pid=host alpine:3 \
+                            nsenter -t "$pid" -m -- sh -c \
+                            'mountpoint -q /run/ferrum-bpffs || mount -t bpf bpffs /run/ferrum-bpffs'
+                        docker exec "$cid" sh -c \
+                            'grep -q " - bpf bpffs " /proc/self/mountinfo || { echo "bpffs is not mounted in the datapath container" >&2; exit 1; }'
+                        docker exec -w "$WORKSPACE" \
+                            -e CARGO_TARGET_DIR=/build-target \
+                            -e CARGO_TERM_COLOR=never \
+                            -e CARGO_INSTALL_ROOT=/cargo-tools \
+                            "$cid" sh .datapath-pins.sh
+                    '''
+                }
+            }
             }
             post {
                 always {
