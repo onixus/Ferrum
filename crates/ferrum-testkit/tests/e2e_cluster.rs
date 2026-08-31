@@ -691,6 +691,160 @@ mod gate {
     ///
     /// `--dry-run=server` rather than a plain apply so this stays a question
     /// and not a second install.
+    /// A cluster-scoped object the policy does not deny is created, and one it
+    /// denies is refused for the policy's reason.
+    ///
+    /// This is issue #17's finding decided by a real API server. On the running
+    /// webhook, `kubectl apply` of any ClusterRoleBinding came back with
+    /// `namespace selector is set but namespace labels were never observed;
+    /// fail closed` — FERRUM refusing the RBAC of its own re-install, over
+    /// labels a cluster-scoped object cannot have. `webhook.rs` holds the same
+    /// claim in-process; what only an API server can add is that the review
+    /// really arrives here at all: `namespaceSelector` on the webhook
+    /// configuration excludes `ferrum` and `kube-system`, and it is easy to
+    /// assume that exempts cluster-scoped objects too. It does not — the API
+    /// server does not apply namespaceSelector to them — and that assumption is
+    /// exactly what this pair of applies refutes.
+    ///
+    /// Both halves, because either alone is passable by a broken webhook: one
+    /// that allows everything passes the first, one that denies everything
+    /// passes the second.
+    #[test]
+    fn a_cluster_scoped_object_reaches_the_webhook_and_is_decided_by_the_policy() {
+        let _lock = serialized();
+        install();
+
+        let benign = "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\n\
+                      metadata:\n  name: ferrum-e2e-benign-bind\nroleRef:\n  \
+                      apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  name: view\n\
+                      subjects:\n  - kind: ServiceAccount\n    name: default\n    \
+                      namespace: default\n";
+        let path = scratch_file("crb-benign.yaml", benign);
+        kubectl(&[
+            "delete",
+            "clusterrolebinding",
+            "ferrum-e2e-benign-bind",
+            "--ignore-not-found",
+        ]);
+        let run = kubectl(&["apply", "-f", path.to_str().expect("utf-8 path")]);
+        assert!(
+            run.ok(),
+            "the webhook refused a ClusterRoleBinding the policy does not deny. A cluster-scoped \
+             object has no namespace whose labels a selector could read, and asking a label \
+             cache about it is how this webhook came to refuse the RBAC of its own \
+             install:\n{}",
+            run.output()
+        );
+        kubectl(&[
+            "delete",
+            "clusterrolebinding",
+            "ferrum-e2e-benign-bind",
+            "--ignore-not-found",
+        ]);
+
+        let admin = "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\n\
+                     metadata:\n  name: ferrum-e2e-admin-bind\nroleRef:\n  \
+                     apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n  \
+                     name: cluster-admin\nsubjects:\n  - kind: ServiceAccount\n    \
+                     name: default\n    namespace: default\n";
+        let path = scratch_file("crb-admin.yaml", admin);
+        kubectl(&[
+            "delete",
+            "clusterrolebinding",
+            "ferrum-e2e-admin-bind",
+            "--ignore-not-found",
+        ]);
+        let run = kubectl(&["apply", "-f", path.to_str().expect("utf-8 path")]);
+        assert_denied_by_ferrum(&run, "cluster-admin bind");
+    }
+
+    /// The webhook is a pair, and the cluster refuses to have both taken at
+    /// once.
+    ///
+    /// `deploy_gate.rs::the_webhook_is_a_pair_that_a_drain_cannot_take_at_once`
+    /// reads the two manifests and checks the arithmetic; what it cannot do is
+    /// establish that the API server honours it, and a PodDisruptionBudget
+    /// whose selector or scale subresource is wrong is applied, listed, and
+    /// enforces nothing. So: evict one replica through the eviction API — the
+    /// same call `kubectl drain` makes — and require the second eviction to be
+    /// refused.
+    ///
+    /// The first eviction is not cleanup that happens to be a test: without it
+    /// the second could be refused for any reason at all, including a budget
+    /// that refuses everything, which is the other failure mode and is a node
+    /// drain that hangs forever.
+    #[test]
+    fn the_second_eviction_of_the_webhook_pair_is_refused_by_the_disruption_budget() {
+        let _lock = serialized();
+        install();
+        admission_pod_set_settled();
+
+        let pods: Vec<String> = kubectl_ok(&[
+            "-n",
+            "ferrum",
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=ferrum-admission",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name}\n{end}",
+        ])
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+        assert!(
+            pods.len() >= 2,
+            "the webhook is running {} replica(s); a disruption budget over one replica is not \
+             the claim this file makes and cannot be tested by evicting anything",
+            pods.len()
+        );
+
+        let evict = |pod: &str| -> Run {
+            let body = format!(
+                "{{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\"metadata\":\
+                 {{\"name\":\"{pod}\",\"namespace\":\"ferrum\"}}}}"
+            );
+            let path = scratch_file(&format!("eviction-{pod}.json"), &body);
+            kubectl(&[
+                "create",
+                "-f",
+                path.to_str().expect("utf-8 path"),
+                "--raw",
+                &format!("/api/v1/namespaces/ferrum/pods/{pod}/eviction"),
+            ])
+        };
+
+        let first = evict(&pods[0]);
+        assert!(
+            first.ok(),
+            "the eviction API refused the *first* replica: the budget permits no voluntary \
+             disruption at all, so a node drain hangs on this object forever — which is a worse \
+             outage than the one it exists to prevent:\n{}",
+            first.output()
+        );
+        let second = evict(&pods[1]);
+        assert!(
+            !second.ok(),
+            "the eviction API took the second replica too. With failurePolicy=Fail that is one \
+             `kubectl drain` between a cluster and a full admission outage, and the \
+             PodDisruptionBudget this tree ships did not stop it:\n{}",
+            second.output()
+        );
+        assert!(
+            second.output().contains("disruption budget"),
+            "the second eviction failed, but not on the disruption budget — so this run says \
+             nothing about the budget:\n{}",
+            second.output()
+        );
+
+        // Leave the pair whole for whichever case runs next.
+        rollout_ready("deployment/ferrum-admission");
+        admission_pod_set_settled();
+    }
+
     #[test]
     fn the_shipped_crds_are_accepted_by_a_real_apiserver() {
         let _lock = serialized();

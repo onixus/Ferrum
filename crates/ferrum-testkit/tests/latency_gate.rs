@@ -385,11 +385,18 @@ fn the_budget_is_a_boundary_the_shipped_histogram_can_decide() {
     // relaxation of the claim: if it ever became the smaller of the two, a
     // release run would be held to the looser number and the product's own
     // claim would be the one nothing checks.
+    // Through locals: the comparison is between two constants, and clippy
+    // refuses an assertion it can fold away. Folding it away is precisely what
+    // must not happen — the point is that a later edit to either number fails
+    // here rather than quietly reordering the two.
+    let (debug, release) = (
+        REVIEW_LATENCY_BUDGET_DEBUG_SECONDS,
+        REVIEW_LATENCY_BUDGET_SECONDS,
+    );
     assert!(
-        REVIEW_LATENCY_BUDGET_DEBUG_SECONDS > REVIEW_LATENCY_BUDGET_SECONDS,
-        "the debug budget ({REVIEW_LATENCY_BUDGET_DEBUG_SECONDS}) is not looser than the release \
-         budget ({REVIEW_LATENCY_BUDGET_SECONDS}), so the two numbers no longer mean what their \
-         names say"
+        debug > release,
+        "the debug budget ({debug}) is not looser than the release budget ({release}), so the \
+         two numbers no longer mean what their names say"
     );
     assert_eq!(
         review_latency_budget_seconds(),

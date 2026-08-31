@@ -5106,8 +5106,8 @@ mod high_availability {
 
     fn read(rel: &str) -> Value {
         let path = repo_root().join(rel);
-        let text =
-            std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
         serde_yaml::from_str(&text).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
     }
 

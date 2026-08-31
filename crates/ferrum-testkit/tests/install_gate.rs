@@ -36,14 +36,18 @@
 //! Freshness is checked, not hoped for: an existing `ferrum` namespace, an
 //! existing `ferrum.io` CRD or an existing `ferrum-admission`
 //! ValidatingWebhookConfiguration is a failure before anything is applied. That
-//! is not tidiness. A cluster that already carries this product carries its
-//! webhook, and with `failurePolicy: Fail` that webhook refuses the
-//! ClusterRoleBindings of its own install — the label cache is asked about the
-//! empty namespace of a cluster-scoped object, has never observed it, and fails
-//! closed. Re-installing over a running FERRUM is a real defect and it is named
-//! in `deploy/README`; what it must not do is decide the verdict of this file
-//! by making the cluster it ran against a different cluster from the one the
-//! claim is about.
+//! is not tidiness: this file's whole claim is about a cluster that has never
+//! seen FERRUM, and a half-installed one would decide the verdict by being a
+//! different cluster from the one the claim is about.
+//!
+//! One reason for it is gone, and it is worth saying which. Until issue #20 a
+//! cluster carrying the applied webhook refused the ClusterRoleBindings of its
+//! own install: the label cache was asked about the empty namespace of a
+//! cluster-scoped object, had never observed it, and failed closed. That is
+//! fixed (`eval.rs::cluster_scoped_kind`), so re-applying over a running FERRUM
+//! is no longer refused for that reason — but freshness is still required here,
+//! because "it installs" and "it re-applies" are two claims and this file makes
+//! the first.
 //!
 //! Its own context and not `FERRUM_E2E_CONTEXT` for that same reason: the
 //! cluster `e2e_cluster.rs` leaves behind has a webhook on it, and pointing
