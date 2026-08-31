@@ -696,12 +696,14 @@ dependencies = [
  "chrono",
  "clap",
  "ferrum-api",
+ "ferrum-breakglass",
  "ferrum-compiler",
  "ferrum-crypto",
  "ferrum-ids",
  "ferrum-policy",
  "ferrum-testkit",
  "serde",
+ "serde_json",
  "serde_yaml",
 ]
 

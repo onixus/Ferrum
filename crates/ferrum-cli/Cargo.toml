@@ -19,6 +19,9 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 ferrum-api.workspace = true
+# The two break-glass operations an operator performs by hand: signing a grant
+# in its own domain, and verifying somebody's journal chain.
+ferrum-breakglass.workspace = true
 ferrum-compiler.workspace = true
 # The only crate that turns on x509: issuance stays off the admission/agent
 # dependency graph.
@@ -26,6 +29,7 @@ ferrum-crypto = { workspace = true, features = ["x509"] }
 ferrum-ids.workspace = true
 ferrum-policy.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde_yaml.workspace = true
 
 [dev-dependencies]

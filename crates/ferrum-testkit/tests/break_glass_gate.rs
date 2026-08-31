@@ -588,23 +588,21 @@ fn no_default_install_arms_break_glass() {
 /// change with none of the review a policy change gets.
 #[test]
 fn a_break_glass_window_is_bounded_and_tighter_than_a_waiver() {
-    const NINETY_DAYS: i64 = 90 * 24 * 60 * 60;
+    // The waiver ceiling is read from where it is enforced, not restated: this
+    // comparison is between two constants of the tree, and a literal here
+    // would keep passing after one of them moved.
+    let waiver = Duration::days(
+        i64::try_from(ferrum_policy::MAX_EXCEPTION_DAYS).expect("exception ceiling fits in i64"),
+    );
+    let ceiling = Duration::seconds(MAX_GRANT_SECONDS);
     assert!(
-        MAX_GRANT_SECONDS < NINETY_DAYS,
-        "the break-glass ceiling ({MAX_GRANT_SECONDS}s) is not tighter than the exception \
-         ceiling ({NINETY_DAYS}s)"
+        ceiling < waiver,
+        "the break-glass ceiling ({ceiling}) is not tighter than the exception ceiling ({waiver})"
     );
     assert!(
-        MAX_GRANT_SECONDS <= 4 * 60 * 60,
+        ceiling <= Duration::hours(4),
         "the break-glass ceiling grew past four hours; the runbook says four hours and an \
          operator plans a handover around it"
-    );
-    // The invariant the policy layer states for a waiver, quoted from where it
-    // is enforced, so this comparison is against the tree and not a literal.
-    let policy = read("crates/ferrum-policy/src/lib.rs");
-    assert!(
-        policy.contains("90"),
-        "ferrum-policy no longer carries the 90-day exception ceiling this is compared against"
     );
     let runbook = read(RUNBOOK);
     assert!(
@@ -869,6 +867,100 @@ fn a_grant_stops_suspending_when_its_window_closes_with_nothing_reloaded() {
         "the journal does not record the window closing: {events:?}"
     );
     let _ = std::fs::remove_dir_all(&mount);
+}
+
+/// The two operations the runbook tells an operator to perform with
+/// `ferrumctl` exist, work, and are the same code the webhook trusts.
+///
+/// Without them the mechanism is described rather than shipped: the runbook
+/// would say «подпись — Ed25519 над BREAK-GLASS-доменом» and leave the person
+/// at 03:00 to write it, and the tamper-evidence of the chain would be a
+/// property nobody outside this repository could check. So both halves are
+/// driven here, through the CLI's own functions rather than a copy of them,
+/// and the signature produced is fed to a real `BreakGlass`.
+#[test]
+fn the_two_break_glass_operations_the_runbook_names_are_shipped_and_work() {
+    let dir = tmp("cli");
+    let seed = dir.join("break-glass.seed");
+    std::fs::write(&seed, hex(&BREAK_GLASS_SK)).expect("seed");
+
+    // 1. An over-long window is refused at the keyboard, not in the cluster.
+    let now = Utc::now();
+    let mut grant = Grant {
+        schema: GRANT_SCHEMA.into(),
+        schema_version: GRANT_SCHEMA_VERSION.into(),
+        id: "bg-cli-1".into(),
+        scope: SCOPE_ADMISSION.into(),
+        subject: "sre-oncall@example.test".into(),
+        issuer: "sec-arch@example.test".into(),
+        ticket: "INC-4471".into(),
+        reason: "signed by the shipped tool".into(),
+        issued_at: now - Duration::seconds(30),
+        expires_at: now + Duration::seconds(MAX_GRANT_SECONDS),
+    };
+    let path = dir.join("grant.json");
+    let sig_path = dir.join("grant.sig");
+    std::fs::write(&path, serde_json::to_vec(&grant).expect("json")).expect("grant");
+    let err = ferrum_cli::break_glass::sign_grant(&path, &seed, &sig_path)
+        .expect_err("a window longer than the ceiling was signed");
+    assert!(
+        err.to_string().contains(&MAX_GRANT_SECONDS.to_string()),
+        "the refusal does not say which rule was broken: {err:#}"
+    );
+
+    // 2. A legal grant signs, and the signature is one the webhook accepts.
+    grant.expires_at = now + Duration::minutes(30);
+    std::fs::write(&path, serde_json::to_vec(&grant).expect("json")).expect("grant");
+    ferrum_cli::break_glass::sign_grant(&path, &seed, &sig_path).expect("sign");
+
+    let mount = dir.join("mount");
+    std::fs::create_dir_all(&mount).expect("mount");
+    std::fs::copy(&path, mount.join(GRANT_FILE)).expect("grant.json");
+    std::fs::copy(&sig_path, mount.join(SIGNATURE_FILE)).expect("grant.sig");
+    let journal_path = dir.join("break-glass.jsonl");
+    let pk = public_key_from_secret(&BREAK_GLASS_SK).expect("pk");
+    let bg = BreakGlass::arm(&mount, &journal_path, pk, "ferrum-admission/gate").expect("arm");
+    bg.poll(Utc::now());
+    assert!(
+        bg.active(Utc::now()).is_some(),
+        "the webhook refused a grant the shipped signer produced: the tool and the verifier \
+         disagree about the domain or the bytes"
+    );
+
+    // 3. The verifier reads a real chain, and refuses an edited one.
+    ferrum_cli::break_glass::verify_journal(&journal_path).expect("the real chain verifies");
+    let text = std::fs::read_to_string(&journal_path).expect("read");
+    let edited = dir.join("edited.jsonl");
+    let tampered = text.replace("sre-oncall@example.test", "somebodyelse@example.test");
+    assert_ne!(tampered, text, "the edit matched nothing");
+    std::fs::write(&edited, tampered).expect("write");
+    assert!(
+        ferrum_cli::break_glass::verify_journal(&edited).is_err(),
+        "the shipped verifier accepted an edited chain"
+    );
+
+    // 4. And the one edit it cannot see, asserted as such rather than left to
+    //    be discovered during an incident: a truncated tail verifies, which is
+    //    exactly why the runbook tells an operator to compare the head against
+    //    a copy kept off the node.
+    let truncated = dir.join("truncated.jsonl");
+    std::fs::write(&truncated, "").expect("write");
+    ferrum_cli::break_glass::verify_journal(&truncated)
+        .expect("an empty chain is a legal chain and says so");
+    let runbook = read(RUNBOOK);
+    assert!(
+        runbook.contains("обрезанный хвост") || runbook.contains("Обрезанный хвост"),
+        "{RUNBOOK} does not name the one tamper the chain cannot see, so an operator would \
+         believe the chain covers it"
+    );
+    for command in ["ferrumctl sign-break-glass", "ferrumctl verify-journal"] {
+        assert!(
+            runbook.contains(command),
+            "{RUNBOOK} does not tell an operator to run `{command}`, which is the only shipped \
+             way to do the step it describes"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A grant signed by a key this deployment does not trust changes nothing, and
