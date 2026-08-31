@@ -630,6 +630,7 @@ dependencies = [
  "ferrum-crypto",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-metrics",
  "ferrum-policy",
  "ferrum-wasm-abi",
  "ferrum-wasm-host",

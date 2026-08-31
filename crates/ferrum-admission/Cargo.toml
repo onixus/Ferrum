@@ -14,6 +14,10 @@ ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ids.workspace = true
 ferrum-policy.workspace = true
+# Prometheus text rendering plus the read-only GET listener behind
+# `--metrics-listen`. No dependencies of its own, and no second HTTP stack:
+# this is std::net, like the webhook server beside it.
+ferrum-metrics.workspace = true
 # Same decision the agent's envelope parser makes, on the same signed slot: a
 # wasm module this binary has no executor for must not load. Graph is
 # ferrum-common; there is no wasm runtime in this tree to pull in.

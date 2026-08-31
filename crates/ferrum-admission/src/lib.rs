@@ -10,6 +10,7 @@ mod bundle;
 mod encoding;
 mod eval;
 mod labels;
+mod metrics;
 mod program;
 mod review;
 mod server;
@@ -37,6 +38,7 @@ pub use labels::WatchedLabels;
 pub use labels::{
     ClusterLabels, ColdLabels, LabelSource, LabelWarmth, LabelWarmthCheck, StaticLabels,
 };
+pub use metrics::{exposition, metrics_text, spawn_metrics};
 pub use program::{parse_program, AdmissionProgram, ADMISSION_ABI, ADMISSION_MAGIC};
 pub use review::{handle_review_bytes, ReviewConfig, ReviewReply};
 pub use server::{poll_bundle_file, poll_exceptions_file, serve, serve_listener, WebhookState};

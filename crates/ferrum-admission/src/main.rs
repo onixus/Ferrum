@@ -27,7 +27,7 @@ fn cmd_eval(args: &[String]) {
     if args.len() != 3 {
         eprintln!("usage: ferrum-admission <program.fadm> <subject.json>");
         eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <exceptions.fsig> --policy-name <name>] <admissionreview.json>");
-        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000] [--apiserver [host:port]] [--cluster-label k=v]");
+        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000] [--apiserver [host:port]] [--cluster-label k=v] [--metrics-listen 0.0.0.0:9102]");
         eprintln!("missing or invalid compiled program denies the request (fail closed)");
         exit(2);
     }
@@ -184,6 +184,25 @@ fn cmd_serve(args: &[String]) {
             exit(2);
         }
     };
+    // Bound before the accept loop starts and before anything reports itself
+    // as serving: a metrics port that cannot be bound must be a startup error
+    // an operator sees, not a scrape target that silently never appears.
+    let metrics_listener = match flags.get("metrics-listen").filter(|s| !s.is_empty()) {
+        Some(addr) => match std::net::TcpListener::bind(addr) {
+            Ok(listener) => {
+                eprintln!(
+                    "ferrum-admission: metrics on {addr}{}",
+                    ferrum_metrics::METRICS_PATH
+                );
+                Some(listener)
+            }
+            Err(err) => {
+                eprintln!("error: bind --metrics-listen {addr}: {err}");
+                exit(2);
+            }
+        },
+        None => None,
+    };
     eprintln!("ferrum-admission listening on {listen}");
     poll_bundle_file(
         watch_path,
@@ -195,6 +214,9 @@ fn cmd_serve(args: &[String]) {
     }
     if let Some(source) = &tls {
         poll_serving_cert(Arc::clone(source), Duration::from_millis(reload_ms));
+    }
+    if let Some(listener) = metrics_listener {
+        ferrum_admission::spawn_metrics(listener, Arc::clone(&state));
     }
     if let Err(err) = serve_listener(listener, state, tls) {
         eprintln!("error: serve: {err}");

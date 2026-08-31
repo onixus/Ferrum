@@ -34,6 +34,21 @@ pub struct WebhookState {
     exceptions_cleared: std::sync::atomic::AtomicU64,
     bundle_unreadable: std::sync::atomic::AtomicU64,
     bundle_absent: std::sync::atomic::AtomicU64,
+    /// The digest of the program in force, kept rather than returned and
+    /// dropped. Until this field existed the process knew which bundle it had
+    /// verified for exactly as long as the `try_reload` call frame lived, and
+    /// nothing outside could ask. It is the label on `ferrum_admission_bundle_info`
+    /// and the only way to tell a fleet mid-rollout from one that is done.
+    bundle_digest: RwLock<Option<Digest>>,
+    /// Latency of `handle`, from the first byte of the body to the reply.
+    ///
+    /// Measured here and not in `serve_http`, deliberately: this is the span
+    /// the API server is blocked on *inside this process*, with the socket and
+    /// the TLS handshake outside it. A budget stated against a number that
+    /// includes the network is a budget nobody can act on.
+    review_seconds: ferrum_metrics::Histogram,
+    reviews_allowed: std::sync::atomic::AtomicU64,
+    reviews_denied: std::sync::atomic::AtomicU64,
     config: ReviewConfig,
 }
 
@@ -52,12 +67,22 @@ impl WebhookState {
             exceptions_cleared: std::sync::atomic::AtomicU64::new(0),
             bundle_unreadable: std::sync::atomic::AtomicU64::new(0),
             bundle_absent: std::sync::atomic::AtomicU64::new(0),
+            bundle_digest: RwLock::new(None),
+            review_seconds: ferrum_metrics::Histogram::new(),
+            reviews_allowed: std::sync::atomic::AtomicU64::new(0),
+            reviews_denied: std::sync::atomic::AtomicU64::new(0),
             config,
         }
     }
 
     /// Clone the current program under a read lock, then evaluate. No disk I/O.
+    ///
+    /// Timed. The instrumentation is three relaxed atomic adds and one
+    /// `Instant::now()` pair, allocates nothing, takes no lock of its own and
+    /// happens whether or not anything is scraping — a latency that is only
+    /// measured while someone is watching is not a latency budget.
     pub fn handle(&self, body: &[u8]) -> crate::review::ReviewReply {
+        let started = std::time::Instant::now();
         let program = self
             .program
             .read()
@@ -68,8 +93,49 @@ impl WebhookState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        self.config
-            .handle_bytes(body, Some(&program), &exceptions, Utc::now())
+        let reply = self
+            .config
+            .handle_bytes(body, Some(&program), &exceptions, Utc::now());
+        self.review_seconds.observe(started.elapsed());
+        if reply.allowed {
+            self.reviews_allowed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.reviews_denied
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        reply
+    }
+
+    /// The latency histogram of [`WebhookState::handle`].
+    pub fn review_seconds(&self) -> &ferrum_metrics::Histogram {
+        &self.review_seconds
+    }
+
+    /// Reviews this process answered allow.
+    pub fn reviews_allowed(&self) -> u64 {
+        self.reviews_allowed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Reviews this process refused — a policy deny, a fail-closed bundle, or
+    /// a request it could not read. All three are refusals to the API server,
+    /// and the first thing an operator asks after a wave of them is which of
+    /// the three; that answer is in the logs and in `bundle_absent`/
+    /// `bundle_unreadable`, not in a label, because a per-reason label on the
+    /// request path is a cardinality decision made by whoever is sending the
+    /// requests.
+    pub fn reviews_denied(&self) -> u64 {
+        self.reviews_denied
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Digest of the bundle whose program is in force, if one has ever loaded.
+    pub fn bundle_digest(&self) -> Option<Digest> {
+        self.bundle_digest
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn set_exceptions(&self, list: Vec<PolicyExceptionSpec>) {
@@ -192,6 +258,12 @@ impl WebhookState {
     ) -> ferrum_common::Result<Digest> {
         let (program, digest) = load_source_with_digest(bytes, &self.trust_root, expected_digest)?;
         *self.program.write().unwrap_or_else(|e| e.into_inner()) = program;
+        // After the swap, never before: a digest published for a program that
+        // was refused would name a bundle this process is not enforcing.
+        *self
+            .bundle_digest
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(digest.clone());
         Ok(digest)
     }
 

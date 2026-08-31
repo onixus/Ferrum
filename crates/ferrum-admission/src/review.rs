@@ -41,6 +41,16 @@ impl Default for ReviewConfig {
 pub struct ReviewReply {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The verdict this reply carries, as a field rather than as something a
+    /// caller re-parses out of `body`.
+    ///
+    /// It exists because the webhook now counts its own decisions, and the
+    /// alternative was a second JSON parse of the response on the request
+    /// path — a parse whose failure mode is a deny silently counted as an
+    /// allow. A 400 is `false` here: the API server under `failurePolicy: Fail`
+    /// treats it as a refusal, so counting it as an allow would put the one
+    /// case an operator most needs to see on the wrong side of the graph.
+    pub allowed: bool,
 }
 
 impl ReviewConfig {
@@ -91,6 +101,7 @@ fn handle_with(
         return ReviewReply {
             status: 400,
             body: encode_response("", false, None, "admission request uid is required"),
+            allowed: false,
         };
     }
 
@@ -169,6 +180,7 @@ fn http_400(message: &str) -> ReviewReply {
         status: 400,
         body: serde_json::to_vec(&json!({"error": message}))
             .unwrap_or_else(|_| br#"{"error":"bad request"}"#.to_vec()),
+        allowed: false,
     }
 }
 
@@ -176,6 +188,7 @@ fn ok_deny(uid: &str, message: &str) -> ReviewReply {
     ReviewReply {
         status: 200,
         body: encode_response(uid, false, None, message),
+        allowed: false,
     }
 }
 
@@ -214,6 +227,7 @@ fn decision_response(uid: &str, object: &Value, decision: &AdmissionDecision) ->
     ReviewReply {
         status: 200,
         body: encode_response(uid, true, patch.as_ref(), ""),
+        allowed: true,
     }
 }
 
