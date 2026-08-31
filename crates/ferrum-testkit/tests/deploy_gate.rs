@@ -30,9 +30,6 @@ const CRD_CLUSTER_SECURITY_POLICY: &str = include_str!(concat!(
     "/../../docs/crd/clustersecuritypolicy.yaml"
 ));
 
-/// `expiresAt <= now() + duration('2160h')` is the CEL spelling of 90 days.
-const CEL_NINETY_DAYS: &str = "2160h";
-
 fn spec_schema(crd: &str) -> Value {
     let root: Value = serde_yaml::from_str(crd).expect("crd yaml");
     root.get("spec")
@@ -207,25 +204,35 @@ fn exception(requested_by: &str, approved_by: &str, days: u64) -> PolicyExceptio
 }
 
 #[test]
-fn exception_ttl_ceiling_is_ninety_days_in_cel_and_in_policy() {
+fn exception_ttl_ceiling_is_ninety_days_in_policy_and_no_schema_may_claim_it() {
+    // Two CEL rules used to stand here — `self.expiresAt > now()` and
+    // `self.expiresAt <= now() + duration('2160h')` — and this test read them
+    // out of the file it was asserting about, which is the whole reason they
+    // survived. A real API server refuses them: CRD validation has no clock,
+    // `now()` is an undeclared reference, and the compilation failure rejects
+    // the *whole* CRD. So the tree shipped a PolicyException that could not be
+    // installed at all, and every other rule in that file — self-approve,
+    // required target — was inert with it. Measured, not read:
+    // `e2e_cluster.rs::the_shipped_crds_are_accepted_by_a_real_apiserver`.
+    //
+    // The direction of this assertion is therefore inverted on purpose. A
+    // schema rule about wall-clock time is not a stricter schema, it is an
+    // uninstallable one, and this is what stops it coming back.
     let rules = cel_rules(CRD_POLICY_EXCEPTION);
     assert!(
-        rules
-            .iter()
-            .any(|r| r.contains("expiresAt") && r.contains(CEL_NINETY_DAYS)),
-        "CRD lost the 90-day CEL ceiling: {rules:?}"
-    );
-    assert!(
-        rules
-            .iter()
-            .any(|r| r.contains("expiresAt") && r.contains("now()")),
-        "CRD lost the expiresAt-in-the-past CEL rule: {rules:?}"
+        !rules.iter().any(|r| r.contains("now(")),
+        "a PolicyException CEL rule reaches for a clock. The API server has \
+         none in CRD validation and refuses the entire CustomResourceDefinition \
+         when it sees one, taking every other rule in the file down with it: \
+         {rules:?}"
     );
 
+    // The ceiling itself did not move; only the place that can hold it did.
     validate_exception(&exception("sre", "ib", 89)).expect("89 days is inside the window");
     let err = validate_exception(&exception("sre", "ib", 91))
-        .expect_err("91 days must be rejected by ferrum-policy too");
+        .expect_err("91 days must be rejected by ferrum-policy");
     assert!(format!("{err}").contains("90"), "{err}");
+    assert_eq!(ferrum_policy::MAX_EXCEPTION_DAYS, 90);
 }
 
 #[test]
@@ -639,14 +646,6 @@ fn the_minimum_reason_length_is_the_same_in_the_schema_and_in_policy() {
             ferrum_policy::MIN_REASON_LEN
         );
     }
-}
-
-/// The 90-day ceiling, spelled as a duration in CEL. Derived from the same
-/// constant rather than from the literal `2160h` written above.
-#[test]
-fn the_cel_ttl_ceiling_is_the_policy_constant_in_hours() {
-    let hours = ferrum_policy::MAX_EXCEPTION_DAYS * 24;
-    assert_eq!(CEL_NINETY_DAYS, format!("{hours}h"));
 }
 
 /// A rule id names the thing an exception waives and an audit record blames.

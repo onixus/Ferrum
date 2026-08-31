@@ -46,9 +46,18 @@ ARG CARGO_AUDITABLE_VERSION
 # rust-lld тем musl, который везёт rustup. `rustup target add` стоит ниже COPY
 # намеренно: rust-toolchain.toml пинит тулчейн, и до появления исходников цель
 # ставится не тому, который потом собирает.
+#
+# Обе цели, а не одна: `TARGET` — аргумент, и толчейн под него должен быть в
+# образе, иначе `--build-arg TARGET=aarch64-unknown-linux-musl` падает не на
+# отсутствии кросс-gcc, а в середине сборки C-половины ring, сообщением
+# cc-rs про `aarch64-linux-musl-gcc`. Ставятся оба набора и объявляются обе
+# пары переменных: переменная цели, которую не собирают, ни на что не влияет,
+# а её отсутствие делает вторую цель несобираемой. Вторая цель нужна e2e:
+# нода kind здесь arm64, и образ под x86_64 на ней не стартует.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
+        gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -63,7 +72,9 @@ RUN cargo install --locked "cargo-auditable@${CARGO_AUDITABLE_VERSION}"
 # a different dependency set than the one CI tested is not one.
 RUN rustup target add "${TARGET}" \
  && CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
     RUSTFLAGS="-C link-self-contained=yes" \
     cargo auditable build --release --locked --target "${TARGET}" \
         -p ferrum-controller \

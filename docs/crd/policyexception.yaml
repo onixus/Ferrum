@@ -45,10 +45,22 @@ spec:
               # conditional CEL copy would admit objects the compiler refuses.
               required: [ticket, requestedBy, approvedBy, reason, expiresAt]
               x-kubernetes-validations:
-                - rule: "self.expiresAt > now()"
-                  message: "expiresAt already in the past"
-                - rule: "self.expiresAt <= now() + duration('2160h')"
-                  message: "expiresAt more than 90 days from now"
+                # Здесь стояли два правила о времени — `self.expiresAt > now()`
+                # и `self.expiresAt <= now() + duration('2160h')`. Их убрал не
+                # выбор, а настоящий apiserver: в CEL валидации CRD нет часов,
+                # и `now()` там — неразрешённая ссылка. Проверено применением
+                # (kind, v1.36.1): apiserver отвергал весь CRD целиком —
+                # `compilation failed: undeclared reference to 'now'`, — то
+                # есть с этими правилами PolicyException не устанавливался
+                # вообще, и ни одна из четырёх остальных проверок этого файла
+                # тоже не работала. Правила были заведомо неисполнимы, а
+                # державший их тест читал текст YAML, а не ответ apiserver.
+                #
+                # Свежесть и потолок 90 дней от этого не исчезли: их решает
+                # `ferrum-policy` (`validate_exception`) при компиляции и
+                # admission/agent на каждом запросе, где часы есть. Схема
+                # держит то, что схема может: `expiresAt` в `required` выше —
+                # waiver без TTL apiserver отвергает.
                 # `has()` guards the evaluation, not the invariant: approvedBy
                 # is required above, and an absent one is refused there. A CEL
                 # rule that dereferences a missing key errors instead of
