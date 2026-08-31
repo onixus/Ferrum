@@ -122,6 +122,29 @@ cargo run -p ferrum-cli -- lint-deploy deploy
 именно исполнялось и где, читайте в «Как читать колонку „Исполняется“» в
 [MVP-1 boundary](docs/MVP-1-BOUNDARY.md).
 
+### Публичный CI
+
+`.github/workflows/ci.yml` гоняет на GitHub Actions четыре стадии из того же
+`Jenkinsfile` и с теми же командами: `Format`, `Clippy`, `Test` и группу
+`Checks` целиком (`Crate boundary`, `Validate policies`,
+`Security: policy invariants`, `Security: MVP acceptance`,
+`Security: supply chain`). Скрипты шагов совпадают со стадиями построчно, и
+это держит `deploy_gate.rs::actions_parity`: два CI, гоняющие похожее, дают
+два разных вердикта об одном дереве.
+
+Датапейс там не исполняется и исполняться не будет: `BPF ELF`, `BPF attach`,
+`BPF join`, `BPF join mutations`, `Datapath tracefs`, `Datapath cgroup`
+требуют настоящего ядра с tracefs, прав `CAP_BPF`/`CAP_PERFMON`, писуемой
+cgroup2 и pid-namespace хоста, а раннер `ubuntu-latest` не даёт ничего из
+этого. Стадия с именем `BPF attach`, зелёная без исполненного attach, была бы
+ровно тем гейтом, умеющим себя пропустить, от которого написан весь этот
+проект. По той же причине в Actions нет стадий образов и `SAST (semgrep)`:
+им нужен docker CLI ноды. Вердикт по датапейсу даёт локальный Jenkins, и
+только он.
+
+На GitHub этот воркфлоу ещё не исполнялся ни разу: поставленный файл — не
+прогон, и «зелено в Actions» здесь не написано, пока прогона нет.
+
 Toolchain — 1.97.1 (`rust-toolchain.toml`), kube 1.x + k8s-openapi 0.25.
 `kube-derive` тулчейн уже пускает, но фича `derive` не включена: типы
 `ferrum-api` остаются serde-эквивалентом тех же манифестов. Nightly нужен
