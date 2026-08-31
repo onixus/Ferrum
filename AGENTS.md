@@ -23,7 +23,7 @@ attach идёт стадией `BPF attach` на aarch64-ноде Jenkins (6.12.
 
 ## Toolchain
 
-- Workspace: Rust 1.97.1, edition 2021, GPL-3.0-only (`rust-toolchain.toml`).
+- Workspace: Rust 1.97.1, edition 2021, Apache-2.0 (`rust-toolchain.toml`).
 - kube 1.x + k8s-openapi 0.25 (`v1_33`). Тулчейн поднят с 1.75 ради advisories: старый
   стек тянул rustls 0.21 с тремя CVE и пять unmaintained crate.
 - Nightly только у `ferrum-ebpf-progs`. Userspace — stable + musl.
