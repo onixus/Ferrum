@@ -37,6 +37,17 @@ pub fn render(envelope: &EventEnvelope) -> String {
     );
     ferrum.insert("agentRole".into(), json!(sanitize(&envelope.agent_role)));
     ferrum.insert("degraded".into(), json!(envelope.degraded));
+    // An array here and a joined string in the two syslog profiles: this one
+    // has a serialiser and a receiver that indexes arrays, and the other two
+    // have neither.
+    ferrum.insert(
+        "degradedReasons".into(),
+        json!(envelope
+            .degraded_reasons
+            .iter()
+            .map(|r| sanitize(r))
+            .collect::<Vec<_>>()),
+    );
     ferrum.insert(
         "bundleDigest".into(),
         match &envelope.bundle_digest {
@@ -149,7 +160,17 @@ mod tests {
         assert_eq!(doc["process"]["pid"], json!(4242));
         assert_eq!(doc["rule"]["id"], json!("no-shell"));
         assert_eq!(doc["rule"]["ruleset"], json!("prod-restricted"));
-        assert_eq!(doc["ferrum"]["schemaVersion"], json!("1.0"));
+        assert_eq!(
+            doc["ferrum"]["schemaVersion"],
+            json!(ferrum_proto::EVENT_SCHEMA_VERSION.to_string())
+        );
+        // An array here rather than the joined string the two syslog profiles
+        // carry: this receiver indexes arrays, and a rule filtering on one
+        // reason must not have to match a substring of a joined field.
+        assert_eq!(
+            doc["ferrum"]["degradedReasons"],
+            json!(["lkg_partial", "clock_rollback"])
+        );
     }
 
     /// A record whose values carry quotes and braces stays one JSON document.

@@ -48,7 +48,7 @@ pub const EVENT_SCHEMA: &str = "ferrum.io/enforcement-event";
 
 /// Version of that schema, `major.minor`. The module docs say what each half
 /// licenses.
-pub const EVENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 0 };
+pub const EVENT_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 1 };
 
 /// The `schema` field: serialises to [`EVENT_SCHEMA`] and refuses to decode
 /// anything else.
@@ -227,6 +227,40 @@ pub struct EventEnvelope {
     pub bundle_digest: Option<Digest>,
     pub agent_role: String,
     pub degraded: bool,
+    /// Stable ids of every degradation the node was in when it decided this
+    /// record. Empty on a healthy node; `#[serde(default)]`, so records written
+    /// by 1.0 still decode.
+    ///
+    /// Added in 1.1, and the reason is the closing criterion of phase 1: «the
+    /// incident *respond killed the wrong process* is investigated from the
+    /// SIEM without access to the node». Walking that path against 1.0 stops
+    /// here. The record said which rule fired, which bundle was in force, which
+    /// tgid was signalled and whether the labels, the path and the container
+    /// flag were known — and then said `degraded: true` and nothing more. Every
+    /// question left is a question about *which* degradation:
+    ///
+    ///  * `lkg_partial` — the node was enforcing a subset of the snapshot that
+    ///    was signed, so `bundleDigest` names more rules than were actually in
+    ///    force and the investigator's reconstruction of the policy is wrong;
+    ///  * `clock_rollback` — every `expiresAt` comparison on that node was made
+    ///    against a time source it could not trust, so a waiver that should have
+    ///    demoted this kill may have read as expired;
+    ///  * `container_flag_disagreement`, `cgroup_index_empty`,
+    ///    `identity_unknown` — the cgroup→pod attribution the record's `pod` and
+    ///    `namespace` rest on was systematically unreliable at that moment.
+    ///
+    /// Each of those lived in `status.json`, which is a 0600 file *on the node*.
+    /// Answering "was this the wrong process?" therefore required exactly the
+    /// access the criterion says must not be required.
+    ///
+    /// Ids and not the sentences an operator reads: the sentences are reworded
+    /// whenever the wording improves, and a SIEM rule written against one stops
+    /// matching with nothing red anywhere. They are the same ids the agent
+    /// already publishes as `ferrum_agent_degraded_reason{reason=...}`, so this
+    /// field joins a record to a graph rather than introducing a second
+    /// vocabulary.
+    #[serde(default)]
+    pub degraded_reasons: Vec<String>,
     pub event: EnforcementEvent,
 }
 
@@ -243,6 +277,7 @@ mod tests {
             bundle_digest: Some(Digest::new("sha256:abc")),
             agent_role: "observe".into(),
             degraded: false,
+            degraded_reasons: Vec::new(),
             event: EnforcementEvent {
                 policy: PolicyId::new("p"),
                 rule: RuleId::new("no-shell"),
@@ -274,6 +309,7 @@ mod tests {
             bundle_digest: Some(Digest::new("sha256:abc")),
             agent_role: "observe".into(),
             degraded: true,
+            degraded_reasons: vec!["lkg_partial".into(), "clock_rollback".into()],
             event: EnforcementEvent {
                 policy: PolicyId::new("p"),
                 rule: RuleId::new("no-shell"),
@@ -295,7 +331,7 @@ mod tests {
         };
         let json = serde_json::to_string(&env).expect("serialize");
         assert!(json.contains("\"schema\":\"ferrum.io/enforcement-event\""));
-        assert!(json.contains("\"schemaVersion\":\"1.0\""));
+        assert!(json.contains("\"schemaVersion\":\"1.1\""));
         assert!(json.contains("\"bundleDigest\":\"sha256:abc\""));
         assert!(json.contains("\"agentRole\":\"observe\""));
         assert!(json.contains("\"degraded\":true"));
@@ -322,7 +358,7 @@ mod tests {
         let ok = serde_json::to_string(&envelope()).expect("serialize");
         serde_json::from_str::<EventEnvelope>(&ok).expect("its own output decodes");
 
-        let no_version = ok.replace(r#""schemaVersion":"1.0","#, "");
+        let no_version = ok.replace(r#""schemaVersion":"1.1","#, "");
         assert_ne!(no_version, ok, "the mutation matched nothing");
         assert!(
             serde_json::from_str::<EventEnvelope>(&no_version).is_err(),
@@ -341,7 +377,7 @@ mod tests {
             "another producer's record decoded as ours because the field names lined up"
         );
 
-        let unparseable = ok.replace(r#""schemaVersion":"1.0""#, r#""schemaVersion":"one""#);
+        let unparseable = ok.replace(r#""schemaVersion":"1.1""#, r#""schemaVersion":"one""#);
         assert_ne!(unparseable, ok);
         assert!(serde_json::from_str::<EventEnvelope>(&unparseable).is_err());
     }
@@ -414,6 +450,47 @@ mod tests {
         assert!(!back.labels_unknown);
         assert!(!back.path_unknown);
         assert!(!back.container_unknown);
+    }
+
+    /// The 1.1 field is present on every record, carries ids rather than
+    /// sentences, and a 1.0 record still decodes with it empty.
+    ///
+    /// The last clause is the whole minor-bump promise, and it is asserted
+    /// against a record that predates the field rather than against one this
+    /// build wrote with the field removed.
+    #[test]
+    fn degraded_reasons_ride_the_envelope_and_default_on_a_ten_record() {
+        let mut env = envelope();
+        env.degraded = true;
+        env.degraded_reasons = vec!["lkg_partial".into(), "clock_rollback".into()];
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            json.contains(r#""degradedReasons":["lkg_partial","clock_rollback"]"#),
+            "{json}"
+        );
+        let back: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.degraded_reasons, env.degraded_reasons);
+
+        // A healthy node writes the key with an empty array, not no key: a
+        // consumer may index on it, which is what `presence: always` promises.
+        let healthy = serde_json::to_string(&envelope()).expect("serialize");
+        assert!(healthy.contains(r#""degradedReasons":[]"#), "{healthy}");
+
+        // A record emitted by 1.0, byte for byte from the frozen corpus.
+        let legacy = r#"{"schema":"ferrum.io/enforcement-event","schemaVersion":"1.0",
+            "ts":"2026-08-31T12:00:01Z","node":"node-a","bundleDigest":null,
+            "agentRole":"observe","degraded":false,
+            "event":{"policy":"p","rule":"default","action":"audit","imageDigest":null,
+            "pod":"web","namespace":"prod","comm":"sh","syscall":"execve","pid":0,"tgid":0,
+            "executed":false,"labelsUnknown":false,"pathUnknown":false,
+            "containerUnknown":false}}"#;
+        let back: EventEnvelope = serde_json::from_str(legacy).expect("a 1.0 record must decode");
+        assert!(back.degraded_reasons.is_empty());
+        assert_eq!(back.schema_version, SchemaVersion { major: 1, minor: 0 });
+        assert!(
+            back.schema_version.readable_by(EVENT_SCHEMA_VERSION),
+            "1.0 must stay readable by this build"
+        );
     }
 
     #[test]

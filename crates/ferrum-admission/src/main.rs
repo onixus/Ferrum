@@ -27,7 +27,7 @@ fn cmd_eval(args: &[String]) {
     if args.len() != 3 {
         eprintln!("usage: ferrum-admission <program.fadm> <subject.json>");
         eprintln!("       ferrum-admission review --bundle <fsig> --trust-root <32-byte-hex> [--exceptions <exceptions.fsig> --policy-name <name>] <admissionreview.json>");
-        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000] [--apiserver [host:port]] [--cluster-label k=v] [--metrics-listen 0.0.0.0:9102]");
+        eprintln!("       ferrum-admission serve --listen 127.0.0.1:8443 --bundle <fsig|secret.json|dir> --trust-root <32-byte-hex> [--exceptions <mount> --policy-name <name>] [--tls-cert --tls-key] [--reload-ms 1000] [--apiserver [host:port]] [--cluster-label k=v] [--metrics-listen 0.0.0.0:9102] [--break-glass <mount> --break-glass-journal <file> --break-glass-root <32-byte-hex>]");
         eprintln!("missing or invalid compiled program denies the request (fail closed)");
         exit(2);
     }
@@ -171,7 +171,53 @@ fn cmd_serve(args: &[String]) {
         _ => 1000,
     };
 
-    let state = Arc::new(WebhookState::new(program, trust_root, Vec::new(), cfg));
+    // Break-glass is armed before the listener binds, and a failure to arm is a
+    // start-up error rather than a warning: an install whose emergency
+    // suspension could never have been journalled must fail `kubectl rollout
+    // status`, not fail at 03:00 during the outage it was installed for.
+    let break_glass = match (
+        flags.get("break-glass").filter(|s| !s.is_empty()),
+        flags.get("break-glass-journal").filter(|s| !s.is_empty()),
+        flags.get("break-glass-root").filter(|s| !s.is_empty()),
+    ) {
+        (None, None, None) => None,
+        (Some(dir), Some(journal), Some(root_hex)) => {
+            let root = match parse_trust_root(root_hex) {
+                Ok(k) => k,
+                Err(err) => {
+                    eprintln!("error: break-glass-root: {err}");
+                    exit(2);
+                }
+            };
+            let component = format!(
+                "ferrum-admission/{}",
+                std::env::var("POD_NAME").unwrap_or_else(|_| "unnamed".into())
+            );
+            match ferrum_admission::BreakGlass::arm(dir, journal, root, component) {
+                Ok(bg) => {
+                    eprintln!(
+                        "ferrum-admission: break-glass armed, journal {journal}, mount {dir}"
+                    );
+                    Some(Arc::new(bg))
+                }
+                Err(err) => {
+                    eprintln!("error: break-glass: {err}");
+                    exit(2);
+                }
+            }
+        }
+        _ => die(
+            "--break-glass, --break-glass-journal and --break-glass-root must be given together; \
+             a mount with no journal is a suspension nobody could account for, and a journal with \
+             no trust root is one anybody could open",
+        ),
+    };
+
+    let mut state = WebhookState::new(program, trust_root, Vec::new(), cfg);
+    if let Some(bg) = &break_glass {
+        state = state.with_break_glass(Arc::clone(bg));
+    }
+    let state = Arc::new(state);
     if let Some(path) = &exceptions_path {
         if let Err(err) = state.try_reload_exceptions_path(path) {
             eprintln!("ferrum-admission: exceptions load failed, starting with empty list: {err}");
@@ -214,6 +260,13 @@ fn cmd_serve(args: &[String]) {
     }
     if let Some(source) = &tls {
         poll_serving_cert(Arc::clone(source), Duration::from_millis(reload_ms));
+    }
+    if let Some(bg) = break_glass {
+        // Reconciled once before the accept loop starts: a grant that was
+        // already in the mount when this replica came up is in force from the
+        // first review, not from the first tick.
+        bg.poll(chrono::Utc::now());
+        ferrum_admission::poll_break_glass(bg, Duration::from_millis(reload_ms));
     }
     if let Some(listener) = metrics_listener {
         ferrum_admission::spawn_metrics(listener, Arc::clone(&state));

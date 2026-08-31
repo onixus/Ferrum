@@ -62,8 +62,40 @@ impl ReviewConfig {
         exceptions: &[PolicyExceptionSpec],
         now: DateTime<Utc>,
     ) -> ReviewReply {
-        handle_with(self, body, program, exceptions, now)
+        handle_with(self, body, program, exceptions, None, now)
     }
+
+    /// The same evaluation with a break-glass grant in force.
+    ///
+    /// A separate entry point rather than a fifth argument on the one above, so
+    /// that every existing caller — the offline `review` subcommand, the
+    /// acceptance tests, the latency gate — keeps meaning "no suspension is
+    /// possible here" without having to restate it. Only the serving path can
+    /// suspend, because only the serving path has a journal to write.
+    pub fn handle_bytes_under_break_glass(
+        &self,
+        body: &[u8],
+        program: Option<&AdmissionProgram>,
+        exceptions: &[PolicyExceptionSpec],
+        break_glass: Option<&BreakGlassGrant>,
+        now: DateTime<Utc>,
+    ) -> ReviewReply {
+        handle_with(self, body, program, exceptions, break_glass, now)
+    }
+}
+
+/// What the review path needs to know about a grant that is in force.
+///
+/// Not `ferrum_breakglass::VerifiedGrant` itself: this module decides
+/// admission, and the only thing it may do with a grant is quote its identity
+/// back to the operator running `kubectl`. Narrowing it here means the request
+/// path cannot reach for `subject` — a person's name — and put it in a message
+/// that lands in whatever collects `kubectl` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakGlassGrant {
+    pub id: String,
+    pub ticket: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// Fail-closed AdmissionReview. Unrecoverable uid → HTTP 400, not 200 with empty uid.
@@ -76,11 +108,28 @@ pub fn handle_review_bytes(
     ReviewConfig::default().handle_bytes(body, program, exceptions, now)
 }
 
+/// The message a suspended webhook puts in its own allow.
+///
+/// It goes to whoever ran `kubectl`, which is the one channel that reaches a
+/// human at the moment an object is admitted unchecked. It names the grant and
+/// the ticket and never the subject: `kubectl` output ends up in CI logs and
+/// terminal scrollback, and a person's name does not belong in either.
+pub fn break_glass_message(grant: &BreakGlassGrant) -> String {
+    format!(
+        "FERRUM break-glass in force (grant {}, ticket {}, until {}): admitted without policy \
+         evaluation",
+        grant.id,
+        grant.ticket,
+        grant.expires_at.to_rfc3339()
+    )
+}
+
 fn handle_with(
     cfg: &ReviewConfig,
     body: &[u8],
     program: Option<&AdmissionProgram>,
     exceptions: &[PolicyExceptionSpec],
+    break_glass: Option<&BreakGlassGrant>,
     now: DateTime<Utc>,
 ) -> ReviewReply {
     if body.is_empty() {
@@ -108,6 +157,24 @@ fn handle_with(
     let Some(request) = parsed.get("request").and_then(Value::as_object) else {
         return ok_deny(&uid, "admission request is missing");
     };
+
+    // Break-glass is checked here and nowhere lower. Above it sit only the two
+    // refusals that are not policy decisions at all — a body this process could
+    // not read, and a review with no uid to echo — and answering those with an
+    // allow would be a suspension of parsing rather than of enforcement. Below
+    // it sits everything a grant is for, the fail-closed arms included: an
+    // unreadable bundle denying every Pod in the cluster is the outage
+    // break-glass exists to end, so a grant that stopped short of it would stop
+    // short of its only job.
+    if let Some(grant) = break_glass {
+        if now < grant.expires_at {
+            return ReviewReply {
+                status: 200,
+                body: encode_response(&uid, true, None, &break_glass_message(grant)),
+                allowed: true,
+            };
+        }
+    }
 
     let Some(program) = program else {
         return ok_deny(&uid, "policy bundle missing, invalid, or unverifiable");

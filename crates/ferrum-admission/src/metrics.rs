@@ -95,6 +95,7 @@ pub fn exposition(state: &WebhookState) -> Exposition {
             1,
         )],
     );
+    break_glass_families(&mut out, state);
     out.labelled_gauge(
         "ferrum_admission_info",
         "1, labelled with the version of this webhook",
@@ -104,6 +105,91 @@ pub fn exposition(state: &WebhookState) -> Exposition {
         )],
     );
     out
+}
+
+/// The break-glass families, published by every replica whether or not it was
+/// armed.
+///
+/// Always emitted, for the reason `ferrum_admission_bundle_info` is: a series
+/// that disappears when nothing is happening cannot be told from a scrape that
+/// failed, and "is break-glass armed on this cluster" is a question an operator
+/// must be able to answer *before* the incident rather than during it. A
+/// replica that was never armed publishes `configured 0`, which is a different
+/// and readable state from `active 0`.
+///
+/// What is deliberately not here: `subject`, `issuer`, `reason` and `ticket`.
+/// This port is reachable from a labelled monitoring namespace, and three of
+/// those are a person and the fourth is an incident reference; the journal and
+/// the container log carry them, and both are surfaces an operator governs
+/// separately. What is here is the head of the chain — a hash, which names
+/// nobody — and it is here on purpose: a Prometheus that stores it is holding
+/// the off-node anchor that makes the chain worth having.
+fn break_glass_families(out: &mut Exposition, state: &WebhookState) {
+    let armed = state.break_glass();
+    let now = chrono::Utc::now();
+    let held = armed.and_then(|bg| bg.active(now));
+    out.bool_gauge(
+        "ferrum_admission_break_glass_configured",
+        "1 when this replica was started with a break-glass mount and a writable journal; 0 \
+         means the emergency suspension is unavailable on this cluster",
+        armed.is_some(),
+    );
+    out.bool_gauge(
+        "ferrum_admission_break_glass_active",
+        "1 while a verified grant is suspending policy evaluation in this replica: every \
+         AdmissionReview is being answered allow without evaluating anything",
+        held.is_some(),
+    );
+    out.gauge(
+        "ferrum_admission_break_glass_expires_in_seconds",
+        "seconds left on the grant in force; 0 when none is",
+        held.as_ref()
+            .map(|g| g.remaining_seconds(now).max(0) as u64)
+            .unwrap_or(0),
+    );
+    out.counter(
+        "ferrum_admission_break_glass_admits_total",
+        "AdmissionReviews this replica allowed because a grant was in force rather than because \
+         a policy said so; not derivable from the allow total",
+        armed.map(|bg| bg.admits()).unwrap_or(0),
+    );
+    out.counter(
+        "ferrum_admission_break_glass_activations_total",
+        "grants that came into force in this replica",
+        armed.map(|bg| bg.activations()).unwrap_or(0),
+    );
+    out.counter(
+        "ferrum_admission_break_glass_rejections_total",
+        "grant documents this replica refused: a bad signature, an expired or over-long window, \
+         a scope it does not honour. Every poll counts, so a retried forgery is visible here \
+         even though the journal records it once",
+        armed.map(|bg| bg.rejections()).unwrap_or(0),
+    );
+    out.counter(
+        "ferrum_admission_break_glass_journal_entries_total",
+        "entries in this replica's break-glass journal chain",
+        armed.map(|bg| bg.journal_entries()).unwrap_or(0),
+    );
+    out.bool_gauge(
+        "ferrum_admission_break_glass_journal_broken",
+        "1 when the journal stopped accepting entries after start-up; while this is 1 no grant \
+         can come into force, because a suspension that cannot be recorded is not taken",
+        armed
+            .map(|bg| bg.journal_broken().is_some())
+            .unwrap_or(false),
+    );
+    out.labelled_gauge(
+        "ferrum_admission_break_glass_journal_info",
+        "1, labelled with the head hash of this replica's journal chain. Storing it is what \
+         makes the chain tamper-evident: an edit is visible to anybody holding an older head",
+        vec![(
+            vec![(
+                "head".into(),
+                armed.map(|bg| bg.journal_head()).unwrap_or_default(),
+            )],
+            1,
+        )],
+    );
 }
 
 /// The whole response body.

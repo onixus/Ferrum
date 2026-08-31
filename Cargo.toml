@@ -4,6 +4,7 @@ members = [
     "crates/ferrum-common",
     "crates/ferrum-ids",
     "crates/ferrum-api",
+    "crates/ferrum-breakglass",
     "crates/ferrum-proto",
     "crates/ferrum-crypto",
     "crates/ferrum-policy",
@@ -34,6 +35,7 @@ rust-version = "1.97"
 ferrum-common = { path = "crates/ferrum-common" }
 ferrum-ids = { path = "crates/ferrum-ids" }
 ferrum-api = { path = "crates/ferrum-api" }
+ferrum-breakglass = { path = "crates/ferrum-breakglass" }
 ferrum-proto = { path = "crates/ferrum-proto" }
 ferrum-crypto = { path = "crates/ferrum-crypto" }
 ferrum-policy = { path = "crates/ferrum-policy" }

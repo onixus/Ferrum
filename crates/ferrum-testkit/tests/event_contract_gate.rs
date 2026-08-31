@@ -97,6 +97,10 @@ const SENTINEL_SYSCALL: &str = "execve";
 const SENTINEL_RESPOND_ERROR: &str = "sentinelresponderror";
 const SENTINEL_TICKET: &str = "SENTINELTICKET-1";
 const SENTINEL_PID: u32 = 131_071;
+/// A degradation reason id. Shaped like a real one — the ids are `[a-z_]` and
+/// this gate's sentinel must not be the one value that happens to survive a
+/// renderer that mangles the rest.
+const SENTINEL_DEGRADED_REASON: &str = "sentineldegradedreason";
 const SENTINEL_TGID: u32 = 262_143;
 /// The two values that must never leave the product.
 const SENTINEL_REQUESTED_BY: &str = "sentinelrequestedby";
@@ -111,6 +115,7 @@ fn maximal() -> EventEnvelope {
         bundle_digest: Some(Digest::new(SENTINEL_BUNDLE)),
         agent_role: SENTINEL_ROLE.into(),
         degraded: true,
+        degraded_reasons: vec![SENTINEL_DEGRADED_REASON.into()],
         event: EnforcementEvent {
             policy: PolicyId::new(SENTINEL_POLICY),
             rule: RuleId::new(SENTINEL_RULE),
@@ -146,6 +151,7 @@ fn minimal() -> EventEnvelope {
         bundle_digest: None,
         agent_role: String::new(),
         degraded: false,
+        degraded_reasons: Vec::new(),
         event: EnforcementEvent {
             policy: PolicyId::new(""),
             rule: RuleId::new(""),
@@ -637,6 +643,7 @@ fn every_emitted_value_reaches_every_profile() {
         ("node", SENTINEL_NODE.to_string()),
         ("bundleDigest", SENTINEL_BUNDLE.to_string()),
         ("agentRole", SENTINEL_ROLE.to_string()),
+        ("degradedReasons", SENTINEL_DEGRADED_REASON.to_string()),
         ("event.policy", SENTINEL_POLICY.to_string()),
         ("event.rule", SENTINEL_RULE.to_string()),
         ("event.action", SENTINEL_ACTION.to_string()),

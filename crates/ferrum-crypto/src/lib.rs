@@ -34,6 +34,19 @@ pub const ED25519_SIGNATURE_LEN: usize = 64;
 /// Domain separator prepended to `raw` for Ed25519 only. Digest is still SHA-256(`raw`).
 pub const BUNDLE_SIGNATURE_CONTEXT: &[u8] = b"FERRUM-POLICY-BUNDLE-v1";
 
+/// Domain separator for a break-glass grant, prepended to the grant bytes for
+/// Ed25519 only.
+///
+/// A third domain beside [`BUNDLE_SIGNATURE_CONTEXT`] and `KEY_BIND_MSG`, and
+/// it is the one that most needed to be separate. A break-glass grant is the
+/// one artefact in this product whose whole effect is to stop enforcement; if
+/// it shared a domain with the policy bundle, the operator who can publish a
+/// bundle could have one of their signatures replayed as a grant, and the
+/// journal would record a suspension nobody issued. Signing keys are held by
+/// different people for exactly that reason, and the domain is what makes
+/// "different people" mean something when one of them is compromised.
+pub const BREAK_GLASS_CONTEXT: &[u8] = b"FERRUM-BREAK-GLASS-GRANT-v1";
+
 /// SHA-256 of `raw`, lowercase hex, no algorithm prefix.
 pub fn bundle_digest(raw: &[u8]) -> Digest {
     Digest::new(hex_encode(Sha256::digest(raw).as_slice()))
@@ -84,11 +97,42 @@ pub fn verify_bundle_digest(raw: &[u8], expected: &Digest) -> Result<()> {
     Ok(())
 }
 
-fn signed_message(raw: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(BUNDLE_SIGNATURE_CONTEXT.len() + raw.len());
-    msg.extend_from_slice(BUNDLE_SIGNATURE_CONTEXT);
+/// Sign break-glass grant bytes with a 32-byte Ed25519 seed.
+///
+/// Present so the gate and `ferrumctl` can produce a grant the verifier
+/// accepts; nothing on the request path signs anything.
+pub fn sign_break_glass(raw: &[u8], secret_key: &[u8]) -> Result<Vec<u8>> {
+    let keypair = parse_keypair(secret_key)?;
+    Ok(keypair
+        .sk
+        .sign(domain_message(BREAK_GLASS_CONTEXT, raw), None)
+        .to_vec())
+}
+
+/// Verify Ed25519 over `BREAK_GLASS_CONTEXT || raw` with a caller-supplied
+/// 32-byte public key.
+///
+/// No unsigned fallback and no shared domain: a signature made over the bundle
+/// domain fails here, and one made here fails [`verify_bundle_signature`].
+pub fn verify_break_glass_signature(raw: &[u8], sig: &[u8], public_key: &[u8]) -> Result<()> {
+    let verifying_key = parse_public_key(public_key)?;
+    let signature = parse_signature(sig)?;
+    verifying_key
+        .verify(domain_message(BREAK_GLASS_CONTEXT, raw), &signature)
+        .map_err(|_| {
+            FerrumError::Integrity("break-glass Ed25519 signature verification failed".into())
+        })
+}
+
+fn domain_message(context: &[u8], raw: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(context.len() + raw.len());
+    msg.extend_from_slice(context);
     msg.extend_from_slice(raw);
     msg
+}
+
+fn signed_message(raw: &[u8]) -> Vec<u8> {
+    domain_message(BUNDLE_SIGNATURE_CONTEXT, raw)
 }
 
 pub(crate) fn is_all_zero(bytes: &[u8]) -> bool {
@@ -292,6 +336,43 @@ mod tests {
         let raw_ed25519 = kp.sk.sign(RAW, None).to_vec();
         assert_ne!(sig, raw_ed25519);
         assert_integrity(verify_bundle_signature(RAW, &raw_ed25519, &unsigned));
+    }
+
+    /// The bundle domain and the break-glass domain are not interchangeable in
+    /// either direction.
+    ///
+    /// This is the same invariant `AGENTS.md` states for
+    /// `BUNDLE_SIGNATURE_CONTEXT` and `KEY_BIND_MSG`, extended to the third
+    /// domain — and it is the one with the sharpest consequence. A grant
+    /// suspends enforcement. If the two shared a domain, anybody holding a
+    /// signature the policy publisher made over some bundle could replay it as
+    /// a grant over the same bytes, and the break-glass journal would record a
+    /// suspension that its named subject never issued: the repudiation the
+    /// journal exists to prevent, arrived at through the signature rather than
+    /// through the log.
+    #[test]
+    fn a_bundle_signature_is_not_a_break_glass_grant_and_the_reverse() {
+        let bundle_sig = sign_bundle(RAW, &RFC8032_SK).expect("sign bundle");
+        let grant_sig = sign_break_glass(RAW, &RFC8032_SK).expect("sign grant");
+        assert_ne!(
+            bundle_sig, grant_sig,
+            "the two domains produced the same signature over the same bytes"
+        );
+
+        verify_break_glass_signature(RAW, &grant_sig, &RFC8032_PK).expect("its own domain");
+        assert_integrity(
+            verify_break_glass_signature(RAW, &bundle_sig, &RFC8032_PK).map(|()| Digest::new("")),
+        );
+        assert_integrity(verify_bundle_signature(RAW, &grant_sig, &RFC8032_PK));
+
+        // And no unsigned fallback on the new domain either.
+        assert_integrity(
+            verify_break_glass_signature(RAW, &[], &RFC8032_PK).map(|()| Digest::new("")),
+        );
+        assert_integrity(
+            verify_break_glass_signature(RAW, &grant_sig, &[0u8; ED25519_PUBLIC_KEY_LEN])
+                .map(|()| Digest::new("")),
+        );
     }
 
     #[test]

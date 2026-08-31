@@ -109,6 +109,7 @@ pub fn render(envelope: &EventEnvelope) -> String {
     sd.put("node", &sanitize(&envelope.node));
     sd.put("agentRole", &sanitize(&envelope.agent_role));
     sd.put("degraded", bool_text(envelope.degraded));
+    sd.put("degradedReasons", &crate::degraded_reasons_text(envelope));
     sd.put(
         "bundleDigest",
         &envelope

@@ -625,6 +625,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ferrum-api",
+ "ferrum-breakglass",
  "ferrum-common",
  "ferrum-compiler",
  "ferrum-crypto",
@@ -673,6 +674,18 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+]
+
+[[package]]
+name = "ferrum-breakglass"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ferrum-common",
+ "ferrum-crypto",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -50,6 +50,13 @@ pub struct WebhookState {
     reviews_allowed: std::sync::atomic::AtomicU64,
     reviews_denied: std::sync::atomic::AtomicU64,
     config: ReviewConfig,
+    /// Break-glass, or `None` on a process that was never armed with it.
+    ///
+    /// `Option` and not a disarmed instance: arming opens and probes a journal,
+    /// so an instance that exists is an instance that could record a
+    /// suspension. A struct that pretended to be armed with nowhere to write
+    /// would be exactly the thing `ferrum-breakglass` refuses to be.
+    break_glass: Option<Arc<crate::break_glass::BreakGlass>>,
 }
 
 impl WebhookState {
@@ -72,7 +79,20 @@ impl WebhookState {
             reviews_allowed: std::sync::atomic::AtomicU64::new(0),
             reviews_denied: std::sync::atomic::AtomicU64::new(0),
             config,
+            break_glass: None,
         }
+    }
+
+    /// Arm this process with break-glass. Consuming, so a state cannot be armed
+    /// twice with two journals.
+    pub fn with_break_glass(mut self, break_glass: Arc<crate::break_glass::BreakGlass>) -> Self {
+        self.break_glass = Some(break_glass);
+        self
+    }
+
+    /// The break-glass this process was armed with, if any.
+    pub fn break_glass(&self) -> Option<&Arc<crate::break_glass::BreakGlass>> {
+        self.break_glass.as_ref()
     }
 
     /// Clone the current program under a read lock, then evaluate. No disk I/O.
@@ -93,10 +113,34 @@ impl WebhookState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let reply = self
-            .config
-            .handle_bytes(body, Some(&program), &exceptions, Utc::now());
+        let now = Utc::now();
+        // Read once per review, from the state the poll loop maintains: this is
+        // an `RwLock` read and a timestamp comparison, never a file. A grant
+        // that had to be re-read from disk here would put a `stat` on the span
+        // `REVIEW_LATENCY_BUDGET_SECONDS` covers, which is precisely the kind of
+        // work that budget exists to catch.
+        let grant = self
+            .break_glass
+            .as_ref()
+            .and_then(|bg| bg.active(now))
+            .map(|held| crate::review::BreakGlassGrant {
+                id: held.grant.id.clone(),
+                ticket: held.grant.ticket.clone(),
+                expires_at: held.grant.expires_at,
+            });
+        let reply = self.config.handle_bytes_under_break_glass(
+            body,
+            Some(&program),
+            &exceptions,
+            grant.as_ref(),
+            now,
+        );
         self.review_seconds.observe(started.elapsed());
+        if grant.is_some() && reply.allowed {
+            if let Some(bg) = &self.break_glass {
+                bg.note_admit();
+            }
+        }
         if reply.allowed {
             self.reviews_allowed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

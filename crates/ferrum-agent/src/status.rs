@@ -236,6 +236,18 @@ impl StatusPublisher {
         if let Some(ctx) = out.ctx {
             ctx.set_bundle_digest(agent.last_good_digest().cloned());
             ctx.set_degraded(state.degraded);
+            // Both halves in one call, so no envelope can carry this tick's
+            // boolean beside the previous tick's reasons. The ids and not the
+            // sentences: the sentences are `status.json`'s, a 0600 file on the
+            // node, and the whole point of putting this on the envelope is that
+            // it reaches somebody who has no node.
+            ctx.set_degraded_reasons(
+                state
+                    .reasons
+                    .iter()
+                    .map(|reason| crate::metrics::degraded_reason_id(reason).to_string())
+                    .collect(),
+            );
         }
         let render = out.status_dir.is_some() || state.transition.is_some();
         let json = render.then(|| status_json(agent, out.ctx, out.sink, &state));

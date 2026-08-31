@@ -10,6 +10,11 @@ description = "Webhook. Forbidden: ferrum-compiler, aya, outbound net on hot pat
 [dependencies]
 chrono.workspace = true
 ferrum-api.workspace = true
+# Break-glass grants and their journal. Graph is chrono, ferrum-common,
+# ferrum-crypto, serde and sha2 — all of which this crate already carries; the
+# suspension mechanism adds no network, no client and no runtime to the
+# decision path.
+ferrum-breakglass.workspace = true
 ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ids.workspace = true

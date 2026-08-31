@@ -6,6 +6,7 @@
 
 #![deny(unsafe_code)]
 
+mod break_glass;
 mod bundle;
 mod encoding;
 mod eval;
@@ -97,6 +98,7 @@ pub const fn review_latency_budget_seconds() -> f64 {
     }
 }
 
+pub use break_glass::{poll_break_glass, BreakGlass, GRANT_FILE, SIGNATURE_FILE};
 pub use bundle::{
     encode_fsig, extract_fsig, load_bundle, load_digest, load_path, load_signed, load_source,
     load_source_with_expected, parse_trust_root, read_exceptions_path, read_source_path,
@@ -118,7 +120,9 @@ pub use labels::{
 };
 pub use metrics::{exposition, metrics_text, spawn_metrics};
 pub use program::{parse_program, AdmissionProgram, ADMISSION_ABI, ADMISSION_MAGIC};
-pub use review::{handle_review_bytes, ReviewConfig, ReviewReply};
+pub use review::{
+    break_glass_message, handle_review_bytes, BreakGlassGrant, ReviewConfig, ReviewReply,
+};
 pub use server::{poll_bundle_file, poll_exceptions_file, serve, serve_listener, WebhookState};
 pub use serving_cert::{
     certificate_facts, poll_serving_cert, CertFacts, Issuer, TlsSource, SERVING_CERT_WARN_DAYS,

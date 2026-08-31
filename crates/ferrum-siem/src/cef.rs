@@ -65,6 +65,10 @@ pub fn render(envelope: &EventEnvelope) -> String {
     ext.put("ferrumSchemaVersion", &envelope.schema_version.to_string());
     ext.put("ferrumAgentRole", &sanitize(&envelope.agent_role));
     ext.put("ferrumDegraded", bool_text(envelope.degraded));
+    ext.put(
+        "ferrumDegradedReasons",
+        &crate::degraded_reasons_text(envelope),
+    );
     ext.put("ferrumExecuted", bool_text(e.executed));
     ext.put("ferrumLabelsUnknown", bool_text(e.labels_unknown));
     ext.put("ferrumPathUnknown", bool_text(e.path_unknown));

@@ -1,0 +1,19 @@
+[package]
+name = "ferrum-breakglass"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# Five, and the list is the boundary. No kube client (a grant is a mount, not
+# an API object), no network (a suspension that needs a reachable IdP is a
+# suspension that stops working during the outage it exists for), no async
+# runtime, no logging framework: the journal writes bytes.
+[dependencies]
+chrono.workspace = true
+ferrum-common.workspace = true
+ferrum-crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true

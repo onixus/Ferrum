@@ -171,7 +171,7 @@ pub enum Disposition {
 /// build failures. That is the whole mechanism — a field added to the schema
 /// cannot reach a third-party system until somebody decides, in writing, that
 /// it should.
-pub const FIELDS: [(&str, Disposition, &str); 26] = [
+pub const FIELDS: [(&str, Disposition, &str); 27] = [
     (
         "schema",
         Disposition::Emitted,
@@ -212,6 +212,19 @@ pub const FIELDS: [(&str, Disposition, &str); 26] = [
         Disposition::Emitted,
         "узел был деградирован в момент решения: запись, принятая \
          fail-closed, и запись при полном знании — разные утверждения",
+    ),
+    (
+        "degradedReasons",
+        Disposition::Emitted,
+        "стабильные id деградаций узла в момент решения. Именно на этом поле \
+         критерий закрытия фазы 1 упирался в доступ к узлу: булев `degraded` \
+         выше говорит «что-то не так», а какой именно из `lkg_partial`, \
+         `clock_rollback`, `container_flag_disagreement` был поднят — жило \
+         только в `status.json`, файле 0600 на самом узле. Уходит наружу, \
+         потому что id — не предложение и не имя политики: это тот же \
+         словарь, что уже публикует `ferrum_agent_degraded_reason`, и \
+         разбирающий инцидент соединяет запись с графиком, а не заводит \
+         второй словарь",
     ),
     (
         "event.policy",
@@ -381,6 +394,27 @@ pub fn sanitize(value: &str) -> String {
     out
 }
 
+/// Separator between degradation reason ids in the two syslog profiles.
+///
+/// A comma and not a space: CEF's extension and RFC 5424's SD-PARAM both take
+/// one value per key, and a space inside it is where a hand-written parser on
+/// the receiver's side splits a field it was not supposed to split. The reason
+/// ids themselves are `[a-z_]`, so a comma cannot occur inside one.
+pub const REASON_SEPARATOR: &str = ",";
+
+/// The node's degradation reason ids as one field value, for the two formats
+/// that have no arrays. Empty when the node was healthy, which is the same
+/// thing `degraded=false` says and is written anyway: a key that disappears is
+/// a key a receiver has to special-case.
+pub fn degraded_reasons_text(envelope: &EventEnvelope) -> String {
+    envelope
+        .degraded_reasons
+        .iter()
+        .map(|reason| sanitize(reason))
+        .collect::<Vec<_>>()
+        .join(REASON_SEPARATOR)
+}
+
 /// CEF severity, 0..10. Shared by all three profiles so a rule written against
 /// one does not disagree with a dashboard built on another.
 pub fn severity(action: &str, executed: bool) -> u8 {
@@ -436,7 +470,8 @@ mod tests {
             node: "node-a".into(),
             bundle_digest: Some(Digest::new("sha256:abc")),
             agent_role: "respond".into(),
-            degraded: false,
+            degraded: true,
+            degraded_reasons: vec!["lkg_partial".into(), "clock_rollback".into()],
             event: EnforcementEvent {
                 policy: PolicyId::new("prod-restricted"),
                 rule: RuleId::new("no-shell"),
