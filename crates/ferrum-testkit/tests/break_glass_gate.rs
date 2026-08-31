@@ -939,7 +939,51 @@ fn the_two_break_glass_operations_the_runbook_names_are_shipped_and_work() {
         "the shipped verifier accepted an edited chain"
     );
 
-    // 4. And the one edit it cannot see, asserted as such rather than left to
+    // 4. Two replicas, one file. This is what `kubectl logs -l` returns on the
+    //    shipped two-replica install, and it is how the procedure was first
+    //    written: the verifier read the two interleaved chains as one and
+    //    failed with «seq 0 where 1 was expected», which in the middle of an
+    //    incident reads as an entry having been removed. Found by running the
+    //    procedure against a live cluster, not by reasoning about it.
+    let second = dir.join("mount-b");
+    std::fs::create_dir_all(&second).expect("mount");
+    std::fs::copy(&path, second.join(GRANT_FILE)).expect("grant.json");
+    std::fs::copy(&sig_path, second.join(SIGNATURE_FILE)).expect("grant.sig");
+    let other_journal = dir.join("replica-b.jsonl");
+    let pk = public_key_from_secret(&BREAK_GLASS_SK).expect("pk");
+    let other = BreakGlass::arm(&second, &other_journal, pk, "ferrum-admission/replica-b")
+        .expect("arm the second replica");
+    other.poll(Utc::now());
+    let mixed = dir.join("mixed.jsonl");
+    let both = format!(
+        "{}{}",
+        std::fs::read_to_string(&journal_path).expect("a"),
+        std::fs::read_to_string(&other_journal).expect("b")
+    );
+    assert_eq!(
+        both.lines().filter(|l| !l.trim().is_empty()).count(),
+        2,
+        "the two replicas did not produce two entries, so the mixed case is not being tested"
+    );
+    std::fs::write(&mixed, &both).expect("write");
+    ferrum_cli::break_glass::verify_journal(&mixed).unwrap_or_else(|err| {
+        panic!(
+            "the collection the runbook tells an operator to make — every replica's log in one \
+             file — is reported as a broken chain: {err:#}"
+        )
+    });
+    // And the same file with one replica's entry actually edited must still
+    // fail, or the grouping above has turned the verifier into a no-op.
+    let mixed_edited = dir.join("mixed-edited.jsonl");
+    let edited_both = both.replace("INC-4471", "INC-9999");
+    assert_ne!(edited_both, both, "the edit matched nothing");
+    std::fs::write(&mixed_edited, edited_both).expect("write");
+    assert!(
+        ferrum_cli::break_glass::verify_journal(&mixed_edited).is_err(),
+        "grouping by writer made the verifier accept an edited entry"
+    );
+
+    // 5. And the one edit it cannot see, asserted as such rather than left to
     //    be discovered during an incident: a truncated tail verifies, which is
     //    exactly why the runbook tells an operator to compare the head against
     //    a copy kept off the node.

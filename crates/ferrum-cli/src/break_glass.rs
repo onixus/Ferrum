@@ -30,7 +30,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use ferrum_breakglass::{check_invariants, Grant, Journal, JOURNAL_SCHEMA};
+use ferrum_breakglass::{check_invariants, Entry, Grant, Journal, JOURNAL_SCHEMA};
 
 /// `ferrumctl sign-break-glass <grant.json> --key <seedfile> -o <grant.sig>`.
 ///
@@ -77,64 +77,116 @@ pub fn sign_grant(input: &Path, key: &Path, output: &Path) -> Result<()> {
 
 /// `ferrumctl verify-journal <break-glass.jsonl>`.
 ///
-/// Prints the chain, one line per entry, and the head. The head is the value to
-/// compare against whatever copy was kept off the node — the container log or
-/// `ferrum_admission_break_glass_journal_info` — because a chain verifies
+/// Prints each chain, one line per entry, with its head. The head is the value
+/// to compare against whatever copy was kept off the node — the container log
+/// or `ferrum_admission_break_glass_journal_info` — because a chain verifies
 /// against itself even when it was rewritten from scratch.
+///
+/// **One file, possibly several chains.** Each replica keeps its own: the
+/// journal is written per process and starts at genesis when that process
+/// starts, so the obvious way to collect one — `kubectl logs -l
+/// app.kubernetes.io/name=ferrum-admission` — returns two interleaved chains on
+/// a two-replica install. Verifying that as one sequence fails with «seq 0
+/// where 1 was expected», which reads as *an entry is missing* and sends an
+/// operator looking for tampering in the middle of an incident. It is not: it
+/// is two chains in one file, and `component` says which is which. So this
+/// groups by `component` first and verifies each group on its own. Found by
+/// running the shipped procedure against a live two-replica install rather than
+/// by reasoning about it.
 pub fn verify_journal(input: &Path) -> Result<()> {
-    let entries = Journal::verify_path(input).map_err(anyhow::Error::from)?;
-    if entries.is_empty() {
+    let text = fs::read_to_string(input).with_context(|| format!("read {}", input.display()))?;
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    if lines.is_empty() {
         println!(
             "{}: empty chain, nothing was ever recorded",
             input.display()
         );
         return Ok(());
     }
-    for entry in &entries {
+
+    // Group by writer, first-seen order, so the output reads in the order the
+    // replicas appear in the file rather than alphabetically.
+    let mut order: Vec<String> = Vec::new();
+    let mut chains: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (n, line) in lines.iter().enumerate() {
+        let entry: Entry = serde_json::from_str(line)
+            .with_context(|| format!("{}:{}: not a journal entry", input.display(), n + 1))?;
         if entry.schema != JOURNAL_SCHEMA {
-            bail!("entry {} is not a {JOURNAL_SCHEMA} record", entry.seq);
+            bail!(
+                "{}:{}: schema {:?} is not {JOURNAL_SCHEMA}",
+                input.display(),
+                n + 1,
+                entry.schema
+            );
         }
-        let window = match (entry.issued_at, entry.expires_at) {
-            (Some(from), Some(to)) => format!(" window={from}..{to}"),
-            _ => String::new(),
-        };
+        if !chains.contains_key(&entry.component) {
+            order.push(entry.component.clone());
+        }
+        chains
+            .entry(entry.component)
+            .or_default()
+            .push(line.clone());
+    }
+
+    if order.len() > 1 {
         println!(
-            "{:>4}  {}  {:<9} grant={} subject={} ticket={}{}{}",
-            entry.seq,
-            entry.ts,
-            entry.event,
-            if entry.grant_id.is_empty() {
-                "-"
-            } else {
-                &entry.grant_id
-            },
-            if entry.subject.is_empty() {
-                "-"
-            } else {
-                &entry.subject
-            },
-            if entry.ticket.is_empty() {
-                "-"
-            } else {
-                &entry.ticket
-            },
-            window,
-            if entry.detail.is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", entry.detail)
-            },
+            "{} chains in this file, one per writer. Each is verified on its own: a journal is \
+             per process and every one of them starts at genesis.\n",
+            order.len()
         );
     }
-    let head = entries.last().expect("non-empty").hash.clone();
+    for component in &order {
+        let group = chains.get(component).expect("grouped");
+        let entries = Journal::verify_lines(group)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("chain of {component}"))?;
+        println!("chain: {component}");
+        for entry in &entries {
+            let window = match (entry.issued_at, entry.expires_at) {
+                (Some(from), Some(to)) => format!(" window={from}..{to}"),
+                _ => String::new(),
+            };
+            println!(
+                "{:>4}  {}  {:<9} grant={} subject={} ticket={}{}{}",
+                entry.seq,
+                entry.ts,
+                entry.event,
+                dash(&entry.grant_id),
+                dash(&entry.subject),
+                dash(&entry.ticket),
+                window,
+                if entry.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", entry.detail)
+                },
+            );
+        }
+        println!(
+            "  verified: {} entries, head {}\n",
+            entries.len(),
+            entries.last().expect("non-empty").hash
+        );
+    }
     println!(
-        "chain verified: {} entries, head {head}\n\
-         Compare that head against the copy kept off the node (the container log, or the \
-         `head` label of ferrum_admission_break_glass_journal_info). A chain rewritten from \
-         scratch verifies too; only an older head can tell you it was.",
-        entries.len()
+        "Compare each head against the copy kept off the node (the container log, or the `head` \
+         label of ferrum_admission_break_glass_journal_info on that replica). A chain rewritten \
+         from scratch verifies too, and so does one with its tail cut off; only an older head \
+         can tell you either happened."
     );
     Ok(())
+}
+
+fn dash(value: &str) -> &str {
+    if value.is_empty() {
+        "-"
+    } else {
+        value
+    }
 }
 
 fn read_secret_key(path: &Path) -> Result<Vec<u8>> {

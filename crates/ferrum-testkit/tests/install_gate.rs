@@ -496,4 +496,93 @@ mod gate {
             run.output()
         );
     }
+
+    /// The break-glass overlay applies, and the Pod template the API server
+    /// stores is the one the operator was promised.
+    ///
+    /// Read back from the API server rather than rendered locally, and that is
+    /// the point: `overlays/break-glass` is six JSON patches against paths in
+    /// somebody else's Deployment, and a patch that lands in the wrong place is
+    /// invisible to every text-reading gate in this tree. `break_glass_gate.rs`
+    /// asserts the flags are in the overlay *file*; this asserts they reached a
+    /// container spec a kubelet would run.
+    ///
+    /// `--dry-run=server -o json`, which is not a weaker check than a real
+    /// apply here: the API server resolves the patches, applies defaulting and
+    /// returns the object it *would* store, so the assertions below are against
+    /// its answer rather than against a local rendering. It stores nothing,
+    /// which keeps this test from leaving the shared cluster in a state the
+    /// other test in this file would then be describing — arming break-glass
+    /// requires a trust-root Secret the operator creates, and a Deployment
+    /// patched to want one that does not exist is not an install anybody
+    /// installed.
+    ///
+    /// What this does not claim: that the armed Pod comes up. That needs
+    /// `ferrum-break-glass-root`, which is an operator's Secret like every
+    /// other Secret in this tree, and creating one here would be this gate
+    /// installing something `deploy/README` says it must not.
+    #[test]
+    fn the_break_glass_overlay_arms_the_deployment_a_real_apiserver_would_store() {
+        let _lock = serialized();
+        install();
+        let run = kubectl(&[
+            "apply",
+            "--dry-run=server",
+            "-o",
+            "json",
+            "-k",
+            "overlays/break-glass",
+        ]);
+        assert!(
+            run.ok(),
+            "the API server refused an object in `overlays/break-glass`:\n{}",
+            run.output()
+        );
+        let stdout = run.output();
+        assert!(
+            stdout.contains("\"ferrum-admission\""),
+            "the answer names no ferrum-admission object, so every assertion below would be \
+             about an empty string:\n{stdout}"
+        );
+
+        for flag in [
+            "--break-glass",
+            "--break-glass-journal",
+            "--break-glass-root",
+        ] {
+            assert!(
+                stdout.contains(&format!("\"{flag}\"")),
+                "{flag} is not in the object the API server would store; the patch resolved \
+                 somewhere else, and no text-reading gate can see that"
+            );
+        }
+        for path in [
+            "/etc/ferrum/break-glass",
+            "/var/lib/ferrum/break-glass.jsonl",
+        ] {
+            assert!(
+                stdout.contains(path),
+                "the binary is told to use {path} and no mount provides it"
+            );
+        }
+        assert!(
+            stdout.contains("\"secretName\": \"ferrum-break-glass\"")
+                || stdout.contains("\"secretName\":\"ferrum-break-glass\""),
+            "the grant mount is not on the template"
+        );
+        assert!(
+            stdout.contains("\"optional\": true") || stdout.contains("\"optional\":true"),
+            "the grant Secret is required; it is empty on every healthy cluster, so both \
+             replicas would sit in ContainerCreating"
+        );
+        assert!(
+            stdout.contains("ferrum-break-glass-root"),
+            "the break-glass trust root is not wired into the container's environment"
+        );
+        assert!(
+            stdout.contains("POD_NAME"),
+            "the replica name is not wired in; a journal entry that cannot say which replica \
+             wrote it is one a reader has to guess about"
+        );
+    }
 }
