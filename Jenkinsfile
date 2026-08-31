@@ -1488,7 +1488,7 @@ pipeline {
                             echo "BPF pins passed without printing the line a test emits only after re-opening a pin with the handle dropped: nothing here proved a pin outlived anything" >&2
                             exit 1
                         fi
-                        if ! grep -q "^test result: ok\. 3 passed" "$out"; then
+                        if ! grep -q "^test result: ok[.] 3 passed" "$out"; then
                             echo "BPF pins did not run all three kernel tests; a filtered or ignored one leaves a refusal path unmeasured" >&2
                             exit 1
                         fi
