@@ -1,0 +1,51 @@
+# The one thing a closed contour has to change, and a large part of why this
+# tree ships kustomize at all: where the images come from.
+#
+# `kubectl apply -k deploy` pulls `ghcr.io/onixus/*`, which is the internet. A
+# contour with an air gap mirrors those images into its own registry and has to
+# say so somewhere; here that somewhere is four lines of `images:` rather than
+# a `sed` over the manifests, and the manifests themselves stay the files the
+# rest of this tree reads and gates.
+#
+# The registry below is `registry.internal.example`, and it is not a
+# placeholder picked for looks: it is the only registry
+# `policies/examples/prod-restricted.yaml` allows
+# (`spec.selector.image.registriesAllow`). So the default install is one that
+# the policy this repository ships would refuse if it were ever selected, and
+# this overlay is what makes the two agree.
+# `deploy_gate.rs::the_mirrored_overlay_moves_the_install_into_the_registry_the_shipped_policy_allows`
+# holds exactly that: the base registry outside the allow-list, the overlay's
+# inside it.
+#
+# Why this sits beside `deploy/` and not inside it: kustomize refuses a root
+# that contains another root it has already visited, so an overlay under
+# `deploy/overlays` naming `../..` is a cycle by construction —
+# `cycle detected: candidate root '.../deploy' contains visited root
+# '.../deploy/overlays/mirrored-registry'`. The alternative is moving every
+# manifest down into `deploy/base`, which would change every path this
+# repository's gates, READMEs and `e2e_cluster.rs` name. A directory here is
+# cheaper than that.
+#
+# Substitute your own registry. What must not be substituted is the tag: there
+# is no `newTag` below, on purpose. The tag is pinned once, in the manifests,
+# and `deploy_gate.rs::the_tag_the_manifests_pin_is_one_the_release_can_publish`
+# is what joins it to the release that can publish it. A second pin in an
+# overlay is a second thing to forget.
+#
+# This overlay is not installable and is not meant to be: nothing answers at
+# `registry.internal.example`. What is checked mechanically is that it changes
+# the images and nothing else — see
+# `deploy_gate.rs::the_mirrored_overlay_changes_image_names_and_nothing_else`.
+# The claim that an install comes up is made once, on the base, against a real
+# API server.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../deploy
+
+images:
+  - name: ghcr.io/onixus/ferrum-admission
+    newName: registry.internal.example/ferrum/ferrum-admission
+  - name: ghcr.io/onixus/ferrum-controller
+    newName: registry.internal.example/ferrum/ferrum-controller

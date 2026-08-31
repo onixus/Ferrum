@@ -1,0 +1,19 @@
+# The controller, as one installable unit.
+#
+# The order is the order `kubectl apply` wants and the order deploy/admission's
+# README spells out for its own directory: identity, then what that identity may
+# do, then the workload that uses it.
+#
+# The two Secrets the Deployment mounts — ferrum-signing-key and, through the
+# webhook, the bundle it writes — are deliberately absent. A signing seed is not
+# a manifest, and a kustomization that generated one would put a key in git or
+# invent one per apply; both are worse than an operator creating it once. Until
+# it exists the Pod sits in ContainerCreating with the Secret named on it, which
+# is the failure said in the place an operator looks.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - serviceaccount.yaml
+  - rbac.yaml
+  - deployment.yaml

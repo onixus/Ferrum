@@ -1,0 +1,29 @@
+# Kustomization root for the CRDs, so `deploy/` can name this directory as a
+# resource instead of a caller remembering to `kubectl apply -f docs/crd/`
+# first. The catalogue stays here — this is where `docs/crd/README.md` reads
+# them, and moving the files under `deploy/` would leave the catalogue pointing
+# at nothing.
+#
+# All seven, not the three the controller watches. `deploy/controller/rbac.yaml`
+# grants three because a grant for a kind nothing watches is a false statement
+# about the system; a CRD that is not installed is a different thing entirely —
+# an object an operator writes and the API server rejects as unknown, with
+# nothing anywhere to say the type was deliberately left out. The list is held
+# against this directory by
+# `deploy_gate.rs::the_crd_kustomization_installs_every_crd_this_repository_ships`,
+# so a CRD added next to these cannot be forgotten here.
+#
+# `e2e_cluster.rs::the_shipped_crds_are_accepted_by_a_real_apiserver` is what
+# makes these files a claim rather than text: two of the seven were refused
+# outright by a real API server while every text-reading gate here held them.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - clustersecuritypolicy.yaml
+  - compliancesnapshot.yaml
+  - ferrumcluster.yaml
+  - policyexception.yaml
+  - policylibrary.yaml
+  - runtimeprofile.yaml
+  - securitypolicy.yaml
