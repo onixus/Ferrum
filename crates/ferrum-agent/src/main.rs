@@ -106,6 +106,11 @@ fn main() {
         Some(s) if !s.is_empty() => s.parse().unwrap_or_else(|_| die("invalid --export-queue")),
         _ => DEFAULT_EXPORT_QUEUE,
     };
+    // Parsed before anything is built, and every error here is exit(2): a
+    // typo in `--siem-profile` that fell back to a default would put the node
+    // on a wire format the receiver cannot parse, and the loss would happen
+    // inside somebody else's parser where nothing in this tree can count it.
+    let siem = siem_config(&flags);
     let node = flags
         .map
         .get("node")
@@ -171,7 +176,7 @@ fn main() {
         "observe"
     };
     let ctx = SinkContext::new(node, role_name);
-    let inner: Box<dyn EventSink + Send + Sync> = match export_dir.clone() {
+    let durable: Box<dyn EventSink + Send + Sync> = match export_dir.clone() {
         Some(dir) => Box::new(RotatingFileSink::new(
             dir,
             export_max_bytes,
@@ -180,11 +185,37 @@ fn main() {
         )),
         None => Box::new(ferrum_export::EnvelopeWriterSink::stdout(ctx.clone())),
     };
+    // The node-local record first, always, and the SIEM beside it — never
+    // instead of it. A destination this node does not own must not be the only
+    // copy of what it enforced: the file survives a SIEM outage, a rotated
+    // credential and a firewall change, and it is what an investigation falls
+    // back to when the export counters say records were lost.
+    let mut destinations: Vec<Box<dyn EventSink + Send + Sync>> = vec![durable];
+    if let Some(config) = siem {
+        eprintln!(
+            "ferrum-agent: exporting to {} over {} as {}",
+            config.address,
+            config.transport.name(),
+            config.profile.name()
+        );
+        destinations.push(Box::new(ferrum_siem::SyslogSink::new(config)));
+    }
+    // Always a fan-out, even with one destination: one code path, and the
+    // envelope is stamped once in one place.
+    let inner: Box<dyn EventSink + Send + Sync> =
+        Box::new(ferrum_export::FanoutSink::new(ctx.clone(), destinations));
     ctx.set_bundle_digest(agent.last_good_digest().cloned());
     ctx.set_degraded(agent.is_degraded());
     let sink = std::sync::Arc::new(QueueSink::new(inner, export_queue));
     install_signal_handlers();
     spawn_shutdown_watcher(Arc::clone(&sink));
+
+    // Bound here, before anything claims to be running: a metrics port that
+    // cannot be bound is a target that never comes up, and discovering that
+    // from the scraper's side is discovering it hours later. Absent flag means
+    // absent port — the endpoint is opt-in, because a listening socket on a
+    // DaemonSet is a cost the operator has to choose.
+    let metrics_listener = bind_metrics(&flags);
 
     run(
         agent,
@@ -195,7 +226,63 @@ fn main() {
         reload_ms,
         &flags,
         cgroup_rx,
+        metrics_listener,
     )
+}
+
+/// `--siem-address host:port [--siem-transport udp|tcp] [--siem-profile ...]`,
+/// or nothing.
+///
+/// Off unless an address is given, and that is not timidity: an export
+/// destination is a site's own address, and a default would either be a name
+/// that does not resolve — every event counted as an export failure on every
+/// node, every node Degraded — or a guess about somebody's network.
+///
+/// The two other flags are only read when an address is present, and a value
+/// this build does not know is exit(2) rather than a fallback. `--siem-profile
+/// syslog` silently becoming CEF would put a fleet on a format the receiver's
+/// parser drops, and that is the one loss no counter in this tree can see: the
+/// records leave this node successfully and die inside somebody else's
+/// pipeline.
+fn siem_config(flags: &Flags) -> Option<ferrum_siem::SinkConfig> {
+    let address = flags
+        .map
+        .get("siem-address")
+        .filter(|s| !s.is_empty())?
+        .clone();
+    let transport = match flags.map.get("siem-transport").filter(|s| !s.is_empty()) {
+        Some(name) => ferrum_siem::Transport::parse_name(name).unwrap_or_else(|err| die(&err)),
+        // TCP by default. UDP loses records with nothing on either side to say
+        // so, which is the failure mode this whole crate is written against;
+        // it stays available for a receiver that only speaks it.
+        None => ferrum_siem::Transport::Tcp,
+    };
+    let profile = match flags.map.get("siem-profile").filter(|s| !s.is_empty()) {
+        Some(name) => ferrum_siem::Profile::parse_name(name).unwrap_or_else(|err| die(&err)),
+        // The standard, not a vendor's dialect: a receiver nobody configured
+        // for us still parses RFC 5424 structured data.
+        None => ferrum_siem::Profile::Rfc5424,
+    };
+    Some(ferrum_siem::SinkConfig {
+        address,
+        transport,
+        profile,
+    })
+}
+
+/// `--metrics-listen host:port`, or nothing.
+fn bind_metrics(flags: &Flags) -> Option<std::net::TcpListener> {
+    let listen = flags.map.get("metrics-listen").filter(|s| !s.is_empty())?;
+    match std::net::TcpListener::bind(listen.as_str()) {
+        Ok(listener) => {
+            eprintln!(
+                "ferrum-agent: metrics on {listen}{}",
+                ferrum_metrics::METRICS_PATH
+            );
+            Some(listener)
+        }
+        Err(err) => die(&format!("bind --metrics-listen {listen}: {err}")),
+    }
 }
 
 /// Fills the cgroup→pod index and publishes its key set to whoever owns the
@@ -328,6 +415,7 @@ fn run(
     reload_ms: u64,
     flags: &Flags,
     cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
+    metrics_listener: Option<std::net::TcpListener>,
 ) -> ! {
     use ferrum_ebpf::{plan_cgroup_sync, KernelHandle, SyscallArch};
     use std::sync::mpsc::sync_channel;
@@ -353,6 +441,14 @@ fn run(
         sink: Some(sink.as_ref()),
         status_dir: export_dir.as_deref(),
     };
+    if let Some(listener) = metrics_listener {
+        ferrum_agent::spawn_metrics(
+            listener,
+            Arc::clone(&agent),
+            ctx.clone(),
+            std::sync::Arc::clone(&sink),
+        );
+    }
     let mut handle = match KernelHandle::attach_for_arch(&elf, arch) {
         Ok(handle) => {
             if !handle.unhooked_syscalls().is_empty() {
@@ -548,7 +644,7 @@ fn park_degraded(
 #[cfg(not(feature = "attach"))]
 #[allow(clippy::too_many_arguments)]
 fn run(
-    mut agent: Agent,
+    agent: Agent,
     sink: std::sync::Arc<QueueSink<Box<dyn EventSink + Send + Sync>>>,
     ctx: SinkContext,
     bundle_path: Option<PathBuf>,
@@ -556,28 +652,37 @@ fn run(
     reload_ms: u64,
     _flags: &Flags,
     _cgroup_rx: std::sync::mpsc::Receiver<CgroupPublish>,
+    metrics_listener: Option<std::net::TcpListener>,
 ) -> ! {
     eprintln!(
         "ferrum-agent: built without the attach feature: no kernel datapath, \
          no syscall events, no reaction. Degraded."
     );
     ctx.set_degraded(true);
+    // Shared rather than owned, and in this build too: the metrics thread is a
+    // second reader of the same agent, and a build whose only difference from
+    // the shipped one is that its state is unreadable would be the harder of
+    // the two to debug. The poll loops are the `_shared` forms for the same
+    // reason the attach build uses them.
+    let agent = std::sync::Arc::new(std::sync::RwLock::new(agent));
     let out = ferrum_agent::StatusOutput {
         ctx: Some(&ctx),
         sink: Some(sink.as_ref()),
         status_dir: export_dir.as_deref(),
     };
+    if let Some(listener) = metrics_listener {
+        ferrum_agent::spawn_metrics(
+            listener,
+            std::sync::Arc::clone(&agent),
+            ctx.clone(),
+            std::sync::Arc::clone(&sink),
+        );
+    }
     match bundle_path {
         Some(path) => {
-            ferrum_agent::poll_bundle(&mut agent, &path, Duration::from_millis(reload_ms), &out)
+            ferrum_agent::poll_bundle_shared(&agent, &path, Duration::from_millis(reload_ms), &out)
         }
-        None => {
-            let mut publisher = ferrum_agent::StatusPublisher::default();
-            loop {
-                std::thread::sleep(Duration::from_millis(reload_ms));
-                publisher.publish(&agent, &out);
-            }
-        }
+        None => ferrum_agent::poll_status(&agent, Duration::from_millis(reload_ms), &out),
     }
 }
 
@@ -613,7 +718,7 @@ fn require_flag(flags: &Flags, name: &str) -> String {
     match flags.map.get(name) {
         Some(v) if !v.is_empty() => v.clone(),
         _ => die(
-            "usage: ferrum-agent --trust-root <32-byte-hex> [--bundle <fsig|dir>] [--lkg-dir <dir>] [--role observe|respond] [--policy-name <name>] [--reload-ms 1000] [--node <name>] [--export-dir <dir>] [--export-max-bytes 67108864] [--export-keep 5] [--export-queue 8192] [--bpf-elf <path>]",
+            "usage: ferrum-agent --trust-root <32-byte-hex> [--bundle <fsig|dir>] [--lkg-dir <dir>] [--role observe|respond] [--policy-name <name>] [--reload-ms 1000] [--node <name>] [--export-dir <dir>] [--export-max-bytes 67108864] [--export-keep 5] [--export-queue 8192] [--siem-address <host:port>] [--siem-transport tcp|udp] [--siem-profile rfc5424|cef|ecs] [--metrics-listen <host:port>] [--bpf-elf <path>]",
         ),
     }
 }

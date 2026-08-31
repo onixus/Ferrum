@@ -1,0 +1,31 @@
+# The webhook, as one installable unit — minus the one object that decides
+# whether it is asked at all.
+#
+# `validatingwebhookconfiguration.tmpl.yaml` is not here and cannot be: it is a
+# template with `caBundle: REPLACE_WITH_PEM_CA_BUNDLE_BASE64` in it, and the CA
+# that replaces it does not exist until `ferrumctl gen-webhook-pki` has run.
+# Applying the template as written would install a webhook the API server
+# cannot dial, and with `failurePolicy: Fail` that is a cluster-wide outage on
+# every Pod outside ferrum/kube-system. The rendered file is applied by hand,
+# last, exactly as the README in this directory orders it — after the serving
+# Secret, which is also not here for the same reason a signing key is not in
+# deploy/controller.
+#
+# So `kubectl apply -k` on this tree installs a webhook that is running and not
+# yet gating anything. That is the correct half to be able to install
+# unattended: nothing before the configuration exists can deny a Pod.
+# `deploy_gate.rs::no_kustomization_root_installs_the_webhook_configuration`
+# keeps it out.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - serviceaccount.yaml
+  - rbac.yaml
+  - service.yaml
+  - deployment.yaml
+  # Ships with the Deployment and never separately: a disruption budget that
+  # arrives in a second, optional apply is a budget half the installs do not
+  # have, and the half without it is the half where a node drain is a
+  # cluster-wide admission outage.
+  - pdb.yaml

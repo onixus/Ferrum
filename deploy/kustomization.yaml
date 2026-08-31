@@ -1,0 +1,58 @@
+# The default install: `kubectl apply -k deploy`.
+#
+# kustomize and not Helm, and the reason is the receiver rather than taste —
+# see `deploy/README`. The short form: kustomize is inside `kubectl`, so a
+# closed contour that already has kubectl has the installer; the files below
+# are the files that ship, not a rendering of them; and the comments in those
+# files, which are half of what this tree knows, survive an install instead of
+# being replaced by `{{ .Values.something }}`.
+#
+# What this root installs is the control plane and nothing else:
+#
+#   * the CRDs, from docs/crd, because an operator's first object must not be
+#     rejected as an unknown type;
+#   * the namespace, which the webhook configuration excludes by name so a cold
+#     cluster cannot deadlock on the admission Pod that has not started;
+#   * the controller and the webhook workloads;
+#   * the NetworkPolicy governing what may reach their ports.
+#
+# What it deliberately does not install, each with a gate that keeps it out:
+#
+#   * the node agent (`deploy/agent`, its own root) — it needs bpffs on the
+#     node, which kind does not mount, and a default install carrying a
+#     workload that cannot come up would force the install gate to excuse one
+#     of its own resources;
+#   * the ValidatingWebhookConfiguration — it does not exist until
+#     `ferrumctl gen-webhook-pki` renders one with a real caBundle, and with
+#     failurePolicy=Fail applying the unrendered template is a cluster-wide
+#     outage;
+#   * `deploy/agent/optional-respond.yaml` — respond is a deliberate act, not
+#     something inherited from an overlay;
+#   * every Secret — a signing seed, a trust root and a serving key are not
+#     manifests, and a generator for them would either put a key in git or
+#     invent a new one on every apply.
+#
+# So this root brings a cluster to the state deploy/admission/README calls the
+# end of step 2: everything running, nothing gating yet. Step 3 — the rendered
+# webhook configuration — stays a separate, deliberate apply, and it is the
+# one that starts denying Pods.
+#
+# The claim that this comes up at all is not made here. It is made by
+# `install_gate.rs::the_default_install_comes_up_on_a_fresh_cluster`, which
+# applies this root to a real API server and waits for the workloads; nothing
+# in this file or in the gates that read it can establish that, and the last
+# cycle showed why — two CRDs passed every text-reading gate in this tree and
+# were refused outright by an API server.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../docs/crd
+  - namespace.yaml
+  - controller
+  - admission
+  # The NetworkPolicy in front of the metrics ports. Installed by default, and
+  # by the same root as the workloads that open those ports: a restriction that
+  # ships separately from the thing it restricts is a restriction half the
+  # installs will not have.
+  - observability

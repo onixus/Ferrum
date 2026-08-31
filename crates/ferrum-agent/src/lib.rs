@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 mod clock;
+mod metrics;
 mod pump;
 mod respond;
 mod ring;
@@ -431,6 +432,10 @@ fn within(slot: &Mutex<Option<Instant>>, now: Instant, window: Duration) -> bool
 }
 
 pub use clock::{MonotonicFloor, MAX_EXCEPTION_DAYS};
+pub use metrics::{
+    degraded_reason_id, exposition, metrics_text, spawn_metrics, Disposition, DEGRADED_REASON_IDS,
+    NON_NUMERIC_KEYS, UNMAPPED_REASON_ID, WAIVERS_UNJOINED_KEY,
+};
 pub use status::{
     status_json, write_status, StatusOutput, StatusPublisher, StatusTick, STATUS_NAME,
     STATUS_TMP_NAME,
@@ -942,6 +947,27 @@ impl Agent {
     /// Calling this records the state as reported: the transition is returned
     /// once, to whoever is going to log it. Reports, never acts — see
     /// `status` for why no probe may be wired to this.
+    /// The same state, read without claiming the transition.
+    ///
+    /// [`Agent::degraded_state_at`] is not a getter: it latches the reason
+    /// list it saw, and `transition` is `Some` for the *first* caller to
+    /// observe a change and nobody after. That is right for the poll loop,
+    /// which owes the operator exactly one line per change. It is wrong for
+    /// any second reader, and this tree now has one — a `/metrics` scrape,
+    /// arriving on its own thread on someone else's schedule. A scrape that
+    /// called the latching form would consume transitions at random, and the
+    /// stderr line for a node going Degraded would go missing on whichever
+    /// changes happened to fall between two ticks. The surface that reports
+    /// must not be able to erase the report.
+    pub fn degraded_snapshot_at(&self, now: Instant) -> DegradedState {
+        let reasons = self.degraded_reasons_at(now);
+        DegradedState {
+            degraded: !reasons.is_empty(),
+            reasons,
+            transition: None,
+        }
+    }
+
     pub fn degraded_state_at(&self, now: Instant) -> DegradedState {
         let reasons = self.degraded_reasons_at(now);
         let degraded = !reasons.is_empty();

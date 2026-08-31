@@ -25,6 +25,15 @@ struct ContextInner {
     node: String,
     agent_role: String,
     degraded: AtomicBool,
+    /// Stable ids of the degradations behind `degraded`, stamped on every
+    /// envelope beside the boolean.
+    ///
+    /// Kept here rather than derived at emit time for the reason every other
+    /// field of this struct is: the emit path runs under the ring drain and
+    /// must not reach into the `Agent` for anything. The status tick publishes
+    /// both halves in the same call, so a record can never carry a `true` with
+    /// last tick's reasons.
+    degraded_reasons: RwLock<Vec<String>>,
     bundle_digest: RwLock<Option<Digest>>,
 }
 
@@ -35,6 +44,7 @@ impl SinkContext {
                 node: node.into(),
                 agent_role: agent_role.into(),
                 degraded: AtomicBool::new(false),
+                degraded_reasons: RwLock::new(Vec::new()),
                 bundle_digest: RwLock::new(None),
             }),
         }
@@ -42,6 +52,25 @@ impl SinkContext {
 
     pub fn set_degraded(&self, degraded: bool) {
         self.inner.degraded.store(degraded, Ordering::Relaxed);
+    }
+
+    /// The stable reason ids behind the boolean. Callers that know only that
+    /// the node is degraded and not why leave this alone; the status tick,
+    /// which computes both, sets both.
+    pub fn set_degraded_reasons(&self, reasons: Vec<String>) {
+        *self
+            .inner
+            .degraded_reasons
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = reasons;
+    }
+
+    pub fn degraded_reasons(&self) -> Vec<String> {
+        self.inner
+            .degraded_reasons
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The node this agent runs on, as stamped on every envelope. Read by the
@@ -64,6 +93,8 @@ impl SinkContext {
 
     pub fn envelope(&self, event: &EnforcementEvent) -> EventEnvelope {
         EventEnvelope {
+            schema: ferrum_proto::SchemaId,
+            schema_version: ferrum_proto::EVENT_SCHEMA_VERSION,
             ts: Utc::now(),
             node: self.inner.node.clone(),
             bundle_digest: self
@@ -74,6 +105,12 @@ impl SinkContext {
                 .clone(),
             agent_role: self.inner.agent_role.clone(),
             degraded: self.inner.degraded.load(Ordering::Relaxed),
+            degraded_reasons: self
+                .inner
+                .degraded_reasons
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             event: event.clone(),
         }
     }
@@ -234,8 +271,11 @@ impl RotatingFileSink {
 
 impl EventSink for RotatingFileSink {
     fn emit(&self, event: &EnforcementEvent) {
-        let envelope = self.ctx.envelope(event);
-        let mut line = match serde_json::to_vec(&envelope) {
+        self.emit_envelope(&self.ctx.envelope(event))
+    }
+
+    fn emit_envelope(&self, envelope: &EventEnvelope) {
+        let mut line = match serde_json::to_vec(envelope) {
             Ok(bytes) => bytes,
             Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -291,8 +331,11 @@ impl EnvelopeWriterSink<std::io::Stdout> {
 
 impl<W: Write> EventSink for EnvelopeWriterSink<W> {
     fn emit(&self, event: &EnforcementEvent) {
-        let envelope = self.ctx.envelope(event);
-        let mut line = match serde_json::to_vec(&envelope) {
+        self.emit_envelope(&self.ctx.envelope(event))
+    }
+
+    fn emit_envelope(&self, envelope: &EventEnvelope) {
+        let mut line = match serde_json::to_vec(envelope) {
             Ok(bytes) => bytes,
             Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);

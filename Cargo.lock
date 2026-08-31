@@ -625,11 +625,13 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ferrum-api",
+ "ferrum-breakglass",
  "ferrum-common",
  "ferrum-compiler",
  "ferrum-crypto",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-metrics",
  "ferrum-policy",
  "ferrum-wasm-abi",
  "ferrum-wasm-host",
@@ -653,8 +655,10 @@ dependencies = [
  "ferrum-export",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-metrics",
  "ferrum-policy",
  "ferrum-proto",
+ "ferrum-siem",
  "ferrum-testkit",
  "libc",
  "serde_json",
@@ -673,6 +677,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-breakglass"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ferrum-common",
+ "ferrum-crypto",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "ferrum-cli"
 version = "0.1.0"
 dependencies = [
@@ -680,12 +696,14 @@ dependencies = [
  "chrono",
  "clap",
  "ferrum-api",
+ "ferrum-breakglass",
  "ferrum-compiler",
  "ferrum-crypto",
  "ferrum-ids",
  "ferrum-policy",
  "ferrum-testkit",
  "serde",
+ "serde_json",
  "serde_yaml",
 ]
 
@@ -797,6 +815,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "ferrum-policy"
 version = "0.1.0"
 dependencies = [
@@ -819,6 +841,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrum-siem"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ferrum-export",
+ "ferrum-ids",
+ "ferrum-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "ferrum-testkit"
 version = "0.1.0"
 dependencies = [
@@ -826,6 +859,7 @@ dependencies = [
  "ferrum-admission",
  "ferrum-agent",
  "ferrum-api",
+ "ferrum-breakglass",
  "ferrum-cli",
  "ferrum-common",
  "ferrum-compiler",
@@ -835,7 +869,10 @@ dependencies = [
  "ferrum-export",
  "ferrum-ids",
  "ferrum-k8smeta",
+ "ferrum-metrics",
  "ferrum-policy",
+ "ferrum-proto",
+ "ferrum-siem",
  "serde",
  "serde_json",
  "serde_yaml",

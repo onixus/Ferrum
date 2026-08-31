@@ -25,8 +25,17 @@ ferrum-ebpf.workspace = true
 ferrum-export.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+# Prometheus text rendering and the read-only GET listener behind
+# `--metrics-listen`. No dependencies of its own; what it adds to this graph is
+# `std::net` and nothing else. See `src/metrics.rs` for why the port exists at
+# all on a DaemonSet.
+ferrum-metrics.workspace = true
 ferrum-policy.workspace = true
 ferrum-proto.workspace = true
+# The event sink for a SIEM: normalisation and a `std::net` socket behind
+# `--siem-address`. No async runtime, no TLS, no HTTP client; see that crate's
+# `sink.rs` for what happens when the destination is not there.
+ferrum-siem.workspace = true
 # kill(2) for the respond role; no other syscall wrapper is used.
 libc.workspace = true
 # Exceptions JSON is parsed only at reload time, never on the per-event path.

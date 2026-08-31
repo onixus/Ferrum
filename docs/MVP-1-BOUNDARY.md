@@ -64,6 +64,31 @@
   разу, и всё, что цитирует `attach_join.rs`, было меряно только руками на
   x86_64-стенде;
 - `U` — исполнено в userspace; приёмочные строки — против настоящего подписанного bundle, стадии CI — против дерева, которое поставляется;
+- `A` — исполнено против **настоящего apiserver**: объект подан
+  `kubectl apply`, решение приняла установка из `deploy/`, и доказательство —
+  ответ apiserver, а не возврат функции. Метка новая, и появилась она потому,
+  что `U` тянула два разных утверждения. «Исполнено в userspace» значило и «мы
+  позвали `admit()` со структурой, которую сами собрали», и — до этого цикла
+  никогда — «кластер отказал в Pod». Первый же прогон `e2e_cluster.rs` показал,
+  насколько это разные вещи: два CRD из семи проходили каждый читающий текст
+  гейт этого дерева и отвергались apiserver целиком. Стенд один — kind
+  v1.36.1 (kindest/node) на aarch64, docker на этой машине, — и, как и с `K`,
+  метка говорит «против настоящего apiserver», а не «против вашего». Кластеров
+  на этом стенде два, и это не то же самое, что два стенда: `ferrum-e2e` для
+  `e2e_cluster.rs` и `ferrum-install` для `install_gate.rs`. Разделены они по
+  необходимости, а не для порядка: первый несёт применённую
+  `ValidatingWebhookConfiguration`, то есть кластер, в котором политика уже
+  действует, а гейт установки утверждает про кластер, который FERRUM не видел.
+  Поэтому он требует свежести и проверяет её до первого apply. Причина этого
+  разделения была шире и одной половины больше нет: до issue #20 применённый
+  вебхук отказывал в ClusterRoleBinding'ах собственной установки — кеш меток
+  спрашивали о пустом namespace объекта уровня кластера, он его никогда не
+  наблюдал и закрывался. Это исправлено (`eval.rs::cluster_scoped_kind`,
+  `webhook.rs::the_shipped_cluster_role_binding_is_not_refused_by_the_shipped_policy`)
+  и проверено на живом kind: тот же apply, который отвергался, принят, а bind
+  на `cluster-admin` по-прежнему отвергнут. Свежесть кластера гейт требует
+  по-прежнему, но уже как утверждение о том, что он ставит с нуля, а не как
+  обход дефекта;
 - `—` — не исполнено ничем.
 
 `K` больше не наследует один стенд, и это первый цикл, когда это так. Стендов
@@ -94,6 +119,22 @@
 это меньше, чем читается. Она **не** утверждает, что стадию исполнял Jenkins,
 и гейт этого проверить не может: между «стадия есть» и «стадия зелёная» он не
 различает.
+
+То же и с публичным воркфлоу `.github/workflows/ci.yml`: он поставляется в
+дереве, его скрипты сверены с одноимёнными стадиями `Jenkinsfile` построчно,
+и на этом всё. На GitHub он **не исполнялся ни разу** — на дату этой правки
+прогонов нет. Ни одна строка ниже не меряна им, и до первого настоящего
+прогона такой строки здесь быть не может.
+
+То же и с релизным воркфлоу `.github/workflows/release.yml`. Он поставляется в
+дереве, множество образов в нём сверено с `deploy/**` и `Jenkinsfile` на
+равенство, подпись в нём keyless и без единого ключа, а процедура проверки в
+README сверена с ним же, — и на этом всё. **Ни один образ не опубликован**: в
+`ghcr.io/onixus/` нет ни одного тега, `docker push` не исполнялся ни разу ни
+здесь, ни где-либо ещё, ни одной подписи cosign не существует, ни одного SBOM
+не приложено ни к одному релизу. Слов «опубликовано» и «подписано» ниже нет и
+до первого настоящего релиза быть не может; всё, что про этот файл сказано, —
+про содержимое файла.
 
 Что известно про исполнение на 2026-08-30, и известно из логов билдов, а не из
 этого абзаца. Билды #31–#37 гоняли **предыдущий** `Jenkinsfile` — без стадии
@@ -216,14 +257,14 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 
 | Случай §D | Плоскость | Метка | Исполняется |
 |---|---|---|---|
-| unsigned image -> deny | admission | U | U `acceptance.rs::unsigned_image_is_denied` |
-| privileged -> deny | admission | U | U `acceptance.rs::privileged_pod_is_denied` |
+| unsigned image -> deny | admission | A+U | U `acceptance.rs::unsigned_image_is_denied` · A `e2e_cluster.rs::an_unsigned_image_is_denied_by_the_real_apiserver` |
+| privileged -> deny | admission | A+U | U `acceptance.rs::privileged_pod_is_denied` · A `e2e_cluster.rs::a_privileged_pod_is_denied_by_the_real_apiserver` |
 | cluster-admin bind -> deny | admission | U | U `acceptance.rs::cluster_admin_bind_is_denied` |
 | exception without TTL -> API reject | admission | — | — |
 | kubectl exec + /bin/sh -> kill | runtime | K+U | U `acceptance.rs::exec_shell_in_container_is_killed` · U `replay.rs::replay_exec_shell_kill` · K `attach_live.rs::execve_path_comes_from_the_first_argument_slot` · K `attach_join.rs::a_kernel_execve_of_a_shell_is_killed_by_the_signed_bundle` |
 | docker.sock -> kill | runtime | K+U | U `acceptance.rs::docker_sock_access_is_killed` · U `replay.rs::replay_docker_sock_kill` · K `attach_live.rs::a_long_path_arrives_as_a_flagged_head` · K `attach_join.rs::a_kernel_openat_of_docker_sock_is_killed_by_the_signed_bundle` · K `attach_join.rs::a_truncated_docker_sock_path_still_kills_and_says_the_match_was_asserted` · K `attach_join.rs::a_kernel_record_stripped_of_the_flag_is_still_read_as_truncated` |
 | bpf() not from the agent -> deny | runtime | K+U | U `acceptance.rs::bpf_not_from_agent_is_denied` · U `replay.rs::replay_bpf_not_from_agent_deny` · K `attach_live.rs::a_foreign_record_is_not_flagged_agent_self` |
-| CP down -> last-known-good | runtime | U | U `acceptance.rs::cp_down_keeps_last_known_good_not_fail_open` |
+| CP down -> last-known-good | runtime | A+U | U `acceptance.rs::cp_down_keeps_last_known_good_not_fail_open` · A `e2e_cluster.rs::a_control_plane_that_is_gone_keeps_the_webhook_on_last_known_good` |
 
 Что эти строки не говорят, и это важнее того, что они говорят:
 
@@ -285,11 +326,48 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
   ловит мутация 05, и обе нужны.
   Ни один из прогонов Jenkins не делал: стадии `BPF join` и
   `BPF join mutations` существуют, а прогонялись руками.
-- **`exception without TTL` стоит `—` намеренно.** Субъект утверждения —
-  API server, а API server здесь не запускался ни разу. `serde` отказывается
-  декодировать объект без `expiresAt`, и CRD в дереве несёт `required` и CEL —
-  это исполнено (см. следующую таблицу), но отказ библиотеки не есть отказ
-  apiserver.
+- **Три случая §D теперь решены настоящим apiserver, и это первый цикл, когда
+  хоть один решён.** `e2e_cluster.rs` разворачивает `deploy/controller` и
+  `deploy/admission` в kind, применяет `policies/examples/prod-restricted.yaml`,
+  ждёт, пока **контроллер** скомпилирует и подпишет bundle (Secret пишет он, а
+  не тест: `status.compile.message == "compiled and signed"`), выпускает PKI
+  тем же `ferrumctl gen-webhook-pki`, который описан в README каталога, и
+  подаёт Pod. Отказ читается из ответа apiserver и обязан назваться отказом
+  `policy.ferrum.io` с причиной: под `failurePolicy: Fail` недоступный webhook
+  отвергает Pod ровно так же, и тест, проверяющий только «Pod не создан»,
+  прочитал бы мёртвый webhook как работающий. Чего эти три строки **не**
+  говорят: агента в этой установке нет (см. ниже), а `A` на строке `CP down` —
+  это admission-плоскость. Диск агента, LKG-снапшот и `Degraded=true`
+  по-прежнему меряет только `acceptance.rs`.
+- **`CP down` в кластере — это удалённый control plane, а не флаг.**
+  Контроллер отмасштабирован в ноль, `ClusterSecurityPolicy` удалён из
+  apiserver, Secret с bundle удалён вместе с ним; webhook продолжает отказывать
+  своей причиной, и тест сверяет, что отвечают **те же Pod'ы** — по именам и
+  счётчикам рестартов, а не по сумме: перезапущенный процесс перечитал бы
+  монтирование на старте, и тогда прогон не сказал бы ничего о процессе,
+  держащем bundle, чей источник исчез.
+- **Установка нашла три дефекта, которых не видел ни один гейт этого дерева, и
+  все три — в поставляемых файлах.** Два CRD apiserver отвергал целиком:
+  `clustersecuritypolicy`/`securitypolicy` — по бюджету стоимости CEL
+  (`estimated rule cost exceeds budget by factor of 1.344083x`), потому что
+  массив `runtime.rules` не имел объявленной границы; `policyexception` — по
+  `now()`, которого в CEL валидации CRD нет и не будет, так как валидация
+  обязана быть детерминированной. Это значит, что PolicyException не
+  устанавливался вообще, а все остальные правила того файла были инертны — и
+  держал их тест, читавший те же строки из того же файла. Третий: `Dockerfile*`
+  умели собирать только цель x86_64, и образ под ноду kind на arm64 собрать
+  было нечем. Ни один из трёх не виден изнутри процесса.
+- **`exception without TTL` стоит `—`, и с этого цикла это уже не граница, а
+  долг.** Субъект утверждения — API server, и раньше здесь стояло, что API
+  server не запускался ни разу; это перестало быть правдой. `serde`
+  отказывается декодировать объект без `expiresAt`, CRD несёт `required` — и
+  теперь установлен в настоящем apiserver, — но отказ библиотеки по-прежнему не
+  есть отказ apiserver, а Pod'ов этот случай не подаёт: `e2e_cluster.rs` его не
+  делает, и говорит об этом в `NOT_COVERED_HERE` своими словами. Цитировать
+  здесь нечего до тех пор, пока кто-нибудь не подаст `PolicyException` без TTL
+  настоящему apiserver и не прочтёт его ответ. Две CEL-строки, которые этот
+  пункт раньше засчитывал себе в актив, apiserver отверг вместе со всем файлом,
+  см. абзац выше.
 - **`CP down` — это `mark_control_plane_down()`.** Ни один control plane не
   падал. Проверено, что при этом состоянии подделанный FSIG не подменяет
   last-known-good, снапшот переживает рестарт с диска и `execve` `/bin/sh`
@@ -306,7 +384,7 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 | Подписанный bundle: FSIG-кодек в четырёх копиях (controller, agent, admission, CLI) сходится на одних байтах | U | U `acceptance.rs::controller_signed_exceptions_are_accepted_by_agent_and_admission` |
 | С mount принимаются только подписанные exception | U | U `acceptance.rs::only_signed_exceptions_are_accepted_from_the_mount` |
 | Exception бьёт deny только в своём scope и до `expiresAt` | U | U `acceptance.rs::docker_sock_kill_is_waived_only_in_scope` · U `acceptance.rs::exception_without_ttl_is_rejected_and_scoped_exception_waives` |
-| CRD требует `expiresAt` и держит потолок 90 дней — в схеме и в `ferrum-policy` | U | U `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode` · U `deploy_gate.rs::exception_ttl_ceiling_is_ninety_days_in_cel_and_in_policy` |
+| CRD требует `expiresAt`; потолок 90 дней держит `ferrum-policy`, и схема его держать не может — в CEL валидации CRD нет часов | A+U | U `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode` · U `deploy_gate.rs::exception_ttl_ceiling_is_ninety_days_in_policy_and_no_schema_may_claim_it` · A `e2e_cluster.rs::the_shipped_crds_are_accepted_by_a_real_apiserver` |
 | Kill/Isolate без match отвергается схемой и политикой (это kill-all) | U | U `deploy_gate.rs::kill_without_match_is_rejected_in_cel_and_in_policy` |
 | Namespaced policy не может `failurePolicy=Ignore` | U | U `deploy_gate.rs::namespaced_policy_cannot_ignore_in_cel_and_in_policy` |
 | Правило, называющее syscall, которого datapath не цепляет, не валидируется | U | U `deploy_gate.rs::a_rule_naming_an_unhooked_syscall_does_not_validate` · U `Jenkinsfile::Validate policies` |
@@ -334,6 +412,10 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 | `attach_for_arch` поднимает soft `RLIMIT_MEMLOCK` до hard перед самим `Bpf::load` — это проверено на живом attach, а не только у функции: лимита не понижает и сообщает числа, а не вердикт | K+U | K `attach_live.rs::attach_raises_the_soft_memlock_it_loads_under` · K `kernel.rs::raise_memlock_never_lowers_the_limit_and_reports_what_it_left` · U `kernel.rs::memlock_describe_reports_the_numbers_not_a_verdict` |
 | `libc` есть в графе `ferrum-ebpf` только под `attach`, и детектор доказан в обе стороны | U | U `Jenkinsfile::Crate boundary` |
 | `rcgen` и `x509-parser` не попадают в графы admission и agent, и детектор доказан на `ferrum-cli` | U | U `Jenkinsfile::Crate boundary` |
+| Публичный воркфлоу `.github/workflows/ci.yml` исполняет ровно userspace-стадии `Jenkinsfile` и побуквенно те же скрипты: `Format`, `Clippy`, `Test` и группа `Checks` целиком, сверенные на равенство строк, а не «по духу». Датапейсной стадии и стадии образов в нём нет по именам, и ни один шаг не может себя пропустить: ни `continue-on-error`, ни условия на шаге, ни подавления кода возврата. Про исполнение на GitHub эта строка не говорит ничего — гейт, как и `Jenkinsfile::<стадия>`, читает поставляемый файл | U | U `deploy_gate.rs::every_mirrored_stage_runs_the_same_script_here_and_in_jenkins` · U `deploy_gate.rs::the_comparison_notices_a_script_that_drifted` · U `deploy_gate.rs::the_public_workflow_claims_no_stage_it_cannot_execute` · U `deploy_gate.rs::no_step_in_the_public_workflow_can_skip_itself` |
+| Версия у этого дерева одна, и это та, которую называет релизный тег: `[workspace.package]` несёт `0.1.0`, все восемнадцать crate берут её через `version.workspace`, ни один не объявляет свою, и каждый `image:` под `deploy/` в `ghcr.io/onixus/` закреплён на `v` + эта версия. Про существование такого тега строка не говорит ничего: гейт читает файлы, а не `git tag` и не реестр | U | U `deploy_gate.rs::the_version_this_workspace_carries_is_the_tag_its_manifests_pin` · U `deploy_gate.rs::every_crate_takes_its_version_from_the_workspace` |
+| Раздел README про первый релиз называет каждый образ, который публикует `.github/workflows/release.yml`: описание, перечисляющее меньше артефактов, чем выпускает тег, учит получателя проверить меньше подписей, чем есть | U | U `deploy_gate.rs::the_first_release_section_names_every_image_that_release_publishes` |
+| `SECURITY.md` называет ровно тот канал раскрытия, который у этого репозитория есть — приватный advisory GitHub, — и не заводит ни одного, которого нет: ни почтового адреса, ни PGP-блока, ни отпечатка. Поддерживаемая линия версий в нём — та, которую несёт `[workspace.package]`, плюс `main`, пока тегов нет. Про то, включён ли приём advisory в настройках репозитория, строка не говорит: это состояние GitHub, а не дерева | U | U `deploy_gate.rs::the_security_policy_names_a_channel_this_repository_actually_has` · U `deploy_gate.rs::the_security_policy_supports_the_version_this_tree_carries` |
 | Оба arch дают один вердикт на одних логических событиях, из записанных байтов | U | U `replay.rs::both_arches_reach_the_same_verdicts_on_the_same_logical_events` · U `replay.rs::recorded_fixture_records_still_produce_the_acceptance_verdicts` |
 | Секретный сканер не пропускает ничего, за что не поручился гейт: исключён ровно один путь, это фикстура, чьё тело не является ключевым материалом (payload не открывается DER SEQUENCE), и FD023 по-прежнему называет её находкой | U | U `deploy_gate.rs::the_scanner_skips_exactly_the_files_this_gate_vouches_for` · U `deploy_gate.rs::every_excluded_file_is_a_fixture_that_only_looks_like_a_key` · U `deploy_gate.rs::the_excluded_fixture_is_still_a_finding_for_the_lint_that_owns_it` · U `Jenkinsfile::SAST (semgrep)` |
 | Prefilter-образ поставляемой политики — тот, который утверждает ручная копия в `ferrum-ebpf` | U | U `deploy_gate.rs::the_prefilter_image_of_the_shipped_policy_is_the_one_its_unit_test_asserts` |
@@ -345,6 +427,7 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 | Несосчитанный rollout отличается на проводе от сосчитанного нуля: поставляемый манифест контроллера флота не объявляет, пустой срез даёт `null` в обоих счётчиках, объявленный вставший флот — `0`, и обе CRD принимают `null`, иначе каждый PATCH статуса отказывал бы | U | U `ferrum-controller/src/lib.rs::an_undeclared_fleet_is_absent_from_status_and_a_stuck_one_is_a_counted_zero` · U `deploy_gate.rs::the_shipped_controller_declares_no_fleet_so_its_rollout_counts_are_absent_not_zero` · U `deploy_gate.rs::both_rollout_counts_are_nullable_in_every_crd_that_carries_them` |
 | Подписанный bundle, чей wasm-слот несёт модуль, которого этот бинарь не исполняет, отвергается обеими плоскостями, и агент остаётся на last-known-good; отличие от принимаемого bundle — один байт kind, подписанный тем же ключом | U | U `acceptance.rs::a_signed_bundle_whose_wasm_slot_no_plane_can_execute_is_refused_by_both` · U `ferrum-wasm-host/src/lib.rs::only_the_versioned_placeholder_is_a_loadable_slot` |
 | Ни одна поставляемая CRD не объявляет status, которого никто не пишет, и ни один писатель status не остаётся без объявления в CRD; фикстура §D тоже не несёт статуса, за который никто не отвечает | U | U `boundary_gate.rs::a_status_no_subject_writes_is_not_a_status_this_tree_ships` · U `ferrum-testkit/src/lib.rs::the_cp_down_fixture_is_a_spec_no_component_answers` |
+| Бюджет латентности admission заявлен числом и меряется: **p99 одного AdmissionReview внутри `handle()` — 5 мс** для release-сборки, которую несут образы, и 50 мс для отладочной, которую собирает `cargo test`. Два числа — это не два бюджета: продукт заявляет первое, второе существует потому, что в debug проверка Ed25519 у подписи образа медленнее на порядок, а держать неоптимизированный артефакт числом, объявленным про оптимизированный, значило бы утверждать про то, чего никто не поставляет. Ни одна из двух веток не умеет пропустить себя. **Измерено**, 2026-08-31, 10 000 review в четыре потока против скомпилированного и подписанного `prod-restricted`: на aarch64/macOS (Apple Silicon, 15 доступных потоков) release — среднее 34 мкс, p99 ≤ 0,1 мс; debug — среднее 289 мкс, p99 ≤ 1 мс. Отдельно, в кластере: один review в Pod'е вебхука на kind (aarch64, musl-бинарь release) — 135 мкс, прочитанный из `/metrics` этого Pod'а; это одно наблюдение, снятое руками и не держимое ни одним гейтом, а не p99, и p99 из него не выводится. Чего это число **не** покрывает: сокет, TLS-рукопожатие, очередь apiserver и сеть — то есть то, что видит `kubectl apply`, больше, и этим деревом не меряно ничем | U | U `latency_gate.rs::the_p99_of_a_review_stays_inside_the_declared_latency_budget` · U `Jenkinsfile::Security: admission latency` |
 | `status.json` пишется целиком, переживает сбой записи и не держит замок на агенте | U | U `ferrum-agent/src/lib.rs::the_poll_tick_publishes_a_whole_status_file_and_logs_transitions` · U `ferrum-agent/src/lib.rs::a_failed_status_write_removes_the_file_rather_than_leave_it_lying` · U `ferrum-agent/src/lib.rs::the_status_write_holds_no_lock_on_the_shared_agent` |
 
 ### Сигналы деградации
@@ -692,6 +775,21 @@ loader, не были названы ни одной строкой, а един
 | Утверждение | Метка | Исполняется |
 |---|---|---|
 | Набор §D закрыт с обеих сторон: случай нельзя уронить, оставив его без приёмочного теста или без сценария реплея | U | U `acceptance.rs::every_acceptance_case_has_a_test` · U `replay.rs::every_runtime_acceptance_case_has_a_replay_scenario` |
+| Случай §D нельзя уронить из кластерного гейта, промолчав: покрытые и непокрытые вместе обязаны быть ровно `AcceptanceCase::ALL`, и у каждого непокрытого — причина | U | U `e2e_cluster.rs::the_uncovered_cases_are_named_not_omitted` |
+| Кластерный гейт нельзя обезвредить, собрав его без фичи: `FERRUM_E2E_REQUIRED` на сборке без `--features e2e` — отказ, а не пустой зелёный прогон | U | U `e2e_cluster.rs::the_cluster_gate_must_not_be_compiled_out` |
+| Поставляемые CRD устанавливаются в настоящий apiserver: правило схемы, которое apiserver отвергает, делает инертным весь файл, и текстовый гейт этого не видит | A | A `e2e_cluster.rs::the_shipped_crds_are_accepted_by_a_real_apiserver` |
+| Установка по умолчанию поднимается на кластере, который FERRUM никогда не видел: `kubectl apply -k deploy` принят apiserver целиком, CRD доходят до `Established`, оба Deployment — до Ready, и повторный apply тоже принят | A | A `install_gate.rs::the_default_install_comes_up_on_a_fresh_cluster` |
+| Корень агента apiserver принимает: то, что его Pod не стартует на kind, — свойство узла (нет bpffs на `/sys/fs/bpf`), а не манифестов | A | A `install_gate.rs::the_agent_root_is_accepted_by_a_real_apiserver` |
+| Гейт устанавливаемости нельзя обезвредить, собрав его без фичи: `FERRUM_INSTALL_REQUIRED` на сборке без `--features e2e` — отказ, а не пустой зелёный прогон | U | U `install_gate.rs::the_install_gate_must_not_be_compiled_out` |
+| Объект уровня кластера доезжает до вебхука и решается политикой, а не кешем меток: `ClusterRoleBinding`, которого политика не запрещает, apiserver создаёт, а bind на `cluster-admin` тот же вебхук отвергает с `cluster-admin bind`. Обе половины нужны: вебхук, разрешающий всё, проходит первую, отвергающий всё — вторую. `namespaceSelector` вебхука здесь ни при чём и это тоже часть утверждения — apiserver к ресурсам уровня кластера его не применяет | A | A `e2e_cluster.rs::a_cluster_scoped_object_reaches_the_webhook_and_is_decided_by_the_policy` |
+| Бюджет прерываний исполняется настоящим apiserver, а не только читается в манифесте: eviction первой реплики вебхука принят, второй — отвергнут по disruption budget. Первая половина не уборка: без неё вторая проходила бы и на бюджете, который отказывает всем, а это повисший навсегда `kubectl drain` | A | A `e2e_cluster.rs::the_second_eviction_of_the_webhook_pair_is_refused_by_the_disruption_budget` |
+| Манифест `deploy/`, который не ставит ни один корень kustomize, либо назван неустанавливаемым с причиной, либо роняет гейт: иначе получатель просто не получает объект | U | U `deploy_gate.rs::every_manifest_in_the_deploy_tree_is_installed_by_a_root_or_excused` |
+| Корень `docs/crd` ставит каждый поставляемый CRD, а не те, что вспомнили: не установленный CRD — тип, которого apiserver не знает | U | U `deploy_gate.rs::the_crd_kustomization_installs_every_crd_this_repository_ships` |
+| Ни один корень kustomize не тянет respond (`hostPID` + `CAP_KILL`) и ни один — нерендеренный вебхук с заглушкой `caBundle` под `failurePolicy: Fail`; `secretGenerator` запрещён во всех | U | U `deploy_gate.rs::no_kustomization_root_installs_the_respond_variant_or_the_unrendered_webhook` |
+| Умолчания установки — restricted, а не удобные: `runAsNonRoot`, `RuntimeDefault`, `readOnlyRootFilesystem`, `drop: [ALL]` без единого `add`, без host-namespace, `--policy-name prod-restricted`, вебхук в двух репликах | U | U `deploy_gate.rs::the_default_install_is_the_restricted_one` |
+| Overlay зеркала меняет имена образов и ничего кроме: ни второго пина тега, ни ключа, которого не читает ни один гейт этого дерева | U | U `deploy_gate.rs::the_mirrored_overlay_changes_image_names_and_nothing_else` |
+| Overlay зеркала переносит установку в тот реестр, который разрешает поставляемая `prod-restricted`, — а установка по умолчанию стоит вне него | U | U `deploy_gate.rs::the_mirrored_overlay_moves_the_install_into_the_registry_the_shipped_policy_allows` |
+| Шаг публичного воркфлоу либо зеркалит одноимённую стадию `Jenkinsfile`, либо назван таким, у которого близнеца нет и не должно быть | U | U `deploy_gate.rs::every_step_here_is_mirrored_or_named_as_workflow_only` |
 | Каждый runtime-случай §D переигрывается из записанных байтов на обеих arch | U | U `replay.rs::runtime_acceptance_cases_replay_from_recorded_bytes` |
 | Освобождает агента от реакции на собственный `bpf()` флаг записи, а не строка `comm`: workload, назвавшийся `ferrum-agent`, освобождения не получает | U | U `replay.rs::agent_self_bpf_is_neither_denied_nor_signalled` |
 | Bundle с действием, которого runtime-плоскость не исполняет, грузится, и каждый матч экспортируется как неисполненное решение с причиной; `defaultAction: deny` тоже грузится | U | U `replay.rs::a_pre_gate_deny_bundle_loads_and_every_match_is_recorded` · U `action_gate.rs::a_signed_deny_default_still_installs` |
@@ -700,15 +798,38 @@ loader, не были названы ни одной строкой, а един
 | Кодировщик bundle принимает ровно то, что принимает `ferrum-policy`, в обе стороны, и оба enum действий — одно множество | U | U `action_gate.rs::the_encoder_accepts_exactly_what_ferrum_policy_accepts` · U `action_gate.rs::the_two_action_enums_are_the_same_set` |
 | Loader отвергает kill-all и на живом пути, и на восстановлении LKG, и отказ не стирает уже работающую политику | U | U `action_gate.rs::the_loader_refuses_every_kill_all_and_keeps_the_inert_deny` · U `action_gate.rs::a_kill_all_default_refuses_the_snapshot_on_the_restore_path_too` · U `action_gate.rs::a_signed_kill_all_default_does_not_install_and_keeps_last_known_good` |
 | Self-approve waiver отвергают и CEL, и `ferrum-policy` | U | U `deploy_gate.rs::self_approve_is_rejected_in_cel_and_in_policy` |
+| Панель дашборда не может спрашивать метрику, которой не отдаёт ни один бинарь: множество экспортируемых семейств берётся прогоном самих рендеров, а не списком | U | U `metrics_gate.rs::every_metric_this_dashboard_charts_is_one_the_binaries_export` |
+| Обратное направление: семейство, которое экспортируется и не попало ни на одну панель, либо названо в `NOT_CHARTED` с причиной, либо роняет гейт — счётчик без читателя это ровно тот дефект, от которого вся задача | U | U `metrics_gate.rs::every_exported_family_is_charted_or_named_as_not_charted` |
+| Контроль на сам разбор дашборда: переименованная метрика обязана быть падением, иначе оба направления выше проходят на пустом множестве | U | U `metrics_gate.rs::the_dashboard_scan_notices_a_renamed_metric` |
+| Внутрикернельный счётчик потерь выведен наружу тем же значением, а не заведён вторым, и обход `status.json` не оставил ни одного ключа без метрики (`status_keys_unmapped` = 0) | U | U `metrics_gate.rs::the_agent_publishes_the_in_kernel_drop_counter_it_already_had` |
+| Скрейп не съедает строку перехода в Degraded: рендер читает `degraded_snapshot_at`, и защёлка достаётся поллеру, а не тому, кто пришёл за метриками | U | U `metrics_gate.rs::a_scrape_does_not_consume_the_degraded_transition` |
+| У каждой причины деградации, которую агент может поднять, есть стабильный короткий id для метки — по тем же трём сканам, что и в `boundary_gate.rs`, — и все id публикуются на каждом скрейпе, включая нулевые | U | U `metrics_gate.rs::every_degradation_reason_the_agent_can_raise_has_a_stable_metric_id` |
+| Порт метрик открыт поставляемыми манифестами, назван, находим Service'ом и закрыт NetworkPolicy, которая при этом заново разрешает 8443: иначе это либо код, которого никто не собирает, либо неаутентифицированное чтение здоровья enforcement из любого Pod'а | U | U `metrics_gate.rs::the_shipped_manifests_open_and_govern_every_metrics_port` |
+| Эндпоинт исполнен на настоящем сокете: `GET /metrics` отдаёт экспозицию, `POST` — 405 и тела не читает, другой путь — 404 | U | U `metrics_gate.rs::the_metrics_endpoint_answers_a_read_and_refuses_everything_else` |
+| Записи, выпущенные прошлыми версиями схемы, декодируются этой сборкой: замороженные строки лежат в дереве и разбираются настоящим типом, а не описанием совместимости | U | U `event_contract_gate.rs::every_record_a_released_version_wrote_is_still_readable_by_this_build` |
+| Форма записи, которую пишет эта сборка, — та, что заморожена для заявленной версии, и каждая прошлая версия того же major является её подмножеством без изменений типа, обязательности и nullable; инвентарь выводится сериализацией самого типа, а не списком | U | U `event_contract_gate.rs::this_builds_record_shape_is_the_one_frozen_for_the_version_it_claims` |
+| Контроль на сам вывод инвентаря: удалённое и переименованное по типу поле обязаны быть падением, иначе сверка выше проходит на выводе, который всегда одинаков | U | U `event_contract_gate.rs::the_inventory_derivation_notices_a_removed_and_a_retyped_field` |
+| У каждого листа экспортируемой записи есть написанное решение, уходит он в чужую систему или нет; поле без решения роняет сборку, а заявленная необязательность проверена декодированием записи без него | U | U `event_contract_gate.rs::every_field_that_leaves_this_product_has_a_written_disposition` |
+| Withheld-поле (два человеческих имени с waiver'а) отсутствует во всех трёх профилях по значению, а не по имени ключа; контроль — тикет того же waiver'а в записи присутствует | U | U `event_contract_gate.rs::a_withheld_field_appears_in_no_profile` |
+| Каждое значение, объявленное уходящим наружу, доезжает до каждого профиля: строки и числа — по значению-сентинелу, булевы — переворотом одного флага, и булево без такой пробы роняет гейт | U | U `event_contract_gate.rs::every_emitted_value_reaches_every_profile` |
+| Враждебная нагрузка не подделывает запись: `comm` с переводом строки и `pod` с `"`/`]`/`[` не порождают ни второй записи, ни второго CEF-заголовка, ни второго SD-элемента, ни сломанного JSON — проверено разбором, а не подсчётом подстрок | U | U `event_contract_gate.rs::a_hostile_workload_cannot_forge_a_record_in_any_profile` |
+| Приёмка §D «`exec` + `/bin/sh` → kill» доезжает до локального приёмника через поставляемую цепочку стоков (`QueueSink` → `FanoutSink` → файл + `SyslogSink`), и запись на узле и запись в приёмнике несут одну временную метку | U | U `event_contract_gate.rs::an_enforcement_decision_reaches_a_local_receiver_through_the_shipped_sink_chain` |
+| Недоступный SIEM учтён существующим `export_write_failed_total` и деградирует узел `DEG_EXPORT_LOSSY`; второго счётчика не заведено | U | U `event_contract_gate.rs::an_unreachable_siem_is_counted_by_the_existing_export_loss_and_degrades_the_node` |
+| Сток подключён в поставке: `overlays/siem-syslog` патчит корень агента флагами, которые бинарь действительно читает, значениями, которые его же парсеры принимают, и установка по умолчанию до него не дотягивается | U | U `event_contract_gate.rs::the_shipped_overlay_configures_the_sink_with_flags_the_binary_parses` |
 | Второй апрувер обязателен независимо от `fourEyes`, а минимальная длина `reason` в схеме — константа компилятора | U | U `deploy_gate.rs::a_waiver_without_a_second_approver_is_refused_by_the_schema_too` · U `deploy_gate.rs::the_minimum_reason_length_is_the_same_in_the_schema_and_in_policy` |
-| Потолок TTL в CEL — та же константа `ferrum-policy`, переведённая в часы, а не число, переписанное в YAML | U | U `deploy_gate.rs::the_cel_ttl_ceiling_is_the_policy_constant_in_hours` |
 | Пустой и дублированный id правила отвергает и схема: id — то, что waiver освобождает, а audit-запись обвиняет | U | U `deploy_gate.rs::a_blank_or_duplicated_rule_id_is_refused_by_the_schema_too` |
 | Границы длин `commIn`/`pathPrefix`/`pathSuffix` в схеме — границы datapath | U | U `deploy_gate.rs::the_match_length_bounds_in_the_schema_are_the_datapath_bounds` |
 | Ключ trust root, не являющийся 64 hex-символами Ed25519, отвергает и схема | U | U `deploy_gate.rs::a_public_key_that_is_not_ed25519_hex_is_refused_by_the_schema_too` |
 | Все шесть §D-фикстур проходят инвариантную копию, и bpf-строка называет только те syscall, которые datapath действительно цепляет | U | U `deploy_gate.rs::acceptance_fixtures_agree_with_the_invariant_copy` |
 | Поставляемое дерево проходит лит; плейсхолдер caBundle вне шаблона его роняет; выпущенный `gen-webhook-pki` PKI делает дерево применимым, а оставленный в нём `ca.key` — нет | U | U `deploy_gate.rs::deploy_tree_passes_the_lint` · U `deploy_gate.rs::a_committed_placeholder_ca_bundle_fails_the_lint` · U `deploy_gate.rs::issued_pki_makes_the_tree_applicable` |
 | Каждый crate с бинарём линкуется стадией, которая выдаёт объектный код; `cargo clippy` доказательством не считается | U | U `deploy_gate.rs::every_crate_with_a_binary_is_linked_by_a_stage_that_emits_object_code` |
-| Тег-половина замыкания образов открыта, и обе посылки, делающие её незакрываемой здесь, держатся тестом, а не doc-комментарием | U | U `deploy_gate.rs::the_tag_half_of_the_closure_is_open_and_says_why` |
+| Тег, который закрепляют манифесты, — тот, который релизный воркфлоу способен выпустить: он совпадает с фильтром тегов триггера, не плавающий и не `latest`, а `Jenkinsfile` по-прежнему не публикует, потому что его `dev-$BUILD_NUMBER` живёт в локальном сторе одной ноды. Про то, что образ опубликован, строка не говорит ничего | U | U `deploy_gate.rs::the_tag_the_manifests_pin_is_one_the_release_can_publish` · U `deploy_gate.rs::the_tag_filter_reader_accepts_and_refuses_the_right_tags` |
+| Множество образов, которые публикует релиз, равно множеству, которое ставит `deploy/**`, и множеству, которое собирает `Jenkinsfile`: не подмножество, а равенство в обе стороны | U | U `deploy_gate.rs::the_release_publishes_exactly_the_images_this_tree_installs` |
+| Каждый публикуемый образ подписывается и получает аттестованный SBOM, и всё это по digest, а не по тегу: подпись, привязанная к тегу, назавтра означала бы другой образ. Число SBOM в релизе равно числу образов, а не «сколько нашлось» | U | U `deploy_gate.rs::every_published_image_is_signed_and_carries_an_attested_sbom` |
+| Подпись образа не заводит ключа: `id-token: write` есть, `--key`, `COSIGN_PRIVATE_KEY`, seed bundle и имена доменов `BUNDLE_SIGNATURE_CONTEXT`/`KEY_BIND_MSG` в релизном воркфлоу отсутствуют, и отсутствие проверено против настоящих имён из `ferrum-crypto`, а не против строки, которая могла бы быть опечаткой | U | U `deploy_gate.rs::the_release_signs_keyless_and_never_touches_the_bundle_signing_domain` |
+| Ни один шаг релизного воркфлоу не может себя пропустить: ни `continue-on-error`, ни условие на шаге, ни подавление кода возврата. Шаг подписи, пропустивший себя, оставляет в реестре неподписанный образ под зелёным значком | U | U `deploy_gate.rs::no_step_in_the_release_workflow_can_skip_itself` |
+| Процедура проверки, опубликованная получателю, — та же, которую релиз исполняет на себе: идентичность собирается из пути файла воркфлоу, издатель, тег и имена образов сверены на равенство. Переименованный воркфлоу роняет строку README, а не остаётся вопросом прилежания | U | U `deploy_gate.rs::the_documented_verification_is_the_one_the_release_performs` |
+| Бинарь в каждом образе несёт список своих зависимостей: линкует `cargo auditable build` с закреплённой версией инструмента, и та же сборка проверяет получившийся файл на секцию `.dep-v0`. Без неё SBOM образа на `scratch` перечисляет ноль crate и читается как ответ на вопрос «что внутри» | U | U `deploy_gate.rs::every_shipped_binary_carries_the_dependency_list_its_sbom_is_made_of` |
 | Флаг, который даёт только cargo feature, вкомпилирован в образ, которому манифест его передаёт | U | U `deploy_gate.rs::a_flag_only_a_feature_provides_is_built_into_the_image_that_is_passed_it` |
 | Каждый non-default feature, который выбирает argv поставляемого манифеста, компилируется и как lint-таргет (`clippy --all-targets`), и как test-таргет: `cargo build` этого не засчитывает, потому что не компилирует ни одного тестового таргета, а `cargo tree` не компилирует вообще ничего | U | U `deploy_gate.rs::every_feature_a_manifest_selects_is_a_lint_and_test_target` · U `deploy_gate.rs::a_build_is_not_a_test_and_a_tree_is_not_a_compile` · U `Jenkinsfile::Clippy` · U `Jenkinsfile::Test` |
 | То же утверждение, исполненное, а не прочитанное: гейт сам запускает `cargo clippy --features … --all-targets -- -D warnings` и `cargo test --features …` для каждой пары (crate, feature), которую выбирает поставляемый манифест, и требует успеха. Строка в Jenkinsfile присутствовала и была верна ровно в тот цикл, когда её таргеты не собирались | U | U `deploy_gate.rs::every_feature_a_manifest_selects_actually_compiles_and_passes` |
@@ -755,10 +876,111 @@ loader, не были названы ни одной строкой, а един
 | `clusterSelector` вне MVP-1 и отвергается при авторстве обеими копиями гейта — валидатором и вторым гейтом компилятора, — а остальные три группы селектора остаются авторуемыми; разбор и fail-closed обеих плоскостей остаются для байтов, которых этот компилятор не производил | U | U `ferrum-policy/src/lib.rs::a_cluster_selector_is_refused_on_both_kinds` · U `ferrum-policy/src/lib.rs::the_other_selector_groups_are_still_authorable` · U `ferrum-compiler/src/lib.rs::a_cluster_selector_does_not_compile` · U `webhook.rs::a_cluster_selector_without_the_flag_is_unknown_and_not_an_empty_map` |
 | `--cluster-label`, съеденный соседним флагом, — отказ, а не заявленный кластер без меток; повторы накапливаются, а не побеждают последним; `--cluster-label ''` по-прежнему заявляет кластер без меток, а отсутствие флага по-прежнему fail-closed | U | U `ferrum-admission/src/main.rs::a_cluster_label_whose_value_was_eaten_is_refused_not_stated` · U `ferrum-admission/src/main.rs::an_explicitly_empty_cluster_label_is_still_a_stated_cluster` · U `ferrum-admission/src/main.rs::repeated_cluster_labels_accumulate_and_disagreements_are_refused` · U `ferrum-admission/src/main.rs::other_flags_keep_the_semantics_the_deploy_lint_models` |
 | Переигранный поток встречает долг relist там же, где живой: нечитаемый кадр поднимает долг и поток читается дальше, а первый кадр после hold-down заканчивает поток — обе половины на обоих потоках | U | U `resolve.rs::a_replayed_stream_answers_an_unreadable_frame_the_way_the_node_does` |
+| Заявленный бюджет латентности исполняется, а не декларируется: p99 одного AdmissionReview внутри `handle()` укладывается в объявленное число, и меряется это прогоном 10 000 настоящих review против скомпилированного и подписанного `prod-restricted` в четыре потока, а p99 читается из той самой гистограммы, которую вебхук отдаёт в `/metrics` | U | U `latency_gate.rs::the_p99_of_a_review_stays_inside_the_declared_latency_budget` · U `Jenkinsfile::Security: admission latency` |
+| Заявленное число обязано быть границей корзины поставляемой гистограммы: между границами она не отвечает, и бюджет, проверяемый интерполяцией внутри корзины, — утверждение точнее прибора, который его держит | U | U `latency_gate.rs::the_budget_is_a_boundary_the_shipped_histogram_can_decide` |
+| Контроль на читателя p99: распределение, у которого 2% наблюдений за бюджетом, обязано быть падением, иначе строка выше проходит на читателе, который всегда говорит «уложились» | U | U `latency_gate.rs::the_reader_notices_a_p99_that_is_past_the_budget` |
+| Число одно на три места: код, панель дашборда и этот документ. Порог на панели сверяется с константой, и оба объявленных числа обязаны быть названы здесь — иначе оператор читает красную черту, проведённую не там, где падает сборка | U | U `latency_gate.rs::the_dashboard_and_the_boundary_state_the_budget_the_code_enforces` |
+| Вебхука две реплики, и вытеснение не может забрать обе: селектор бюджета выбирает те Pod'ы, что поднимает Deployment, число из бюджета меньше числа реплик, и бюджет ставится тем же корнем kustomize, что и Deployment | U | U `deploy_gate.rs::the_webhook_is_a_pair_that_a_drain_cannot_take_at_once` |
+| Реплики предпочитают разные узлы, и предпочтение не умеет оставить одну висеть: anti-affinity есть, она по `kubernetes.io/hostname`, полного веса, и она **мягкая** — `required` на одноузловом кластере (то есть на kind, куда ставят `install_gate.rs` и публичный воркфлоу) оставила бы вторую реплику в Pending навсегда | U | U `deploy_gate.rs::the_two_replicas_prefer_different_nodes_and_the_preference_cannot_strand_one` |
+| Из-под вебхука исключены ровно `ferrum` и `kube-system`, и решает это `kubernetes.io/metadata.name` — ключ, который apiserver проставляет и контролирует сам. На любом другом ключе namespace выдаёт себе исключение из политики сам | U | U `deploy_gate.rs::the_webhook_exemption_is_decided_by_a_label_the_api_server_owns` |
+| У каждого ресурса, который регистрирует поставляемый вебхук, есть scope, известный коду, который его решает, и обе стороны сверены: `namespaceSelector` apiserver к ресурсам уровня кластера не применяет, поэтому для них решение целиком за `ferrum-admission` | U | U `deploy_gate.rs::every_resource_the_webhook_registers_has_a_scope_this_crate_knows` |
+| Поставляемый ClusterRoleBinding не отвергается поставляемой политикой на холодном кеше меток — это issue #17 как тест: объект уровня кластера не имеет namespace, чьи метки можно было бы наблюдать, и спрашивать о них кеш нельзя ни на холодном, ни на тёплом. Контроль в том же тесте: bind на `cluster-admin` тем же программой и в том же состоянии по-прежнему отвергнут | U | U `webhook.rs::the_shipped_cluster_role_binding_is_not_refused_by_the_shipped_policy` |
+| Подписанный grant приостанавливает admission: review, который поставляемая политика отвергает (privileged Pod под `prod-restricted`), в окне grant'а пропускается, человек у `kubectl` видит в warning'е id grant'а и тикет, а `subject` туда не попадает. Контроль в том же тесте — тот же review до grant'а отвергнут | U | U `break_glass_gate.rs::a_signed_grant_suspends_a_review_the_shipped_policy_denies` |
+| Окно закрывается само: ничего не перезагружали, grant по-прежнему лежит в mount'е, а следующий review снова отвергнут, и журнал несёт `expired` вслед за `activated`. Иначе весь довод про TTL был бы декоративным | U | U `break_glass_gate.rs::a_grant_stops_suspending_when_its_window_closes_with_nothing_reloaded` |
+| Ключ подписи bundle не открывает break-glass: домены подписи разделены, поэтому grant, подписанный тем ключом, который в кластере действительно есть, ничего не приостанавливает — и попытка попадает в журнал как `rejected`, без единого поля из непроверенного документа | U | U `break_glass_gate.rs::a_grant_signed_with_the_bundle_key_suspends_nothing_and_is_journalled` |
+| Бессрочного break-glass выразить нечем, и потолок окна туже потолка waiver'а: четыре часа против девяноста дней, потому что приостановление берут под давлением и без рецензии | U | U `break_glass_gate.rs::a_break_glass_window_is_bounded_and_tighter_than_a_waiver` |
+| Поставляемый оверлей армирует break-glass флагами, которые бинарь действительно парсит, тремя вместе, кладёт журнал на писуемый том, а Secret grant'а делает `optional` — обязательный mount под Secret, пустой на здоровом кластере, оставил бы обе реплики в ContainerCreating | U | U `break_glass_gate.rs::the_shipped_overlay_arms_break_glass_with_flags_the_binary_parses` |
+| Установка по умолчанию break-glass не армирует: ни один корень под `deploy/` его не называет, и поставляемый Deployment не несёт ни одного флага break-glass | U | U `break_glass_gate.rs::no_default_install_arms_break_glass` |
+| Каждый путь, который runbook велит применить, существует в дереве: путь, который переехал, превращает вставленную команду в ошибку про каталог посреди инцидента | U | U `break_glass_gate.rs::every_path_the_runbook_tells_an_operator_to_apply_exists` |
+| Каждое семейство метрик, названное в runbook'е, публикует настоящий бинарь — набор получен рендером обоих бинарей, а не списком. `grep`, который ничего не нашёл, читается точно так же, как здоровый узел | U | U `break_glass_gate.rs::every_metric_family_the_runbook_names_is_one_a_binary_publishes` |
+| Runbook называет каждую причину деградации, которую агент умеет поднять, и не называет ни одной, которой нет: новая причина не может появиться без строки о том, что с ней делать | U | U `break_glass_gate.rs::the_runbook_names_every_degradation_reason_the_agent_can_raise` |
+| Числа в разделе «Радиус поражения» — те, что несёт дерево: `timeoutSeconds: 5`, `replicas: 2`, `maxUnavailable: 1`, бюджет 5 мс вместе с именем константы и порт метрик. Разъехавшееся число хуже отсутствующего: по нему принимают решение | U | U `break_glass_gate.rs::the_numbers_in_the_blast_radius_section_are_the_ones_the_tree_carries` |
+| Каждый объект Kubernetes, который runbook велит трогать, существует в `deploy/**` — и в обратную сторону: имя, которое установка ставит, обязано быть в runbook'е | U | U `break_glass_gate.rs::every_kubernetes_object_the_runbook_names_is_one_this_tree_installs` |
+| Граница «что требует внешнего IdP» стоит в runbook'е дословно той строкой, которой её объявляет код: пересказ — это то, как ограничение смягчается, а разница между «FERRUM знает, кто снял enforce» и «FERRUM знает, что использовали ключ» меняет процесс вокруг хранения ключа | U | U `break_glass_gate.rs::the_runbook_states_the_idp_boundary_in_the_words_the_code_states_it` |
+| Обе операции, которые runbook велит делать руками, поставляются и работают: `ferrumctl sign-break-glass` отвергает слишком длинное окно до подписи, а подпись, которую он выдаёт, принимает настоящий `BreakGlass`; `ferrumctl verify-journal` читает настоящую цепочку и отвергает правленую. И одна правка, которой цепочка не видит — обрезанный хвост, — утверждена как невидимая, а не обнаружена в инциденте: runbook обязан её называть | U | U `break_glass_gate.rs::the_two_break_glass_operations_the_runbook_names_are_shipped_and_work` |
+| Оверлей армирования принят настоящим apiserver, и объект, который тот **сохранил бы**, несёт всё обещанное: три флага, оба пути, mount grant'а как `optional`, писуемый том под журнал, trust root и имя реплики в окружении. Это шесть JSON-патчей в чужой Deployment, и патч, приземлившийся не туда, не виден ни одному текстовому гейту этого дерева | A | A `install_gate.rs::the_break_glass_overlay_arms_the_deployment_a_real_apiserver_would_store` |
+| Критерий закрытия фазы 1 как тест: настоящее решение §D «`exec` + `/bin/sh` → kill» уезжает поставляемой цепочкой стоков в сокет, и разбор «того ли убили» проходится по одной пришедшей записи — что произошло, кого убили (`tgid`, `pid`, `comm`), где (`node`, namespace, Pod), почему (`rule`, политика), по какой выкатке (дайджест bundle, тот самый, что узел проверил), насколько обоснованно (три флага) и в каком состоянии был узел (`degradedReasons`, id из таблицы самого агента). Ни `status.json`, ни `events.jsonl`, ни `/metrics` при этом не читаются | U | U `event_contract_gate.rs::the_wrong_process_investigation_is_answerable_from_one_exported_record` |
 
 ## Не делает
 
 Плоские утверждения. Каждое проверено по дереву на этом коммите.
+
+- **Break-glass не связывает ключ с человеком.** Проверка отвечает ровно на
+  один вопрос: «держатель ключа K это утверждал». `subject`, `issuer` и
+  `ticket` — строки, которые выбрал подписывающий; что за ними стоит живой
+  уполномоченный человек, знает система, выдающая ключи поимённо, и её в этом
+  дереве нет. Ставить её на путь нельзя намеренно: break-glass, падающий
+  вместе с недоступным IdP, падает ровно в том отказе, ради которого
+  существует. Это внешняя граница, а не отложенная работа.
+- **Цепочка журнала доказывает согласованность файла, а не его полноту.**
+  Правка, удаление и перестановка ломают ссылку; цепочка, переписанная с нуля
+  тем, у кого есть доступ на запись, проверяется идеально. Нужен якорь вне
+  процесса, и оба, что есть, — вне контроля этого дерева: строка на stderr,
+  которую собирает лог-конвейер кластера, и голова цепочки меткой
+  `ferrum_admission_break_glass_journal_info`, которую хранит Prometheus. Сам
+  файл живёт в `emptyDir` и умирает с Pod'ом: hostPath дал бы Deployment'у
+  control plane право писать на узел, а PVC RWO не делится между двумя
+  репликами. На кластере, где не собирают ни лог контейнера, ни метрики,
+  армирование break-glass даёт заметно меньше, чем выглядит.
+- **Break-glass не снимает runtime-реакции.** Единственный scope, который эта
+  сборка исполняет, — `admission`. Роль `respond` у агента снимается тем же
+  `kubectl delete -f deploy/agent/optional-respond.yaml`, что и раньше, и этот
+  акт не журналируется ничем. Scope, который дерево разбирало бы и ничем не
+  исполняло, был бы рычагом, ничего не меняющим, поэтому его в перечислении
+  нет.
+- **Break-glass прогнан на живом кластере, руками, один раз.** kind v1.36.1
+  (kindest/node, aarch64) на этой машине, 2026-08-31: установка
+  `kubectl apply -k deploy`, армирование `kubectl apply -k overlays/break-glass`,
+  две реплики поставляемого образа. Пройдены все четыре события журнала —
+  `activated`, `revoked`, `rejected`, `expired`: privileged Pod отвергался
+  fail-closed, после появления подписанного grant'а принимался с warning'ом,
+  несущим id grant'а и тикет; удаление grant'а из Secret'а дало `revoked`;
+  grant, подписанный **ключом подписи bundle**, не приостановил ничего и дал
+  один `rejected` при шестидесяти трёх подсчитанных отказах — ровно тот обмен
+  «журнал читаемый, счётчик полный», который заложен; двухминутный grant истёк
+  по часам сам, без единой перезагрузки, и оставил `expired`, а потом один
+  `rejected` про то, что просроченный документ так и лежит в mount'е. Цепочку
+  из шести записей подтвердил `ferrumctl verify-journal`.
+
+  Чего в том прогоне **не было**: поведения кластера, у которого вебхук
+  действительно не отвечает; второго узла; и повторяемости — держится тестом
+  ровно оверлей
+  (`install_gate.rs::the_break_glass_overlay_arms_the_deployment_a_real_apiserver_would_store`),
+  а само приостановление на живом кластере повторяется руками. Стадия
+  `Security: break-glass` не исполнялась ни на Jenkins, ни на GitHub.
+- **Найдено тем прогоном и починено:** процедура разбора журнала собирала
+  `kubectl logs -l` в один файл, то есть две независимые цепочки, и проверка
+  падала с «seq 0 where 1 was expected» — сообщением, которое посреди инцидента
+  читается как «запись пропала». Журнал ведёт процесс, и каждая реплика
+  начинает с генезиса; `verify-journal` теперь группирует по `component`.
+  Ни один текстовый гейт этого не видел и увидеть не мог.
+- **Runbook'и не проходили целиком в состоянии отказа.** `docs/runbooks/README.md`
+  держится гейтом на том, что каждая команда, каждое имя объекта, каждое имя
+  метрики и каждый id причины существуют в этом дереве. Что процедура помогает
+  — не проверено ничем, и §7 документа говорит это первым абзацем.
+- **Сток событий доезжает до сокета, а не до SIEM.** `ferrum-siem` рендерит
+  CEF, RFC 5424 и ECS и отправляет их по TCP или UDP; всё, что про это
+  исполнено, исполнено против приёмника, который поднял сам тест на
+  `127.0.0.1`, и против бинаря агента, запущенного на этой машине с
+  `--siem-address`. Ни ArcSight, ни Elastic, ни Splunk, ни rsyslog не
+  получали от этого дерева ни одной записи, и ни один их парсер не говорил,
+  что запись разобралась. Формат, который «должен» разбираться, и формат,
+  который разобрался, — разные утверждения, и здесь сделано первое.
+- **У стока нет TLS.** Транспорт — голый TCP или UDP, а запись несёт имена
+  Pod'ов, namespace, имена процессов и имена политик, которые кластер
+  применяет. `overlays/siem-syslog` говорит об этом прямо и отправляет
+  оператора к локальному форвардеру; форвардера в этом дереве нет, и
+  «поставьте коллектор в доверенную сеть» — это перекладывание, а не решение.
+  Клиент TLS внутри DaemonSet'а добавил бы хранилище доверия и путь обновления
+  сертификата в процесс, который threat model называет второй целью после
+  kubelet, и эта сделка не заключена.
+- **Наружу едут только события агента.** Вердикты admission — deny по подписи
+  образа, по privileged, по cluster-admin — в SIEM не уходят: `EventEnvelope`
+  штампует сток агента, а вебхук публикует только `/metrics`. Половина
+  приёмки §D поэтому в SIEM не видна вообще.
+- **Обрамление только LF.** RFC 6587 octet-counting не реализован, и приёмник,
+  настроенный на `octet-counted`, эти записи отбросит у себя — там, где ни
+  один счётчик этого дерева их не увидит.
 
 - **Образы собираются, но никуда не едут.** Все три стадии образов проходят на
   локальном Jenkins в каждом билде начиная с 2026-08-28 и по #44 включительно
@@ -767,24 +989,47 @@ loader, не были названы ни одной строкой, а един
   `/var/run/docker.sock`, тот самый hostPath, на который FD006 даёт находку, а
   runtime-правила убивают. Проверки *внутри* `Dockerfile` — интерпретатор,
   `apiserver` в бинаре вебхука, `elf_inspect` над BPF-объектом — исполняются
-  вместе с ними. Чего по-прежнему нет: `docker push` не делал никто, тег
-  существует только на демоне, который его собрал, а `deploy/**` ссылается на
-  `ghcr.io/ferrum/*:v0.1.0`, которых никто не публиковал. И ни один из этих
-  образов не запускали: то, что он собрался и объявляет `linux/amd64`, не
-  утверждение о том, что он стартует на узле.
-- **Замыкание «манифест ↔ pipeline» закрыто по репозиторию и открыто по
-  тегу.** `every_image_a_manifest_names_is_built_by_the_pipeline` сравнивает
-  только репозиторий, потому что стадии тегируют
-  `dev-$BUILD_NUMBER`, а манифесты закрепляют `v0.1.0`: два непересекающихся
-  пространства тегов, которые нельзя сравнить, читая их внимательнее.
-  Закрыть теговую половину в этом репозитории нечестно — ничто не делает
-  `docker push`, так что тег, который придумывает CI, существует только в
-  локальном сторе одного узла, а манифест, закреплённый на таком теге, —
-  отдельный дефект, а не починка. Поэтому это сказано здесь, а не спрятано
-  в doc-комментарии, который описывал весь класс отказа целиком:
-  `the_tag_half_of_the_closure_is_open_and_says_why` держит обе посылки —
-  ничто не публикует образ, и ни один манифест не называет плавающий тег —
-  и падает в тот день, когда первая перестанет быть верной.
+  вместе с ними. Чего по-прежнему нет: `docker push` не исполнялся ни разу и
+  нигде, тег существует только на демоне, который его собрал, а `deploy/**`
+  ссылается на `ghcr.io/onixus/*:v0.1.0`, которых никто не публиковал. И ни
+  один из этих образов не запускали: то, что он собрался и объявляет
+  `linux/amd64`, не утверждение о том, что он стартует на узле.
+- **Поставка описана и подписана в файле, а не в реестре.** Появился
+  `.github/workflows/release.yml`: `docker push` трёх образов по git-тегу,
+  `cosign sign` keyless по digest, SBOM от `syft` и `cosign attest` на нём,
+  SBOM файлами в GitHub Release. Ни одна строка этого предложения не
+  исполнялась. Воркфлоу на GitHub не запускался, в `ghcr.io/onixus/` пусто, ни
+  одной подписи не существует, ни одного SBOM никуда не приложено, и в Rekor
+  нет записи об этом репозитории. Проверено здесь ровно то, что можно
+  проверить на дереве: множества образов сходятся, подпись не заводит ключа,
+  ни один шаг не может себя пропустить, инструкция получателю совпадает с тем,
+  что воркфлоу делает. «Умеет» и «сделал» — разные слова, и второго тут нет.
+- **Релиза нет.** Тега `v0.1.0` в этом репозитории не существует: он не
+  проставлен, GitHub Release под ним не создан, `release.yml` по нему не
+  запускался. Появилось описание того, что этим тегом будет выпущено — раздел
+  README «Первый релиз» — и три конца версии сведены гейтом: `Cargo.toml`,
+  `deploy/**` и фильтр триггера больше не могут разъехаться молча. Всё это —
+  утверждения о файлах. Тег ставит человек, и до тех пор строки «выпущено»
+  здесь нет.
+- **Приватный приём сообщений об уязвимостях в настройках репозитория не
+  подтверждён.** `SECURITY.md` появился и отправляет к
+  `security/advisories/new`; работает эта ссылка, только если private
+  vulnerability reporting включён в настройках GitHub, а настройки — не файл в
+  дереве, и ни один гейт их не видит. Пока это не проверено человеком,
+  единственный названный канал раскрытия остаётся непроверенным, и это ровно
+  тот разрыв, ради которого в самом файле сказано «нет ответа за 14 дней —
+  раскрывайте публично».
+- **Замыкание «манифест ↔ pipeline» по тегу закрыто наполовину, и это первый
+  цикл, когда оно закрыто хоть на сколько-то.** Прежде тег сравнивать было не с
+  чем: стадии Jenkins тегируют `dev-$BUILD_NUMBER`, манифесты закрепляют
+  `v0.1.0`, и два пространства не пересекались, потому что публиковать было
+  нечему. Релизный воркфлоу публикует имя git-тега, поэтому вопрос «может ли
+  этот манифест вообще разрешиться» стал проверяемым, и он проверяется:
+  `the_tag_the_manifests_pin_is_one_the_release_can_publish` требует, чтобы
+  закреплённый тег попадал в фильтр триггера и не был плавающим. Открытая
+  половина осталась та же и по той же причине: ничто не подтверждает, что образ
+  с этим тегом существует. Гейт читает файл, а не реестр, и до первого
+  настоящего релиза `kubectl apply -f deploy/` даёт три `ImagePullBackOff`.
 - **Заархивированный `dist/ferrum-agent` — не тот бинарь, что в образе.**
   Стадия `Agent binary` линкует и фингерпринтит один; `docker build` линкует
   внутри себя второй, из застэшенных исходников. Фингерпринт на артефакте про
@@ -977,8 +1222,17 @@ loader, не были названы ни одной строкой, а един
   утверждение, которому понадобился бы собственный гейт. Разбор и fail-closed
   обеих плоскостей остались для байтов, которых этот компилятор не
   производил.
-- **Ничто и никогда не обращалось к API server.** Ни webhook под нагрузкой
-  admission, ни watch, ни запись status.
+- **Обращение к API server перестало быть нулём, и это первый цикл, когда так.**
+  Здесь стояло «ничто и никогда не обращалось к API server» — про webhook под
+  нагрузкой admission, про watch и про запись status. Первого больше нет:
+  `e2e_cluster.rs` подаёт Pod настоящему apiserver, тот зовёт webhook, и
+  webhook отказывает своей причиной. Второе тоже: контроллер в kind поднимает
+  watch на три Kind и по нему компилирует и подписывает bundle — Secret в
+  кластере написал он. Что **не** изменилось: нагрузки не было (счёт Pod'ов
+  здесь идёт на единицы), запись `status` меряна только тем, что тест прочитал
+  `status.compile.message` у одного объекта, а агент к apiserver в кластере не
+  обращался ни разу — его DaemonSet на этом рантайме не стартует, см. строку в
+  «Верим, но не доказано».
 
 ## Верим, но не доказано
 
@@ -987,15 +1241,17 @@ loader, не были названы ни одной строкой, а един
 
 | Утверждение | Чем закрывается | Статус |
 |---|---|---|
-| Собранный образ стартует на узле | запуск контейнера из этого образа на настоящем узле | Не исполнено. `docker build` теперь исполняется — три стадии образов проходят в каждом билде по #44 включительно, — но запускать полученный образ не пробовал никто, и `docker push` тоже не делал никто |
+| Собранный образ стартует на узле | запуск контейнера из этого образа на настоящем узле | **Исполнено для двух образов из трёх, и опровергнуто для третьего.** `ferrum-controller` и `ferrum-admission` стартуют на узле kind и делают работу: `e2e_cluster.rs` доводит оба Deployment до Ready и читает их результат. Образ агента там же не стартует, и не по своей вине — см. следующую строку. `docker push` по-прежнему не делал никто, а сборка под arm64 до этого цикла была невозможна: `Dockerfile*` знали одну цель |
+| `deploy/agent/daemonset.yaml` разворачивается на настоящем узле | DaemonSet, дошедший до Ready на узле с tracefs и `CAP_BPF` | **Механизм исполнен, и утверждение им опровергнуто.** На containerd (kind, aarch64) Pod не стартует: манифест монтирует hostPath в `/sys/fs/bpf/ferrum`, runc обязан создать эту точку монтирования внутри собственного sysfs контейнера, а sysfs только для чтения — `mkdirat …/rootfs/sys/fs/bpf/ferrum: no such file or directory`. Образ, ELF и права тут ни при чём: ELF собран из этого дерева и все одиннадцать символов на месте. Починка — правка монтирования pin path, и в ней сидит вопрос threat model: смонтировать `/sys/fs/bpf` целиком значит отдать агенту весь bpffs узла. Пока этой строки нет, ни один runtime-случай §D в кластере не исполняется. Этот цикл измерил тот же отказ на слой раньше и назвал его причину точнее: на kind v1.36.1 `/sys/fs/bpf` — это каталог sysfs только для чтения, bpffs на нём не смонтирована, поэтому hostPath типа `DirectoryOrCreate` не создаётся вовсе и до runc дело не доходит — `MountVolume.SetUp failed for volume "bpf-pins": mkdir /sys/fs/bpf/ferrum: no such file or directory`. Это и есть причина, по которой `deploy/agent` — отдельный корень kustomize и не часть установки по умолчанию: гейт устанавливаемости, вынужденный делать исключение для собственного ресурса, перестал бы быть гейтом |
 | Собранный продуктовый бинарь аттачится на узле, а не только линкуется | Стадия, которая запускает слинкованный musl-бинарь и читает его `status.json` | В слайсе A это делали руками: бинарь написал `"attached": true`, а на испорченной релокации — причину в `containerMapError` и `degradedReasons`. В дереве нет ничего, что бы это повторило |
 | Поднятие memlock что-то решает на ядрах, куда это едет | Измерение на 5.8–5.10, где лимит ещё считает BPF-память | Не начато, и на этом хосте невозможно: soft = hard = 8 MiB, а с 5.11 память учитывается memcg. Манифест объявляет пол «ядро >= 5.8», и 5.8–5.10 — ровно тот диапазон, где лимит решает, загрузится ли datapath |
-| API server отвергает `PolicyException` без `expiresAt` | envtest или kind с применённым CRD: применить объект и потребовать отказ | Не начато. Ближайшее исполненное — `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode`: он читает CRD из дерева, а не ответ apiserver |
+| API server отвергает `PolicyException` без `expiresAt` | kind с применённым CRD: применить объект и потребовать отказ | Не исполнено, но механизм с этого цикла есть и стоит в дереве: `e2e_cluster.rs` разворачивает kind и применяет `docs/crd/`, где CRD с `required: expiresAt` теперь устанавливается (до этого цикла он не устанавливался вовсе). Не хватает ровно одного `kubectl apply` объекта без TTL и чтения ответа; `NOT_COVERED_HERE` в том файле называет это своими словами |
 | Агент сам обнаруживает падение CP и переходит на last-known-good | Тест на watch-клиент с оборванным соединением, не `mark_control_plane_down()` | Не начато |
 | `--policy-name` действительно джойнит waiver с политикой | Имя политики в FRMB — смена формата, бамп ABI и bundle, который откажется грузить каждый развёрнутый агент | **Заявлено, не закрыто.** Агент объявляет себя Degraded, если держит waiver, ни один из которых не называет его политику, а FD024 проверяет развёрнутые объекты. Джойн в рантайме остаётся недоказанным |
 | Разбор argv в этом дереве — одна грамматика | Поднять разбор в `ferrum-common` и оставить одну копию | **Заявлено, не закрыто, и прежняя формулировка этой строки была неверна в трёх местах.** (1) «Стоит зависимости в графе каждого crate» — платить нечем: `ferrum-common` уже существует и уже стоит в зависимостях `ferrum-agent`, `ferrum-admission` **и** `ferrum-controller`. (2) «Две копии дословные» — нет: admission собирает позиционные аргументы для `review <file>` и несёт второе поле в `Flags`; совпадает только ветка флагов. (3) Грамматик не три, а четыре: `ferrum-controller/src/main.rs::parse_run` — не last-wins вовсе (`--cluster` накапливается, флаг на месте значения — ошибка, а не пустая строка, разбор возвращает `Result`, а не карту), при этом FD027 читает argv контроллера через `container_flag`, то есть семантикой агента. Сам рефакторинг всё равно не работа этого цикла: за ним не стоит дефекта, FD025 делает удвоенный флаг находкой раньше, а копия, которая имела бы значение, — в `ferrum-cli`, который от `ferrum-common` не зависит |
+| NetworkPolicy перед портом метрик что-то закрывает на кластере получателя | Тест, который поднимает Pod в непомеченном namespace и требует отказа | **Исполнено руками, в дереве не повторяется.** На `kind-ferrum-install` (`kindest/kindnetd:v20260528-9350166c`, движок `kube-network-policies`) 2026-08-31: из непомеченного namespace `http://ferrum-admission.ferrum.svc:9102/metrics` не соединяется вовсе (curl `000`), из namespace с меткой `ferrum.io/metrics-scrape=true` отдаёт `200` и экспозицию с настоящим `bundle_info{digest=...}`, `POST` — `405`, `/healthz` — `404`, а порт 8443 отвечает из обоих. Гейтом это не стало намеренно: тест зависел бы от того, несёт ли CNI кластера движок политик, и на кластере без него был бы красным по причине, о которой утверждение не делается. Про сборки kindnetd без движка — комментарий в самом манифесте |
 | Пинов нет — и это заметно тому, кто снимет enforcement | LSM на pin path и self-watch вне процесса (RFC-02 §C, Tampering) | Не начато. Строка threat model закрыта нулём контрмер, и ни один сигнал `DEG_*` этого не назовёт |
-| `status.json` кто-то читает | Scrape config или acceptance-прогон, который делает `cat` | Файл — контракт, читателя в дереве нет |
+| `status.json` кто-то читает | Scrape config или acceptance-прогон, который делает `cat` | **Закрыто наполовину, и вторая половина никуда не делась.** Читатель в дереве появился: `/metrics` агента строится обходом того самого объекта, который печатает `status_json`, и `metrics_gate.rs::the_agent_publishes_the_in_kernel_drop_counter_it_already_had` требует, чтобы ни один ключ не остался неразмещённым. Но это читатель *объекта*, а не *файла*: порт читает ту же функцию в памяти, а `status.json` на диске по-прежнему не читает никто, и там живёт всё, что наружу сознательно не отдаётся — имя политики, текст терминального отказа, ошибка cgroup-карты, строка о неприсоединённых waiver'ах |
 | Поведение на `aarch64` совпадает с измеренным на x86_64 | Стадия `BPF attach` на arm64-раннере | **Механизм исполнен, и утверждение им опровергнуто.** Стадия идёт на arm64-ноде с билда #38 и зелёная с #39. Совпадения не оказалось: путь, переданный в `openat` ребёнком, ничего не сделавшим после `fork`, на x86_64 читается, а на aarch64 — нет. Расхождение закрыто не сближением ядер, а тем, что нечитаемое перестало выдаваться за короткое (`attach_live.rs::a_path_this_kernel_could_not_read_is_never_reported_as_a_short_one`). Строка остаётся здесь, потому что закрыт один найденный случай, а не класс |
 | Стык `attach_join.rs` ведёт себя на второй ноде так же, как на x86_64-стенде | Зелёная стадия `BPF join` на этой ноде | **Механизм исполнен, и утверждение подтвердилось — но не раньше, чем разошлось трижды.** С билда #52 стадия зелёная: шесть тестов из шести, четыре с `SIGKILL`, подтверждённым `waitpid`. Разошлись при этом не продукт, а пробы: они отдавали ядру непрочитанную страницу пути, целились в tgid, который агент не сигналит по построению, и трогали один байт там, где строка занимает две страницы. Агент на этой ноде повёл себя так же, как на x86_64, во всех шести случаях — включая тот, где нечитаемый путь заставил правило по пути **утвердить** совпадение |
 

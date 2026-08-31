@@ -17,6 +17,20 @@ spec:
       labels:
         app.kubernetes.io/name: ferrum-admission
         app.kubernetes.io/part-of: ferrum
+      annotations:
+        # For an annotation-driven scrape config, which is the one shape that
+        # needs nothing installed on our side. A Prometheus running the
+        # ServiceMonitor CRD reads the Service instead; both find the same
+        # port. What decides who may reach it is neither of these — it is
+        # deploy/observability/networkpolicy.yaml.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9102"
+        prometheus.io/path: /metrics
+        # Plain HTTP on purpose. The scrape must not need the caBundle the API
+        # server pins for 8443: that would make the offline webhook PKI a
+        # monitoring dependency and every serving-cert rotation a monitoring
+        # outage. See crates/ferrum-admission/src/metrics.rs.
+        prometheus.io/scheme: http
     spec:
       serviceAccountName: ferrum-admission
       # --apiserver below opens the namespace/ServiceAccount label watch, and
@@ -31,16 +45,38 @@ spec:
         runAsUser: 65532
         seccompProfile:
           type: RuntimeDefault
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: ferrum-admission
+      # Two replicas on one node are two replicas that one node failure takes.
+      # This is the half of HA that a PodDisruptionBudget cannot do: the budget
+      # governs evictions, and a node that dies asks nobody.
+      #
+      # `preferred` and not `required`, and that is a real trade rather than
+      # caution. Required anti-affinity on a single-node cluster leaves the
+      # second replica Pending forever — kind is a single-node cluster, and so
+      # is every cluster `install_gate.rs` and the public workflow install into,
+      # so `required` would make the shipped install one that does not come up
+      # on the cluster its own gate uses. It would also, on a two-node cluster
+      # losing a node, refuse to reschedule the replica that node carried:
+      # under `failurePolicy: Fail` a Pod that will not schedule is worse than a
+      # Pod sharing a node. Weight 100 is the whole weight there is, so on any
+      # cluster with two schedulable nodes the scheduler separates them.
+      #
+      # One mechanism and not two: this replaced a `topologySpreadConstraints`
+      # with `maxSkew: 1, whenUnsatisfiable: ScheduleAnyway`, which expressed
+      # the same preference over the same topology key. Two scheduler inputs
+      # saying one thing drift apart silently — the pair that ships is this rule
+      # and pdb.yaml, and they say different things on purpose.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ferrum-admission
       containers:
         - name: admission
-          image: ghcr.io/ferrum/ferrum-admission:v0.1.0
+          image: ghcr.io/onixus/ferrum-admission:v0.1.0
           args:
             - serve
             - --listen
@@ -60,6 +96,11 @@ spec:
             # Without this the namespace/SA label cache stays cold, and a
             # policy carrying a namespaceSelector denies every Pod.
             - --apiserver
+            # Read-only GET /metrics, on its own listener and its own port.
+            # Never on 8443: that port is the API server's, is served with the
+            # pinned certificate, and answers POST only.
+            - --metrics-listen
+            - 0.0.0.0:9102
           env:
             - name: FERRUM_TRUST_ROOT
               valueFrom:
@@ -69,6 +110,8 @@ spec:
           ports:
             - name: https
               containerPort: 8443
+            - name: metrics
+              containerPort: 9102
           # The server answers POST only; a GET probe would read as 405, so
           # readiness is a TCP connect.
           readinessProbe:

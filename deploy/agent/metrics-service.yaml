@@ -1,0 +1,28 @@
+# Endpoints for the node agents, so a scraper has something to discover.
+#
+# Headless (`clusterIP: None`) and that is the whole point: a DaemonSet must be
+# scraped per node. A ClusterIP would load-balance across nodes, and every
+# scrape would land on whichever agent the kube-proxy chose — so
+# `ferrum_agent_events_dropped_total` would look like one flapping series
+# instead of one series per node, and the node that is actually dropping
+# records would be invisible in the average.
+#
+# There is no port 8443 here and no other port at all: the agent listens on
+# exactly one socket, and it is read-only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-agent-metrics
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-agent
+    app.kubernetes.io/part-of: ferrum
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ferrum-agent
+  ports:
+    - name: metrics
+      port: 9102
+      targetPort: metrics
+      protocol: TCP

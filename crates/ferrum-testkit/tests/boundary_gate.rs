@@ -63,13 +63,37 @@ use std::path::{Path, PathBuf};
 /// section, and the §D check below then fails rather than passing quietly.
 const DOES_HEADING: &str = "## Делает";
 const NOT_EXECUTED: &str = "—";
+/// The markers a citation may carry, i.e. the stands this repository can
+/// measure something on.
+///
+/// `A` is the third and the newest, and it exists because `U` was being asked
+/// to carry two different claims. `U` says the code ran in userspace against
+/// the tree that ships — no kernel, and, until this cycle, no API server
+/// either, because none had ever run here. A row measured by
+/// `e2e_cluster.rs` is neither: the decider is a real API server, the input is
+/// a `kubectl apply`, and the evidence is the API server's own answer. Filing
+/// that under `U` would have made "executed in userspace" mean both "we called
+/// `admit()` with a struct we built" and "a cluster refused a Pod", which are
+/// the two things the first run of that file showed apart — two CRDs pass
+/// every text-reading gate in this tree and are refused outright by an API
+/// server.
+///
+/// A marker is the author's word for where a test ran; nothing here can check
+/// it, and `Как читать колонку «Исполняется»` in the document is where each
+/// one is defined.
+const MARKERS: [char; 3] = ['K', 'U', 'A'];
 const ENTRY_SEPARATOR: char = '·';
 
 /// The subjects in «Делает» that may carry `—`, each because the thing the row
 /// is about has no executor in this tree at all.
 ///
 /// `exception without TTL -> API reject` is the §D case whose subject is the
-/// API server, and no API server has ever run here. Its row must still exist —
+/// API server. It kept this exemption for cycles because no API server had
+/// ever run here; one runs now (`e2e_cluster.rs`), and the exemption survives
+/// for a weaker and more uncomfortable reason: nobody has submitted a
+/// `PolicyException` without a TTL to it. That is a gap, not a boundary, and
+/// the day someone does the row loses its dash and this entry goes with it.
+/// Its row must still exist —
 /// the §D check below refuses a dropped case — so it must be able to say that
 /// it is not executed. Nothing else may: a row that has an executor and does
 /// not cite it belongs in a different section of the document, not in this one
@@ -184,9 +208,10 @@ fn parse_evidence(cell: &str) -> Result<Vec<Citation>, String> {
         }
         let mut chars = entry.chars();
         let marker = chars.next().expect("non-empty");
-        if marker != 'K' && marker != 'U' {
+        if !MARKERS.contains(&marker) {
             return Err(format!(
-                "citation {entry:?} must begin with the marker K or U, not {marker:?}"
+                "citation {entry:?} must begin with one of the markers {MARKERS:?}, \
+                 not {marker:?}"
             ));
         }
         let rest = chars.as_str();
@@ -1599,6 +1624,16 @@ impl CrdStatusSurface {
 fn crd_status_surfaces(root: &Path) -> (Vec<CrdStatusSurface>, Vec<String>) {
     let mut files = Vec::new();
     yaml_files(&root.join("docs/crd"), &mut files);
+    // The one file here that is not a CRD and never will be: the kustomization
+    // root that installs the seven that are. It is dropped by exact name and
+    // not by a shape test, because "a document that is not a
+    // CustomResourceDefinition" is precisely what the `unread` half below
+    // exists to report, and softening that check would let a real CRD file
+    // that stopped being one pass unnoticed. That this root names every CRD
+    // beside it is a separate claim, held by
+    // `deploy_gate.rs::the_crd_kustomization_installs_every_crd_this_repository_ships`,
+    // so a CRD cannot leave the install by being dropped here either.
+    files.retain(|path| path.file_name().and_then(|n| n.to_str()) != Some("kustomization.yaml"));
     files.sort();
     let mut out = Vec::new();
     let mut unread = Vec::new();

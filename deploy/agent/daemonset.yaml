@@ -19,6 +19,11 @@ spec:
       labels:
         app.kubernetes.io/name: ferrum-agent
         app.kubernetes.io/part-of: ferrum
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9102"
+        prometheus.io/path: /metrics
+        prometheus.io/scheme: http
     spec:
       # Base install runs observe. Switching to --role respond alone changes
       # nothing until optional-respond.yaml binds the respond ServiceAccount.
@@ -37,7 +42,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agent
-          image: ghcr.io/ferrum/ferrum-agent:v0.1.0
+          image: ghcr.io/onixus/ferrum-agent:v0.1.0
           args:
             - --role
             - observe
@@ -57,6 +62,19 @@ spec:
             # the image; it is not built at runtime.
             - --bpf-elf
             - /usr/share/ferrum/ferrum-ebpf-progs.bpf.o
+            # A listening socket on a DaemonSet that runs on every node is a
+            # second attack surface on the process the threat model calls the
+            # second target after the kubelet. That cost is not denied
+            # anywhere: it is paid, because `events_dropped_total` locked
+            # inside the process is a node that misses enforcement and reports
+            # healthy. What is done about it: GET /metrics and nothing else,
+            # no request body ever read, none of the free-text state (policy
+            # name, terminal fault, cgroup errors) published, and
+            # deploy/observability/networkpolicy.yaml in front of the port.
+            # status.json beside events.jsonl keeps everything regardless, so
+            # this port is a second reader and never the only one.
+            - --metrics-listen
+            - 0.0.0.0:9102
           env:
             - name: NODE_NAME
               valueFrom:
@@ -67,6 +85,9 @@ spec:
                 secretKeyRef:
                   name: ferrum-trust-root
                   key: trustRoot
+          ports:
+            - name: metrics
+              containerPort: 9102
           resources:
             requests:
               cpu: 100m

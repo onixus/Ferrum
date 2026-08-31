@@ -240,6 +240,18 @@ spec:
                       enum: [allow, audit, deny, kill, isolate]
                     rules:
                       type: array
+                      # Не продуктовый лимит, а требование API server: без
+                      # объявленной границы оценщик стоимости CEL считает эту
+                      # ветку по максимуму запроса, и правило kill/isolate ниже
+                      # («нужен syscalls или match») превышает бюджет в 1.34
+                      # раза — CRD не применяется вовсе. Измерено на настоящем
+                      # apiserver (kind, v1.36.1): без этой строки
+                      # `kubectl apply -f docs/crd/` отдаёт Forbidden на
+                      # x-kubernetes-validations[3], с ней проходит. Число
+                      # выбрано с запасом: бюджет проходит и на большем, и
+                      # ничто в компиляторе числом правил не ограничено, так
+                      # что читать эту границу как продуктовую нельзя.
+                      maxItems: 1024
                       # Rule ids are the names exceptions and audit records
                       # refer to, so two rules may not share one. A list-map
                       # key is the API server's own uniqueness check and costs

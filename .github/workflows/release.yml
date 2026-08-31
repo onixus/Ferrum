@@ -1,0 +1,291 @@
+# Поставка: три образа в ghcr.io, подписанные, с SBOM.
+#
+# Продукт про подписанный bundle, который сам едет неподписанным, — это ровно
+# тот разрыв, от которого написан docs/MVP-1-BOUNDARY.md: получатель обязан
+# верить на слово там, где его учат не верить. Этот файл закрывает половину
+# разрыва — ту, что про артефакт. Вторая половина, `docker push`, случившийся
+# на самом деле, файлом не закрывается: воркфлоу, ни разу не запущенный,
+# ничего не опубликовал, и в границе про него сказано ровно то же, что про
+# `.github/workflows/ci.yml`.
+#
+# Два домена подписи, и они не пересекаются:
+#
+#  - **bundle** — Ed25519-seed из Secret, который монтирует контроллер, контекст
+#    `BUNDLE_SIGNATURE_CONTEXT`. Он живёт в кластере и в этот воркфлоу не
+#    попадает ни в каком виде;
+#  - **образ** — эфемерный ключ Fulcio, выданный на один запуск под OIDC-токен
+#    GitHub. Приватная половина умирает вместе с job.
+#
+# Смешать их значило бы сделать ключ, которым кластер проверяет политику,
+# ключом, который лежит в CI. Ключа в CI здесь нет вообще, и это главный довод
+# за keyless в публичном репозитории: долгоживущий `COSIGN_PRIVATE_KEY` — это
+# секрет, который надо хранить, ротировать и однажды потерять, а взамен он не
+# даёт ничего сверх идентичности «этот воркфлоу, этот репозиторий, этот тег»,
+# выписанной Fulcio и записанной в Rekor. Получатель проверяет именно её —
+# README, раздел «Поставка».
+#
+# Ни `continue-on-error`, ни `if:` на шагах, ни `|| true`: неподписанный образ,
+# доехавший до ghcr под зелёным значком, — тот самый гейт, умеющий себя
+# пропустить.
+#
+# Держит этот файл `crates/ferrum-testkit/tests/deploy_gate.rs`, модуль
+# `release_supply_chain`.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  # Версии инструментов закреплены. Воркфлоу, который ставит «последний»
+  # cosign, подписывает тем, что выложат завтра, — в файле, который весь про
+  # происхождение.
+  COSIGN_VERSION: v3.1.3
+  SYFT_VERSION: v1.51.1
+
+jobs:
+  # Датапейсный ELF собирается здесь, потому что без него образ агента не
+  # собирается вообще: `COPY ${BPF_ELF}` в Dockerfile падает, и это намеренно —
+  # агент без датапейса выходит на первом же --bpf-elf, который передаёт ему
+  # DaemonSet.
+  #
+  # Это не стадия `BPF ELF` Jenkinsfile и не претендует на её имя: там рецепт
+  # исполняется каждый билд, здесь — ни разу. Общее у них образ и команды:
+  # bpf-linker собирается против LLVM ровно той версии, которую несёт nightly, а
+  # репозиторий apt.llvm.org берётся под bookworm, потому что единственное
+  # известное исполнение этого рецепта — в bookworm-контейнере, а не на
+  # ubuntu-latest.
+  datapath-elf:
+    name: Datapath ELF
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Datapath ELF"
+        run: |
+          set -eu
+          cat > /tmp/ferrum-bpf-elf.sh <<'SCRIPT'
+          set -eu
+          llvm_major=23
+          have=$(rustc +nightly --version --verbose \
+                 | awk '/^LLVM version:/{split($3, v, "."); print v[1]}')
+          if [ "$have" != "$llvm_major" ]; then
+              echo "nightly несёт LLVM $have, воркфлоу ставит $llvm_major" >&2
+              exit 1
+          fi
+          apt-get update
+          apt-get install -y --no-install-recommends curl gnupg ca-certificates
+          # Ключ пинится по отпечатку, а не «как отдал сервер»: иначе
+          # подменённый ключ подписал бы подменённый LLVM, и apt на это не
+          # пожалуется.
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm.asc
+          fpr=$(gpg --show-keys --with-colons /tmp/llvm.asc \
+                | awk -F: '/^fpr/{print $10; exit}')
+          if [ "$fpr" != 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421 ]; then
+              echo "ключ apt.llvm.org не тот: $fpr" >&2
+              exit 1
+          fi
+          gpg --dearmor < /tmp/llvm.asc > /usr/share/keyrings/ferrum-llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/ferrum-llvm.gpg]" \
+               "https://apt.llvm.org/bookworm/" \
+               "llvm-toolchain-bookworm-$llvm_major main" \
+              > /etc/apt/sources.list.d/ferrum-llvm.list
+          apt-get update
+          apt-get install -y --no-install-recommends "llvm-$llvm_major-dev"
+          ln -sf "/usr/lib/llvm-$llvm_major/bin/llvm-config" /usr/local/bin/llvm-config
+          # Линковку берёт на себя рустец: образ не несёт простого libLLVM.so,
+          # поэтому версионный шимится, а сисрут едет на rpath.
+          sysroot="$(rustc +nightly --print sysroot)"
+          shim=/tmp/ferrum-llvm-shim
+          mkdir -p "$shim"
+          ln -sf "$sysroot"/lib/libLLVM-*.so "$shim/libLLVM.so"
+          RUSTFLAGS="-L $shim -L $sysroot/lib -C link-arg=-Wl,-rpath,$sysroot/lib" \
+              cargo +nightly install bpf-linker --locked
+          cargo +nightly build -p ferrum-ebpf-progs \
+              --target bpfel-unknown-none -Z build-std=core --release
+          elf="$CARGO_TARGET_DIR/bpfel-unknown-none/release/ferrum-ebpf-progs"
+          readelf -sW "$elf" > /tmp/ferrum-bpf-symbols.txt
+          for sym in \
+              ferrum_sys_enter_execve \
+              ferrum_sys_enter_execveat \
+              ferrum_sys_enter_open \
+              ferrum_sys_enter_openat \
+              ferrum_sys_enter_bpf \
+              ferrum_sys_enter_init_module \
+              ferrum_sys_enter_finit_module \
+              ferrum_events \
+              ferrum_cgroups \
+              ferrum_self \
+              events_dropped_total
+          do
+              if ! grep -Eq "[[:space:]]$sym\$" /tmp/ferrum-bpf-symbols.txt; then
+                  echo "missing symbol $sym in bpf ELF" >&2
+                  exit 1
+              fi
+          done
+          FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
+              cargo test -p ferrum-ebpf --test elf_inspect
+          mkdir -p dist
+          cp "$elf" dist/ferrum-ebpf-progs.bpf.o
+          SCRIPT
+          # nightly ставится снаружи скрипта: rustup в контейнере читает
+          # rust-toolchain.toml из /src и первым же вызовом ставит пиннутый
+          # стабильный тулчейн, а не тот, которым собирается bpf-таргет.
+          docker run --rm \
+              -v "$PWD:/src" -w /src \
+              -v /tmp/ferrum-bpf-elf.sh:/ferrum-bpf-elf.sh:ro \
+              -e CARGO_TARGET_DIR=/build-target \
+              -e CARGO_INSTALL_ROOT=/usr/local/cargo \
+              -e CARGO_TERM_COLOR=never \
+              rust:1-bookworm sh -euc \
+                  'rustup toolchain install nightly --profile minimal --component rust-src
+                   sh /ferrum-bpf-elf.sh'
+          test -s dist/ferrum-ebpf-progs.bpf.o
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpf-elf
+          path: dist/ferrum-ebpf-progs.bpf.o
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ matrix.crate }}
+    needs: datapath-elf
+    runs-on: ubuntu-latest
+    permissions:
+      # packages: write — сам push в ghcr.
+      # id-token: write — OIDC-токен, под который Fulcio выписывает сертификат.
+      # Без него keyless-подписи не существует, и это единственное право,
+      # которое здесь стоит ради подписи.
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: ferrum-agent
+            dockerfile: Dockerfile
+            build_args: --build-arg BPF_ELF=dist/ferrum-ebpf-progs.bpf.o
+          - crate: ferrum-admission
+            dockerfile: Dockerfile.admission
+            build_args: ""
+          - crate: ferrum-controller
+            dockerfile: Dockerfile.controller
+            build_args: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bpf-elf
+          path: dist
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+      - uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+      - name: "Publish ${{ matrix.crate }}"
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # Репозиторий образа зашит, а не собран из github.repository_owner:
+          # ровно эту строку несут deploy/**, и разойтись им нельзя —
+          # deploy_gate.rs сравнивает оба множества на равенство. Форк, который
+          # не может сюда пушить, узнает об этом отказом push, а не тихой
+          # публикацией под другим именем.
+          image="ghcr.io/onixus/${{ matrix.crate }}"
+          tag="$GITHUB_REF_NAME"
+
+          printf '%s' "$GHCR_TOKEN" \
+              | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --platform=linux/amd64 \
+              -f "${{ matrix.dockerfile }}" ${{ matrix.build_args }} \
+              -t "$image:$tag" .
+          docker push "$image:$tag"
+
+          # Дальше всё по digest. Тег переставляется, digest — нет, и подпись,
+          # привязанная к тегу, назавтра означала бы другой образ.
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$tag")"
+          case "$digest" in
+              "$image@sha256:"*) ;;
+              *) echo "docker inspect отдал $digest, а не $image@sha256:…" >&2; exit 1 ;;
+          esac
+          echo "published $digest"
+
+          cosign sign --yes "$digest"
+
+          # SBOM считается по опубликованному образу, а не по дереву:
+          # утверждение должно быть про то, что поедет на узел. Внутри
+          # scratch-образа лежит один статический ELF, и перечислить его
+          # зависимости syft может только потому, что бинарь слинкован
+          # cargo-auditable — см. Dockerfile.
+          sbom="sbom-${{ matrix.crate }}.spdx.json"
+          syft "$digest" -o "spdx-json=$sbom"
+          # Файл, лежащий рядом с релизом, ни с чем не связан. Аттестация
+          # связывает: предикат подписан той же идентичностью и прикреплён к
+          # digest.
+          cosign attest --yes --type spdxjson --predicate "$sbom" "$digest"
+
+          # Та же процедура, что описана в README для получателя, исполненная
+          # здесь же. Опубликованная инструкция, которая не проходит на только
+          # что подписанном образе, не пройдёт и у получателя, а узнает он это
+          # первым.
+          identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/release.yml@$GITHUB_REF"
+          issuer=https://token.actions.githubusercontent.com
+          cosign verify \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "$digest"
+          cosign verify-attestation --type spdxjson \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer "$issuer" \
+              "$digest"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.crate }}
+          path: sbom-${{ matrix.crate }}.spdx.json
+          if-no-files-found: error
+
+  release:
+    name: Release artefacts
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: sbom
+          pattern: sbom-*
+          merge-multiple: true
+      - name: "Attach SBOMs to the release"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="$GITHUB_REF_NAME"
+          # Три и ровно три. Релиз с двумя SBOM — это релиз, про один из трёх
+          # образов которого не сказано ничего, и заметить это обязан воркфлоу,
+          # а не получатель.
+          count=$(ls sbom/*.spdx.json | wc -l)
+          if [ "$count" -ne 3 ]; then
+              echo "ожидалось три SBOM, найдено $count:" >&2
+              ls -l sbom >&2
+              exit 1
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+              gh release upload "$tag" sbom/*.spdx.json --clobber
+          else
+              gh release create "$tag" --verify-tag --title "$tag" \
+                  --generate-notes sbom/*.spdx.json
+          fi

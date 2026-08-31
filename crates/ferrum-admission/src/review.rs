@@ -6,7 +6,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 use crate::encoding::b64_encode;
-use crate::eval::{admit, AdmissionDecision, Patch};
+use crate::eval::{admit, cluster_scoped_kind, AdmissionDecision, Patch};
 use crate::labels::{ColdLabels, LabelSource};
 use crate::program::AdmissionProgram;
 use crate::subject::subject_from_object;
@@ -41,6 +41,16 @@ impl Default for ReviewConfig {
 pub struct ReviewReply {
     pub status: u16,
     pub body: Vec<u8>,
+    /// The verdict this reply carries, as a field rather than as something a
+    /// caller re-parses out of `body`.
+    ///
+    /// It exists because the webhook now counts its own decisions, and the
+    /// alternative was a second JSON parse of the response on the request
+    /// path — a parse whose failure mode is a deny silently counted as an
+    /// allow. A 400 is `false` here: the API server under `failurePolicy: Fail`
+    /// treats it as a refusal, so counting it as an allow would put the one
+    /// case an operator most needs to see on the wrong side of the graph.
+    pub allowed: bool,
 }
 
 impl ReviewConfig {
@@ -52,8 +62,40 @@ impl ReviewConfig {
         exceptions: &[PolicyExceptionSpec],
         now: DateTime<Utc>,
     ) -> ReviewReply {
-        handle_with(self, body, program, exceptions, now)
+        handle_with(self, body, program, exceptions, None, now)
     }
+
+    /// The same evaluation with a break-glass grant in force.
+    ///
+    /// A separate entry point rather than a fifth argument on the one above, so
+    /// that every existing caller — the offline `review` subcommand, the
+    /// acceptance tests, the latency gate — keeps meaning "no suspension is
+    /// possible here" without having to restate it. Only the serving path can
+    /// suspend, because only the serving path has a journal to write.
+    pub fn handle_bytes_under_break_glass(
+        &self,
+        body: &[u8],
+        program: Option<&AdmissionProgram>,
+        exceptions: &[PolicyExceptionSpec],
+        break_glass: Option<&BreakGlassGrant>,
+        now: DateTime<Utc>,
+    ) -> ReviewReply {
+        handle_with(self, body, program, exceptions, break_glass, now)
+    }
+}
+
+/// What the review path needs to know about a grant that is in force.
+///
+/// Not `ferrum_breakglass::VerifiedGrant` itself: this module decides
+/// admission, and the only thing it may do with a grant is quote its identity
+/// back to the operator running `kubectl`. Narrowing it here means the request
+/// path cannot reach for `subject` — a person's name — and put it in a message
+/// that lands in whatever collects `kubectl` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakGlassGrant {
+    pub id: String,
+    pub ticket: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 /// Fail-closed AdmissionReview. Unrecoverable uid → HTTP 400, not 200 with empty uid.
@@ -66,11 +108,28 @@ pub fn handle_review_bytes(
     ReviewConfig::default().handle_bytes(body, program, exceptions, now)
 }
 
+/// The message a suspended webhook puts in its own allow.
+///
+/// It goes to whoever ran `kubectl`, which is the one channel that reaches a
+/// human at the moment an object is admitted unchecked. It names the grant and
+/// the ticket and never the subject: `kubectl` output ends up in CI logs and
+/// terminal scrollback, and a person's name does not belong in either.
+pub fn break_glass_message(grant: &BreakGlassGrant) -> String {
+    format!(
+        "FERRUM break-glass in force (grant {}, ticket {}, until {}): admitted without policy \
+         evaluation",
+        grant.id,
+        grant.ticket,
+        grant.expires_at.to_rfc3339()
+    )
+}
+
 fn handle_with(
     cfg: &ReviewConfig,
     body: &[u8],
     program: Option<&AdmissionProgram>,
     exceptions: &[PolicyExceptionSpec],
+    break_glass: Option<&BreakGlassGrant>,
     now: DateTime<Utc>,
 ) -> ReviewReply {
     if body.is_empty() {
@@ -91,12 +150,31 @@ fn handle_with(
         return ReviewReply {
             status: 400,
             body: encode_response("", false, None, "admission request uid is required"),
+            allowed: false,
         };
     }
 
     let Some(request) = parsed.get("request").and_then(Value::as_object) else {
         return ok_deny(&uid, "admission request is missing");
     };
+
+    // Break-glass is checked here and nowhere lower. Above it sit only the two
+    // refusals that are not policy decisions at all — a body this process could
+    // not read, and a review with no uid to echo — and answering those with an
+    // allow would be a suspension of parsing rather than of enforcement. Below
+    // it sits everything a grant is for, the fail-closed arms included: an
+    // unreadable bundle denying every Pod in the cluster is the outage
+    // break-glass exists to end, so a grant that stopped short of it would stop
+    // short of its only job.
+    if let Some(grant) = break_glass {
+        if now < grant.expires_at {
+            return ReviewReply {
+                status: 200,
+                body: encode_break_glass_allow(&uid, &break_glass_message(grant)),
+                allowed: true,
+            };
+        }
+    }
 
     let Some(program) = program else {
         return ok_deny(&uid, "policy bundle missing, invalid, or unverifiable");
@@ -128,8 +206,14 @@ fn handle_with(
     // warmth once and carry its cause into the reply: this message is the only
     // channel admission has, and it reaches the human running kubectl at the
     // moment of the deny.
+    // An object in no namespace is decided without the watch: see
+    // `program_applies`. Asking a cold cache about it would deny every
+    // ClusterRoleBinding for the first minute of every webhook Pod's life —
+    // including the ones an operator applies to repair the cluster — over
+    // labels that would not have been read even on a warm cache.
+    let cluster_scoped = cluster_scoped_kind(&subject.kind);
     let warmth = cfg.labels.warmth();
-    if !warmth.is_warm() && watched_labels_selected(program) {
+    if !warmth.is_warm() && !cluster_scoped && watched_labels_selected(program) {
         return ok_deny(
             &uid,
             &format!("namespace labels unavailable: {}", warmth.reason()),
@@ -169,6 +253,7 @@ fn http_400(message: &str) -> ReviewReply {
         status: 400,
         body: serde_json::to_vec(&json!({"error": message}))
             .unwrap_or_else(|_| br#"{"error":"bad request"}"#.to_vec()),
+        allowed: false,
     }
 }
 
@@ -176,6 +261,7 @@ fn ok_deny(uid: &str, message: &str) -> ReviewReply {
     ReviewReply {
         status: 200,
         body: encode_response(uid, false, None, message),
+        allowed: false,
     }
 }
 
@@ -214,7 +300,32 @@ fn decision_response(uid: &str, object: &Value, decision: &AdmissionDecision) ->
     ReviewReply {
         status: 200,
         body: encode_response(uid, true, patch.as_ref(), ""),
+        allowed: true,
     }
+}
+
+/// An allow that says why it is an allow.
+///
+/// `status.message` is not available here: the API server ignores it on an
+/// allowed response, so the only channel that reaches the human running
+/// `kubectl` at the moment an object is admitted unchecked is `warnings`, which
+/// `kubectl` prints as `Warning: ...`. Everything else about a break-glass is
+/// visible only to somebody already looking at the cluster's metrics or logs;
+/// this line is the one that reaches the person doing the thing.
+fn encode_break_glass_allow(uid: &str, message: &str) -> Vec<u8> {
+    let body = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "response": {
+            "uid": uid,
+            "allowed": true,
+            "warnings": [message],
+        },
+    });
+    serde_json::to_vec(&body).unwrap_or_else(|_| {
+        b"{\"apiVersion\":\"admission.k8s.io/v1\",\"kind\":\"AdmissionReview\",\"response\":{\"uid\":\"\",\"allowed\":false}}"
+            .to_vec()
+    })
 }
 
 fn encode_response(uid: &str, allowed: bool, patch: Option<&Value>, message: &str) -> Vec<u8> {

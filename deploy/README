@@ -1,0 +1,208 @@
+Installing FERRUM
+=================
+
+    kubectl apply -k deploy
+
+That is the default install, and it is the restricted one. There is no second
+mode, no `--set enable-respond=true`, no values file whose defaults are the
+convenient ones; what this root installs is the control plane with everything
+this repository knows how to lock down already locked down, and every loosening
+is a separate, deliberate act by an operator who typed it.
+
+What that command installs
+--------------------------
+
+  * the seven CRDs from docs/crd — so an operator's first policy object is not
+    rejected as an unknown type;
+  * the `ferrum` namespace, which the webhook configuration excludes by name —
+    on `kubernetes.io/metadata.name`, the key the API server owns — so a cold
+    cluster cannot deadlock on the admission Pod that has not started yet;
+  * the controller (ServiceAccount, RBAC, Deployment);
+  * the webhook (ServiceAccount, RBAC, Service, Deployment).
+
+It ends where deploy/admission/README ends its step 2: everything running,
+nothing gating. Three things are still yours, and none of them can be a
+manifest:
+
+  1. the bundle signing seed, as Secret `ferrum-signing-key` in `ferrum`;
+  2. the trust root the webhook pins, as Secret `ferrum-trust-root`, key
+     `trustRoot` — the Ed25519 public key of that seed;
+  3. the serving PKI, from `ferrumctl gen-webhook-pki` (see
+     deploy/admission/README).
+
+A kustomization that generated any of those would either put a key in git or
+mint a new one on every apply. Both are worse than you creating them once.
+
+Until the Secrets exist the Pods sit in ContainerCreating with the Secret they
+are waiting for named on them, which is the failure said once, in the place an
+operator looks. Until a ClusterSecurityPolicy exists and the controller has
+compiled it, the webhook has no bundle Secret to mount and waits the same way.
+
+Then, and only then, the object that starts gating the cluster:
+
+    kubectl apply -f deploy/admission/validatingwebhookconfiguration.yaml
+
+That file is rendered by `ferrumctl gen-webhook-pki`; the template beside it
+carries `caBundle: REPLACE_WITH_PEM_CA_BUNDLE_BASE64` and is not appliable. It
+is applied last, by hand, and it is not in any kustomization root — with
+`failurePolicy: Fail` it refuses Pods the moment it exists, so it must never
+arrive as a side effect of an install someone inherited.
+
+The node agent is a separate root
+---------------------------------
+
+    kubectl apply -k deploy/agent
+
+Not part of the default install, and this is a limitation rather than a design
+preference. The DaemonSet mounts its BPF pin path as a hostPath of type
+DirectoryOrCreate at /sys/fs/bpf/ferrum, which requires bpffs to be mounted at
+/sys/fs/bpf on the node. A kind node has no bpffs there — /sys/fs/bpf is a
+read-only sysfs directory — so kubelet cannot create the subdirectory and the
+Pod never leaves ContainerCreating:
+
+    MountVolume.SetUp failed for volume "bpf-pins":
+    mkdir /sys/fs/bpf/ferrum: no such file or directory
+
+Measured on kind v1.36.1 (kindest/node, aarch64), 2026-08-31. The repair is a
+threat-model question and not a kustomize one — mounting /sys/fs/bpf whole
+hands the agent the node's entire bpffs — so until it is answered this root
+stays out of the install the gate proves, rather than the gate growing an
+exception for one of its own resources. Apply it on a cluster whose nodes carry
+bpffs; there is nothing else different about it.
+
+`deploy/agent/optional-respond.yaml` is in no kustomization root either. It
+replaces the DaemonSet with one carrying hostPID and CAP_KILL, and turning kill
+from a logged decision into an action must be a `kubectl apply -f` somebody
+typed, never a value somebody inherited.
+`deploy_gate.rs::no_kustomization_root_installs_the_respond_variant_or_the_unrendered_webhook`
+is what keeps both of those out.
+
+Air-gapped: overlays/mirrored-registry
+--------------------------------------
+
+    kubectl apply -k overlays/mirrored-registry
+
+The base pulls `ghcr.io/onixus/*`, which is the internet. That overlay rewrites
+the image names into `registry.internal.example`, which is the only registry
+`policies/examples/prod-restricted.yaml` allows — so the default install is one
+the policy this repository ships would refuse if it were ever selected, and the
+overlay is what makes the two agree. Substitute your own registry there. Do not
+add a `newTag`: the tag is pinned once, in the manifests, and joined to the
+release that can publish it by
+`deploy_gate.rs::the_tag_the_manifests_pin_is_one_the_release_can_publish`.
+
+It sits beside `deploy/` rather than under it because kustomize refuses a root
+that contains a root it has already visited, and an overlay at
+`deploy/overlays/*` naming `../..` is that cycle by construction.
+
+Events to a SIEM: overlays/siem-syslog
+--------------------------------------
+
+    kubectl apply -k overlays/siem-syslog
+
+The base install writes enforcement events to `events.jsonl` on each node and
+nothing leaves the cluster. That overlay adds a second destination to the
+agent's export fan-out — syslog over TCP or UDP, in RFC 5424 structured data,
+ArcSight CEF or ECS JSON — and leaves the node-local file exactly where it was.
+Second, never instead: the file is what an investigation falls back to when the
+export counters say records were lost.
+
+Not part of any install anybody inherits, for two reasons that are both in the
+file. The address belongs to the site, and a default would be a name that does
+not resolve on every node — which reads as every node Degraded and every event
+counted as an export failure. And shipping records of what this cluster
+enforces to a system outside it is a decision, in the same sense respond is.
+
+What that overlay does not do is TLS. The transport is plain TCP or UDP, and
+the records carry pod names, namespaces, process names and the names of the
+policies in force. Put the collector on a network the cluster already trusts,
+or point the agent at a local forwarder that terminates TLS for it; a TLS
+client inside the DaemonSet would add a trust store and a renewal path to the
+process the threat model calls the second target after the kubelet, and that
+trade has not been made.
+
+When the collector is not there: nothing waits and nothing is lost quietly.
+Every undelivered event is counted in `export_write_failed_total` — the same
+counter `status.json`, `/metrics` and `DEG_EXPORT_LOSSY` already read, not a
+new one — and the node reports Degraded. What that counter does not say is
+*which* destination failed; the agent's stderr says it, once per transition.
+
+The emergency lever: overlays/break-glass
+-----------------------------------------
+
+    kubectl apply -k overlays/break-glass
+
+Arms the webhook to honour a signed, time-bounded grant that suspends policy
+evaluation, and to journal every activation, expiry, revocation and refusal
+into a hash chain. It does not suspend anything: arming and breaking glass are
+two acts, and the second one is dropping a signed grant into Secret
+`ferrum-break-glass` during an incident. The procedure is in
+docs/runbooks/README.md §5.
+
+Apply it on a quiet afternoon, not during the outage. `ferrum-admission`
+refuses to start when break-glass is configured and the journal cannot be
+written — a suspension nobody can account for afterwards is worse than no
+suspension — so a broken arming fails `kubectl rollout status` here instead of
+failing at 03:00. Check `ferrum_admission_break_glass_configured` is 1 on every
+replica afterwards.
+
+The key is yours and is deliberately not the bundle signing key: the signature
+domains are separate, so a signature the policy publisher made cannot be
+replayed as a grant. Issue it to named people from whatever directory the site
+already runs — that binding is the part this tree cannot do, and the runbook
+says so in the words the code states it in.
+
+Two limits, both in the overlay file at length. The journal is an emptyDir and
+dies with the Pod, so the durable copies are the container log and the metric
+carrying the chain head; and the only scope this build honours is `admission`,
+so the agent's respond role is still suspended by hand.
+
+Why kustomize and not Helm
+--------------------------
+
+Four reasons, in the order they mattered.
+
+The receiver. The wedge for this product is the closed contour — air gap, no
+egress, an operator who already has `kubectl` and a mirrored registry and
+nothing else. `kubectl apply -k` needs no second binary, no chart repository,
+no OCI artefact to get across the gap, and no `helm` version to agree with the
+cluster's. A chart is one more thing to mirror and one more supply chain to
+verify for a product whose entire argument is that you should not have to trust
+the vendor's channel.
+
+The manifests are the artefact. Half of what this tree knows is written in the
+comments of these files — why `defaultMode: 288` is decimal, why the bundle
+mount is not `optional: true`, why tracefs is `type: Directory`. Helm would
+turn each of them into a template, so the thing an operator reviews would stop
+being the thing the API server receives, and every gate in this repository that
+reads `deploy/**` would be reading a program instead of a manifest.
+
+Values are a place for defaults to rot. A chart's defaults are a second copy of
+the security posture, in a file nothing else reads, and the pressure on them is
+always toward the convenient. Here there is one copy: the manifests. An
+overlay can only add to them, in a file whose whole diff is the loosening.
+
+Nothing was given up. What a chart would buy — one command, a rendered
+namespace, image rewriting for a mirror — kustomize does in the four lines of
+overlays/mirrored-registry. What a chart would additionally buy, release
+tracking and rollback, this product does not want: the thing that must be
+version-pinned and rolled back here is the signed PolicyBundle, and that is the
+controller's job, not an installer's.
+
+What holds all of this
+----------------------
+
+`install_gate.rs` applies this root to a real API server on a cluster that has
+never seen FERRUM, and requires both Deployments to roll out. It is not a
+reading of these files: last cycle two of the seven CRDs passed every
+text-reading gate in this tree and were rejected outright by an API server.
+
+`deploy_gate.rs::kustomize_roots` is the reading half, and it says so. It holds
+that every manifest here is named by exactly one root or excused with a reason,
+that the CRD root lists every CRD this repository ships, that the default
+install is the restricted one, and that neither the respond variant nor the
+unrendered webhook configuration is reachable from any root.
+
+`ferrumctl lint-deploy` is the third, and it is about the manifests themselves —
+a private key in the tree, a caBundle placeholder, hostPID without respond, a
+projected token that disagrees with `--apiserver`.

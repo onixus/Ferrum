@@ -30,9 +30,6 @@ const CRD_CLUSTER_SECURITY_POLICY: &str = include_str!(concat!(
     "/../../docs/crd/clustersecuritypolicy.yaml"
 ));
 
-/// `expiresAt <= now() + duration('2160h')` is the CEL spelling of 90 days.
-const CEL_NINETY_DAYS: &str = "2160h";
-
 fn spec_schema(crd: &str) -> Value {
     let root: Value = serde_yaml::from_str(crd).expect("crd yaml");
     root.get("spec")
@@ -207,25 +204,35 @@ fn exception(requested_by: &str, approved_by: &str, days: u64) -> PolicyExceptio
 }
 
 #[test]
-fn exception_ttl_ceiling_is_ninety_days_in_cel_and_in_policy() {
+fn exception_ttl_ceiling_is_ninety_days_in_policy_and_no_schema_may_claim_it() {
+    // Two CEL rules used to stand here — `self.expiresAt > now()` and
+    // `self.expiresAt <= now() + duration('2160h')` — and this test read them
+    // out of the file it was asserting about, which is the whole reason they
+    // survived. A real API server refuses them: CRD validation has no clock,
+    // `now()` is an undeclared reference, and the compilation failure rejects
+    // the *whole* CRD. So the tree shipped a PolicyException that could not be
+    // installed at all, and every other rule in that file — self-approve,
+    // required target — was inert with it. Measured, not read:
+    // `e2e_cluster.rs::the_shipped_crds_are_accepted_by_a_real_apiserver`.
+    //
+    // The direction of this assertion is therefore inverted on purpose. A
+    // schema rule about wall-clock time is not a stricter schema, it is an
+    // uninstallable one, and this is what stops it coming back.
     let rules = cel_rules(CRD_POLICY_EXCEPTION);
     assert!(
-        rules
-            .iter()
-            .any(|r| r.contains("expiresAt") && r.contains(CEL_NINETY_DAYS)),
-        "CRD lost the 90-day CEL ceiling: {rules:?}"
-    );
-    assert!(
-        rules
-            .iter()
-            .any(|r| r.contains("expiresAt") && r.contains("now()")),
-        "CRD lost the expiresAt-in-the-past CEL rule: {rules:?}"
+        !rules.iter().any(|r| r.contains("now(")),
+        "a PolicyException CEL rule reaches for a clock. The API server has \
+         none in CRD validation and refuses the entire CustomResourceDefinition \
+         when it sees one, taking every other rule in the file down with it: \
+         {rules:?}"
     );
 
+    // The ceiling itself did not move; only the place that can hold it did.
     validate_exception(&exception("sre", "ib", 89)).expect("89 days is inside the window");
     let err = validate_exception(&exception("sre", "ib", 91))
-        .expect_err("91 days must be rejected by ferrum-policy too");
+        .expect_err("91 days must be rejected by ferrum-policy");
     assert!(format!("{err}").contains("90"), "{err}");
+    assert_eq!(ferrum_policy::MAX_EXCEPTION_DAYS, 90);
 }
 
 #[test]
@@ -641,14 +648,6 @@ fn the_minimum_reason_length_is_the_same_in_the_schema_and_in_policy() {
     }
 }
 
-/// The 90-day ceiling, spelled as a duration in CEL. Derived from the same
-/// constant rather than from the literal `2160h` written above.
-#[test]
-fn the_cel_ttl_ceiling_is_the_policy_constant_in_hours() {
-    let hours = ferrum_policy::MAX_EXCEPTION_DAYS * 24;
-    assert_eq!(CEL_NINETY_DAYS, format!("{hours}h"));
-}
-
 /// A rule id names the thing an exception waives and an audit record blames.
 /// `ferrum-policy` refuses a blank one and refuses two rules that share one;
 /// the schema required the key and bounded nothing, so both passed the API
@@ -1061,8 +1060,9 @@ mod build_closure {
     /// limit rather than a convenience: the pipeline tags with
     /// `${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}` and the manifests pin `v0.1.0`,
     /// so the two tag spaces do not intersect and cannot be made to by reading
-    /// them harder. `the_tag_half_of_the_closure_is_open_and_says_why` states
-    /// what that leaves open and fails the day it becomes closable.
+    /// them harder. The tag half is held elsewhere, against the file that does
+    /// publish under a tag a manifest can pin —
+    /// `release_supply_chain::the_tag_the_manifests_pin_is_one_the_release_can_publish`.
     fn image_repo(reference: &str) -> String {
         let reference = reference.trim().trim_matches('"');
         let last_segment = reference.rfind('/').map_or(0, |i| i + 1);
@@ -1252,6 +1252,11 @@ mod build_closure {
 
     /// Every `cargo <subcommand> ... -p <package>` in a script, one entry per
     /// package named.
+    /// Обёртки cargo, стоящие перед настоящей подкомандой. Не список
+    /// «всех»: здесь ровно те, которые дерево использует, и каждая добавляется
+    /// вместе с местом, где она появилась.
+    const CARGO_WRAPPERS: [&str; 1] = ["auditable"];
+
     fn cargo_runs(script: &str, lang: Lang) -> Vec<CargoRun> {
         let mut out = Vec::new();
         for line in joined_lines(script, lang) {
@@ -1276,7 +1281,14 @@ mod build_closure {
                     .unwrap_or(tokens.len())
                     .min(starts.get(nth + 1).copied().unwrap_or(usize::MAX));
                 // `cargo +nightly build`: the toolchain sits between the two.
-                let Some(subcommand) = tokens[start + 1..end].iter().find(|t| !t.starts_with('+'))
+                // `cargo auditable build`: so does the wrapper that embeds the
+                // dependency list. Reading `auditable` as the subcommand would
+                // make the three image builds invisible to every gate below —
+                // the failure would be silent and would look like an image
+                // that links nothing.
+                let Some(subcommand) = tokens[start + 1..end]
+                    .iter()
+                    .find(|t| !t.starts_with('+') && !CARGO_WRAPPERS.contains(t))
                 else {
                     continue;
                 };
@@ -1424,13 +1436,14 @@ mod build_closure {
     /// and built by nothing in it, so `kubectl apply -f deploy/` produced two
     /// ImagePullBackOffs and an enforcement plane that admits everything.
     ///
-    /// It closes the repository half of that failure and no more. The tag half
-    /// is open — `image_repo` says why, and
-    /// `the_tag_half_of_the_closure_is_open_and_says_why` holds the reason to
-    /// the tree — so a manifest naming a repository this pipeline builds under
-    /// a tag it never produced still ImagePullBackOffs, and this test passes.
-    /// Reading the doc comment above as covering the whole class is the mistake
-    /// this paragraph exists to stop.
+    /// It closes the repository half of that failure and no more. A manifest
+    /// naming a repository this pipeline builds, under a tag nothing produces,
+    /// still ImagePullBackOffs and this test still passes: `image_repo` says
+    /// why, and the tag half is held by
+    /// `release_supply_chain::the_tag_the_manifests_pin_is_one_the_release_can_publish`
+    /// against the release workflow, which is the only file in this tree that
+    /// publishes anything. Reading the doc comment above as covering the whole
+    /// class is the mistake this paragraph exists to stop.
     #[test]
     fn every_image_a_manifest_names_is_built_by_the_pipeline() {
         let root = repo_root();
@@ -1467,60 +1480,6 @@ mod build_closure {
              existed: the manifest applies, the Pod never starts, and the plane it \
              belongs to enforces nothing.",
             orphans.join("\n")
-        );
-    }
-
-    /// What the closure above does not close, said in the gate's own words, and
-    /// held to the two facts that make it unclosable here.
-    ///
-    /// The decision: the tag half cannot honestly be closed *in this
-    /// repository*. Nothing pushes — no stage in the Jenkinsfile runs
-    /// `docker push` — so the tags the pipeline invents
-    /// (`dev-$BUILD_NUMBER`) exist only in one node's local image store, and a
-    /// manifest pinned to one of them would name an image no cluster can pull
-    /// and would have to be rewritten on every build. Pinning the manifests to
-    /// a tag CI invents is its own defect, not a repair. So the comparison
-    /// stays on the repository, and this test keeps the two premises honest
-    /// instead of the doc comment quietly claiming the whole class:
-    ///
-    ///   * nothing publishes an image, and
-    ///   * every manifest pins a fixed tag rather than a floating one.
-    ///
-    /// The day the first stops being true — a `docker push` appears, and the
-    /// tags become something a cluster can resolve — this test fails, and the
-    /// repair is to close the tag half rather than to delete this. `:latest` in
-    /// a manifest fails it too: that is the one tag whose value cannot be
-    /// checked against anything, on the plane that decides admission.
-    #[test]
-    fn the_tag_half_of_the_closure_is_open_and_says_why() {
-        let root = repo_root();
-        let jenkins = strip_comments(&jenkinsfile(&root), Lang::Groovy);
-        assert!(
-            !jenkins.contains("docker push") && !jenkins.contains("docker image push"),
-            "a stage now publishes an image, so the tags this pipeline produces are \
-             resolvable and the closure gate can compare them. Close the tag half: \
-             `every_image_a_manifest_names_is_built_by_the_pipeline` compares \
-             repositories only, and a manifest pinning a tag nothing pushed is the \
-             ImagePullBackOff that gate exists to refuse."
-        );
-
-        let containers = deploy_containers(&root);
-        assert!(!containers.is_empty(), "no container found under deploy/");
-        let floating: Vec<String> = containers
-            .iter()
-            .filter(|c| {
-                let tag = c.image[image_repo(&c.image).len()..].trim_start_matches(':');
-                tag.is_empty() || tag == "latest"
-            })
-            .map(|c| format!("  {} (named by {})", c.image, c.file))
-            .collect();
-        assert!(
-            floating.is_empty(),
-            "these manifests name a floating tag:\n{}\nNothing in this repository \
-             publishes an image, so the tag is the only part of the reference an \
-             operator controls; `latest` hands it to whoever pushed last, on the \
-             plane that decides admission.",
-            floating.join("\n")
         );
     }
 
@@ -1586,6 +1545,11 @@ mod build_closure {
         assert!(
             linked("cargo +nightly build -p ferrum-probe --target x").contains("ferrum-probe"),
             "a toolchain override must not hide the package"
+        );
+        assert!(
+            linked("cargo auditable build --release -p ferrum-probe").contains("ferrum-probe"),
+            "`cargo auditable build` is the link the three images run; read as its own \
+             subcommand it makes every image look like one that links nothing"
         );
         assert!(
             linked("cargo run -p ferrum-probe --quiet -- validate x").contains("ferrum-probe"),
@@ -3044,6 +3008,2469 @@ mod rollout_accounting {
                     );
                 }
             }
+        }
+    }
+}
+
+/// Публичный воркфлоу Actions исполняет те же команды, что и одноимённые
+/// стадии `Jenkinsfile`, и ни одной датапейсной.
+///
+/// Два CI, гоняющие похожее, — это два вердикта об одном дереве, и «зелено»
+/// перестаёт что-либо значить в тот день, когда они расходятся. Расхождение
+/// при этом не выглядит как поломка: воркфлоу остаётся зелёным, просто мерит
+/// не то. Поэтому тела шагов сверяются побуквенно, а не «по духу», и сверка
+/// живёт здесь, а не в ревью.
+///
+/// Вторая половина — про то, чего в воркфлоу быть не должно. Раннер
+/// `ubuntu-latest` не даёт ни tracefs, ни `CAP_BPF`/`CAP_PERFMON`, ни писуемой
+/// cgroup2; шаг с именем `BPF attach`, зелёный на такой машине, — гейт,
+/// умеющий себя пропустить, и он опаснее отсутствующего, потому что читается
+/// как исполненный.
+///
+/// Чего гейт не делает: он не утверждает, что воркфлоу хоть раз исполнялся на
+/// GitHub. Как и `Jenkinsfile::<стадия>` в границе, он говорит только про
+/// содержимое поставляемого файла.
+mod actions_parity {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// Стадии `Jenkinsfile`, которые обязаны быть в публичном воркфлоу с тем
+    /// же телом. Это ровно userspace: группа `Build` без `BPF ELF` и группа
+    /// `Checks` целиком.
+    const MIRRORED: [&str; 12] = [
+        "Format",
+        "Clippy",
+        "Test",
+        "Crate boundary",
+        "Validate policies",
+        "Security: policy invariants",
+        "Security: MVP acceptance",
+        "Security: metrics contract",
+        "Security: admission latency",
+        "Security: event contract",
+        "Security: break-glass",
+        "Security: supply chain",
+    ];
+
+    /// Стадии, которых в публичном воркфлоу быть не может: первым шести нужно
+    /// настоящее ядро, остальным — docker CLI ноды.
+    const NOT_MIRRORED: [&str; 10] = [
+        "BPF ELF",
+        "BPF attach",
+        "BPF join",
+        "BPF join mutations",
+        "Datapath tracefs",
+        "Datapath cgroup",
+        "Agent image",
+        "Admission image",
+        "Controller image",
+        "SAST (semgrep)",
+    ];
+
+    /// Шаги воркфлоу, у которых стадии-близнеца в `Jenkinsfile` нет и не
+    /// должно быть.
+    ///
+    /// Ровно один сюжет на сегодня: установка чарта в kind. Датапейс живёт на
+    /// Jenkins, потому что раннеру не дают ядра; установка живёт здесь по
+    /// зеркальной причине — на ноде Jenkins нет kind, и стадия там была бы
+    /// либо всегда красной, либо под `when`, то есть тем самым гейтом, умеющим
+    /// себя пропустить.
+    ///
+    /// Список нужен не ради этих трёх строк, а ради направления, которого до
+    /// него не было: пока каждый шаг обязан быть либо зеркальным, либо
+    /// названным здесь, шаг, тихо дописанный в один из двух CI, роняет гейт.
+    /// Без этого расхождение двух CI видно только тому, кто читает оба файла
+    /// рядом.
+    const WORKFLOW_ONLY: [&str; 3] = ["Install: images", "Install: cluster", "Install: gate"];
+
+    const WORKFLOW: &str = ".github/workflows/ci.yml";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> String {
+        let path = repo_root().join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// Тело шелл-блока стадии, значащими строками.
+    ///
+    /// Отступ не сравнивается ни здесь, ни в воркфлоу: в Groovy он один, в
+    /// блочном скаляре YAML другой, а шеллу он безразличен — heredoc в этих
+    /// телах нет. Комментарии остаются: они и есть половина того, что должно
+    /// доехать до второго CI.
+    fn jenkins_stage_body(jenkinsfile: &str, stage: &str) -> Vec<String> {
+        let head = format!("stage('{stage}')");
+        let at = jenkinsfile
+            .find(&head)
+            .unwrap_or_else(|| panic!("Jenkinsfile has no {head}: the stage was renamed"));
+        let rest = &jenkinsfile[at..];
+        let quote = "'''";
+        let opener = format!("sh {quote}");
+        let open = rest
+            .find(&opener)
+            .unwrap_or_else(|| panic!("{head} carries no shell body"))
+            + opener.len();
+        let close = rest[open..]
+            .find(quote)
+            .unwrap_or_else(|| panic!("{head}: unterminated shell body"));
+        significant(&rest[open..open + close])
+    }
+
+    fn significant(text: &str) -> Vec<String> {
+        text.lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// Тело шага воркфлоу с этим именем, значащими строками.
+    ///
+    /// Скрипт кончается там, где кончается блочный скаляр YAML, — на первой
+    /// значащей строке с отступом не больше, чем у `run:`. Не на следующем
+    /// `- name:`: последний шаг джобы кончается её концом, и по такому правилу
+    /// в него утекала бы вся следующая джоба.
+    ///
+    /// В результат попадает всё, что в скаляре есть. Именно всё: сравнение с
+    /// телом стадии — на равенство, поэтому лишняя команда, дописанная в шаг,
+    /// роняет гейт так же, как выпавшая.
+    fn workflow_step_body(workflow: &str, name: &str) -> Vec<String> {
+        let head = format!("- name: \"{name}\"");
+        let lines: Vec<&str> = workflow.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == head)
+            .unwrap_or_else(|| panic!("{WORKFLOW} has no step {head}"));
+        let run = lines.get(at + 1).copied().unwrap_or_default();
+        assert_eq!(
+            run.trim(),
+            "run: |",
+            "step {head}: the line after the name must be `run: |` — this gate reads the script \
+             that follows it and nothing else"
+        );
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let opened = indent(run);
+        let script: Vec<&str> = lines[at + 2..]
+            .iter()
+            .copied()
+            .take_while(|line| line.trim().is_empty() || indent(line) > opened)
+            .collect();
+        significant(&script.join("\n"))
+    }
+
+    #[test]
+    fn every_mirrored_stage_runs_the_same_script_here_and_in_jenkins() {
+        let jenkinsfile = read("Jenkinsfile");
+        let workflow = read(WORKFLOW);
+        for stage in MIRRORED {
+            let expected = jenkins_stage_body(&jenkinsfile, stage);
+            assert!(
+                expected.len() > 1,
+                "Jenkinsfile::{stage} has {} significant lines: this gate would compare almost \
+                 nothing",
+                expected.len()
+            );
+            let actual = workflow_step_body(&workflow, stage);
+            assert_eq!(
+                actual, expected,
+                "{WORKFLOW} step {stage:?} and Jenkinsfile::{stage} run different scripts. Two \
+                 CIs measuring different things return two verdicts about one tree, and the \
+                 weaker one is the one that gets read. Change both or neither."
+            );
+        }
+    }
+
+    /// Контроль на сравнение: команда, изменённая в одном из двух файлов,
+    /// обязана быть падением.
+    ///
+    /// Без него равенство выше проходило бы и на компараторе, который всегда
+    /// говорит «совпало» — например, если бы разбор тела возвращал пустой
+    /// список на любом входе.
+    #[test]
+    fn the_comparison_notices_a_script_that_drifted() {
+        let jenkinsfile = read("Jenkinsfile");
+        let workflow = read(WORKFLOW);
+        let intact = jenkins_stage_body(&jenkinsfile, "Format");
+        assert_eq!(intact, workflow_step_body(&workflow, "Format"));
+
+        let softened = jenkinsfile.replace(
+            "cargo fmt --all -- --check",
+            "cargo fmt --all -- --check ; true",
+        );
+        assert_ne!(
+            softened, jenkinsfile,
+            "the line this control mutates is gone from the Jenkinsfile, so the control mutates \
+             nothing"
+        );
+        assert_ne!(
+            jenkins_stage_body(&softened, "Format"),
+            intact,
+            "a softened command in Jenkinsfile::Format read as the same body: the comparison \
+             above cannot detect drift and proves nothing"
+        );
+
+        let dropped = jenkinsfile.replace("rustup component add rustfmt\n", "");
+        assert_ne!(dropped, jenkinsfile);
+        assert_ne!(
+            jenkins_stage_body(&dropped, "Format"),
+            intact,
+            "a deleted command read as the same body"
+        );
+    }
+
+    #[test]
+    fn the_public_workflow_claims_no_stage_it_cannot_execute() {
+        let jenkinsfile = read("Jenkinsfile");
+        let workflow = read(WORKFLOW);
+        for stage in NOT_MIRRORED {
+            assert!(
+                jenkinsfile.contains(&format!("stage('{stage}')")),
+                "Jenkinsfile has no stage('{stage}'), so this list names something that no \
+                 longer exists and the check below is about nothing"
+            );
+            assert!(
+                !workflow.contains(&format!("- name: \"{stage}\"")),
+                "{WORKFLOW} carries a step named {stage:?}. That stage needs a real kernel or \
+                 the node's docker CLI; a green step of that name on a hosted runner is a gate \
+                 that skipped itself and reads as one that ran."
+            );
+        }
+    }
+
+    /// Каждый шаг воркфлоу либо зеркалит стадию, либо назван таким, у которого
+    /// близнеца нет.
+    ///
+    /// Обратное направление к `every_mirrored_stage_runs_the_same_script_here_and_in_jenkins`.
+    /// Тот требует, чтобы названное совпадало, и ничего не говорит про шаг,
+    /// которого в списке нет: до этой проверки в публичный CI можно было
+    /// дописать что угодно, и два вердикта об одном дереве расходились бы
+    /// молча — ровно то направление, в котором гниют документы этого
+    /// репозитория.
+    #[test]
+    fn every_step_here_is_mirrored_or_named_as_workflow_only() {
+        let workflow = read(WORKFLOW);
+        let known: BTreeSet<&str> = MIRRORED.into_iter().chain(WORKFLOW_ONLY).collect();
+        let mut seen = BTreeSet::new();
+        for line in workflow.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("- name: \"") else {
+                continue;
+            };
+            let name = rest.trim_end_matches('"');
+            assert!(
+                known.contains(name),
+                "{WORKFLOW} has a step {name:?} that neither mirrors a \
+                 Jenkinsfile stage nor is named in WORKFLOW_ONLY. A step that \
+                 belongs to one CI and not the other is fine; a step nobody \
+                 wrote down as belonging to one CI is how the two verdicts \
+                 drift apart in silence."
+            );
+            seen.insert(name.to_string());
+        }
+        for name in WORKFLOW_ONLY {
+            assert!(
+                seen.contains(name),
+                "WORKFLOW_ONLY names {name:?}, and {WORKFLOW} has no such step: \
+                 the entry excuses nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn no_step_in_the_public_workflow_can_skip_itself() {
+        let workflow = read(WORKFLOW);
+        let softeners = ["continue-on-error", "if:"];
+        for (number, line) in workflow.lines().enumerate() {
+            let line = line.trim();
+            // Комментарии воркфлоу называют эти конструкции затем, чтобы
+            // сказать, что их здесь нет.
+            if line.starts_with('#') {
+                continue;
+            }
+            let number = number + 1;
+            for softener in softeners {
+                assert!(
+                    !line.starts_with(softener),
+                    "{WORKFLOW}:{number}: `{softener}` makes a red gate a green run — a step \
+                     that can skip itself reports success for having done nothing"
+                );
+            }
+            assert!(
+                !line.contains("|| true"),
+                "{WORKFLOW}:{number}: `|| true` swallows the exit code the whole stage is for"
+            );
+        }
+    }
+}
+
+/// Поставка: что релизный воркфлоу публикует, чем подписывает и совпадает ли
+/// это с тем, что дерево просит кластер скачать.
+///
+/// Продукт, который проверяет подпись bundle, а сам едет неподписанным,
+/// требует от получателя ровно того доверия, от которого отучает. Файл
+/// `.github/workflows/release.yml` закрывает эту половину; чего он не
+/// закрывает — того, что запуск был, — не закрывает и этот модуль, и в границе
+/// про него написано то же, что про `ci.yml`: поставленный файл не прогон.
+///
+/// Что здесь держится и почему именно это:
+///
+///  * **множество образов**. Три места называют образы — `deploy/**`,
+///    `Jenkinsfile` и этот воркфлоу, — и расхождение любого из них тихое:
+///    манифест, тянущий репозиторий, который релиз не публикует, — это
+///    `ImagePullBackOff` у получателя и зелёный прогон у нас;
+///  * **домены подписи**. `ferrum-crypto` подписывает bundle Ed25519-seed'ом в
+///    контексте `BUNDLE_SIGNATURE_CONTEXT`. Образ подписывается эфемерным
+///    ключом Fulcio. Общего ключа у них нет и быть не должно, а самый простой
+///    способ его завести — вписать в релиз долгоживущий `--key`;
+///  * **процедура проверки**. Инструкция получателю — часть поставки, и
+///    расходится она молча: команда, называющая идентичность, которой Fulcio не
+///    выпишет, не пройдёт ни у кого, а красным от этого не станет ничего.
+mod release_supply_chain {
+    use serde_yaml::Value;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    const WORKFLOW: &str = ".github/workflows/release.yml";
+    const README: &str = "README.md";
+
+    /// Раздел README, который описывает процедуру получателю.
+    const DELIVERY_HEADING: &str = "## Поставка";
+
+    /// Издатель OIDC-токена, под который Fulcio выписывает сертификат
+    /// GitHub-воркфлоу. Единственное его значение для Actions; получатель обязан
+    /// называть именно его, иначе проверка примет подпись кого угодно с любым
+    /// другим провайдером.
+    const ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> String {
+        let path = repo_root().join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    fn workflow() -> Value {
+        serde_yaml::from_str(&read(WORKFLOW)).expect("release workflow is not valid YAML")
+    }
+
+    fn job<'a>(workflow: &'a Value, name: &str) -> &'a Value {
+        workflow
+            .get("jobs")
+            .and_then(|jobs| jobs.get(name))
+            .unwrap_or_else(|| panic!("{WORKFLOW} has no job {name:?}"))
+    }
+
+    /// Тело `run` шага, чьё имя начинается с `prefix`.
+    ///
+    /// По префиксу, а не по равенству: имя шага несёт `${{ matrix.crate }}`, и
+    /// сравнение с полным именем читало бы шаблон, а не имя.
+    fn step_script(job: &Value, prefix: &str) -> String {
+        let steps = job
+            .get("steps")
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("{WORKFLOW}: a job has no steps"));
+        let mut found: Vec<String> = steps
+            .iter()
+            .filter(|step| {
+                step.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .filter_map(|step| step.get("run").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "{WORKFLOW}: expected exactly one step whose name starts with {prefix:?} and carries \
+             a script; found {}",
+            found.len()
+        );
+        found.remove(0)
+    }
+
+    /// Репозитории образов, которые публикует релиз.
+    ///
+    /// Собираются из двух половин файла, а не из одной строки: имя строится в
+    /// скрипте (`image="<префикс>${{ matrix.crate }}"`), а перебирается
+    /// матрицей. Читать только матрицу значило бы не заметить смену префикса,
+    /// читать только скрипт — не заметить исчезнувший образ.
+    fn published_repos() -> BTreeSet<String> {
+        let workflow = workflow();
+        let publish = job(&workflow, "publish");
+        let script = step_script(publish, "Publish ");
+        assert!(
+            script.contains(r#"docker push "$image:$tag""#),
+            "{WORKFLOW}: the publish step no longer pushes `$image:$tag`, so nothing below can \
+             say what this release puts in a registry"
+        );
+        let marker = "image=";
+        let line = script
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(marker))
+            .unwrap_or_else(|| panic!("{WORKFLOW}: the publish step assigns no `image=`"));
+        let prefix = line
+            .trim_start_matches(marker)
+            .trim_matches('"')
+            .strip_suffix("${{ matrix.crate }}")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{WORKFLOW}: `image=` is {line:?}; this gate reads a fixed prefix followed by \
+                     the matrix crate, and a name built any other way cannot be compared with \
+                     deploy/**"
+                )
+            })
+            .to_string();
+
+        let entries = publish
+            .get("strategy")
+            .and_then(|strategy| strategy.get("matrix"))
+            .and_then(|matrix| matrix.get("include"))
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("{WORKFLOW}: the publish job has no matrix include"));
+        let repos: BTreeSet<String> = entries
+            .iter()
+            .map(|entry| {
+                let name = entry
+                    .get("crate")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("{WORKFLOW}: a matrix entry names no crate"));
+                format!("{prefix}{name}")
+            })
+            .collect();
+        assert!(
+            !repos.is_empty(),
+            "{WORKFLOW}: the publish matrix is empty, so this gate sees nothing published and \
+             every comparison below is satisfied by finding nothing"
+        );
+        repos
+    }
+
+    fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
+        {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                yaml_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "yaml") {
+                out.push(path);
+            }
+        }
+    }
+
+    fn collect_images(node: &Value, out: &mut Vec<String>) {
+        match node {
+            Value::Mapping(map) => {
+                if let Some(Value::String(image)) = map.get(Value::from("image")) {
+                    out.push(image.clone());
+                }
+                for (_, value) in map.iter() {
+                    collect_images(value, out);
+                }
+            }
+            Value::Sequence(items) => items.iter().for_each(|item| collect_images(item, out)),
+            _ => {}
+        }
+    }
+
+    /// `repo:tag` из каждого контейнера в `deploy/`, как манифест его пишет.
+    fn deploy_images() -> Vec<String> {
+        let root = repo_root();
+        let mut files = Vec::new();
+        yaml_files(&root.join("deploy"), &mut files);
+        files.sort();
+        let mut out = Vec::new();
+        for path in files {
+            let raw = std::fs::read_to_string(&path).expect("manifest");
+            for document in raw.split("\n---") {
+                let Ok(value) = serde_yaml::from_str::<Value>(document) else {
+                    continue;
+                };
+                collect_images(&value, &mut out);
+            }
+        }
+        assert!(
+            !out.is_empty(),
+            "no container under deploy/ names an image, so this gate cannot see what the cluster \
+             is asked to pull and proves nothing"
+        );
+        out
+    }
+
+    fn repo_of(reference: &str) -> String {
+        let last = reference.rfind('/').map_or(0, |i| i + 1);
+        match reference[last..].find(':') {
+            Some(colon) => reference[..last + colon].to_string(),
+            None => reference.to_string(),
+        }
+    }
+
+    fn tag_of(reference: &str) -> String {
+        reference[repo_of(reference).len()..]
+            .trim_start_matches(':')
+            .to_string()
+    }
+
+    /// Репозитории, которые собирает `Jenkinsfile`, по строкам `-t`.
+    fn jenkins_repos() -> BTreeSet<String> {
+        let jenkinsfile = read("Jenkinsfile");
+        let out: BTreeSet<String> = jenkinsfile
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter_map(|line| line.split("-t \"").nth(1))
+            // До закрывающей кавычки, и только то, что вообще может быть
+            // ссылкой на образ: `-t` встречается в этом файле и у `nsenter`,
+            // где за ним стоит pid.
+            .filter_map(|rest| rest.split('"').next())
+            .filter(|reference| reference.contains('/') && reference.contains(':'))
+            .map(repo_of)
+            .collect();
+        assert!(
+            !out.is_empty(),
+            "no `docker build -t \"…\"` in the Jenkinsfile: this gate cannot see what the \
+             pipeline produces and proves nothing"
+        );
+        out
+    }
+
+    /// Три места называют образ, и все три обязаны называть один и тот же.
+    ///
+    /// Не подмножество, а равенство. Образ, который релиз публикует, а манифест
+    /// не ставит, — тег, который никто не тянет; образ, который манифест
+    /// ставит, а релиз не публикует, — `ImagePullBackOff` у получателя, зелёный
+    /// прогон у нас и молчание с обеих сторон.
+    #[test]
+    fn the_release_publishes_exactly_the_images_this_tree_installs() {
+        let published = published_repos();
+        let installed: BTreeSet<String> = deploy_images().iter().map(|i| repo_of(i)).collect();
+        let built = jenkins_repos();
+        assert_eq!(
+            published, installed,
+            "the images the release publishes and the images deploy/** installs are different \
+             sets. One of them is a reference nobody can resolve."
+        );
+        assert_eq!(
+            published, built,
+            "the images the release publishes and the images the Jenkinsfile builds are \
+             different sets: two pipelines producing two different products out of one tree"
+        );
+    }
+
+    /// Тег, который закрепляют манифесты, — тот, который релиз способен
+    /// выпустить.
+    ///
+    /// Это вторая половина замыкания образов, и раньше она была открыта по
+    /// причине, которой больше нет: ничто в дереве не публиковало, поэтому тег,
+    /// придуманный CI, жил в локальном сторе одного узла, а сравнивать его с
+    /// закреплённым в манифесте было не с чем. Теперь публикует релизный
+    /// воркфлоу, и публикует он имя git-тега, — значит вопрос «может ли этот
+    /// манифест вообще разрешиться» стал проверяемым.
+    ///
+    /// Чего этот тест по-прежнему **не** утверждает: что образ опубликован.
+    /// Воркфлоу в дереве — не запуск, ровно как `Jenkinsfile::<стадия>` в
+    /// границе не значит «зелено в CI». Здесь проверяется, что закреплённый тег
+    /// принадлежит множеству, которое релиз выпускает, а не что кто-то нажал
+    /// кнопку.
+    ///
+    /// `Jenkinsfile` при этом по-прежнему не публикует, и это отдельная
+    /// посылка: его `dev-$BUILD_NUMBER` — имена, живущие в локальном сторе
+    /// ноды, и манифест, закреплённый на таком имени, был бы дефектом, а не
+    /// починкой.
+    #[test]
+    fn the_tag_the_manifests_pin_is_one_the_release_can_publish() {
+        let jenkinsfile = read("Jenkinsfile");
+        assert!(
+            !jenkinsfile.contains("docker push") && !jenkinsfile.contains("docker image push"),
+            "a Jenkins stage now publishes an image. Its tags are `dev-$BUILD_NUMBER`, which no \
+             manifest can pin without being rewritten every build; if publication has moved \
+             there, the manifests and this gate have to move with it."
+        );
+
+        let workflow = workflow();
+        let triggers = workflow
+            .as_mapping()
+            .expect("workflow mapping")
+            .iter()
+            // `on` — булев литерал YAML 1.1, и разные парсеры дают разный ключ.
+            // Ключ ищется по написанию, а не по типу.
+            .find(|(key, _)| matches!(key, Value::Bool(true)) || key.as_str() == Some("on"))
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("{WORKFLOW} declares no `on:`"));
+        let patterns: Vec<String> = triggers
+            .get("push")
+            .and_then(|push| push.get("tags"))
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("{WORKFLOW} is not triggered by a tag push"))
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(
+            !patterns.is_empty(),
+            "{WORKFLOW}: the tag filter is empty, so this gate matches nothing and passes for it"
+        );
+
+        let script = step_script(job(&workflow, "publish"), "Publish ");
+        assert!(
+            script.contains(r#"tag="$GITHUB_REF_NAME""#),
+            "{WORKFLOW}: the publish step no longer tags with the git tag that triggered it. A \
+             tag the run invents is one no manifest can pin, which is the state this gate was \
+             written to leave."
+        );
+
+        for image in deploy_images() {
+            let tag = tag_of(&image);
+            assert!(
+                !tag.is_empty() && tag != "latest",
+                "{image} names a floating tag on the plane that decides admission: `latest` is \
+                 whatever was pushed last"
+            );
+            assert!(
+                patterns.iter().any(|pattern| tag_matches(pattern, &tag)),
+                "{image} pins the tag {tag:?}, and no trigger of {WORKFLOW} ({patterns:?}) \
+                 publishes it. The manifest asks the cluster for something this repository has \
+                 no way of producing."
+            );
+        }
+    }
+
+    /// Глоб-фильтр тегов GitHub Actions, в том объёме, который здесь нужен:
+    /// `*` — любая последовательность без `/`, `[…]` — класс символов, `+`
+    /// после класса — один символ класса или больше, всё прочее — литерал.
+    ///
+    /// Свой, а не regex-crate: `ferrum-testkit` не заводит зависимость ради
+    /// одного сравнения, объём замкнут, а сам сопоставитель проверен
+    /// `the_tag_filter_reader_accepts_and_refuses_the_right_tags`.
+    fn tag_matches(pattern: &str, tag: &str) -> bool {
+        fn in_class(class: &[u8], c: u8) -> bool {
+            let mut i = 0;
+            while i < class.len() {
+                if i + 2 < class.len() && class[i + 1] == b'-' {
+                    if c >= class[i] && c <= class[i + 2] {
+                        return true;
+                    }
+                    i += 3;
+                } else {
+                    if class[i] == c {
+                        return true;
+                    }
+                    i += 1;
+                }
+            }
+            false
+        }
+        fn go(pattern: &[u8], tag: &[u8]) -> bool {
+            let Some(head) = pattern.first().copied() else {
+                return tag.is_empty();
+            };
+            match head {
+                b'*' => (0..=tag.len()).any(|take| {
+                    tag[..take].iter().all(|c| *c != b'/') && go(&pattern[1..], &tag[take..])
+                }),
+                b'[' => {
+                    let Some(close) = pattern.iter().position(|c| *c == b']') else {
+                        return false;
+                    };
+                    let class = &pattern[1..close];
+                    let mut rest = &pattern[close + 1..];
+                    let mut most = 1;
+                    if rest.first() == Some(&b'+') {
+                        rest = &rest[1..];
+                        most = tag.len();
+                    }
+                    (1..=most).any(|take| {
+                        take <= tag.len()
+                            && tag[..take].iter().all(|c| in_class(class, *c))
+                            && go(rest, &tag[take..])
+                    })
+                }
+                literal => tag.first() == Some(&literal) && go(&pattern[1..], &tag[1..]),
+            }
+        }
+        go(pattern.as_bytes(), tag.as_bytes())
+    }
+
+    /// Читатель фильтра — на входах, ответ на которых известен.
+    ///
+    /// Без него «тег манифеста публикуется релизом» одинаково верно и для
+    /// сопоставителя, который говорит «да» на всё, а ровно такой получается из
+    /// опечатки в разборе класса.
+    #[test]
+    fn the_tag_filter_reader_accepts_and_refuses_the_right_tags() {
+        let semver = "v[0-9]+.[0-9]+.[0-9]+";
+        assert!(tag_matches(semver, "v0.1.0"));
+        assert!(tag_matches(semver, "v12.30.4"));
+        assert!(!tag_matches(semver, "v0.1"));
+        assert!(!tag_matches(semver, "0.1.0"));
+        assert!(!tag_matches(semver, "v0.1.0-rc1"));
+        assert!(!tag_matches(semver, "latest"));
+        assert!(tag_matches("v*", "v0.1.0"));
+        assert!(!tag_matches("v*", "w0.1.0"));
+        assert!(!tag_matches("v*", "v0.1/0"));
+    }
+
+    /// Каждый опубликованный образ подписан, и подпись стоит на digest.
+    ///
+    /// Подпись по тегу — это подпись под тем, что по этому тегу лежало в момент
+    /// подписи. Тег переставляется, и назавтра проверка проходит на другом
+    /// образе; digest — единственное имя, которое этого не умеет.
+    ///
+    /// SBOM здесь же и по той же причине: файл, приложенный к релизу, связан с
+    /// образом только словом того, кто его приложил. `cosign attest`
+    /// подписывает предикат той же идентичностью и цепляет его к digest, и
+    /// только эта половина проверяема на стороне получателя.
+    #[test]
+    fn every_published_image_is_signed_and_carries_an_attested_sbom() {
+        let workflow = workflow();
+        let script = step_script(job(&workflow, "publish"), "Publish ");
+        for required in [
+            r#"digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$image:$tag")""#,
+            r#"cosign sign --yes "$digest""#,
+            r#"syft "$digest" -o "spdx-json=$sbom""#,
+            r#"cosign attest --yes --type spdxjson --predicate "$sbom" "$digest""#,
+        ] {
+            assert!(
+                script.contains(required),
+                "{WORKFLOW}: the publish step does not run `{required}`. An image published \
+                 without it is one the consumer cannot tell from any other image wearing the \
+                 same tag."
+            );
+        }
+        for line in script.lines().map(str::trim) {
+            if line.starts_with('#') {
+                continue;
+            }
+            for command in ["cosign sign", "cosign attest", "cosign verify", "syft "] {
+                assert!(
+                    !(line.starts_with(command) && line.contains("$image:$tag")),
+                    "{WORKFLOW}: `{line}` names the image by tag. A tag is repointable, so the \
+                     signature would outlive the bytes it was made over."
+                );
+            }
+        }
+
+        // Релиз несёт SBOM каждого образа, а не какого-нибудь. Проверяется
+        // числом, потому что «загрузили что нашли» — это ровно тот отказ,
+        // который выглядит успехом.
+        let count = job(&workflow, "publish")
+            .get("strategy")
+            .and_then(|strategy| strategy.get("matrix"))
+            .and_then(|matrix| matrix.get("include"))
+            .and_then(Value::as_sequence)
+            .expect("matrix include")
+            .len();
+        let release = step_script(job(&workflow, "release"), "Attach SBOMs");
+        assert!(
+            release.contains(&format!(r#"if [ "$count" -ne {count} ]; then"#)),
+            "{WORKFLOW}: the release step does not require exactly {count} SBOMs — one per \
+             published image. A release carrying two of three says nothing about the third, and \
+             nothing there would go red."
+        );
+    }
+
+    /// Подпись образа не берёт ключ ниоткуда, и в частности не берёт его у
+    /// подписи bundle.
+    ///
+    /// Домены разные по построению: bundle подписывается Ed25519-seed'ом в
+    /// контексте `BUNDLE_SIGNATURE_CONTEXT` и живёт в Secret кластера, образ —
+    /// эфемерным ключом Fulcio, выданным на один запуск под OIDC. Единственный
+    /// способ их смешать — завести в релизе долгоживущий ключ, поэтому здесь
+    /// проверяется отсутствие всякого `--key` и всякого имени, которым в этом
+    /// дереве зовут ключевой материал bundle.
+    ///
+    /// Отсутствие само по себе доказывает мало: его же даёт опечатка в списке.
+    /// Поэтому вторая половина — положительный контроль: `id-token: write`
+    /// обязан стоять (без него keyless не существует), а имена доменов обязаны
+    /// быть настоящими именами из `ferrum-crypto`.
+    #[test]
+    fn the_release_signs_keyless_and_never_touches_the_bundle_signing_domain() {
+        let workflow = workflow();
+        let permissions = job(&workflow, "publish")
+            .get("permissions")
+            .and_then(Value::as_mapping)
+            .unwrap_or_else(|| panic!("{WORKFLOW}: the publish job declares no permissions"));
+        for (key, expected) in [("id-token", "write"), ("packages", "write")] {
+            assert_eq!(
+                permissions.get(Value::from(key)).and_then(Value::as_str),
+                Some(expected),
+                "{WORKFLOW}: the publish job needs `{key}: {expected}` — without id-token there \
+                 is no OIDC token for Fulcio and no keyless signature at all"
+            );
+        }
+
+        for (source, domain) in [
+            (
+                "crates/ferrum-crypto/src/lib.rs",
+                "BUNDLE_SIGNATURE_CONTEXT",
+            ),
+            ("crates/ferrum-crypto/src/mtls.rs", "KEY_BIND_MSG"),
+        ] {
+            assert!(
+                read(source).contains(domain),
+                "{source} no longer names {domain}, so the check below forbids a string that \
+                 means nothing and proves nothing"
+            );
+        }
+
+        let text = read(WORKFLOW);
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            // Комментарии файла называют эти вещи затем, чтобы сказать, что их
+            // здесь нет.
+            if line.starts_with('#') {
+                continue;
+            }
+            let number = number + 1;
+            for forbidden in [
+                "COSIGN_PRIVATE_KEY",
+                "COSIGN_PASSWORD",
+                "cosign generate-key-pair",
+                "--key ",
+                "--seed-file",
+                "BUNDLE_SIGNATURE_CONTEXT",
+                "KEY_BIND_MSG",
+                "ferrumctl sign",
+            ] {
+                assert!(
+                    !line.contains(forbidden),
+                    "{WORKFLOW}:{number}: `{forbidden}`. The image domain signs with an \
+                     ephemeral Fulcio key that dies with the job; a long-lived key here is a \
+                     secret to store, rotate and lose, and if it is the bundle's, the key a \
+                     cluster trusts for policy is a key that lives in CI."
+                );
+            }
+        }
+    }
+
+    /// Ни один шаг релиза не может себя пропустить.
+    ///
+    /// Тот же запрет, что у публичного CI, и здесь он строже по последствиям:
+    /// шаг подписи, пропустивший себя, оставляет в ghcr неподписанный образ под
+    /// зелёным значком — ровно то, что получатель прочтёт как подписанное.
+    #[test]
+    fn no_step_in_the_release_workflow_can_skip_itself() {
+        let text = read(WORKFLOW);
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            let number = number + 1;
+            for softener in ["continue-on-error", "if:"] {
+                assert!(
+                    !line.starts_with(softener),
+                    "{WORKFLOW}:{number}: `{softener}` makes a red gate a green run"
+                );
+            }
+            assert!(
+                !line.contains("|| true"),
+                "{WORKFLOW}:{number}: `|| true` swallows the exit code the step is for"
+            );
+        }
+    }
+
+    /// Инструкция получателю — та же процедура, которую релиз исполняет на
+    /// себе.
+    ///
+    /// Инструкция расходится с воркфлоу молча: `cosign verify` с
+    /// идентичностью, которой Fulcio не выпишет, не проходит ни у кого, и
+    /// красным от этого не становится ничего. Поэтому идентичность в README
+    /// собирается здесь из пути файла воркфлоу и сверяется на равенство: файл
+    /// переименован — строка в README стала ложью, и это падение, а не вопрос
+    /// прилежания автора строки.
+    #[test]
+    fn the_documented_verification_is_the_one_the_release_performs() {
+        let readme = read(README);
+        let at = readme
+            .find(DELIVERY_HEADING)
+            .unwrap_or_else(|| panic!("{README} has no {DELIVERY_HEADING:?} section"));
+        let section = &readme[at..];
+        let section = match section[DELIVERY_HEADING.len()..].find("\n## ") {
+            Some(end) => &section[..DELIVERY_HEADING.len() + end],
+            None => section,
+        };
+
+        let identity = format!("https://github.com/onixus/Ferrum/{WORKFLOW}@refs/tags/$TAG");
+        assert!(
+            section.contains(&identity),
+            "{README} § {DELIVERY_HEADING} does not tell the consumer to verify against \
+             {identity:?}. That string is the subject Fulcio puts in the certificate for this \
+             workflow; any other one either fails for everybody or accepts a signature made by \
+             something else."
+        );
+        assert!(
+            section.contains(ISSUER),
+            "{README} § {DELIVERY_HEADING} names no OIDC issuer. Without \
+             --certificate-oidc-issuer the identity above can be asserted by any provider."
+        );
+        for command in [
+            "cosign verify",
+            "cosign verify-attestation --type spdxjson",
+            "cargo audit bin",
+        ] {
+            assert!(
+                section.contains(command),
+                "{README} § {DELIVERY_HEADING} does not document `{command}`, which is half of \
+                 what the release produces: a signature nobody is told to check is not delivery"
+            );
+        }
+
+        // Тег в инструкции — тот, который закреплён в манифестах. Иначе
+        // получатель проверяет один образ, а ставит другой.
+        let pinned: BTreeSet<String> = deploy_images().iter().map(|i| tag_of(i)).collect();
+        assert_eq!(
+            pinned.len(),
+            1,
+            "deploy/** pins more than one tag ({pinned:?}); the README procedure names one"
+        );
+        let pinned = pinned.into_iter().next().expect("one tag");
+        assert!(
+            section.contains(&format!("TAG={pinned}")),
+            "{README} § {DELIVERY_HEADING} does not set TAG={pinned}, the tag deploy/** pins. A \
+             procedure verifying one tag while the manifests install another checks an image the \
+             cluster will not run."
+        );
+        for repo in published_repos() {
+            assert!(
+                section.contains(&repo),
+                "{README} § {DELIVERY_HEADING} says nothing about {repo}, which the release \
+                 publishes. An image with no documented verification ships unverified."
+            );
+        }
+    }
+
+    /// Бинарь в каждом образе несёт список своих зависимостей.
+    ///
+    /// Образ на `scratch` — это один статический ELF, и SBOM по нему без
+    /// `cargo-auditable` перечисляет ровно ничего: syft видит файл и не видит
+    /// ни одного crate. Такой SBOM хуже отсутствующего — он приложен к релизу и
+    /// читается как ответ на вопрос «что внутри».
+    ///
+    /// Обе половины: линкует `cargo auditable build`, и получившийся бинарь
+    /// проверен на секцию `.dep-v0` в том же Dockerfile. Первая — намерение,
+    /// вторая — результат, и без второй тихо проходит любая сборка, из которой
+    /// инструмент выпал.
+    #[test]
+    fn every_shipped_binary_carries_the_dependency_list_its_sbom_is_made_of() {
+        for (dockerfile, binary) in [
+            ("Dockerfile", "ferrum-agent"),
+            ("Dockerfile.admission", "ferrum-admission"),
+            ("Dockerfile.controller", "ferrum-controller"),
+        ] {
+            let text = read(dockerfile);
+            assert!(
+                text.contains("cargo auditable build --release --locked"),
+                "{dockerfile} links with plain `cargo build`: the binary it ships carries no \
+                 dependency list, and the SBOM of the image would list no crate at all"
+            );
+            assert!(
+                !text.contains("    cargo build --release --locked"),
+                "{dockerfile} still carries a plain `cargo build --release --locked` line; the \
+                 binary that reaches the image must be the auditable one"
+            );
+            assert!(
+                text.contains(&format!("readelf -SW /{binary} | grep -q '\\.dep-v0'")),
+                "{dockerfile} does not check /{binary} for the .dep-v0 section. The cargo line \
+                 above is an intention; this is the only place the result is visible."
+            );
+            assert!(
+                text.contains(
+                    "cargo install --locked \"cargo-auditable@${CARGO_AUDITABLE_VERSION}\""
+                ),
+                "{dockerfile} installs cargo-auditable without a pinned version, in a file whose \
+                 whole subject is provenance"
+            );
+        }
+    }
+}
+
+/// Первый релиз: версия, тег и файлы, которые про них говорят.
+///
+/// `release_supply_chain` выше держит подпись и происхождение образа — то, что
+/// получатель проверяет, уже имея артефакт. Здесь другая половина: артефакта
+/// ещё нет, и единственное, что может разойтись до его появления, — четыре
+/// написания одной и той же версии. Она стоит в `[workspace.package]`, в теге,
+/// который ставит человек, в фильтре триггера `release.yml` и в `image:`
+/// каждого манифеста `deploy/**`. Три из четырёх лежат в дереве, четвёртое
+/// выводится из первого по правилу `v` + версия, и разъехаться они могут молча:
+/// `cargo` не читает `deploy/**`, `deploy/**` не читает `Cargo.toml`, а фильтр
+/// тега не читает ни того, ни другого. Разъехавшись, они дают ровно тот отказ,
+/// от которого написан `every_image_a_manifest_names_is_built_by_the_pipeline`,
+/// — `ImagePullBackOff` на плоскости, решающей admission, — только теперь не по
+/// имени образа, а по его тегу.
+///
+/// Ни один тест здесь не утверждает, что релиз состоялся. Тега `v0.1.0` в этом
+/// репозитории нет, и гейт, читающий дерево, узнать о нём не может: он читает
+/// файлы, а не `git tag` и не реестр.
+mod first_release {
+    use std::path::{Path, PathBuf};
+
+    const README: &str = "README.md";
+    const SECURITY: &str = "SECURITY.md";
+    const MANIFEST: &str = "Cargo.toml";
+    const WORKFLOW: &str = ".github/workflows/release.yml";
+
+    /// Приватный канал GitHub, единственный, который у этого репозитория есть.
+    const ADVISORY_URL: &str = "https://github.com/onixus/Ferrum/security/advisories/new";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> String {
+        let path = repo_root().join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// Версия из `[workspace.package]` корневого манифеста.
+    ///
+    /// Читается именно эта секция, а не первое `version =` в файле: в
+    /// `[workspace.dependencies]` их два десятка, и `version` любого из них
+    /// прошёл бы вместо версии продукта.
+    fn workspace_version() -> String {
+        let manifest = read(MANIFEST);
+        let mut in_section = false;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_section = line == "[workspace.package]";
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("version") {
+                let value = rest
+                    .trim_start()
+                    .strip_prefix('=')
+                    .unwrap_or_else(|| {
+                        panic!("{MANIFEST}: [workspace.package] version line is {line:?}")
+                    })
+                    .trim()
+                    .trim_matches('"');
+                assert!(
+                    !value.is_empty(),
+                    "{MANIFEST}: [workspace.package] declares an empty version"
+                );
+                return value.to_string();
+            }
+        }
+        panic!(
+            "{MANIFEST} has no version in [workspace.package]. Every crate here inherits its \
+             version from there; without it there is no single version this tree carries, and \
+             nothing below can be compared with a tag."
+        );
+    }
+
+    /// Имя git-тега, которым выпускается эта версия.
+    fn release_tag() -> String {
+        format!("v{}", workspace_version())
+    }
+
+    /// Манифесты crate вместе с именами их каталогов, отсортированные, чтобы
+    /// сообщение об ошибке не плавало от прогона к прогону.
+    fn crate_manifests() -> Vec<(String, String)> {
+        let crates = repo_root().join("crates");
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&crates)
+            .expect("crates/")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.join(MANIFEST).is_file())
+            .collect();
+        dirs.sort();
+        let out: Vec<(String, String)> = dirs
+            .iter()
+            .map(|dir| {
+                let name = dir
+                    .file_name()
+                    .expect("crate directory name")
+                    .to_string_lossy()
+                    .to_string();
+                let text = std::fs::read_to_string(dir.join(MANIFEST))
+                    .unwrap_or_else(|err| panic!("{}/{MANIFEST}: {err}", dir.display()));
+                (name, text)
+            })
+            .collect();
+        assert!(
+            !out.is_empty(),
+            "no crate manifest was found under crates/, so this gate sees no version at all and \
+             every comparison below is satisfied by finding nothing"
+        );
+        out
+    }
+
+    /// Все `image:` под `deploy/`, вместе с файлом, который их называет.
+    ///
+    /// Свой обход, а не `release_supply_chain::deploy_images`: там путь до файла
+    /// теряется, а сообщение «версия разъехалась» без имени файла заставляет
+    /// искать его руками по четырём манифестам.
+    fn deploy_image_references() -> Vec<(String, String)> {
+        let root = repo_root();
+        let mut files = Vec::new();
+        collect_yaml(&root.join("deploy"), &mut files);
+        files.sort();
+        let mut out = Vec::new();
+        for path in files {
+            let raw = std::fs::read_to_string(&path).expect("manifest");
+            let shown = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                let Some(rest) = trimmed.strip_prefix("image:") else {
+                    continue;
+                };
+                let image = rest.trim().trim_matches('"').trim_matches('\'');
+                if image.is_empty() {
+                    continue;
+                }
+                out.push((shown.clone(), image.to_string()));
+            }
+        }
+        out
+    }
+
+    fn collect_yaml(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display()))
+        {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                collect_yaml(&path, out);
+            } else if path.extension().is_some_and(|e| e == "yaml") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Одна версия на дерево, и она — та, которую называет тег.
+    ///
+    /// Тег ставит человек, а не воркфлоу, поэтому вывести его из файла нельзя;
+    /// вывести можно правило, по которому он строится, и проверить, что все
+    /// написания версии в дереве этому правилу отвечают. `deploy/**` закрепляет
+    /// `v0.1.0`, `[workspace.package]` несёт `0.1.0`, и разница между ними —
+    /// одна буква, которую до этого теста не проверял никто.
+    ///
+    /// `release_supply_chain::the_tag_the_manifests_pin_is_one_the_release_can_publish`
+    /// проверяет другое и меньшее: что закреплённый тег вообще попадает в фильтр
+    /// триггера. Под `v9.9.9` в манифестах он проходит — фильтр такой тег
+    /// пропускает, — а собрано из этого дерева будет `0.1.0`.
+    #[test]
+    fn the_version_this_workspace_carries_is_the_tag_its_manifests_pin() {
+        let tag = release_tag();
+        let readme = read(README);
+        assert!(
+            readme.contains(&tag),
+            "{README} never names {tag}, the tag this tree's version produces. The section \
+             describing the first release has to name the version it releases, or it describes \
+             some other one."
+        );
+
+        let mut seen = 0usize;
+        for (path, image) in deploy_image_references() {
+            let Some(colon) = image.rfind(':') else {
+                panic!(
+                    "{path} names the image {image:?} with no tag at all: the cluster would be \
+                     asked for `latest`, which is whatever was pushed last"
+                );
+            };
+            let (repo, pinned) = image.split_at(colon);
+            let pinned = &pinned[1..];
+            if !repo.starts_with("ghcr.io/onixus/") {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(
+                pinned,
+                tag,
+                "{path} pins {image:?}, but this workspace carries version {} and releases it as \
+                 {tag}. One of the two was bumped without the other, and the cluster would be \
+                 asked for an image no tag of this repository produces.",
+                workspace_version()
+            );
+        }
+        assert!(
+            seen > 0,
+            "no manifest under deploy/ names an image in ghcr.io/onixus/, so this gate compared \
+             nothing and passed for it"
+        );
+    }
+
+    /// Ни один crate не объявляет собственную версию.
+    ///
+    /// Тег один, а версий было бы восемнадцать. Crate, отставший на своей
+    /// строке, поедет в образ под тегом, который называет чужую версию, и
+    /// узнать об этом можно будет только развернув образ: `cargo` на такое
+    /// расхождение не жалуется — своя версия у члена workspace совершенно
+    /// законна.
+    #[test]
+    fn every_crate_takes_its_version_from_the_workspace() {
+        for (name, manifest) in crate_manifests() {
+            let mut in_package = false;
+            let mut declared: Option<String> = None;
+            for line in manifest.lines() {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    in_package = line == "[package]";
+                    continue;
+                }
+                if !in_package {
+                    continue;
+                }
+                if line.starts_with("version.workspace") {
+                    declared = Some(String::new());
+                    break;
+                }
+                if line.starts_with("version") {
+                    declared = Some(line.to_string());
+                    break;
+                }
+            }
+            match declared {
+                Some(line) if line.is_empty() => {}
+                Some(line) => panic!(
+                    "crates/{name}/{MANIFEST} declares its own version ({line}). This tree \
+                     releases one tag for all of them; a crate carrying a different number ships \
+                     inside an image whose tag says otherwise, and nothing but this test looks."
+                ),
+                None => panic!(
+                    "crates/{name}/{MANIFEST} declares no version in [package] at all, so what \
+                     the tag {} names for this crate is undefined",
+                    release_tag()
+                ),
+            }
+        }
+    }
+
+    /// Раздел про первый релиз называет каждый образ, который релиз публикует.
+    ///
+    /// Иначе появившийся четвёртый образ выйдет под тем же тегом и не будет
+    /// назван нигде, кроме воркфлоу: получатель, читающий README, проверит три
+    /// подписи из четырёх и решит, что проверил всё.
+    #[test]
+    fn the_first_release_section_names_every_image_that_release_publishes() {
+        let readme = read(README);
+        let heading = "### Первый релиз";
+        let start = readme.find(heading).unwrap_or_else(|| {
+            panic!(
+                "{README} has no {heading:?} section. What a tag produces would then be named \
+                 nowhere but the workflow file, which is not where a recipient looks."
+            )
+        });
+        let section = &readme[start..];
+        let end = section[heading.len()..]
+            .find("\n## ")
+            .map_or(section.len(), |offset| offset + heading.len());
+        let section = &section[..end];
+
+        let workflow = read(WORKFLOW);
+        let mut crates: Vec<&str> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("- crate: "))
+            .map(str::trim)
+            .collect();
+        crates.sort();
+        assert!(
+            !crates.is_empty(),
+            "{WORKFLOW} publishes no image this gate can see, so the section was compared \
+             against nothing"
+        );
+        for name in crates {
+            assert!(
+                section.contains(name),
+                "{README}: the first-release section does not name {name:?}, which {WORKFLOW} \
+                 publishes under this tag. A release describing fewer artefacts than it produces \
+                 teaches the recipient to verify fewer."
+            );
+        }
+    }
+
+    /// SECURITY.md называет канал, который у этого репозитория есть, и не
+    /// заводит ни одного, которого нет.
+    ///
+    /// Выдуманный канал раскрытия хуже отсутствующего: адрес, который никто не
+    /// читает, и отпечаток, которого нет ни у одного ключа, превращают
+    /// сообщение об обходе enforcement в письмо в никуда, а отправитель считает
+    /// себя сообщившим. Поэтому проверяются обе стороны: приватный advisory
+    /// назван, а почты и PGP в файле нет вовсе.
+    #[test]
+    fn the_security_policy_names_a_channel_this_repository_actually_has() {
+        let text = read(SECURITY);
+        assert!(
+            text.contains(ADVISORY_URL),
+            "{SECURITY} does not name {ADVISORY_URL}. GitHub private vulnerability reporting is \
+             the only confidential channel this repository has; a policy without it sends the \
+             reporter to a public issue."
+        );
+
+        assert!(
+            !text.contains("BEGIN PGP"),
+            "{SECURITY} carries a PGP block. This project publishes no key; a block here is a \
+             key nobody holds, and everything encrypted to it is lost."
+        );
+        for (index, line) in text.lines().enumerate() {
+            let number = index + 1;
+            if let Some(word) = line.split_whitespace().find(|word| {
+                let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                word.len() == 40 && word.chars().all(|c| c.is_ascii_hexdigit())
+            }) {
+                panic!(
+                    "{SECURITY}:{number}: {word:?} reads as a key fingerprint. This project has \
+                     no key and no fingerprint to publish, and one written here would be a trust \
+                     anchor nothing in this tree can back."
+                );
+            }
+            if let Some(word) = line.split_whitespace().find(|word| {
+                let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '@');
+                match word.split_once('@') {
+                    Some((user, host)) => {
+                        !user.is_empty() && host.contains('.') && !host.ends_with('.')
+                    }
+                    None => false,
+                }
+            }) {
+                panic!(
+                    "{SECURITY}:{number}: {word:?} reads as an e-mail address. No mailbox for \
+                     this project is confirmed, and a reporting address nobody reads is worse \
+                     than none: the reporter believes they have reported."
+                );
+            }
+        }
+    }
+
+    /// SECURITY.md поддерживает ту версию, которую это дерево несёт.
+    ///
+    /// Политика, называющая поддерживаемой линию, которой в дереве нет, — это
+    /// занижение и завышение сразу: сообщивший против `main` не знает, примут ли
+    /// его, а сообщивший против несуществующей `0.2.x` считает себя покрытым.
+    #[test]
+    fn the_security_policy_supports_the_version_this_tree_carries() {
+        let text = read(SECURITY);
+        let version = workspace_version();
+        let (major, rest) = version
+            .split_once('.')
+            .unwrap_or_else(|| panic!("{MANIFEST}: version {version:?} has no minor component"));
+        let minor = rest.split('.').next().expect("minor component");
+        let line = format!("{major}.{minor}.x");
+        assert!(
+            text.contains(&line),
+            "{SECURITY} says nothing about {line}, the line this tree builds. A reporter cannot \
+             tell whether the version they are running is one this project answers for."
+        );
+        assert!(
+            text.contains("main"),
+            "{SECURITY} does not say whether `main` is supported. Until the first tag exists it \
+             is the only thing anybody can be running."
+        );
+    }
+}
+
+/// Устанавливаемость, читающая текст — и говорящая об этом вслух.
+///
+/// `install_gate.rs` ставит `deploy` в настоящий apiserver и ждёт, пока
+/// workload'ы поднимутся; вот там утверждение про установку. Здесь — только
+/// про файлы, и разница ровно та, на которой прошлый цикл поймал это дерево:
+/// два CRD из семи проходили каждый читающий текст гейт и отвергались
+/// apiserver целиком. Поэтому ни один тест ниже не называется
+/// «устанавливается».
+///
+/// Чего эта половина всё-таки не даёт сделать:
+///
+///  * забыть манифест. Файл в `deploy/`, который не ставит ни один корень и не
+///    назван исключением с причиной, — это объект, который получатель не
+///    применит и о котором ничего не покраснеет;
+///  * унаследовать respond. `optional-respond.yaml` меняет DaemonSet на тот,
+///    что несёт `hostPID` и `CAP_KILL`; попасть он должен ровно одним способом
+///    — руками набранным `kubectl apply -f`;
+///  * применить нерендеренный вебхук. В шаблоне стоит
+///    `caBundle: REPLACE_WITH_PEM_CA_BUNDLE_BASE64`, а `failurePolicy: Fail`
+///    начинает отказывать в Pod'ах в момент появления объекта: установка,
+///    затянувшая его за собой, — это отказ всему кластеру;
+///  * подменить умолчания на удобные. Значения по умолчанию — это то, что
+///    ставится одной командой, и держатся они здесь, а не в values-файле,
+///    которого нет.
+mod kustomize_roots {
+    use serde::Deserialize;
+    use serde_yaml::Value;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+
+    const KUSTOMIZATION: &str = "kustomization.yaml";
+    /// Корень, который ставит `kubectl apply -k deploy`.
+    const DEFAULT_INSTALL: &str = "deploy";
+    /// Корень агента: отдельный, и `deploy/README` объясняет почему.
+    const AGENT_INSTALL: &str = "deploy/agent";
+    const CRD_INSTALL: &str = "docs/crd";
+    const MIRRORED_OVERLAY: &str = "overlays/mirrored-registry";
+    const POLICY: &str = "policies/examples/prod-restricted.yaml";
+
+    /// Манифесты `deploy/`, которые не ставит ни один корень, и причина у
+    /// каждого.
+    ///
+    /// Список, а не прозаический комментарий: файл может выпасть из установки
+    /// по недосмотру, и единственная разница между недосмотром и решением —
+    /// написанная причина. Короткая строка причины ниже — падение.
+    const NOT_INSTALLED_BY_ANY_ROOT: [(&str, &str); 2] = [
+        (
+            "deploy/admission/validatingwebhookconfiguration.tmpl.yaml",
+            "шаблон, а не манифест: в нём стоит \
+             `caBundle: REPLACE_WITH_PEM_CA_BUNDLE_BASE64`, и CA, который его \
+             заменит, не существует, пока не отработал `ferrumctl \
+             gen-webhook-pki`. Применённый как есть, он ставит вебхук, до \
+             которого apiserver не дозвонится, а с `failurePolicy: Fail` это \
+             отказ в каждом Pod'е вне ferrum/kube-system. Отрендеренный файл \
+             применяется руками и последним — deploy/admission/README, шаг 3",
+        ),
+        (
+            "deploy/agent/optional-respond.yaml",
+            "не часть базовой установки по построению: этот файл заменяет \
+             DaemonSet на тот, что несёт hostPID и CAP_KILL, то есть \
+             превращает kill из записанного решения в действие. Такое \
+             включается набранным `kubectl apply -f`, а не наследуется из \
+             overlay, который кто-то однажды выбрал",
+        ),
+    ];
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read_yaml(path: &Path) -> Value {
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        serde_yaml::from_str(&text).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// Путь относительно корня репозитория, слэшами и без `./`.
+    fn rel(path: &Path) -> String {
+        path.strip_prefix(repo_root())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Корень kustomize: то, что в нём написано, без интерпретации.
+    struct Root {
+        dir: PathBuf,
+        doc: Value,
+    }
+
+    impl Root {
+        fn open(rel_dir: &str) -> Root {
+            let dir = repo_root().join(rel_dir);
+            let file = dir.join(KUSTOMIZATION);
+            assert!(
+                file.is_file(),
+                "{rel_dir} is not a kustomization root: no {KUSTOMIZATION} in it"
+            );
+            Root {
+                doc: read_yaml(&file),
+                dir,
+            }
+        }
+
+        fn strings(&self, key: &str) -> Vec<String> {
+            self.doc
+                .get(key)
+                .and_then(Value::as_sequence)
+                .map(|seq| {
+                    seq.iter()
+                        .map(|v| {
+                            v.as_str()
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "{}/{KUSTOMIZATION}: {key} holds a non-string",
+                                        rel(&self.dir)
+                                    )
+                                })
+                                .to_string()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        fn keys(&self) -> BTreeSet<String> {
+            self.doc
+                .as_mapping()
+                .expect("kustomization is a mapping")
+                .keys()
+                .map(|k| k.as_str().unwrap_or_default().to_string())
+                .collect()
+        }
+    }
+
+    /// Всё, что корень в итоге ставит: файлы манифестов, разрешённые
+    /// рекурсивно через вложенные корни.
+    ///
+    /// Разрешение, а не чтение одного файла: `deploy/kustomization.yaml` не
+    /// называет ни одного манифеста напрямую, и гейт, читающий только его,
+    /// не увидел бы ничего.
+    fn installed_files(rel_dir: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        collect(rel_dir, &mut out, &mut seen);
+        out
+    }
+
+    fn collect(rel_dir: &str, out: &mut BTreeSet<String>, seen: &mut BTreeSet<String>) {
+        if !seen.insert(rel_dir.to_string()) {
+            return;
+        }
+        let root = Root::open(rel_dir);
+        for entry in root.strings("resources") {
+            let path = root
+                .dir
+                .join(&entry)
+                .canonicalize()
+                .unwrap_or_else(|err| panic!("{rel_dir}: resource {entry:?}: {err}"));
+            if path.is_dir() {
+                collect(&rel(&path), out, seen);
+            } else {
+                assert!(
+                    out.insert(rel(&path)),
+                    "{rel_dir}: {entry:?} is installed twice by this root"
+                );
+            }
+        }
+    }
+
+    /// Каждый корень kustomize в дереве. Найденные, а не перечисленные: корень,
+    /// добавленный и не вписанный сюда, — ровно то, что проверки ниже должны
+    /// увидеть.
+    fn every_root() -> Vec<String> {
+        let mut out = Vec::new();
+        walk(&repo_root(), &mut |path: &Path| {
+            if path.file_name().and_then(|n| n.to_str()) == Some(KUSTOMIZATION) {
+                out.push(rel(path.parent().expect("file has a parent")));
+            }
+        });
+        out.sort();
+        assert!(
+            out.len() >= 4,
+            "found {} kustomization roots; this tree has at least four \
+             (deploy, deploy/agent, docs/crd, overlays/mirrored-registry) and \
+             the walk that found fewer is reading the wrong directory",
+            out.len()
+        );
+        out
+    }
+
+    fn walk(dir: &Path, visit: &mut impl FnMut(&Path)) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || name == "target" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, visit);
+            } else {
+                visit(&path);
+            }
+        }
+    }
+
+    fn yaml_files_under(rel_dir: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        walk(&repo_root().join(rel_dir), &mut |path: &Path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name == KUSTOMIZATION {
+                return;
+            }
+            if name.ends_with(".yaml") || name.ends_with(".yml") {
+                out.push(rel(path));
+            }
+        });
+        out.sort();
+        out
+    }
+
+    /// Документы одного файла: манифесты этого дерева многодокументные.
+    fn documents(rel_path: &str) -> Vec<Value> {
+        let path = repo_root().join(rel_path);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{rel_path}: {err}"));
+        serde_yaml::Deserializer::from_str(&text)
+            .map(|doc| Value::deserialize(doc).unwrap_or_else(|err| panic!("{rel_path}: {err}")))
+            .filter(|doc| !doc.is_null())
+            .collect()
+    }
+
+    /// Все объекты, которые ставит корень.
+    fn installed_objects(rel_dir: &str) -> Vec<(String, Value)> {
+        installed_files(rel_dir)
+            .into_iter()
+            .flat_map(|file| {
+                documents(&file)
+                    .into_iter()
+                    .map(move |doc| (file.clone(), doc))
+            })
+            .collect()
+    }
+
+    fn pod_specs(objects: &[(String, Value)]) -> Vec<(String, &Value)> {
+        objects
+            .iter()
+            .filter_map(|(file, doc)| {
+                doc.get("spec")
+                    .and_then(|s| s.get("template"))
+                    .and_then(|t| t.get("spec"))
+                    .map(|spec| (file.clone(), spec))
+            })
+            .collect()
+    }
+
+    fn containers(pod: &Value) -> Vec<&Value> {
+        pod.get("containers")
+            .and_then(Value::as_sequence)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Реестр из ссылки на образ: всё до первого `/`.
+    fn registry_of(reference: &str) -> String {
+        reference
+            .split('/')
+            .next()
+            .expect("split yields one element")
+            .to_string()
+    }
+
+    /// Ссылка без тега и без digest.
+    fn repo_of(reference: &str) -> String {
+        let without_digest = reference.split('@').next().unwrap_or(reference);
+        match without_digest.rsplit_once(':') {
+            Some((repo, _)) => repo.to_string(),
+            None => without_digest.to_string(),
+        }
+    }
+
+    fn images_installed_by(rel_dir: &str) -> BTreeSet<String> {
+        let objects = installed_objects(rel_dir);
+        let mut out = BTreeSet::new();
+        for (_, pod) in pod_specs(&objects) {
+            for container in containers(pod) {
+                if let Some(image) = container.get("image").and_then(Value::as_str) {
+                    out.insert(image.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Каждый манифест `deploy/` ставится ровно одним корнем — или назван
+    /// неустанавливаемым, с причиной.
+    ///
+    /// Направление, в котором дерево гниёт молча: манифест добавляют, корень
+    /// не трогают, `kubectl apply -k deploy` его не ставит, и не краснеет
+    /// ничего — получатель просто не получает объект. Обратное направление
+    /// (корень называет несуществующий файл) ловит сам kustomize, и оно
+    /// шумное.
+    #[test]
+    fn every_manifest_in_the_deploy_tree_is_installed_by_a_root_or_excused() {
+        let installed: BTreeSet<String> = installed_files(DEFAULT_INSTALL)
+            .into_iter()
+            .chain(installed_files(AGENT_INSTALL))
+            .collect();
+        let excused: BTreeMap<&str, &str> = NOT_INSTALLED_BY_ANY_ROOT.into_iter().collect();
+
+        for (file, reason) in &excused {
+            assert!(
+                repo_root().join(file).is_file(),
+                "{file} is excused from every kustomization root, and it does not \
+                 exist: the entry is about nothing"
+            );
+            assert!(
+                reason.len() > 40,
+                "{file} is excused by {reason:?}, which is not a reason"
+            );
+            assert!(
+                !installed.contains(*file),
+                "{file} is both installed by a kustomization root and listed as \
+                 not installed by any. If it became installable, delete the \
+                 entry; if it did not, delete the resource."
+            );
+        }
+
+        for file in yaml_files_under(DEFAULT_INSTALL) {
+            assert!(
+                installed.contains(&file) || excused.contains_key(file.as_str()),
+                "{file} is a manifest no kustomization root installs and no entry \
+                 in NOT_INSTALLED_BY_ANY_ROOT excuses. `kubectl apply -k deploy` \
+                 does not deliver it, and nothing in this tree would go red for \
+                 that — the receiver simply would not have the object."
+            );
+        }
+    }
+
+    /// Корень CRD ставит каждый CRD, который это дерево поставляет.
+    ///
+    /// Не три, которые смотрит контроллер, и не «те, что вспомнили». Не
+    /// установленный CRD — это тип, которого apiserver не знает: объект,
+    /// который оператор пишет, отвергается как неизвестный, и ни в одном файле
+    /// нет строки о том, что тип оставили снаружи намеренно.
+    #[test]
+    fn the_crd_kustomization_installs_every_crd_this_repository_ships() {
+        let shipped: BTreeSet<String> = yaml_files_under(CRD_INSTALL).into_iter().collect();
+        let installed = installed_files(CRD_INSTALL);
+        assert!(
+            shipped.len() >= 7,
+            "found {} CRD files under {CRD_INSTALL}; the catalogue has seven, so \
+             this walk is reading the wrong directory",
+            shipped.len()
+        );
+        assert_eq!(
+            installed, shipped,
+            "{CRD_INSTALL}/{KUSTOMIZATION} and the files beside it disagree. A CRD \
+             this repository ships and this root does not install is a type the \
+             API server never learns."
+        );
+    }
+
+    /// Ни один корень не тянет respond и ни один не тянет нерендеренный вебхук.
+    ///
+    /// Проверяется по всем корням дерева, а не по двум ожидаемым: смысл в том,
+    /// что этих двух файлов нельзя получить *никак*, кроме набранного руками
+    /// `kubectl apply -f`. Корень, добавленный завтра, попадает сюда сам.
+    ///
+    /// Плюс запрет на `secretGenerator`: seed подписи и serving-ключ — не
+    /// манифесты, и генератор для них либо кладёт ключ в git, либо выпускает
+    /// новый на каждый apply.
+    #[test]
+    fn no_kustomization_root_installs_the_respond_variant_or_the_unrendered_webhook() {
+        for root in every_root() {
+            let installed = installed_files(&root);
+            for (file, _) in NOT_INSTALLED_BY_ANY_ROOT {
+                assert!(
+                    !installed.contains(file),
+                    "kustomization root {root} installs {file}. \
+                     `optional-respond.yaml` hands the agent hostPID and \
+                     CAP_KILL, and the webhook template hands the API server a \
+                     caBundle placeholder under failurePolicy: Fail. Neither may \
+                     arrive as a consequence of choosing an overlay."
+                );
+            }
+            let keys = Root::open(&root).keys();
+            for forbidden in ["secretGenerator", "helmCharts"] {
+                assert!(
+                    !keys.contains(forbidden),
+                    "kustomization root {root} carries `{forbidden}`. A generated \
+                     Secret is either a key in git or a new key on every apply, \
+                     and a chart pulled at install time is the supply chain this \
+                     product exists to refuse."
+                );
+            }
+        }
+    }
+
+    /// Умолчания — restricted, а не удобные.
+    ///
+    /// «Значения по умолчанию» здесь буквально то, что ставится одной командой:
+    /// values-файла нет, и второй копии этой позиции тоже. Каждое утверждение
+    /// ниже — про объекты, которые вернул разбор корня `deploy`, а не про
+    /// конкретный файл, так что послабление, приехавшее новым манифестом,
+    /// падает здесь так же, как правка старого.
+    #[test]
+    fn the_default_install_is_the_restricted_one() {
+        let objects = installed_objects(DEFAULT_INSTALL);
+        let pods = pod_specs(&objects);
+        assert_eq!(
+            pods.len(),
+            2,
+            "the default install has {} workloads; it is supposed to be exactly \
+             two — the controller and the webhook. A third one appearing here \
+             has to be argued for, and the agent is not it (deploy/README says \
+             why it is a root of its own).",
+            pods.len()
+        );
+
+        for (file, pod) in &pods {
+            for field in ["hostPID", "hostIPC", "hostNetwork"] {
+                assert!(
+                    pod.get(field).is_none(),
+                    "{file}: the default install sets {field}. \
+                     `policies/examples/prod-restricted.yaml` denies all three \
+                     (`admit.deny`), so this install would be refused by the \
+                     policy it ships with."
+                );
+            }
+            let security = pod
+                .get("securityContext")
+                .unwrap_or_else(|| panic!("{file}: workload has no pod securityContext"));
+            assert_eq!(
+                security.get("runAsNonRoot").and_then(Value::as_bool),
+                Some(true),
+                "{file}: the default install does not require runAsNonRoot"
+            );
+            assert_eq!(
+                security
+                    .get("seccompProfile")
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str),
+                Some("RuntimeDefault"),
+                "{file}: the default install does not set the RuntimeDefault \
+                 seccomp profile"
+            );
+
+            let containers = containers(pod);
+            assert!(!containers.is_empty(), "{file}: workload has no containers");
+            for container in containers {
+                let name = container
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unnamed>");
+                let sc = container
+                    .get("securityContext")
+                    .unwrap_or_else(|| panic!("{file}: container {name} has no securityContext"));
+                assert_eq!(
+                    sc.get("readOnlyRootFilesystem").and_then(Value::as_bool),
+                    Some(true),
+                    "{file}: container {name} has a writable root filesystem in \
+                     the default install"
+                );
+                assert_eq!(
+                    sc.get("allowPrivilegeEscalation").and_then(Value::as_bool),
+                    Some(false),
+                    "{file}: container {name} allows privilege escalation in the \
+                     default install"
+                );
+                assert_ne!(
+                    sc.get("privileged").and_then(Value::as_bool),
+                    Some(true),
+                    "{file}: container {name} is privileged in the default install"
+                );
+                let dropped: BTreeSet<&str> = sc
+                    .get("capabilities")
+                    .and_then(|c| c.get("drop"))
+                    .and_then(Value::as_sequence)
+                    .map(|s| s.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                assert!(
+                    dropped.contains("ALL"),
+                    "{file}: container {name} does not drop ALL capabilities"
+                );
+                let added: BTreeSet<&str> = sc
+                    .get("capabilities")
+                    .and_then(|c| c.get("add"))
+                    .and_then(Value::as_sequence)
+                    .map(|s| s.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                assert!(
+                    added.is_empty(),
+                    "{file}: container {name} adds {added:?} in the default \
+                     install. The control plane needs no capability at all; the \
+                     one component that does (the agent, BPF and PERFMON) is a \
+                     root of its own."
+                );
+
+                let args: Vec<&str> = container
+                    .get("args")
+                    .and_then(Value::as_sequence)
+                    .map(|s| s.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                if let Some(at) = args.iter().position(|a| *a == "--policy-name") {
+                    assert_eq!(
+                        args.get(at + 1),
+                        Some(&"prod-restricted"),
+                        "{file}: container {name} is installed against a policy \
+                         that is not prod-restricted"
+                    );
+                }
+            }
+        }
+
+        // Один экземпляр вебхука под failurePolicy=Fail — это отказ всему
+        // кластеру при первом же вытеснении, а не «менее доступно».
+        let replicas = objects
+            .iter()
+            .find(|(_, doc)| {
+                doc.get("kind").and_then(Value::as_str) == Some("Deployment")
+                    && doc
+                        .get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(Value::as_str)
+                        == Some("ferrum-admission")
+            })
+            .and_then(|(_, doc)| doc.get("spec"))
+            .and_then(|spec| spec.get("replicas"))
+            .and_then(Value::as_u64)
+            .expect("the default install carries a ferrum-admission Deployment");
+        assert!(
+            replicas >= 2,
+            "the default install runs {replicas} webhook replica(s) under \
+             failurePolicy=Fail: a single eviction is then a cluster-wide outage"
+        );
+
+        // Respond не только не ставится файлом — его identity не связана.
+        for (file, doc) in &objects {
+            if doc.get("kind").and_then(Value::as_str) == Some("ClusterRoleBinding") {
+                let name = doc
+                    .get("metadata")
+                    .and_then(|m| m.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                assert_ne!(
+                    name, "ferrum-agent-respond",
+                    "{file}: the default install binds the respond ServiceAccount"
+                );
+            }
+        }
+    }
+
+    /// Overlay для зеркала меняет имена образов и больше ничего.
+    ///
+    /// Overlay, который «заодно» правит что-то ещё, — это вторая копия
+    /// установки, расходящаяся с первой молча: гейты этого дерева читают
+    /// `deploy/**`, и то, что дописано в overlay, не читает ни один.
+    #[test]
+    fn the_mirrored_overlay_changes_image_names_and_nothing_else() {
+        let overlay = Root::open(MIRRORED_OVERLAY);
+        assert_eq!(
+            overlay.keys(),
+            ["apiVersion", "images", "kind", "resources"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>(),
+            "{MIRRORED_OVERLAY}/{KUSTOMIZATION} carries a key beyond the image \
+             rewrite. Anything else here is a second copy of the install that no \
+             gate in this tree reads."
+        );
+        assert_eq!(
+            overlay.strings("resources"),
+            vec![format!("../../{DEFAULT_INSTALL}")],
+            "{MIRRORED_OVERLAY} is an overlay over something other than the \
+             default install"
+        );
+
+        let entries = overlay
+            .doc
+            .get("images")
+            .and_then(Value::as_sequence)
+            .expect("the overlay carries an images list");
+        let mut rewritten = BTreeSet::new();
+        for entry in entries {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("image entry names an image");
+            assert!(
+                entry.get("newName").and_then(Value::as_str).is_some(),
+                "{MIRRORED_OVERLAY}: entry for {name} rewrites no registry"
+            );
+            for forbidden in ["newTag", "digest"] {
+                assert!(
+                    entry.get(forbidden).is_none(),
+                    "{MIRRORED_OVERLAY}: entry for {name} sets `{forbidden}`. The \
+                     tag is pinned once, in the manifests, and joined to the \
+                     release that can publish it by \
+                     `the_tag_the_manifests_pin_is_one_the_release_can_publish`. \
+                     A second pin here is a second thing to forget."
+                );
+            }
+            rewritten.insert(name.to_string());
+        }
+
+        let installed: BTreeSet<String> = images_installed_by(DEFAULT_INSTALL)
+            .iter()
+            .map(|image| repo_of(image))
+            .collect();
+        assert_eq!(
+            rewritten, installed,
+            "{MIRRORED_OVERLAY} rewrites a different set of images than the \
+             default install pulls. An entry matching nothing is silently \
+             ignored by kustomize, so an image left out of this list is an image \
+             that goes on being pulled from the internet in a contour that has \
+             none."
+        );
+    }
+
+    /// Overlay переносит установку в тот реестр, который разрешает
+    /// поставляемая политика — а база стоит вне него.
+    ///
+    /// Обе половины утверждения нужны. Без первой overlay мог бы указывать
+    /// куда угодно; без второй он был бы декорацией — если бы база уже стояла
+    /// в разрешённом реестре, переносить было бы нечего, и незамеченным
+    /// осталось бы то, что установка по умолчанию тянет образы из интернета.
+    #[test]
+    fn the_mirrored_overlay_moves_the_install_into_the_registry_the_shipped_policy_allows() {
+        let policy = documents(POLICY);
+        let allowed: BTreeSet<String> = policy
+            .first()
+            .and_then(|doc| doc.get("spec"))
+            .and_then(|spec| spec.get("selector"))
+            .and_then(|sel| sel.get("image"))
+            .and_then(|img| img.get("registriesAllow"))
+            .and_then(Value::as_sequence)
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .expect("prod-restricted names the registries it allows");
+        assert!(
+            !allowed.is_empty(),
+            "{POLICY} allows no registry at all, so nothing below is a comparison"
+        );
+
+        for image in images_installed_by(DEFAULT_INSTALL) {
+            assert!(
+                !allowed.contains(&registry_of(&image)),
+                "the default install pulls {image}, which {POLICY} already \
+                 allows. That would make {MIRRORED_OVERLAY} decoration — it \
+                 exists because the shipped install comes from the internet and \
+                 the shipped policy does not permit that registry."
+            );
+        }
+
+        let overlay = Root::open(MIRRORED_OVERLAY);
+        let entries = overlay
+            .doc
+            .get("images")
+            .and_then(Value::as_sequence)
+            .expect("the overlay carries an images list");
+        for entry in entries {
+            let new_name = entry
+                .get("newName")
+                .and_then(Value::as_str)
+                .expect("entry rewrites a registry");
+            assert!(
+                allowed.contains(&registry_of(new_name)),
+                "{MIRRORED_OVERLAY} rewrites an image to {new_name}, whose \
+                 registry {POLICY} does not allow. The overlay's whole job is to \
+                 make the install and the policy agree."
+            );
+        }
+    }
+}
+
+/// Вебхук с `failurePolicy: Fail` — единственная точка отказа кластера, и
+/// доступность здесь свойство поставляемых манифестов, а не эксплуатации.
+///
+/// Что читает этот модуль: реплик больше одной, вытеснение не может забрать
+/// обе, реплики предпочитают разные узлы, а исключение из-под вебхука решается
+/// меткой, которую namespace не может выдать себе сам. Каждое из четырёх — то,
+/// чего нет в коде и нельзя проверить прогоном: это текст, который применит
+/// оператор.
+mod high_availability {
+    use serde_yaml::Value;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    const DEPLOYMENT: &str = "deploy/admission/deployment.yaml";
+    const PDB: &str = "deploy/admission/pdb.yaml";
+    const WEBHOOK_TMPL: &str = "deploy/admission/validatingwebhookconfiguration.tmpl.yaml";
+    const ADMISSION_ROOT: &str = "deploy/admission/kustomization.yaml";
+    /// Метка, по которой Deployment собирает свои Pod'ы. Всё в этом модуле —
+    /// про то, что PDB и anti-affinity говорят о тех же Pod'ах.
+    const APP_LABEL: &str = "app.kubernetes.io/name";
+    const APP_NAME: &str = "ferrum-admission";
+    /// Ключ, который apiserver проставляет и контролирует на каждом namespace
+    /// с 1.21. Единственный, по которому исключение не может быть выдано
+    /// самому себе.
+    const OWNED_LABEL: &str = "kubernetes.io/metadata.name";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> Value {
+        let path = repo_root().join(rel);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        serde_yaml::from_str(&text).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    fn pod_spec(deployment: &Value) -> &Value {
+        deployment
+            .get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("spec"))
+            .expect("the webhook Deployment carries a pod template")
+    }
+
+    /// Реплик больше одной, и вытеснение не может забрать их все разом.
+    ///
+    /// Две половины, и по отдельности каждая бесполезна. Две реплики без
+    /// бюджета — это две реплики, которые `kubectl drain` одного узла снимает
+    /// одной командой, а с `failurePolicy: Fail` пауза между «сняли» и
+    /// «поднялись» — это отказ в создании Pod'ов по всему кластеру. Бюджет без
+    /// второй реплики — это запрет на любое вытеснение вообще: drain повисает
+    /// навсегда, и обновление узлов кластера останавливается на этом объекте.
+    /// Поэтому число реплик и число из бюджета читаются вместе, а не порознь.
+    #[test]
+    fn the_webhook_is_a_pair_that_a_drain_cannot_take_at_once() {
+        let deployment = read(DEPLOYMENT);
+        let replicas = deployment
+            .get("spec")
+            .and_then(|s| s.get("replicas"))
+            .and_then(Value::as_u64)
+            .expect("the webhook Deployment states its replica count");
+        assert!(
+            replicas >= 2,
+            "{DEPLOYMENT} runs {replicas} replica(s) under failurePolicy=Fail: одно вытеснение — \
+             отказ всему кластеру"
+        );
+
+        let pdb = read(PDB);
+        assert_eq!(
+            pdb.get("kind").and_then(Value::as_str),
+            Some("PodDisruptionBudget"),
+            "{PDB} is not a PodDisruptionBudget"
+        );
+        assert_eq!(
+            pdb.get("metadata")
+                .and_then(|m| m.get("namespace"))
+                .and_then(Value::as_str),
+            deployment
+                .get("metadata")
+                .and_then(|m| m.get("namespace"))
+                .and_then(Value::as_str),
+            "{PDB} is in a different namespace from {DEPLOYMENT}, so it governs no Pod of it"
+        );
+
+        // Селектор бюджета обязан выбирать те Pod'ы, что поднимает Deployment.
+        // Бюджет с чужим селектором — объект, который применяется, ничего не
+        // защищает и читается как защита.
+        let selector = pdb
+            .get("spec")
+            .and_then(|s| s.get("selector"))
+            .and_then(|s| s.get("matchLabels"))
+            .and_then(Value::as_mapping)
+            .expect("{PDB} selects Pods by matchLabels");
+        let template_labels = deployment
+            .get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("metadata"))
+            .and_then(|m| m.get("labels"))
+            .and_then(Value::as_mapping)
+            .expect("the pod template carries labels");
+        for (key, want) in selector {
+            assert_eq!(
+                template_labels.get(key),
+                Some(want),
+                "{PDB} selects on {key:?}={want:?}, which the Pods {DEPLOYMENT} creates do not \
+                 carry: the budget governs nothing"
+            );
+        }
+        assert_eq!(
+            selector.get(Value::from(APP_LABEL)),
+            Some(&Value::from(APP_NAME)),
+            "{PDB} does not select the webhook by {APP_LABEL}"
+        );
+
+        let spec = pdb.get("spec").expect("pdb spec");
+        let max_unavailable = spec.get("maxUnavailable").and_then(Value::as_u64);
+        let min_available = spec.get("minAvailable").and_then(Value::as_u64);
+        match (max_unavailable, min_available) {
+            (Some(max), None) => {
+                assert!(
+                    max >= 1,
+                    "{PDB} allows {max} unavailable: every voluntary eviction is refused, and a \
+                     node drain hangs on this object forever"
+                );
+                assert!(
+                    max < replicas,
+                    "{PDB} allows {max} of {replicas} replicas unavailable at once, which is all \
+                     of them: the budget permits exactly the outage it exists to prevent"
+                );
+            }
+            (None, Some(min)) => {
+                assert!(
+                    min >= 1,
+                    "{PDB} requires {min} available, so a drain may take every replica"
+                );
+                assert!(
+                    min < replicas,
+                    "{PDB} requires {min} of {replicas} available: no eviction is ever permitted \
+                     and a node drain hangs on this object forever"
+                );
+            }
+            _ => panic!(
+                "{PDB} states neither exactly one of maxUnavailable and minAvailable; the API \
+                 rejects both together and decides nothing with neither"
+            ),
+        }
+
+        // И бюджет обязан ставиться тем же корнем, что и Deployment: правило,
+        // приезжающее отдельным apply, — правило, которого нет у половины
+        // установок.
+        let root = read(ADMISSION_ROOT);
+        let resources: BTreeSet<String> = root
+            .get("resources")
+            .and_then(Value::as_sequence)
+            .expect("the admission root lists resources")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        assert!(
+            resources.contains("pdb.yaml") && resources.contains("deployment.yaml"),
+            "{ADMISSION_ROOT} installs {resources:?}: the budget and the Deployment it governs \
+             must arrive together"
+        );
+    }
+
+    /// Реплики предпочитают разные узлы, и предпочтение не умеет оставить одну
+    /// висеть.
+    ///
+    /// Бюджет выше — про добровольные вытеснения; узел, который умер, никого не
+    /// спрашивает, и против этого работает только anti-affinity. Но требование
+    /// `required` на одноузловом кластере оставляет вторую реплику в Pending
+    /// навсегда — а именно одноузловой кластер поднимает `install_gate.rs` и
+    /// публичный воркфлоу, то есть поставлялась бы установка, не поднимающаяся
+    /// на том кластере, которым её же и проверяют. Поэтому здесь проверяется
+    /// обратное обычному: правило есть **и** оно мягкое.
+    #[test]
+    fn the_two_replicas_prefer_different_nodes_and_the_preference_cannot_strand_one() {
+        let deployment = read(DEPLOYMENT);
+        let anti = pod_spec(&deployment)
+            .get("affinity")
+            .and_then(|a| a.get("podAntiAffinity"))
+            .expect(
+                "the webhook Deployment declares no podAntiAffinity: two replicas the scheduler \
+                 is free to put on one node are two replicas one node failure takes",
+            );
+        assert!(
+            anti.get("requiredDuringSchedulingIgnoredDuringExecution")
+                .is_none(),
+            "{DEPLOYMENT} requires anti-affinity. On a single-node cluster — which is what kind \
+             is, and what install_gate.rs and the public workflow install into — the second \
+             replica stays Pending forever, so the shipped install would be one that does not \
+             come up on the cluster its own gate uses."
+        );
+        let preferred = anti
+            .get("preferredDuringSchedulingIgnoredDuringExecution")
+            .and_then(Value::as_sequence)
+            .expect("the anti-affinity is stated as a preference");
+        let term = preferred
+            .iter()
+            .find(|t| {
+                t.get("podAffinityTerm")
+                    .and_then(|t| t.get("topologyKey"))
+                    .and_then(Value::as_str)
+                    == Some("kubernetes.io/hostname")
+            })
+            .expect(
+                "no anti-affinity term over kubernetes.io/hostname: a preference over some other \
+                 topology says nothing about two replicas on one node",
+            );
+        assert_eq!(
+            term.get("weight").and_then(Value::as_u64),
+            Some(100),
+            "the anti-affinity carries less than the full weight, so any other preference can \
+             outvote it and the two replicas land together anyway"
+        );
+        let labels = term
+            .get("podAffinityTerm")
+            .and_then(|t| t.get("labelSelector"))
+            .and_then(|s| s.get("matchLabels"))
+            .and_then(Value::as_mapping)
+            .expect("the term selects the Pods it is about");
+        assert_eq!(
+            labels.get(Value::from(APP_LABEL)),
+            Some(&Value::from(APP_NAME)),
+            "the anti-affinity term selects Pods other than this webhook's, so the scheduler is \
+             separating the wrong thing"
+        );
+    }
+
+    /// Из-под вебхука исключены ровно два namespace, и решает это метка,
+    /// которую apiserver проставляет сам.
+    ///
+    /// Исключения нужны: с `failurePolicy: Fail` вебхук, гейтящий namespace
+    /// собственных Pod'ов и namespace плоскости управления кластера, нельзя
+    /// перезапустить после того, как он перестал отвечать. Но ключ, по
+    /// которому исключение решается, — это и есть политика: любой
+    /// `ferrum.io/*`-опт-аут был бы исключением, которое namespace выдаёт себе
+    /// сам, а в продукте про enforcement это вся политика целиком.
+    #[test]
+    fn the_webhook_exemption_is_decided_by_a_label_the_api_server_owns() {
+        let webhook = read(WEBHOOK_TMPL);
+        let hook = webhook
+            .get("webhooks")
+            .and_then(Value::as_sequence)
+            .and_then(|w| w.first())
+            .expect("the template carries a webhook");
+        let selector = hook
+            .get("namespaceSelector")
+            .expect("the webhook states a namespaceSelector");
+        assert!(
+            selector.get("matchLabels").is_none(),
+            "{WEBHOOK_TMPL} exempts by matchLabels: an equality selector cannot say NotIn, so \
+             this either gates nothing or gates one namespace"
+        );
+        let expressions = selector
+            .get("matchExpressions")
+            .and_then(Value::as_sequence)
+            .expect("the selector is stated as matchExpressions");
+        let mut exempt: BTreeSet<String> = BTreeSet::new();
+        for expr in expressions {
+            let key = expr
+                .get("key")
+                .and_then(Value::as_str)
+                .expect("expression names a key");
+            assert_eq!(
+                key, OWNED_LABEL,
+                "{WEBHOOK_TMPL} decides the exemption on {key:?}. Only {OWNED_LABEL} is set and \
+                 enforced by the API server; on any other key a namespace exempts itself from \
+                 the policy by labelling itself."
+            );
+            assert_eq!(
+                expr.get("operator").and_then(Value::as_str),
+                Some("NotIn"),
+                "the exemption is not stated as NotIn, so it is a list of namespaces the webhook \
+                 *does* gate — everything else in the cluster is then ungated"
+            );
+            exempt.extend(
+                expr.get("values")
+                    .and_then(Value::as_sequence)
+                    .expect("NotIn carries values")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        assert!(
+            exempt.contains("kube-system"),
+            "{WEBHOOK_TMPL} gates kube-system. With failurePolicy=Fail that is a cluster whose \
+             control plane cannot restart while this webhook is down; exempt {exempt:?} does not \
+             include it"
+        );
+        assert!(
+            exempt.contains("ferrum"),
+            "{WEBHOOK_TMPL} gates the namespace holding this webhook's own Pods, so a cold \
+             cluster deadlocks on the replica that has not started yet; exempt is {exempt:?}"
+        );
+        // И ровно эти два: каждый лишний — namespace, в котором политика не
+        // действует и об этом знает только этот файл.
+        assert_eq!(
+            exempt,
+            ["ferrum", "kube-system"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<String>>(),
+            "the webhook exempts more than the two namespaces it must: every extra one is a \
+             namespace where the shipped policy does not apply and nothing else in this tree \
+             says so"
+        );
+    }
+
+    /// У каждого ресурса, который вебхук регистрирует, есть scope, известный
+    /// коду, который его решает.
+    ///
+    /// Это шов, на котором сломался issue #17. `namespaceSelector` выше не
+    /// применяется apiserver к ресурсам уровня кластера, значит для них
+    /// решение целиком за `ferrum-admission`, и он обязан знать, что у такого
+    /// объекта нет namespace, а не спрашивать кеш меток о пустой строке.
+    /// Ресурс, дописанный в `rules` и не разобранный здесь, — второй заход на
+    /// ту же ошибку, поэтому таблица ниже полная, а незнакомый ресурс — падение.
+    #[test]
+    fn every_resource_the_webhook_registers_has_a_scope_this_crate_knows() {
+        /// resource → (Kind, cluster-scoped?). Полная, а не «то, что
+        /// встретилось»: в этом и смысл.
+        const SCOPES: [(&str, &str, bool); 6] = [
+            ("pods", "Pod", false),
+            ("roles", "Role", false),
+            ("rolebindings", "RoleBinding", false),
+            ("clusterroles", "ClusterRole", true),
+            ("clusterrolebindings", "ClusterRoleBinding", true),
+            ("namespaces", "Namespace", true),
+        ];
+
+        let webhook = read(WEBHOOK_TMPL);
+        let hook = webhook
+            .get("webhooks")
+            .and_then(Value::as_sequence)
+            .and_then(|w| w.first())
+            .expect("the template carries a webhook");
+        let mut registered: BTreeSet<String> = BTreeSet::new();
+        for rule in hook
+            .get("rules")
+            .and_then(Value::as_sequence)
+            .expect("the webhook carries rules")
+        {
+            registered.extend(
+                rule.get("resources")
+                    .and_then(Value::as_sequence)
+                    .expect("a rule names resources")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        assert!(
+            !registered.is_empty(),
+            "{WEBHOOK_TMPL} registers no resource at all, so nothing below is about anything"
+        );
+
+        for resource in &registered {
+            let (_, kind, cluster_scoped) = SCOPES
+                .iter()
+                .find(|(name, _, _)| name == resource)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{WEBHOOK_TMPL} registers {resource:?}, whose scope this gate does not \
+                         know. Decide it here and in ferrum_admission::CLUSTER_SCOPED_KINDS \
+                         together: a cluster-scoped resource reaching a policy that carries a \
+                         namespaceSelector is what denied every ClusterRoleBinding in the \
+                         cluster until issue #20, and a namespaced one wrongly listed as \
+                         cluster-scoped would skip the namespace selector entirely."
+                    )
+                });
+            assert_eq!(
+                ferrum_admission::CLUSTER_SCOPED_KINDS.contains(kind),
+                *cluster_scoped,
+                "{WEBHOOK_TMPL} registers {resource:?} ({kind}), which this gate calls \
+                 cluster-scoped={cluster_scoped} and ferrum_admission::CLUSTER_SCOPED_KINDS \
+                 disagrees with. One of the two is wrong, and while they disagree the webhook \
+                 either asks a label cache about an object with no namespace or applies no \
+                 namespace selector to an object that has one."
+            );
+        }
+
+        // Обратное направление: `Namespace` намеренно не в списке crate, и это
+        // держится только тем, что вебхук его не регистрирует. Зарегистрирует —
+        // и `cluster_scoped_kind` начнёт отвечать «нет» на объект, у которого
+        // метки namespace есть, но лежат на нём самом.
+        if registered.contains("namespaces") {
+            panic!(
+                "{WEBHOOK_TMPL} now registers `namespaces`. For a Namespace object the labels a \
+                 namespaceSelector asks about are the object's own — a third case that neither \
+                 cluster_scoped_kind nor program_applies decides today. Decide it before this \
+                 rule ships."
+            );
         }
     }
 }

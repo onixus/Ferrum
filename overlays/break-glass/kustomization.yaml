@@ -1,0 +1,138 @@
+# Arm the emergency suspension of admission enforcement.
+#
+#     kubectl apply -k overlays/break-glass
+#
+# What it does: gives every `ferrum-admission` replica a mount to look for a
+# signed break-glass grant in, a trust root to verify it against, and a place
+# to write the journal chain. It does **not** suspend anything. Arming and
+# breaking glass are two acts: this one is done in advance, at install time,
+# by whoever also holds the key; the second is dropping a signed grant into
+# Secret `ferrum-break-glass` during an incident. See docs/runbooks/README.md.
+#
+# Why arming is a separate, deliberate overlay rather than part of the default
+# install, and why it is nevertheless meant to be applied *before* you need it:
+#
+#   * It needs a key that does not exist in this repository and must not. The
+#     break-glass signing key is issued to named people by whatever directory
+#     the site already runs, and it is deliberately not the PolicyBundle
+#     signing key — see `ferrum_crypto::BREAK_GLASS_CONTEXT`. A default install
+#     that armed break-glass would have to invent one or ship one.
+#   * `ferrum-admission` refuses to start if break-glass is configured and the
+#     journal cannot be written. That is the design (a suspension nobody can
+#     account for is worse than no suspension), and it means a broken arming
+#     fails `kubectl rollout status` here rather than failing at 03:00. Apply
+#     this on a quiet afternoon and check
+#     `ferrum_admission_break_glass_configured` is 1.
+#   * Unarmed is a survivable state and a readable one: that metric is 0, the
+#     runbook's escape hatch is `kubectl delete
+#     validatingwebhookconfiguration ferrum-admission`, and the API server will
+#     always allow that. The difference armed makes is the record, not the
+#     escape.
+#
+# What this overlay does not solve, said here because it is where an operator
+# will look for it:
+#
+#   * **The journal file lives in an emptyDir and dies with the Pod.** There is
+#     no honest alternative in this tree: a hostPath would give a control-plane
+#     Deployment write access to the node, and a PVC cannot be RWO across two
+#     replicas. The chain is therefore tamper-evidence *within one replica's
+#     life* — against somebody who reaches the container and edits the file —
+#     and not durable storage. Durability comes from the two copies that leave
+#     the Pod on their own: every entry is printed to stderr verbatim (the
+#     container log, collected by whatever the cluster runs), and the head hash
+#     and entry count are on `/metrics`, which Prometheus stores. If neither of
+#     those is collected on your cluster, arming break-glass buys you much less
+#     than it looks like; fix that first.
+#   * **It covers admission only.** The node agent's `respond` role is not
+#     suspended by any grant — the only scope this build honours is
+#     `admission`, and a scope it parsed and did not act on would be a switch
+#     that changes nothing. Suspending kills is still `kubectl delete -f
+#     deploy/agent/optional-respond.yaml` followed by re-applying
+#     `deploy/agent`, and that act is not journalled here.
+#
+# The Secret this expects is yours to create, like every other Secret in this
+# tree, and it is empty until an incident:
+#
+#     kubectl -n ferrum create secret generic ferrum-break-glass
+#     kubectl -n ferrum create secret generic ferrum-break-glass-root \
+#         --from-file=trustRoot=<the Ed25519 public key, 32 bytes as 64 hex>
+#
+# `break_glass_gate.rs` holds this file against the binary: every flag here is
+# one `ferrum-admission` parses, the file names it mounts are the ones the code
+# looks for, and the default install does not reach this root.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../deploy
+
+patches:
+  - target:
+      kind: Deployment
+      name: ferrum-admission
+    patch: |
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --break-glass
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: /etc/ferrum/break-glass
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --break-glass-journal
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: /var/lib/ferrum/break-glass.jsonl
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: --break-glass-root
+      - op: add
+        path: /spec/template/spec/containers/0/args/-
+        value: $(FERRUM_BREAK_GLASS_ROOT)
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: FERRUM_BREAK_GLASS_ROOT
+          valueFrom:
+            secretKeyRef:
+              name: ferrum-break-glass-root
+              key: trustRoot
+      # The journal entry names which replica wrote it. Two replicas keep two
+      # chains, and an entry that does not say which is one a reader has to
+      # guess about.
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: break-glass
+          mountPath: /etc/ferrum/break-glass
+          readOnly: true
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: break-glass-journal
+          mountPath: /var/lib/ferrum
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: break-glass
+          secret:
+            # Optional, and this is the one mount in this tree that is. The
+            # Secret is empty for the whole life of a healthy cluster; making
+            # it required would put both replicas in ContainerCreating until
+            # somebody creates an empty Secret, which is a cluster-wide
+            # admission outage caused by arming the thing that ends
+            # cluster-wide admission outages.
+            secretName: ferrum-break-glass
+            optional: true
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: break-glass-journal
+          emptyDir: {}

@@ -1,0 +1,553 @@
+{
+  "__ferrum_note": "Every PromQL expression below names only metric families the shipped binaries actually export, and metrics_gate.rs::every_metric_this_dashboard_charts_is_one_the_binaries_export fails the build if that stops being true. The reverse direction is held too: a family exported and charted nowhere must be named in NOT_CHARTED with a reason.",
+  "title": "FERRUM — enforcement plane",
+  "uid": "ferrum-enforcement",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "tags": ["ferrum", "enforcement"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Is the fleet enforcing",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Nodes not attached to the kernel",
+      "description": "ferrum_agent_degraded_reason{reason=\"not_attached\"} is 1 on a node where nothing feeds the decision path. Such a node reports Ready and enforces nothing. Anything but 0 here is the alert.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_agent_degraded_reason{reason=\"not_attached\"})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Degraded nodes",
+      "description": "ferrum_agent_degraded is the whole degraded state as one bool; the breakdown below says which reason.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 1 },
+      "targets": [
+        { "refId": "A", "expr": "sum(ferrum_agent_degraded)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Bundle digests in force (agents)",
+      "description": "One value while a rollout is settled; two or more means the fleet is split across bundles. Digest and not policy name on purpose: a content hash names no policy.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (digest) (ferrum_agent_bundle_info))"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Bundle digests in force (webhook)",
+      "description": "Replicas of the webhook disagreeing about the bundle is a rollout that has not converged; under failurePolicy: Fail that means two different verdicts for the same Pod depending on which replica answers.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (digest) (ferrum_admission_bundle_info))"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Degradation reasons across the fleet",
+      "description": "Every reason this build can raise is published on every scrape, 0 included, so a flat line at zero means 'not raised' and a gap means 'not scraped'. The two are different and this panel can tell them apart.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (ferrum_agent_degraded_reason) > 0",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Records that reached no rule",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "In-kernel ring drops per second",
+      "description": "ferrum_agent_events_dropped_total is the in-kernel counter: records the ring dropped under flood, which no rule ever saw. Enforcement missed, on a node that otherwise reports healthy. This is the counter that existed inside the process for eight cycles with no reader.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(ferrum_agent_events_dropped_total[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Records that failed to decode",
+      "description": "The other side of the ring: a record that arrived and no rule could read. Same loss, different half.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(ferrum_agent_records_decode_failed_total[5m]))",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Enforcement events lost on export",
+      "description": "A kill that happened and was not written down is the repudiation case. Three separate losses, kept separate: a full queue, a failed write, and a writer that is gone for good.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ferrum_agent_export_queue_dropped_total[5m]))",
+          "legendFormat": "queue full"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_agent_export_write_failed_total[5m]))",
+          "legendFormat": "write failed"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(ferrum_agent_export_writer_lost_total[5m]))",
+          "legendFormat": "writer gone"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_agent_export_lost_total[5m]))",
+          "legendFormat": "lost, as the agent counts it"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(ferrum_agent_export_writer_dead)",
+          "legendFormat": "nodes with a dead writer"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 11,
+      "type": "row",
+      "title": "Identity the datapath could not resolve",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Selectors resolved against a cold cache",
+      "description": "labels_unknown and identity_unknown are fail-closed resolutions, not non-matches: the rules were applied without the facts they select on.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 25 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ferrum_agent_labels_unknown_total[5m]))",
+          "legendFormat": "labels unknown"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_agent_identity_unknown_total[5m]))",
+          "legendFormat": "identity unknown"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(ferrum_agent_container_unproven_total[5m]))",
+          "legendFormat": "container unproven"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_agent_container_flag_disagreement_total[5m]))",
+          "legendFormat": "container flag disagreement"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Container map",
+      "description": "Until the cgroups the index knows are in the kernel map, EVENT_FLAG_CONTAINER is never set and every containerOnly rule misses.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 25 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_agent_container_map_entries)",
+          "legendFormat": "entries"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(ferrum_agent_container_map_synced)",
+          "legendFormat": "nodes synced"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(ferrum_agent_container_map_stale)",
+          "legendFormat": "nodes stale"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Paths the kernel could not carry whole",
+      "description": "A truncated path is a suffix rule decided without the bytes it names. The rule still fired — on an assertion.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 25 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ferrum_agent_path_truncated_total[5m]))",
+          "legendFormat": "paths truncated"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_agent_unknown_syscall_total[5m]))",
+          "legendFormat": "unknown syscall nr"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(ferrum_agent_datapath_abi_mismatch_total[5m]))",
+          "legendFormat": "datapath ABI mismatch"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 15,
+      "type": "row",
+      "title": "Reactions",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Signals sent and refused",
+      "description": "A refusal is a guard doing its job; a failure is a kill the agent tried and could not deliver, and a stale target is one it refused because the tgid may have been reused. The three are not one number.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ferrum_agent_respond_kill_total[5m]))",
+          "legendFormat": "killed"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_agent_respond_refused_total[5m]))",
+          "legendFormat": "refused by a guard"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(ferrum_agent_respond_failed_total[5m]))",
+          "legendFormat": "signal failed"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_agent_respond_stale_target_total[5m]))",
+          "legendFormat": "stale target"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(ferrum_agent_respond_role_skipped_total[5m]))",
+          "legendFormat": "observe role"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Waivers held on the nodes",
+      "description": "A waiver that joins nothing is signed, verified, in scope, and demotes nothing here. A table that was dropped enforces stricter than the policy that was signed.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 34 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_agent_exceptions_held)",
+          "legendFormat": "held"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(ferrum_agent_waivers_unjoined_total)",
+          "legendFormat": "unjoined"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(ferrum_agent_waivers_inert_total)",
+          "legendFormat": "inert"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_agent_exceptions_reload_failed_total[5m]))",
+          "legendFormat": "reload failures"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Admission",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Review latency inside the process",
+      "description": "p50/p90/p99 of the span the API server is blocked on in this process. The socket and the TLS handshake are outside it deliberately: a budget stated on a number that includes the network is one nobody can act on. The red step is the declared budget, 5 ms — the same number ferrum_admission::REVIEW_LATENCY_BUDGET_SECONDS holds and latency_gate.rs measures against; a panel whose threshold disagreed with the code would draw a line nobody could act on either.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 43 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(ferrum_admission_review_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(ferrum_admission_review_seconds_bucket[5m])))",
+          "legendFormat": "p90"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(ferrum_admission_review_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.005 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Verdicts per second",
+      "description": "A deny wave with no policy change behind it is usually the bundle or the waiver table, not the policy — see the panel to the right.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 43 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ferrum_admission_reviews_allowed_total[5m]))",
+          "legendFormat": "allowed"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_admission_reviews_denied_total[5m]))",
+          "legendFormat": "denied"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "What the webhook lost hold of",
+      "description": "A poll loop that stopped seeing changes, a bundle key that vanished from the mount, and a waiver table emptied by either. Each of these makes the webhook enforce something other than what was published, without the policy having changed.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ferrum_admission_bundle_unreadable_total[5m]))",
+          "legendFormat": "bundle mount unreadable"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_admission_bundle_absent_total[5m]))",
+          "legendFormat": "bundle key absent"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(ferrum_admission_exceptions_resets_total[5m]))",
+          "legendFormat": "waivers reset (unverifiable)"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_admission_exceptions_cleared_total[5m]))",
+          "legendFormat": "waivers cleared (absent)"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Waivers the webhook would apply",
+      "description": "Compare with the node-side count: the two planes read one signed table, and a disagreement between them is a rollout in flight or a Secret only one of them can read.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_admission_exceptions_active)",
+          "legendFormat": "active"
+        }
+      ],
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 23,
+      "type": "row",
+      "title": "The surfaces themselves",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 59 }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Is the reporting surface itself down",
+      "description": "status.json unwritable, the clock floor unpersisted, the bundle mount unreadable, and — the meta one — status.json keys this build could not turn into a metric. Anything but zero on the last means a counter exists on the node that this dashboard cannot see.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 60 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_agent_status_write_failed)",
+          "legendFormat": "nodes whose status file will not write"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(ferrum_agent_clock_floor_unpersisted)",
+          "legendFormat": "nodes with an in-memory-only rollback floor"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(ferrum_agent_bundle_unreadable)",
+          "legendFormat": "nodes whose bundle mount will not stat"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_agent_clock_floor_unpersisted_total[5m]))",
+          "legendFormat": "failed writes of the rollback floor"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(ferrum_agent_bundle_stat_failed_total[5m]))",
+          "legendFormat": "failed stats of the bundle mount"
+        },
+        {
+          "refId": "F",
+          "expr": "sum(ferrum_agent_status_keys_unmapped)",
+          "legendFormat": "counters this dashboard cannot see"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 25,
+      "type": "row",
+      "title": "Break-glass",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 68 }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Is admission enforcement suspended, and can it be",
+      "description": "While `suspended` is above zero the webhook answers allow to every AdmissionReview without evaluating anything, and `admitted without evaluation` counts the objects that went in that way. `armed` is the one to read on a quiet day: zero means no replica can break glass at all, so the emergency lever is absent rather than unused. `refused` moving while `suspended` is zero is a grant being rejected on every poll — a wrong key, a stale window, or somebody trying. `journal stopped` above zero is a replica that can no longer record a suspension, and while it is set no grant comes into force.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 69 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_admission_break_glass_active)",
+          "legendFormat": "replicas with enforcement suspended"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_admission_break_glass_admits_total[5m]))",
+          "legendFormat": "objects admitted without evaluation"
+        },
+        {
+          "refId": "C",
+          "expr": "min(ferrum_admission_break_glass_expires_in_seconds > 0)",
+          "legendFormat": "seconds left on the grant in force"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_admission_break_glass_rejections_total[5m]))",
+          "legendFormat": "grant documents refused"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(ferrum_admission_break_glass_configured)",
+          "legendFormat": "replicas armed for break-glass"
+        },
+        {
+          "refId": "F",
+          "expr": "sum(ferrum_admission_break_glass_journal_broken)",
+          "legendFormat": "replicas whose journal stopped accepting entries"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    }
+  ]
+}

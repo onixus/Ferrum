@@ -518,7 +518,7 @@ pipeline {
                     test -f dist/ferrum-ebpf-progs.bpf.o
                     docker build --platform=linux/amd64 \
                         --build-arg BPF_ELF=dist/ferrum-ebpf-progs.bpf.o \
-                        -t "ghcr.io/ferrum/ferrum-agent:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
+                        -t "ghcr.io/onixus/ferrum-agent:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
                 '''
             }
         }
@@ -537,7 +537,7 @@ pipeline {
                 sh '''
                     set -eu
                     docker build --platform=linux/amd64 -f Dockerfile.admission \
-                        -t "ghcr.io/ferrum/ferrum-admission:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
+                        -t "ghcr.io/onixus/ferrum-admission:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
                 '''
             }
         }
@@ -550,7 +550,7 @@ pipeline {
                 sh '''
                     set -eu
                     docker build --platform=linux/amd64 -f Dockerfile.controller \
-                        -t "ghcr.io/ferrum/ferrum-controller:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
+                        -t "ghcr.io/onixus/ferrum-controller:${FERRUM_IMAGE_TAG:-dev-$BUILD_NUMBER}" .
                 '''
             }
         }
@@ -879,6 +879,108 @@ pipeline {
                     sh '''
                         set -eu
                         cargo test -p ferrum-admission --test mvp
+                    '''
+                }
+            }
+
+            // Инвариант, а не удобство: /metrics — открытый порт в продукте
+            // про enforcement, и всё, что о нём можно утверждать текстом,
+            // утверждается здесь. Дашборд и код обязаны называть одни и те же
+            // семейства в обе стороны, у каждой причины деградации обязан быть
+            // стабильный id, порт обязан быть открыт манифестами и закрыт
+            // NetworkPolicy, а сам эндпоинт обязан отвечать только на чтение.
+            // Красное здесь — это либо панель, которая молча читается как
+            // «No data», либо неаутентифицированное чтение здоровья
+            // enforcement из любого Pod'а кластера. Ни то, ни другое не флейк.
+            stage('Security: metrics contract') {
+                steps {
+                    sh '''
+                        set -eu
+                        cargo test -p ferrum-metrics
+                        cargo test -p ferrum-testkit --test metrics_gate
+                    '''
+                }
+            }
+
+            // Инвариант доступности, а не производительности. Вебхук стоит с
+            // `failurePolicy: Fail` перед apiserver: время, которое он
+            // проводит в `handle`, apiserver проводит заблокированным, и
+            // сетевой вызов, чтение с диска или замок, удержанный через I/O,
+            // на этом пути превращают деградацию одной реплики в остановку
+            // создания Pod'ов. Заявленное число — 5 мс на p99 — живёт в
+            // `ferrum_admission::REVIEW_LATENCY_BUDGET_SECONDS`, и меряет его
+            // та самая гистограмма, которую вебхук отдаёт в `/metrics`:
+            // второй секундомер мог бы быть зелёным при сломанном первом, а
+            // оператор читает первый.
+            //
+            // `--release`, и это не оптимизация прогона: заявленное число —
+            // про образ, который ставят, а он собран `--release`. Отладочная
+            // сборка того же кода медленнее на порядок (почти вся разница —
+            // проверка Ed25519 у подписи образа), и держать её тем же числом
+            // значило бы утверждать про артефакт, которого никто не
+            // поставляет; для неё в коде объявлено второе, своё число, и
+            // обычный `cargo test --workspace` в стадии `Test` проверяет его.
+            // Пропуска нет ни в одной из двух: `latency_gate.rs` меряет
+            // всегда и на любой машине.
+            stage('Security: admission latency') {
+                steps {
+                    sh '''
+                        set -eu
+                        cargo test --release -p ferrum-testkit --test latency_gate
+                    '''
+                }
+            }
+
+            // Инвариант, и он про то, чего это дерево не контролирует.
+            // `EventEnvelope` — интерфейс с чужой системой: правило в SIEM
+            // пишет человек, который этот репозиторий не откроет, один раз,
+            // по именам полей увиденной записи. Переименованное поле — это
+            // детект, который молча перестал срабатывать, и ни здесь, ни там
+            // ничего не покраснеет. Поэтому: инвентарь полей выводится
+            // сериализацией самого типа и сверяется с замороженным для
+            // версии, которую код заявляет; записи, выпущенные прошлыми
+            // версиями, обязаны декодироваться этой сборкой; у каждого листа
+            // конверта есть решение, уходит он наружу или нет, и withheld
+            // отсутствует во всех трёх профилях; враждебная нагрузка не
+            // подделывает запись ни в одном из них; и сам сток исполняется —
+            // приёмка §D едет через поставляемую цепочку стоков в локальный
+            // сокет. Красное здесь — это либо потерянный получателем детект,
+            // либо персональные данные в чужом хранилище.
+            stage('Security: event contract') {
+                steps {
+                    sh '''
+                        set -eu
+                        cargo test -p ferrum-proto
+                        cargo test -p ferrum-siem
+                        cargo test -p ferrum-testkit --test event_contract_gate
+                    '''
+                }
+            }
+
+            // Инвариант, и он про единственный в этом продукте механизм,
+            // который enforcement выключает. Способ снять enforce был и до
+            // него — `kubectl delete validatingwebhookconfiguration`, — и он
+            // не оставлял в enforcement plane ничего; строка threat model
+            // «journal + IdP на break-glass» ровно про это. Красное здесь —
+            // это либо приостановление, которое некому потом объяснить, либо
+            // runbook, разъехавшийся с деревом.
+            //
+            // Что держится: grant подписан в своём домене (подпись bundle им
+            // не является), окно обязательно и не длиннее четырёх часов,
+            // цепочка журнала ломается на правке, удалении и перестановке, а
+            // журнал, в который нельзя писать, не даёт grant'у вступить в
+            // силу. И отдельно — runbook: каждый путь после `-k`/`-f`
+            // существует, каждое имя метрики публикует настоящий бинарь,
+            // каждая причина деградации агента названа, каждое число радиуса
+            // поражения равно константе, из которой взято. Runbook, команды
+            // которого разъехались с деревом, — это будущая ложь, и заметить
+            // её иначе некому.
+            stage('Security: break-glass') {
+                steps {
+                    sh '''
+                        set -eu
+                        cargo test -p ferrum-breakglass
+                        cargo test -p ferrum-testkit --test break_glass_gate
                     '''
                 }
             }

@@ -10,10 +10,19 @@ description = "Webhook. Forbidden: ferrum-compiler, aya, outbound net on hot pat
 [dependencies]
 chrono.workspace = true
 ferrum-api.workspace = true
+# Break-glass grants and their journal. Graph is chrono, ferrum-common,
+# ferrum-crypto, serde and sha2 — all of which this crate already carries; the
+# suspension mechanism adds no network, no client and no runtime to the
+# decision path.
+ferrum-breakglass.workspace = true
 ferrum-common.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ids.workspace = true
 ferrum-policy.workspace = true
+# Prometheus text rendering plus the read-only GET listener behind
+# `--metrics-listen`. No dependencies of its own, and no second HTTP stack:
+# this is std::net, like the webhook server beside it.
+ferrum-metrics.workspace = true
 # Same decision the agent's envelope parser makes, on the same signed slot: a
 # wasm module this binary has no executor for must not load. Graph is
 # ferrum-common; there is no wasm runtime in this tree to pull in.

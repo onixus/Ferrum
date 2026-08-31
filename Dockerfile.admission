@@ -1,4 +1,4 @@
-# The webhook image. Produces ghcr.io/ferrum/ferrum-admission, which
+# The webhook image. Produces ghcr.io/onixus/ferrum-admission, which
 # deploy/admission/deployment.yaml names and which nothing in this repository
 # built until now.
 #
@@ -20,10 +20,21 @@
 # Pod CrashLoops on a node: a build-time defect turned into a runtime one.
 #
 #   docker build -f Dockerfile.admission \
-#       -t ghcr.io/ferrum/ferrum-admission:v0.1.0 .
+#       -t ghcr.io/onixus/ferrum-admission:v0.1.0 .
 
 ARG RUST_IMAGE=rust:1.75-bookworm
 ARG TARGET=x86_64-unknown-linux-musl
+
+# cargo-auditable вписывает в бинарь список crate и версий из Cargo.lock той
+# сборки, которая его слинковала. Без него SBOM образа — это `scratch` и один
+# статический ELF: syft увидит файл и ни одной зависимости, то есть SBOM,
+# который нечего сказать. С ним `cargo audit bin` на стороне получателя
+# отвечает на вопрос «что внутри» из самого артефакта, а не из репозитория,
+# которому получатель ещё не обязан верить.
+#
+# Версия закреплена. `cargo install` без неё подписывает то, что выложат
+# завтра, — в файле, который существует ради происхождения.
+ARG CARGO_AUDITABLE_VERSION=0.7.5
 
 # --platform=$BUILDPLATFORM: собирать натив, а образ помечать целевой
 # платформой. Без этого `docker build` на arm64-ноде клеймит образ
@@ -32,6 +43,7 @@ ARG TARGET=x86_64-unknown-linux-musl
 # видит: они читают сам файл, а не манифест вокруг него.
 FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS build
 ARG TARGET
+ARG CARGO_AUDITABLE_VERSION
 
 # musl, not gnu, и цель x86_64 берётся кроссом, а не архитектурой демона:
 # `docker build` идёт на ноде, а нода здесь arm64. musl-tools дал бы musl-gcc
@@ -39,13 +51,27 @@ ARG TARGET
 # rust-lld тем musl, который везёт rustup. `rustup target add` стоит ниже COPY
 # намеренно: rust-toolchain.toml пинит тулчейн, и до появления исходников цель
 # ставится не тому, который потом собирает.
+#
+# Обе цели, а не одна: `TARGET` — аргумент, и толчейн под него должен быть в
+# образе, иначе `--build-arg TARGET=aarch64-unknown-linux-musl` падает не на
+# отсутствии кросс-gcc, а в середине сборки C-половины ring, сообщением
+# cc-rs про `aarch64-linux-musl-gcc`. Ставятся оба набора и объявляются обе
+# пары переменных: переменная цели, которую не собирают, ни на что не влияет,
+# а её отсутствие делает вторую цель несобираемой. Вторая цель нужна e2e:
+# нода kind здесь arm64, и образ под x86_64 на ней не стартует.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         gcc-x86-64-linux-gnu libc6-dev-amd64-cross \
+        gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
+
+# Ниже COPY по той же причине, что и `rustup target add`: тулчейн пинит
+# rust-toolchain.toml, и до появления исходников инструмент собрался бы
+# не тем компилятором, который потом линкует бинарь.
+RUN cargo install --locked "cargo-auditable@${CARGO_AUDITABLE_VERSION}"
 
 # --features apiserver is not an option here. It is the production combination:
 # deploy/admission/deployment.yaml passes --apiserver, and without the feature
@@ -55,9 +81,11 @@ COPY . .
 # one.
 RUN rustup target add "${TARGET}" \
  && CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
     RUSTFLAGS="-C link-self-contained=yes" \
-    cargo build --release --locked --target "${TARGET}" \
+    cargo auditable build --release --locked --target "${TARGET}" \
         -p ferrum-admission --features apiserver \
  && cp "target/${TARGET}/release/ferrum-admission" /ferrum-admission
 
@@ -70,6 +98,17 @@ RUN rustup target add "${TARGET}" \
 RUN if readelf -lW /ferrum-admission | grep -q 'Requesting program interpreter'; then \
         echo "the webhook linked for ${TARGET} requests an interpreter: it would not" >&2; \
         echo "start on the scratch base this image is built on" >&2; \
+        exit 1; \
+    fi
+
+# Список зависимостей — в бинаре, а не только в обещании выше. Секция
+# `.dep-v0` — то единственное, что `cargo audit bin` на стороне получателя
+# читает; сборка обычным `cargo build` её не кладёт, и SBOM образа тогда
+# честно перечисляет один файл. Проверка стоит здесь, потому что это
+# единственное место, где виден именно тот бинарь, который поедет в образ.
+RUN if ! readelf -SW /ferrum-admission | grep -q '\.dep-v0'; then \
+        echo "/ferrum-admission carries no .dep-v0 section: it was linked by plain" >&2; \
+        echo "cargo build, and the SBOM of this image would list no dependency" >&2; \
         exit 1; \
     fi
 

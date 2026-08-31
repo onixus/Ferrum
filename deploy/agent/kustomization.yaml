@@ -1,0 +1,37 @@
+# The node agent, as its own root and deliberately not part of the default
+# install above it. See `deploy/README` for the whole argument; the short form
+# is that this DaemonSet has a node prerequisite the control plane does not
+# have, and an install gate that had to excuse one of its own workloads would
+# be a gate that skips itself.
+#
+# What it needs and kind does not give: bpffs mounted at /sys/fs/bpf on the
+# node. The pin-path volume is a hostPath of type DirectoryOrCreate, and on a
+# kind node /sys/fs/bpf is a read-only sysfs directory with no bpffs on it, so
+# kubelet cannot create the subdirectory and the Pod never leaves
+# ContainerCreating:
+#
+#     MountVolume.SetUp failed for volume "bpf-pins":
+#     mkdir /sys/fs/bpf/ferrum: no such file or directory
+#
+# That is a fact about the node, not about this file, and the repair is a
+# threat-model question rather than a kustomize one — mounting /sys/fs/bpf
+# whole hands the agent the node's entire bpffs. So the agent installs with
+# `kubectl apply -k deploy/agent` on a cluster whose nodes carry bpffs, and the
+# install gate does not claim a stand where it has never come up.
+#
+# optional-respond.yaml is not a resource here and must not become one:
+# applying it replaces the DaemonSet below with one carrying hostPID and
+# CAP_KILL. Respond is opt-in by a deliberate `kubectl apply -f`, not by an
+# overlay somebody inherits.
+# `deploy_gate.rs::no_kustomization_root_reaches_the_respond_variant` holds it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - serviceaccount-observe.yaml
+  - serviceaccount-respond.yaml
+  - rbac.yaml
+  - daemonset.yaml
+  # Headless, so the scrape is per node rather than load-balanced across the
+  # fleet. See the file for why that distinction is not cosmetic here.
+  - metrics-service.yaml

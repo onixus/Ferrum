@@ -2,6 +2,7 @@
 //! these modules; the testkit gates the deploy tree through the same code the
 //! CLI runs, not a copy of it.
 
+pub mod break_glass;
 pub mod compile;
 pub mod fsig;
 pub mod gen_pki;

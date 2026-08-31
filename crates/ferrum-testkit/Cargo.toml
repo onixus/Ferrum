@@ -6,6 +6,14 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+# The cluster gate: `tests/e2e_cluster.rs` against a real API server. Opt-in
+# for the same reason `ferrum-ebpf`'s `attach` is — the thing it needs is not
+# in a default `cargo test`, and here that thing is a Kubernetes cluster. Off,
+# the file compiles to one test that refuses `FERRUM_E2E_REQUIRED`; on, it
+# refuses to run without a context and never skips.
+e2e = []
+
 [dependencies]
 ferrum-api.workspace = true
 serde.workspace = true
@@ -17,6 +25,9 @@ serde_yaml.workspace = true
 chrono.workspace = true
 ferrum-admission = { path = "../ferrum-admission" }
 ferrum-agent = { path = "../ferrum-agent" }
+# The break-glass gate signs a real grant and reads back the real journal
+# chain; a fixture copy of either would be the drift it exists to catch.
+ferrum-breakglass.workspace = true
 # Only for the error type of `ferrum_agent::Responder`, which the replay
 # harness has to implement to observe a kill without CAP_KILL.
 ferrum-common.workspace = true
@@ -31,5 +42,14 @@ ferrum-ebpf.workspace = true
 ferrum-export.workspace = true
 ferrum-ids.workspace = true
 ferrum-k8smeta.workspace = true
+# The metrics gate binds a real socket and reads METRICS_PATH from the crate
+# that serves it, rather than from a literal that could drift from it.
+ferrum-metrics.workspace = true
 ferrum-policy.workspace = true
+# The exported record contract itself, and the crate that renders it. The
+# schema gate derives the field inventory by serialising the real type and
+# renders through the real profiles; a copy of either would be the drift it
+# exists to catch.
+ferrum-proto.workspace = true
+ferrum-siem.workspace = true
 serde_json.workspace = true

@@ -51,6 +51,52 @@ offline command.
 
        kubectl apply -f deploy/admission/validatingwebhookconfiguration.yaml
 
+Availability
+============
+
+This webhook is `failurePolicy: Fail`, which means it is the cluster's single
+point of failure for every Pod outside `ferrum` and `kube-system`. Three things
+in this directory are what keep that from being a promise nobody kept, and all
+three ship by default:
+
+  * two replicas (deployment.yaml). One replica plus fail-closed is a
+    cluster-wide outage on the first eviction.
+  * pdb.yaml, `maxUnavailable: 1`. A node drain that would take both replicas
+    is refused by the eviction API rather than by luck. Verified against a real
+    API server, not only read out of the manifest:
+    `e2e_cluster.rs::the_second_eviction_of_the_webhook_pair_is_refused_by_the_disruption_budget`.
+  * soft anti-affinity over `kubernetes.io/hostname` (deployment.yaml). A node
+    that dies consults no budget; this is what keeps both replicas off it. Soft
+    and not required, because required leaves the second replica Pending
+    forever on a single-node cluster — the reasoning is in the manifest.
+
+What none of that covers: a single-node cluster still runs both replicas on
+that node, and the anti-affinity has never been exercised on a cluster with two
+nodes. On such a cluster it is a preference the scheduler is free to ignore
+under pressure.
+
+The exemptions are two, `ferrum` and `kube-system`, and they are decided on
+`kubernetes.io/metadata.name` — the label the API server sets and enforces.
+They are not an exemption for cluster-scoped objects: the API server does not
+apply `namespaceSelector` to those, so every ClusterRoleBinding in the cluster
+reaches this webhook and is decided by the policy
+(`eval.rs::cluster_scoped_kind`). Until issue #20 it was decided by a label
+cache instead, and a running FERRUM refused the ClusterRoleBindings of its own
+re-install.
+
+Latency
+=======
+
+The declared budget is **5 ms at p99** for one AdmissionReview inside the
+process, i.e. exactly the span `ferrum_admission_review_seconds` measures: the
+socket, the TLS handshake and the API server's queue are outside it. It is
+`ferrum_admission::REVIEW_LATENCY_BUDGET_SECONDS`, it is drawn as a threshold
+on the Grafana panel this repository ships, and it is measured on every build
+by `latency_gate.rs` — which reads its p99 out of that same histogram rather
+than starting a stopwatch of its own. `timeoutSeconds: 5` on the webhook
+configuration is the other, unrelated number: it covers the network and is
+three orders of magnitude away.
+
 Build features
 ==============
 

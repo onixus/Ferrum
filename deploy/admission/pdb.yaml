@@ -1,0 +1,39 @@
+# Two replicas are what makes a node drain survivable; this is what stops the
+# drain from taking both.
+#
+# Without it `kubectl drain` on the one node that happens to hold both webhook
+# Pods evicts both at once, and with `failurePolicy: Fail` the cluster stops
+# admitting Pods everywhere outside ferrum/kube-system until a replacement is
+# Ready — including the replacement Pods of the webhook's own Deployment if
+# their namespace were not exempt. The anti-affinity in deployment.yaml is a
+# preference; this is the part the eviction API is obliged to honour.
+#
+# `maxUnavailable: 1` and not `minAvailable: 1`, which is the same number at two
+# replicas and stops being the same the moment someone scales up: at three
+# replicas `minAvailable: 1` lets a drain take two at once, while this always
+# leaves N-1 serving. It is also the form that cannot become a deadlock by
+# arithmetic — a `minAvailable` that has caught up with `replicas` blocks every
+# voluntary eviction in the cluster forever, which is a worse outage than the
+# one this file prevents, and it is a one-character edit away.
+#
+# It does not survive a single-replica Deployment: at `replicas: 1` this makes
+# every eviction impossible and a node drain hangs. That is why
+# `deploy_gate.rs::the_webhook_is_a_pair_that_a_drain_cannot_take_at_once` reads
+# this file and deployment.yaml together rather than either alone.
+#
+# Nothing here helps with an involuntary disruption — a node that dies takes its
+# Pod with it and no budget is consulted. That case is the anti-affinity's, and
+# neither is a substitute for the other.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ferrum-admission
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-admission
+    app.kubernetes.io/part-of: ferrum
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ferrum-admission

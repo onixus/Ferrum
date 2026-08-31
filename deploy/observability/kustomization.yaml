@@ -1,0 +1,20 @@
+# Everything about being watched from outside the process.
+#
+# Part of the default install and not an opt-in overlay, because the thing it
+# installs is a *restriction*. An operator who applies `deploy` and forgets
+# this directory would get the metrics ports — they are in the workload
+# manifests — with nothing in front of them. The safe default is the one that
+# arrives with the ports.
+#
+# The Grafana dashboard beside this file is not a Kubernetes object and is not
+# installed by anything: how a dashboard reaches Grafana is a decision about
+# somebody else's stack (a provisioning sidecar, a ConfigMap they template, a
+# UI import), and shipping one of those three as if it were the answer would be
+# a guess in a directory whose whole job is not to guess. What this tree does
+# guarantee about it is checked by `metrics_gate.rs`: every metric it charts is
+# one the binaries actually export.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - networkpolicy.yaml

@@ -4,6 +4,7 @@ members = [
     "crates/ferrum-common",
     "crates/ferrum-ids",
     "crates/ferrum-api",
+    "crates/ferrum-breakglass",
     "crates/ferrum-proto",
     "crates/ferrum-crypto",
     "crates/ferrum-policy",
@@ -17,6 +18,8 @@ members = [
     "crates/ferrum-agent",
     "crates/ferrum-controller",
     "crates/ferrum-export",
+    "crates/ferrum-metrics",
+    "crates/ferrum-siem",
     "crates/ferrum-cli",
     "crates/ferrum-testkit",
 ]
@@ -24,7 +27,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "GPL-3.0-only"
+license = "Apache-2.0"
 publish = false
 rust-version = "1.97"
 
@@ -32,6 +35,7 @@ rust-version = "1.97"
 ferrum-common = { path = "crates/ferrum-common" }
 ferrum-ids = { path = "crates/ferrum-ids" }
 ferrum-api = { path = "crates/ferrum-api" }
+ferrum-breakglass = { path = "crates/ferrum-breakglass" }
 ferrum-proto = { path = "crates/ferrum-proto" }
 ferrum-crypto = { path = "crates/ferrum-crypto" }
 ferrum-policy = { path = "crates/ferrum-policy" }
@@ -42,6 +46,8 @@ ferrum-ebpf = { path = "crates/ferrum-ebpf" }
 ferrum-ebpf-progs = { path = "crates/ferrum-ebpf-progs" }
 ferrum-k8smeta = { path = "crates/ferrum-k8smeta" }
 ferrum-export = { path = "crates/ferrum-export" }
+ferrum-metrics = { path = "crates/ferrum-metrics" }
+ferrum-siem = { path = "crates/ferrum-siem" }
 ferrum-testkit = { path = "crates/ferrum-testkit" }
 
 anyhow = "1.0"
