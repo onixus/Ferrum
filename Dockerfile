@@ -36,6 +36,17 @@
 
 ARG RUST_IMAGE=rust:1.75-bookworm
 ARG TARGET=x86_64-unknown-linux-musl
+
+# cargo-auditable вписывает в бинарь список crate и версий из Cargo.lock той
+# сборки, которая его слинковала. Без него SBOM образа — это `scratch` и один
+# статический ELF: syft увидит файл и ни одной зависимости, то есть SBOM,
+# который нечего сказать. С ним `cargo audit bin` на стороне получателя
+# отвечает на вопрос «что внутри» из самого артефакта, а не из репозитория,
+# которому получатель ещё не обязан верить.
+#
+# Версия закреплена. `cargo install` без неё подписывает то, что выложат
+# завтра, — в файле, который существует ради происхождения.
+ARG CARGO_AUDITABLE_VERSION=0.7.5
 ARG BPF_ELF=dist/ferrum-ebpf-progs.bpf.o
 
 # --platform=$BUILDPLATFORM: собирать натив, а образ помечать целевой
@@ -45,6 +56,7 @@ ARG BPF_ELF=dist/ferrum-ebpf-progs.bpf.o
 # видит: они читают сам файл, а не манифест вокруг него.
 FROM --platform=$BUILDPLATFORM ${RUST_IMAGE} AS build
 ARG TARGET
+ARG CARGO_AUDITABLE_VERSION
 ARG BPF_ELF
 
 # musl, not gnu, и цель x86_64 берётся кроссом, а не архитектурой демона:
@@ -61,13 +73,18 @@ RUN apt-get update \
 WORKDIR /src
 COPY . .
 
+# Ниже COPY по той же причине, что и `rustup target add`: тулчейн пинит
+# rust-toolchain.toml, и до появления исходников инструмент собрался бы
+# не тем компилятором, который потом линкует бинарь.
+RUN cargo install --locked "cargo-auditable@${CARGO_AUDITABLE_VERSION}"
+
 # --locked: the image is a release artefact, and a build that may resolve a
 # different dependency set than CI tested is not one.
 RUN rustup target add "${TARGET}" \
  && CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
     RUSTFLAGS="-C link-self-contained=yes" \
-    cargo build --release --locked --target "${TARGET}" \
+    cargo auditable build --release --locked --target "${TARGET}" \
         -p ferrum-agent --features attach,apiserver \
  && cp "target/${TARGET}/release/ferrum-agent" /ferrum-agent
 
@@ -79,6 +96,17 @@ RUN rustup target add "${TARGET}" \
 RUN if readelf -lW /ferrum-agent | grep -q 'Requesting program interpreter'; then \
         echo "the agent linked for ${TARGET} requests an interpreter: it would not" >&2; \
         echo "start on the scratch base this image is built on" >&2; \
+        exit 1; \
+    fi
+
+# Список зависимостей — в бинаре, а не только в обещании выше. Секция
+# `.dep-v0` — то единственное, что `cargo audit bin` на стороне получателя
+# читает; сборка обычным `cargo build` её не кладёт, и SBOM образа тогда
+# честно перечисляет один файл. Проверка стоит здесь, потому что это
+# единственное место, где виден именно тот бинарь, который поедет в образ.
+RUN if ! readelf -SW /ferrum-agent | grep -q '\.dep-v0'; then \
+        echo "/ferrum-agent carries no .dep-v0 section: it was linked by plain" >&2; \
+        echo "cargo build, and the SBOM of this image would list no dependency" >&2; \
         exit 1; \
     fi
 

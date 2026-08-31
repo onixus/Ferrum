@@ -1252,6 +1252,11 @@ mod build_closure {
 
     /// Every `cargo <subcommand> ... -p <package>` in a script, one entry per
     /// package named.
+    /// Обёртки cargo, стоящие перед настоящей подкомандой. Не список
+    /// «всех»: здесь ровно те, которые дерево использует, и каждая добавляется
+    /// вместе с местом, где она появилась.
+    const CARGO_WRAPPERS: [&str; 1] = ["auditable"];
+
     fn cargo_runs(script: &str, lang: Lang) -> Vec<CargoRun> {
         let mut out = Vec::new();
         for line in joined_lines(script, lang) {
@@ -1276,7 +1281,14 @@ mod build_closure {
                     .unwrap_or(tokens.len())
                     .min(starts.get(nth + 1).copied().unwrap_or(usize::MAX));
                 // `cargo +nightly build`: the toolchain sits between the two.
-                let Some(subcommand) = tokens[start + 1..end].iter().find(|t| !t.starts_with('+'))
+                // `cargo auditable build`: so does the wrapper that embeds the
+                // dependency list. Reading `auditable` as the subcommand would
+                // make the three image builds invisible to every gate below —
+                // the failure would be silent and would look like an image
+                // that links nothing.
+                let Some(subcommand) = tokens[start + 1..end]
+                    .iter()
+                    .find(|t| !t.starts_with('+') && !CARGO_WRAPPERS.contains(t))
                 else {
                     continue;
                 };
@@ -1586,6 +1598,11 @@ mod build_closure {
         assert!(
             linked("cargo +nightly build -p ferrum-probe --target x").contains("ferrum-probe"),
             "a toolchain override must not hide the package"
+        );
+        assert!(
+            linked("cargo auditable build --release -p ferrum-probe").contains("ferrum-probe"),
+            "`cargo auditable build` is the link the three images run; read as its own \
+             subcommand it makes every image look like one that links nothing"
         );
         assert!(
             linked("cargo run -p ferrum-probe --quiet -- validate x").contains("ferrum-probe"),
