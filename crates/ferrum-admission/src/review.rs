@@ -170,7 +170,7 @@ fn handle_with(
         if now < grant.expires_at {
             return ReviewReply {
                 status: 200,
-                body: encode_response(&uid, true, None, &break_glass_message(grant)),
+                body: encode_break_glass_allow(&uid, &break_glass_message(grant)),
                 allowed: true,
             };
         }
@@ -302,6 +302,30 @@ fn decision_response(uid: &str, object: &Value, decision: &AdmissionDecision) ->
         body: encode_response(uid, true, patch.as_ref(), ""),
         allowed: true,
     }
+}
+
+/// An allow that says why it is an allow.
+///
+/// `status.message` is not available here: the API server ignores it on an
+/// allowed response, so the only channel that reaches the human running
+/// `kubectl` at the moment an object is admitted unchecked is `warnings`, which
+/// `kubectl` prints as `Warning: ...`. Everything else about a break-glass is
+/// visible only to somebody already looking at the cluster's metrics or logs;
+/// this line is the one that reaches the person doing the thing.
+fn encode_break_glass_allow(uid: &str, message: &str) -> Vec<u8> {
+    let body = json!({
+        "apiVersion": "admission.k8s.io/v1",
+        "kind": "AdmissionReview",
+        "response": {
+            "uid": uid,
+            "allowed": true,
+            "warnings": [message],
+        },
+    });
+    serde_json::to_vec(&body).unwrap_or_else(|_| {
+        b"{\"apiVersion\":\"admission.k8s.io/v1\",\"kind\":\"AdmissionReview\",\"response\":{\"uid\":\"\",\"allowed\":false}}"
+            .to_vec()
+    })
 }
 
 fn encode_response(uid: &str, allowed: bool, patch: Option<&Value>, message: &str) -> Vec<u8> {

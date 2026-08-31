@@ -25,6 +25,9 @@ serde_yaml.workspace = true
 chrono.workspace = true
 ferrum-admission = { path = "../ferrum-admission" }
 ferrum-agent = { path = "../ferrum-agent" }
+# The break-glass gate signs a real grant and reads back the real journal
+# chain; a fixture copy of either would be the drift it exists to catch.
+ferrum-breakglass.workspace = true
 # Only for the error type of `ferrum_agent::Responder`, which the replay
 # harness has to implement to observe a kill without CAP_KILL.
 ferrum-common.workspace = true

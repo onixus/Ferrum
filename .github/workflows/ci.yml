@@ -420,6 +420,11 @@ jobs:
           cargo test -p ferrum-proto
           cargo test -p ferrum-siem
           cargo test -p ferrum-testkit --test event_contract_gate
+      - name: "Security: break-glass"
+        run: |
+          set -eu
+          cargo test -p ferrum-breakglass
+          cargo test -p ferrum-testkit --test break_glass_gate
       - name: "Security: supply chain"
         run: |
           set -eu

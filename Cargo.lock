@@ -857,6 +857,7 @@ dependencies = [
  "ferrum-admission",
  "ferrum-agent",
  "ferrum-api",
+ "ferrum-breakglass",
  "ferrum-cli",
  "ferrum-common",
  "ferrum-compiler",

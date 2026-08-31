@@ -39,7 +39,7 @@ const DASHBOARD: &str = "deploy/observability/grafana-dashboard.json";
 /// in `deploy_gate.rs` is one: a family drops out of the dashboard by
 /// oversight exactly as easily as by decision, and the only difference between
 /// the two is a written reason. A short one fails.
-const NOT_CHARTED: [(&str, &str); 11] = [
+const NOT_CHARTED: [(&str, &str); 14] = [
     (
         "ferrum_agent_info",
         "идентичность процесса, не измерение: версия и роль нужны как ярлык на \
@@ -49,6 +49,26 @@ const NOT_CHARTED: [(&str, &str); 11] = [
     (
         "ferrum_admission_info",
         "то же самое на стороне вебхука: версия как ярлык, а не как график",
+    ),
+    (
+        "ferrum_admission_break_glass_journal_info",
+        "идентичность цепочки, а не измерение: head — хеш, который всегда \
+         равен единице как серия, и нужен он затем, что Prometheus его \
+         хранит. Это и есть его работа — держать копию головы вне узла, — \
+         и панель, показывающая единицу, к ней ничего не добавляет",
+    ),
+    (
+        "ferrum_admission_break_glass_activations_total",
+        "накопительная половина `break_glass_active`, который на панели \
+         есть: сколько раз grant вступал в силу, читается при разборе \
+         инцидента, а на графике это вторая линия про то же событие",
+    ),
+    (
+        "ferrum_admission_break_glass_journal_entries_total",
+        "длина цепочки. Она растёт на каждом переходе, которые панель уже \
+         показывает по отдельности, и сама по себе не отвечает ни на один \
+         вопрос оператора; нужна она при сверке журнала — сколько записей \
+         должно быть в файле, — то есть при разборе, а не на дежурстве",
     ),
     (
         "ferrum_agent_attached",

@@ -499,6 +499,55 @@
         "defaults": {},
         "overrides": []
       }
+    },
+    {
+      "id": 25,
+      "type": "row",
+      "title": "Break-glass",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 68 }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Is admission enforcement suspended, and can it be",
+      "description": "While `suspended` is above zero the webhook answers allow to every AdmissionReview without evaluating anything, and `admitted without evaluation` counts the objects that went in that way. `armed` is the one to read on a quiet day: zero means no replica can break glass at all, so the emergency lever is absent rather than unused. `refused` moving while `suspended` is zero is a grant being rejected on every poll — a wrong key, a stale window, or somebody trying. `journal stopped` above zero is a replica that can no longer record a suspension, and while it is set no grant comes into force.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 69 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_admission_break_glass_active)",
+          "legendFormat": "replicas with enforcement suspended"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_admission_break_glass_admits_total[5m]))",
+          "legendFormat": "objects admitted without evaluation"
+        },
+        {
+          "refId": "C",
+          "expr": "min(ferrum_admission_break_glass_expires_in_seconds > 0)",
+          "legendFormat": "seconds left on the grant in force"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_admission_break_glass_rejections_total[5m]))",
+          "legendFormat": "grant documents refused"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(ferrum_admission_break_glass_configured)",
+          "legendFormat": "replicas armed for break-glass"
+        },
+        {
+          "refId": "F",
+          "expr": "sum(ferrum_admission_break_glass_journal_broken)",
+          "legendFormat": "replicas whose journal stopped accepting entries"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
     }
   ]
 }
