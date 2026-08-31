@@ -95,6 +95,12 @@
 и гейт этого проверить не может: между «стадия есть» и «стадия зелёная» он не
 различает.
 
+То же и с публичным воркфлоу `.github/workflows/ci.yml`: он поставляется в
+дереве, его скрипты сверены с одноимёнными стадиями `Jenkinsfile` построчно,
+и на этом всё. На GitHub он **не исполнялся ни разу** — на дату этой правки
+прогонов нет. Ни одна строка ниже не меряна им, и до первого настоящего
+прогона такой строки здесь быть не может.
+
 Что известно про исполнение на 2026-08-30, и известно из логов билдов, а не из
 этого абзаца. Билды #31–#37 гоняли **предыдущий** `Jenkinsfile` — без стадии
 `Datapath tracefs` и без `DATAPATH_DOCKER_ARGS`; в каждом из них проходили
@@ -334,6 +340,7 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 | `attach_for_arch` поднимает soft `RLIMIT_MEMLOCK` до hard перед самим `Bpf::load` — это проверено на живом attach, а не только у функции: лимита не понижает и сообщает числа, а не вердикт | K+U | K `attach_live.rs::attach_raises_the_soft_memlock_it_loads_under` · K `kernel.rs::raise_memlock_never_lowers_the_limit_and_reports_what_it_left` · U `kernel.rs::memlock_describe_reports_the_numbers_not_a_verdict` |
 | `libc` есть в графе `ferrum-ebpf` только под `attach`, и детектор доказан в обе стороны | U | U `Jenkinsfile::Crate boundary` |
 | `rcgen` и `x509-parser` не попадают в графы admission и agent, и детектор доказан на `ferrum-cli` | U | U `Jenkinsfile::Crate boundary` |
+| Публичный воркфлоу `.github/workflows/ci.yml` исполняет ровно userspace-стадии `Jenkinsfile` и побуквенно те же скрипты: `Format`, `Clippy`, `Test` и группа `Checks` целиком, сверенные на равенство строк, а не «по духу». Датапейсной стадии и стадии образов в нём нет по именам, и ни один шаг не может себя пропустить: ни `continue-on-error`, ни условия на шаге, ни подавления кода возврата. Про исполнение на GitHub эта строка не говорит ничего — гейт, как и `Jenkinsfile::<стадия>`, читает поставляемый файл | U | U `deploy_gate.rs::every_mirrored_stage_runs_the_same_script_here_and_in_jenkins` · U `deploy_gate.rs::the_comparison_notices_a_script_that_drifted` · U `deploy_gate.rs::the_public_workflow_claims_no_stage_it_cannot_execute` · U `deploy_gate.rs::no_step_in_the_public_workflow_can_skip_itself` |
 | Оба arch дают один вердикт на одних логических событиях, из записанных байтов | U | U `replay.rs::both_arches_reach_the_same_verdicts_on_the_same_logical_events` · U `replay.rs::recorded_fixture_records_still_produce_the_acceptance_verdicts` |
 | Секретный сканер не пропускает ничего, за что не поручился гейт: исключён ровно один путь, это фикстура, чьё тело не является ключевым материалом (payload не открывается DER SEQUENCE), и FD023 по-прежнему называет её находкой | U | U `deploy_gate.rs::the_scanner_skips_exactly_the_files_this_gate_vouches_for` · U `deploy_gate.rs::every_excluded_file_is_a_fixture_that_only_looks_like_a_key` · U `deploy_gate.rs::the_excluded_fixture_is_still_a_finding_for_the_lint_that_owns_it` · U `Jenkinsfile::SAST (semgrep)` |
 | Prefilter-образ поставляемой политики — тот, который утверждает ручная копия в `ferrum-ebpf` | U | U `deploy_gate.rs::the_prefilter_image_of_the_shipped_policy_is_the_one_its_unit_test_asserts` |

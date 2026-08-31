@@ -3047,3 +3047,239 @@ mod rollout_accounting {
         }
     }
 }
+
+/// Публичный воркфлоу Actions исполняет те же команды, что и одноимённые
+/// стадии `Jenkinsfile`, и ни одной датапейсной.
+///
+/// Два CI, гоняющие похожее, — это два вердикта об одном дереве, и «зелено»
+/// перестаёт что-либо значить в тот день, когда они расходятся. Расхождение
+/// при этом не выглядит как поломка: воркфлоу остаётся зелёным, просто мерит
+/// не то. Поэтому тела шагов сверяются побуквенно, а не «по духу», и сверка
+/// живёт здесь, а не в ревью.
+///
+/// Вторая половина — про то, чего в воркфлоу быть не должно. Раннер
+/// `ubuntu-latest` не даёт ни tracefs, ни `CAP_BPF`/`CAP_PERFMON`, ни писуемой
+/// cgroup2; шаг с именем `BPF attach`, зелёный на такой машине, — гейт,
+/// умеющий себя пропустить, и он опаснее отсутствующего, потому что читается
+/// как исполненный.
+///
+/// Чего гейт не делает: он не утверждает, что воркфлоу хоть раз исполнялся на
+/// GitHub. Как и `Jenkinsfile::<стадия>` в границе, он говорит только про
+/// содержимое поставляемого файла.
+mod actions_parity {
+    use std::path::{Path, PathBuf};
+
+    /// Стадии `Jenkinsfile`, которые обязаны быть в публичном воркфлоу с тем
+    /// же телом. Это ровно userspace: группа `Build` без `BPF ELF` и группа
+    /// `Checks` целиком.
+    const MIRRORED: [&str; 8] = [
+        "Format",
+        "Clippy",
+        "Test",
+        "Crate boundary",
+        "Validate policies",
+        "Security: policy invariants",
+        "Security: MVP acceptance",
+        "Security: supply chain",
+    ];
+
+    /// Стадии, которых в публичном воркфлоу быть не может: первым шести нужно
+    /// настоящее ядро, остальным — docker CLI ноды.
+    const NOT_MIRRORED: [&str; 10] = [
+        "BPF ELF",
+        "BPF attach",
+        "BPF join",
+        "BPF join mutations",
+        "Datapath tracefs",
+        "Datapath cgroup",
+        "Agent image",
+        "Admission image",
+        "Controller image",
+        "SAST (semgrep)",
+    ];
+
+    const WORKFLOW: &str = ".github/workflows/ci.yml";
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("workspace root")
+    }
+
+    fn read(rel: &str) -> String {
+        let path = repo_root().join(rel);
+        std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+    }
+
+    /// Тело шелл-блока стадии, значащими строками.
+    ///
+    /// Отступ не сравнивается ни здесь, ни в воркфлоу: в Groovy он один, в
+    /// блочном скаляре YAML другой, а шеллу он безразличен — heredoc в этих
+    /// телах нет. Комментарии остаются: они и есть половина того, что должно
+    /// доехать до второго CI.
+    fn jenkins_stage_body(jenkinsfile: &str, stage: &str) -> Vec<String> {
+        let head = format!("stage('{stage}')");
+        let at = jenkinsfile
+            .find(&head)
+            .unwrap_or_else(|| panic!("Jenkinsfile has no {head}: the stage was renamed"));
+        let rest = &jenkinsfile[at..];
+        let quote = "'''";
+        let opener = format!("sh {quote}");
+        let open = rest
+            .find(&opener)
+            .unwrap_or_else(|| panic!("{head} carries no shell body"))
+            + opener.len();
+        let close = rest[open..]
+            .find(quote)
+            .unwrap_or_else(|| panic!("{head}: unterminated shell body"));
+        significant(&rest[open..open + close])
+    }
+
+    fn significant(text: &str) -> Vec<String> {
+        text.lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// Тело шага воркфлоу с этим именем, значащими строками.
+    ///
+    /// Скрипт кончается там, где кончается блочный скаляр YAML, — на первой
+    /// значащей строке с отступом не больше, чем у `run:`. Не на следующем
+    /// `- name:`: последний шаг джобы кончается её концом, и по такому правилу
+    /// в него утекала бы вся следующая джоба.
+    ///
+    /// В результат попадает всё, что в скаляре есть. Именно всё: сравнение с
+    /// телом стадии — на равенство, поэтому лишняя команда, дописанная в шаг,
+    /// роняет гейт так же, как выпавшая.
+    fn workflow_step_body(workflow: &str, name: &str) -> Vec<String> {
+        let head = format!("- name: \"{name}\"");
+        let lines: Vec<&str> = workflow.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == head)
+            .unwrap_or_else(|| panic!("{WORKFLOW} has no step {head}"));
+        let run = lines.get(at + 1).copied().unwrap_or_default();
+        assert_eq!(
+            run.trim(),
+            "run: |",
+            "step {head}: the line after the name must be `run: |` — this gate reads the script \
+             that follows it and nothing else"
+        );
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let opened = indent(run);
+        let script: Vec<&str> = lines[at + 2..]
+            .iter()
+            .copied()
+            .take_while(|line| line.trim().is_empty() || indent(line) > opened)
+            .collect();
+        significant(&script.join("\n"))
+    }
+
+    #[test]
+    fn every_mirrored_stage_runs_the_same_script_here_and_in_jenkins() {
+        let jenkinsfile = read("Jenkinsfile");
+        let workflow = read(WORKFLOW);
+        for stage in MIRRORED {
+            let expected = jenkins_stage_body(&jenkinsfile, stage);
+            assert!(
+                expected.len() > 1,
+                "Jenkinsfile::{stage} has {} significant lines: this gate would compare almost \
+                 nothing",
+                expected.len()
+            );
+            let actual = workflow_step_body(&workflow, stage);
+            assert_eq!(
+                actual, expected,
+                "{WORKFLOW} step {stage:?} and Jenkinsfile::{stage} run different scripts. Two \
+                 CIs measuring different things return two verdicts about one tree, and the \
+                 weaker one is the one that gets read. Change both or neither."
+            );
+        }
+    }
+
+    /// Контроль на сравнение: команда, изменённая в одном из двух файлов,
+    /// обязана быть падением.
+    ///
+    /// Без него равенство выше проходило бы и на компараторе, который всегда
+    /// говорит «совпало» — например, если бы разбор тела возвращал пустой
+    /// список на любом входе.
+    #[test]
+    fn the_comparison_notices_a_script_that_drifted() {
+        let jenkinsfile = read("Jenkinsfile");
+        let workflow = read(WORKFLOW);
+        let intact = jenkins_stage_body(&jenkinsfile, "Format");
+        assert_eq!(intact, workflow_step_body(&workflow, "Format"));
+
+        let softened = jenkinsfile.replace(
+            "cargo fmt --all -- --check",
+            "cargo fmt --all -- --check ; true",
+        );
+        assert_ne!(
+            softened, jenkinsfile,
+            "the line this control mutates is gone from the Jenkinsfile, so the control mutates \
+             nothing"
+        );
+        assert_ne!(
+            jenkins_stage_body(&softened, "Format"),
+            intact,
+            "a softened command in Jenkinsfile::Format read as the same body: the comparison \
+             above cannot detect drift and proves nothing"
+        );
+
+        let dropped = jenkinsfile.replace("rustup component add rustfmt\n", "");
+        assert_ne!(dropped, jenkinsfile);
+        assert_ne!(
+            jenkins_stage_body(&dropped, "Format"),
+            intact,
+            "a deleted command read as the same body"
+        );
+    }
+
+    #[test]
+    fn the_public_workflow_claims_no_stage_it_cannot_execute() {
+        let jenkinsfile = read("Jenkinsfile");
+        let workflow = read(WORKFLOW);
+        for stage in NOT_MIRRORED {
+            assert!(
+                jenkinsfile.contains(&format!("stage('{stage}')")),
+                "Jenkinsfile has no stage('{stage}'), so this list names something that no \
+                 longer exists and the check below is about nothing"
+            );
+            assert!(
+                !workflow.contains(&format!("- name: \"{stage}\"")),
+                "{WORKFLOW} carries a step named {stage:?}. That stage needs a real kernel or \
+                 the node's docker CLI; a green step of that name on a hosted runner is a gate \
+                 that skipped itself and reads as one that ran."
+            );
+        }
+    }
+
+    #[test]
+    fn no_step_in_the_public_workflow_can_skip_itself() {
+        let workflow = read(WORKFLOW);
+        let softeners = ["continue-on-error", "if:"];
+        for (number, line) in workflow.lines().enumerate() {
+            let line = line.trim();
+            // Комментарии воркфлоу называют эти конструкции затем, чтобы
+            // сказать, что их здесь нет.
+            if line.starts_with('#') {
+                continue;
+            }
+            let number = number + 1;
+            for softener in softeners {
+                assert!(
+                    !line.starts_with(softener),
+                    "{WORKFLOW}:{number}: `{softener}` makes a red gate a green run — a step \
+                     that can skip itself reports success for having done nothing"
+                );
+            }
+            assert!(
+                !line.contains("|| true"),
+                "{WORKFLOW}:{number}: `|| true` swallows the exit code the whole stage is for"
+            );
+        }
+    }
+}
