@@ -49,8 +49,49 @@
 # datapath.
 set -eu
 
-root="$(git rev-parse --show-toplevel)"
-here="$root/crates/ferrum-agent/tests/mutations"
+# The root, from this script's own path rather than from `git rev-parse`, and
+# every git call below carrying `-c safe.directory=$root`.
+#
+# Both halves are about the same fact: everywhere this script is *meant* to
+# run, the process is root and the checkout is not its. The join needs CAP_BPF
+# and CAP_KILL, so the container runs `-u 0:0`, while the tree it mounts
+# belongs to whoever cloned it — and git refuses a repository owned by another
+# user with `dubious ownership`, before the first patch is applied. That is
+# what happened on the third stand (docs/MVP-1-BOUNDARY.md): the stage died on
+# `git rev-parse`, having measured nothing, and looked from the log exactly
+# like a broken build. It does not happen on the Jenkins node only because
+# there the workspace happens to belong to the same uid as the container, i.e.
+# by coincidence of that one setup.
+#
+# `-c` and not `git config --global`: the exemption is scoped to this one path
+# and to these invocations, and it does not edit the caller's ~/.gitconfig or
+# outlive the run. What it gives up is nothing this script had: the check
+# exists to stop git from reading another user's repository config and hooks,
+# and this script is a file *in* that repository, invoked deliberately, which
+# then builds and runs that repository's code. There is no trust here for the
+# check to protect — refusing to run is the only thing it can add.
+here="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+root="${here%/crates/ferrum-agent/tests/mutations}"
+if [ "$root" = "$here" ]; then
+    echo "run.sh must live in crates/ferrum-agent/tests/mutations of the tree it" >&2
+    echo "mutates: it derives the repository root from its own path, and from" >&2
+    echo "$here it cannot. Run the copy in the checkout, not a copy beside it." >&2
+    exit 1
+fi
+
+git_tree() {
+    git -c "safe.directory=$root" -C "$root" "$@"
+}
+
+# git's own answer, kept as a cross-check rather than as the source: a root
+# derived from a path and a root git disagrees with means this script is about
+# to patch a tree other than the one it was run from.
+toplevel="$(git_tree rev-parse --show-toplevel)"
+if [ "$toplevel" != "$root" ]; then
+    echo "this script sits in $root but git calls $toplevel the top level of that" >&2
+    echo "tree. Applying mutations here would patch one checkout and test another." >&2
+    exit 1
+fi
 : "${FERRUM_BPF_ELF:?set FERRUM_BPF_ELF to the compiled bpf ELF}"
 elf="$FERRUM_BPF_ELF"
 test -f "$elf"
@@ -71,7 +112,7 @@ applied=''
 restore() {
     code=$?
     if [ -n "$applied" ]; then
-        if git -C "$root" apply -R "$applied"; then
+        if git_tree apply -R "$applied"; then
             applied=''
         else
             echo "could not revert $(basename "$applied"): the working tree is still" >&2
@@ -100,7 +141,7 @@ build_elf() {
 # Revert the patch this iteration applied, and put the datapath object back
 # where the next iteration expects it.
 revert() {
-    git -C "$root" apply -R "$1"
+    git_tree apply -R "$1"
     applied=''
     if grep -q 'ferrum-ebpf-progs' "$1"; then
         build_elf
@@ -146,7 +187,7 @@ measured=0
 for patch in "$here"/*.patch; do
     name="$(basename "$patch")"
     echo "=== mutation: $name"
-    if ! git -C "$root" apply "$patch"; then
+    if ! git_tree apply "$patch"; then
         echo "    STALE: $name no longer applies to this tree." >&2
         echo "    That is a fact about the mutation harness, not about the build:" >&2
         echo "    the patch is anchored to code another slice has since edited." >&2
