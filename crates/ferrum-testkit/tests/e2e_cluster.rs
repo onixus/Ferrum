@@ -338,6 +338,15 @@ mod gate {
                 "deploy/admission/rbac.yaml",
                 "deploy/admission/service.yaml",
                 "deploy/admission/deployment.yaml",
+                // The budget, and it belongs to this list rather than to the
+                // one test that reads it. Without this line
+                // `the_second_eviction_of_the_webhook_pair_is_refused_by_the_disruption_budget`
+                // evicts both replicas of a Deployment no PodDisruptionBudget
+                // selects, and passes only on a cluster where something else —
+                // `install_gate.rs`, or an operator's `kubectl apply -k deploy`
+                // — had already created it. Measured on a cluster that had
+                // never seen the install root: both evictions returned 201.
+                "deploy/admission/pdb.yaml",
             ]);
             // A fresh CA every run, and the process pins the issuer it started
             // with: replacing the Secret under a running pod is refused by
