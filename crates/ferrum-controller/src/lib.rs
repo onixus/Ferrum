@@ -7,6 +7,7 @@ mod apply;
 mod bundle;
 mod health;
 mod key;
+mod metrics;
 #[cfg(test)]
 mod testapi;
 mod watch;
@@ -28,6 +29,10 @@ pub use health::{
 pub use key::{
     hex_decode, hex_encode, load_seed, load_seed_file, parse_public_key_hex, parse_seed_bytes,
     parse_seed_hex, SEED_ENV, SEED_FILE_ENV,
+};
+pub use metrics::{
+    bind_metrics_listener, exposition, metrics_text, spawn_metrics, ControllerMetrics,
+    DEFAULT_METRICS_PORT,
 };
 pub use watch::{
     cluster_security_policy_gvk, cluster_security_policy_resource, observe_exception,
@@ -238,6 +243,8 @@ pub struct WatchConfig {
     /// reader outside the process, which is the shipped default for anyone
     /// running this binary by hand; the manifest passes `--status-dir`.
     pub status_dir: Option<PathBuf>,
+    /// Port on which Prometheus `/metrics` is exposed. `None` means no metrics port is opened.
+    pub metrics_port: Option<u16>,
 }
 
 pub struct ReconcileInput<'a> {

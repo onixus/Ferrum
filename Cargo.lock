@@ -738,6 +738,7 @@ dependencies = [
  "ferrum-compiler",
  "ferrum-crypto",
  "ferrum-ids",
+ "ferrum-metrics",
  "ferrum-policy",
  "ferrum-testkit",
  "futures",

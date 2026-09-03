@@ -7,10 +7,11 @@ use crate::apply::{
     plan_apply_namespaced, secret_name, ApplyPlan,
 };
 use crate::health::{ControllerHealth, FailureClass, Requested};
+use crate::metrics::{bind_metrics_listener, spawn_metrics, ControllerMetrics};
 use crate::{
     compile_status_err, exception_status_patch, reconcile, reconcile_exception,
     reconcile_namespaced, NamespacedReconcileInput, ObservedException, ObservedNamespacedPolicy,
-    ObservedPolicy, ReconcileInput, WatchConfig,
+    ObservedPolicy, ReconcileInput, ReconcileOutcome, WatchConfig,
 };
 use ferrum_api::{
     ClusterSecurityPolicySpec, PolicyExceptionSpec, PolicyExceptionStatus, PolicyStatus,
@@ -236,13 +237,21 @@ pub async fn run_watch(cfg: WatchConfig) -> Result<()> {
         .map_err(|e| FerrumError::Degraded(format!("kube client: {e}")))?;
     let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
     let health = ControllerHealth::new();
+    let metrics = Arc::new(ControllerMetrics::new());
+
+    if let Some(port) = cfg.metrics_port {
+        let listener = bind_metrics_listener(port)
+            .map_err(|e| FerrumError::Degraded(format!("bind metrics port {port}: {e}")))?;
+        spawn_metrics(listener, Arc::clone(&metrics));
+    }
+
     // Published before the first event, so an operator who finds no file at
     // all knows the process never reached its watches rather than that it is
     // idle.
     health.publish(cfg.status_dir.as_deref());
     tokio::select! {
-        r = run_cluster_policy_watch(&client, &cfg, &exceptions, &health) => r,
-        r = run_namespaced_policy_watch(&client, &cfg, &exceptions, &health) => r,
+        r = run_cluster_policy_watch(&client, &cfg, &exceptions, &health, &metrics) => r,
+        r = run_namespaced_policy_watch(&client, &cfg, &exceptions, &health, &metrics) => r,
         r = run_exception_watch(&client, &cfg, &exceptions, &health) => r,
         r = publish_status(&cfg, &health) => r,
     }
@@ -262,6 +271,7 @@ async fn run_cluster_policy_watch(
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
     health: &ControllerHealth,
+    metrics: &ControllerMetrics,
 ) -> Result<()> {
     let api: Api<DynamicObject> =
         Api::all_with(client.clone(), &cluster_security_policy_resource());
@@ -273,8 +283,12 @@ async fn run_cluster_policy_watch(
                 // file made: the request is the watch itself, and an event
                 // delivered is its answer.
                 health.note_success(Requested::of(FailureClass::Watch));
-                if let Err(failure) = reconcile_object(client, cfg, exceptions, health, obj).await {
+                metrics.record_reconcile();
+                if let Err(failure) =
+                    reconcile_object(client, cfg, exceptions, health, metrics, obj).await
+                {
                     eprintln!("ferrum-controller: {}", failure.err);
+                    metrics.record_reconcile_error();
                     health.note_failure(failure.class, &failure.err)?;
                 }
             }
@@ -295,6 +309,7 @@ async fn run_namespaced_policy_watch(
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
     health: &ControllerHealth,
+    metrics: &ControllerMetrics,
 ) -> Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client.clone(), &security_policy_resource());
     let mut stream = std::pin::pin!(watcher(api, watcher::Config::default()).applied_objects());
@@ -302,10 +317,12 @@ async fn run_namespaced_policy_watch(
         match event {
             Ok(obj) => {
                 health.note_success(Requested::of(FailureClass::Watch));
+                metrics.record_reconcile();
                 if let Err(failure) =
-                    reconcile_namespaced_object(client, cfg, exceptions, health, obj).await
+                    reconcile_namespaced_object(client, cfg, exceptions, health, metrics, obj).await
                 {
                     eprintln!("ferrum-controller: {}", failure.err);
+                    metrics.record_reconcile_error();
                     health.note_failure(failure.class, &failure.err)?;
                 }
             }
@@ -541,6 +558,7 @@ async fn reconcile_object(
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
     health: &ControllerHealth,
+    metrics: &ControllerMetrics,
     obj: DynamicObject,
 ) -> Classed {
     let reconcile_class = as_class(FailureClass::Reconcile);
@@ -548,6 +566,9 @@ async fn reconcile_object(
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
+        if !digest.is_empty() {
+            metrics.set_bundle_digest(&digest);
+        }
         let loaded = load_bundle_secret(client, &cfg.namespace, &secret_name(&name))
             .await
             .map_err(&reconcile_class)?;
@@ -568,7 +589,7 @@ async fn reconcile_object(
             return Ok(());
         }
     }
-    let plan = match observe_policy(&obj) {
+    let (plan, compile_failed) = match observe_policy(&obj) {
         Ok(observed) => {
             let outcome = reconcile(ReconcileInput {
                 spec: &observed.spec,
@@ -577,16 +598,29 @@ async fn reconcile_object(
                 library: cfg.library.as_ref(),
                 clusters: &cfg.clusters,
             });
-            plan_apply(&observed.name, &cfg.namespace, &outcome, &cfg.trust_root)
+            let failed = matches!(outcome, ReconcileOutcome::Failed(_));
+            if let ReconcileOutcome::Applied(ref applied) = outcome {
+                metrics.set_bundle_digest(applied.bundle.digest.as_str());
+            }
+            (
+                plan_apply(&observed.name, &cfg.namespace, &outcome, &cfg.trust_root),
+                failed,
+            )
         }
-        Err(err) => plan_apply(
-            &name,
-            &cfg.namespace,
-            &failed_outcome(generation, &err),
-            &cfg.trust_root,
+        Err(err) => (
+            plan_apply(
+                &name,
+                &cfg.namespace,
+                &failed_outcome(generation, &err),
+                &cfg.trust_root,
+            ),
+            true,
         ),
     };
     if failed_status_already_recorded(&obj, generation, &plan) {
+        if compile_failed {
+            metrics.record_reconcile_error();
+        }
         return Ok(());
     }
     let persisted = persist(client, &name, &cfg.namespace, &plan)
@@ -599,6 +633,9 @@ async fn reconcile_object(
         .await
         .map_err(as_class(FailureClass::ExceptionPublish))?;
     health.note_success(attached);
+    if compile_failed {
+        metrics.record_reconcile_error();
+    }
     Ok(())
 }
 
@@ -607,6 +644,7 @@ async fn reconcile_namespaced_object(
     cfg: &WatchConfig,
     exceptions: &ExceptionSet,
     health: &ControllerHealth,
+    metrics: &ControllerMetrics,
     obj: DynamicObject,
 ) -> Classed {
     let reconcile_class = as_class(FailureClass::Reconcile);
@@ -615,6 +653,9 @@ async fn reconcile_namespaced_object(
     let generation = obj.metadata.generation.unwrap_or(0);
     let (og, ready, digest) = status_compile(&obj);
     if ready {
+        if !digest.is_empty() {
+            metrics.set_bundle_digest(&digest);
+        }
         let loaded = load_bundle_secret(
             client,
             &cfg.namespace,
@@ -634,7 +675,7 @@ async fn reconcile_namespaced_object(
             return Ok(());
         }
     }
-    let plan = match observe_namespaced_policy(&obj) {
+    let (plan, compile_failed) = match observe_namespaced_policy(&obj) {
         Ok(observed) => {
             let outcome = reconcile_namespaced(NamespacedReconcileInput {
                 spec: &observed.spec,
@@ -643,23 +684,36 @@ async fn reconcile_namespaced_object(
                 library: cfg.library.as_ref(),
                 clusters: &cfg.clusters,
             });
-            plan_apply_namespaced(
-                &observed.name,
-                &observed.namespace,
-                &cfg.namespace,
-                &outcome,
-                &cfg.trust_root,
+            let failed = matches!(outcome, ReconcileOutcome::Failed(_));
+            if let ReconcileOutcome::Applied(ref applied) = outcome {
+                metrics.set_bundle_digest(applied.bundle.digest.as_str());
+            }
+            (
+                plan_apply_namespaced(
+                    &observed.name,
+                    &observed.namespace,
+                    &cfg.namespace,
+                    &outcome,
+                    &cfg.trust_root,
+                ),
+                failed,
             )
         }
-        Err(err) => plan_apply_namespaced(
-            &name,
-            &policy_namespace,
-            &cfg.namespace,
-            &failed_outcome(generation, &err),
-            &cfg.trust_root,
+        Err(err) => (
+            plan_apply_namespaced(
+                &name,
+                &policy_namespace,
+                &cfg.namespace,
+                &failed_outcome(generation, &err),
+                &cfg.trust_root,
+            ),
+            true,
         ),
     };
     if failed_status_already_recorded(&obj, generation, &plan) {
+        if compile_failed {
+            metrics.record_reconcile_error();
+        }
         return Ok(());
     }
     let persisted = persist_dynamic(
@@ -677,6 +731,9 @@ async fn reconcile_namespaced_object(
         .await
         .map_err(as_class(FailureClass::ExceptionPublish))?;
     health.note_success(attached);
+    if compile_failed {
+        metrics.record_reconcile_error();
+    }
     Ok(())
 }
 
@@ -1395,6 +1452,7 @@ mod tests {
             library: None,
             clusters: Vec::new(),
             status_dir: None,
+            metrics_port: None,
         }
     }
 
@@ -1601,15 +1659,17 @@ mod tests {
         let client = stub.client();
         let cfg = stub_cfg();
         let health = ControllerHealth::new();
+        let metrics = ControllerMetrics::new();
         let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
 
         let obj = converged_object("prod-restricted", 3, &digest);
         assert!(
-            reconcile_object(&client, &cfg, &exceptions, &health, obj)
+            reconcile_object(&client, &cfg, &exceptions, &health, &metrics, obj)
                 .await
                 .is_ok(),
             "a converged object is not a failure"
         );
+        assert_eq!(metrics.bundle_digest().as_deref(), Some(digest.as_str()));
         assert_eq!(
             stub.seen_matching("GET", "secrets").len(),
             1,

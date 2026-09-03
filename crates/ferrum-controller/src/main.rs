@@ -77,6 +77,7 @@ struct RunOpts {
     min_agent_abi: u32,
     min_admission_abi: u32,
     trust_root: Option<String>,
+    metrics_port: Option<u16>,
 }
 
 fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> {
@@ -88,6 +89,7 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
         min_agent_abi: 0,
         min_admission_abi: 0,
         trust_root: None,
+        metrics_port: None,
     };
     let mut it = args;
     while let Some(arg) = it.next() {
@@ -101,6 +103,12 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
             }
             "--status-dir" => {
                 opts.status_dir = Some(PathBuf::from(require_val("--status-dir", it.next())?));
+            }
+            "--metrics-port" => {
+                opts.metrics_port = Some(parse_u16(
+                    "--metrics-port",
+                    &require_val("--metrics-port", it.next())?,
+                )?);
             }
             "--cluster" => {
                 opts.clusters
@@ -149,6 +157,7 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
         library,
         clusters: opts.clusters,
         status_dir: opts.status_dir,
+        metrics_port: opts.metrics_port,
     })
 }
 
@@ -180,6 +189,11 @@ fn parse_cluster(spec: &str) -> Result<ClusterAbi, String> {
 fn parse_u32(flag: &str, raw: &str) -> Result<u32, String> {
     raw.parse::<u32>()
         .map_err(|_| format!("{flag}: expected u32, got {raw}"))
+}
+
+fn parse_u16(flag: &str, raw: &str) -> Result<u16, String> {
+    raw.parse::<u16>()
+        .map_err(|_| format!("{flag}: expected u16, got {raw}"))
 }
 
 /// The next token, once it has been shown not to be a flag.
@@ -233,7 +247,7 @@ fn yaml_kind(raw: &str) -> Result<String, String> {
 }
 
 fn usage() -> String {
-    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--status-dir /run/ferrum] [--cluster name:agentAbi:admissionAbi]...".into()
+    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--status-dir /run/ferrum] [--metrics-port 9104] [--cluster name:agentAbi:admissionAbi]...".into()
 }
 
 #[cfg(test)]
@@ -288,6 +302,7 @@ mod tests {
             "--min-agent-abi",
             "--min-admission-abi",
             "--trust-root",
+            "--metrics-port",
         ] {
             let err = parse_run(argv(&[flag, "--trust-root"]).into_iter())
                 .err()
@@ -378,6 +393,47 @@ mod tests {
              nowhere, and a pod with no status file is indistinguishable from one that was \
              never asked for one"
         );
+        let _ = fs::remove_file(&seed);
+    }
+
+    #[test]
+    fn parse_run_metrics_port_flag() {
+        let seed = seed_file();
+        let seed_str = seed.to_string_lossy().into_owned();
+
+        // Default without --metrics-port is None
+        let cfg = parse_run(argv(&["--seed-file", &seed_str]).into_iter())
+            .expect("parse without metrics-port");
+        assert_eq!(cfg.metrics_port, None);
+
+        // Valid port 9104
+        let cfg =
+            parse_run(argv(&["--seed-file", &seed_str, "--metrics-port", "9104"]).into_iter())
+                .expect("parse with metrics-port 9104");
+        assert_eq!(cfg.metrics_port, Some(9104));
+
+        // Valid custom port
+        let cfg =
+            parse_run(argv(&["--seed-file", &seed_str, "--metrics-port", "8080"]).into_iter())
+                .expect("parse with metrics-port 8080");
+        assert_eq!(cfg.metrics_port, Some(8080));
+
+        // Non-numeric port returns error
+        let err = parse_run(argv(&["--seed-file", &seed_str, "--metrics-port", "abc"]).into_iter())
+            .expect_err("non-numeric port");
+        assert!(err.contains("--metrics-port: expected u16"), "{err}");
+
+        // Overflow port returns error
+        let err =
+            parse_run(argv(&["--seed-file", &seed_str, "--metrics-port", "70000"]).into_iter())
+                .expect_err("overflow port");
+        assert!(err.contains("--metrics-port: expected u16"), "{err}");
+
+        // Missing value returns error
+        let err = parse_run(argv(&["--seed-file", &seed_str, "--metrics-port"]).into_iter())
+            .expect_err("missing port value");
+        assert!(err.contains("--metrics-port requires a value"), "{err}");
+
         let _ = fs::remove_file(&seed);
     }
 }
