@@ -74,6 +74,188 @@ pub const EVENT_FLAG_PATH_TRUNCATED: u8 = 1 << 2;
 /// a flags byte (a shifted or zeroed record) can never read as valid.
 pub const DATAPATH_ABI: u16 = 0xFE10;
 
+/// Slots in `ferrum_rules`.
+///
+/// A fixed array and not a growing map: the in-kernel matcher walks every slot
+/// on every exec, so the bound is what keeps that walk inside the verifier's
+/// instruction budget. Userspace refuses a whole rule set that does not fit
+/// rather than writing the head of one — see `compile_kernel_rules`.
+pub const MAX_KERNEL_RULES: u32 = 64;
+
+/// The slot holds a rule. Needed because `ACTION_ALLOW` is 0, so a zeroed slot
+/// is indistinguishable from a real "allow" rule by its action alone, and an
+/// array map starts out zeroed.
+pub const KRULE_FLAG_USED: u8 = 1 << 0;
+/// Matches only inside a pod container, by presence in `ferrum_cgroups`.
+pub const KRULE_FLAG_CONTAINER_ONLY: u8 = 1 << 1;
+/// Never matches the agent's own thread group, by `ferrum_self`.
+pub const KRULE_FLAG_NOT_AGENT_SELF: u8 = 1 << 2;
+
+/// The `-EPERM` an LSM hook returns to refuse. Named, because `-1` at a return
+/// site is a number and this is a decision.
+pub const EPERM: i32 = 1;
+
+/// One rule as the kernel can decide it, with no userspace round trip.
+///
+/// This is deliberately **not** the whole of [`Rule`](../ferrum_ebpf/spec) —
+/// it is the part that needs nothing the hook cannot see. What is absent and
+/// why:
+///
+/// * **No path predicate.** Reading the executable's path inside
+///   `bprm_check_security` means reading a field of `linux_binprm`, and the
+///   toolchain this tree pins has no CO-RE: `aya-ebpf` carries no field
+///   relocation in any published version, and `aya-ebpf-bindings` declares
+///   `linux_binprm` opaque on purpose. A hand-written offset would either
+///   refuse to load on a kernel whose layout differs or — worse, when the
+///   offset happens to land on another field of the same width — match on
+///   garbage. So rules naming a path are not represented here at all, are
+///   named as such by `compile_kernel_rules`, and stay on the tracepoint path.
+/// * **No selector.** Label selectors are resolved against a pod identity the
+///   kernel does not have. A policy carrying one is refused wholesale rather
+///   than enforced against every container, which is over-enforcement and
+///   breaks workloads the policy never selected.
+///
+/// `comm` is one value, not a list: a rule naming three `comm`s becomes three
+/// slots. It keeps this struct flat and the walk branch-free, and the cost is
+/// slots, which are counted and bounded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct KernelRule {
+    /// `ACTION_DENY` or `ACTION_KILL`; nothing else is written here, because
+    /// nothing else refuses an exec.
+    pub action: u8,
+    pub flags: u8,
+    /// Bytes of `comm` that are the predicate. 0 means "any `comm`".
+    pub comm_len: u8,
+    pub _pad: u8,
+    pub comm: [u8; COMM_LEN],
+}
+
+impl KernelRule {
+    pub const fn empty() -> Self {
+        Self {
+            action: ACTION_ALLOW,
+            flags: 0,
+            comm_len: 0,
+            _pad: 0,
+            comm: [0; COMM_LEN],
+        }
+    }
+
+    pub const fn is_used(self) -> bool {
+        self.flags & KRULE_FLAG_USED != 0
+    }
+
+    pub const fn container_only(self) -> bool {
+        self.flags & KRULE_FLAG_CONTAINER_ONLY != 0
+    }
+
+    pub const fn not_agent_self(self) -> bool {
+        self.flags & KRULE_FLAG_NOT_AGENT_SELF != 0
+    }
+}
+
+impl Default for KernelRule {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// Does this slot apply to an exec by `comm` in this context?
+///
+/// The predicate order is the one `ferrum_ebpf::eval::rule_matches` uses for
+/// the same fields, and `krules.rs` has a test that walks both over the same
+/// inputs. Two matchers that drift are two policies.
+///
+/// `comm` is the caller's, which is what `comm_in` has always meant: at
+/// `sys_enter_execve` and at `bprm_check_security` alike the new program has
+/// not taken over the name yet.
+pub fn kernel_rule_matches(
+    rule: &KernelRule,
+    comm: &[u8; COMM_LEN],
+    in_container: bool,
+    agent_self: bool,
+) -> bool {
+    if !rule.is_used() {
+        return false;
+    }
+    if rule.comm_len != 0 {
+        let len = rule.comm_len as usize;
+        if len > COMM_LEN {
+            return false;
+        }
+        let mut i = 0;
+        while i < COMM_LEN {
+            if i < len && rule.comm[i] != comm[i] {
+                return false;
+            }
+            // The predicate is the whole name: a rule for `sh` must not match
+            // `shred`, so the byte after the last one has to be the
+            // terminator rather than anything at all.
+            if i == len && comm[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    if rule.not_agent_self() && agent_self {
+        return false;
+    }
+    if rule.container_only() && !in_container {
+        return false;
+    }
+    true
+}
+
+/// The action of the strongest slot that applies, or `ACTION_ALLOW` when none
+/// does.
+///
+/// Strongest by [`action_rank`], the same order userspace ranks by. The walk
+/// is over every slot and never breaks early: a fixed trip count is what makes
+/// this shape acceptable to the verifier, and the cost of the branch that
+/// would leave early is larger than the loop it saves.
+pub fn kernel_verdict(
+    rules: &[KernelRule],
+    comm: &[u8; COMM_LEN],
+    in_container: bool,
+    agent_self: bool,
+) -> u8 {
+    let mut best = ACTION_ALLOW;
+    let mut i = 0;
+    while i < rules.len() {
+        let rule = rules[i];
+        if kernel_rule_matches(&rule, comm, in_container, agent_self)
+            && action_rank(rule.action) > action_rank(best)
+        {
+            best = rule.action;
+        }
+        i += 1;
+    }
+    best
+}
+
+/// Whether this action refuses the exec.
+pub const fn action_refuses(action: u8) -> bool {
+    action == ACTION_DENY || action == ACTION_KILL
+}
+
+/// Severity order of the runtime actions.
+///
+/// Duplicated from `ferrum_ebpf::spec::Action::rank` because that enum needs
+/// `std` and this crate is `no_std` on the bpf target;
+/// `krules.rs::the_two_action_ranks_are_one_order` fails the build if the two
+/// ever disagree, which is the only thing that makes a duplicate acceptable.
+pub const fn action_rank(action: u8) -> u8 {
+    match action {
+        ACTION_ALLOW => 0,
+        ACTION_AUDIT => 1,
+        ACTION_DENY => 2,
+        ACTION_ISOLATE => 3,
+        ACTION_KILL => 4,
+        _ => 0,
+    }
+}
+
 /// Ring-buffer record. No `String`; fixed buffers only.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -128,6 +310,95 @@ impl Default for Event {
 mod tests {
     use super::*;
     use core::mem::size_of;
+
+    /// The value size the map ABI check in `kernel.rs` states, and the reason
+    /// it may not drift by accident: a slot that grew is a map the shipped ELF
+    /// and this userspace disagree about, and both write into it.
+    #[test]
+    fn a_kernel_rule_is_the_size_the_map_abi_declares() {
+        assert_eq!(size_of::<KernelRule>(), 20);
+        assert_eq!(core::mem::align_of::<KernelRule>(), 1);
+        // A zeroed slot — what an array map starts as — is not a rule.
+        assert!(!KernelRule::empty().is_used());
+        assert!(!kernel_rule_matches(
+            &KernelRule::empty(),
+            &[0; COMM_LEN],
+            true,
+            false
+        ));
+    }
+
+    /// The whole name, not a prefix of it: the byte after the predicate has to
+    /// be the terminator. Without this a rule for `sh` refuses `shred`, which
+    /// is a refusal the policy never asked for.
+    #[test]
+    fn a_comm_predicate_is_the_whole_name() {
+        let mut rule = KernelRule::empty();
+        rule.flags = KRULE_FLAG_USED;
+        rule.action = ACTION_DENY;
+        rule.comm[..2].copy_from_slice(b"sh");
+        rule.comm_len = 2;
+
+        let mut sh = [0u8; COMM_LEN];
+        sh[..2].copy_from_slice(b"sh");
+        let mut shred = [0u8; COMM_LEN];
+        shred[..5].copy_from_slice(b"shred");
+
+        assert!(kernel_rule_matches(&rule, &sh, false, false));
+        assert!(!kernel_rule_matches(&rule, &shred, false, false));
+    }
+
+    /// The two gates the kernel *can* answer, each on its own.
+    #[test]
+    fn container_only_and_not_agent_self_are_each_decidable() {
+        let mut rule = KernelRule::empty();
+        rule.flags = KRULE_FLAG_USED | KRULE_FLAG_CONTAINER_ONLY | KRULE_FLAG_NOT_AGENT_SELF;
+        rule.action = ACTION_KILL;
+        let comm = [0u8; COMM_LEN];
+
+        assert!(kernel_rule_matches(&rule, &comm, true, false));
+        assert!(
+            !kernel_rule_matches(&rule, &comm, false, false),
+            "container_only matched outside a container"
+        );
+        assert!(
+            !kernel_rule_matches(&rule, &comm, true, true),
+            "not_agent_self matched the agent itself"
+        );
+    }
+
+    /// The strongest applying slot wins, and a set with nothing applying is
+    /// allow — never the zero value of some other field.
+    #[test]
+    fn the_verdict_is_the_strongest_slot_that_applies() {
+        let used = |action: u8| {
+            let mut r = KernelRule::empty();
+            r.flags = KRULE_FLAG_USED;
+            r.action = action;
+            r
+        };
+        let comm = [0u8; COMM_LEN];
+
+        assert_eq!(kernel_verdict(&[], &comm, true, false), ACTION_ALLOW);
+        assert_eq!(
+            kernel_verdict(&[KernelRule::empty(); 4], &comm, true, false),
+            ACTION_ALLOW,
+            "an untouched array must not decide anything"
+        );
+        assert_eq!(
+            kernel_verdict(&[used(ACTION_DENY), used(ACTION_KILL)], &comm, true, false),
+            ACTION_KILL
+        );
+        assert_eq!(
+            kernel_verdict(&[used(ACTION_KILL), used(ACTION_DENY)], &comm, true, false),
+            ACTION_KILL,
+            "the order of the slots decided the verdict"
+        );
+        assert!(action_refuses(ACTION_DENY) && action_refuses(ACTION_KILL));
+        assert!(!action_refuses(ACTION_ALLOW) && !action_refuses(ACTION_AUDIT));
+        // Isolate is not an exec refusal, and is never written into a slot.
+        assert!(!action_refuses(ACTION_ISOLATE));
+    }
 
     #[test]
     fn map_names() {

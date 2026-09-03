@@ -6,6 +6,7 @@ mod envelope;
 mod eval;
 mod event;
 mod kernel;
+mod krules;
 mod loader;
 mod prefilter;
 mod spec;
@@ -20,17 +21,20 @@ pub use event::{
     syscall_name, SyscallArch, EVENT_FLAGS_OFFSET, EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
 };
 pub use ferrum_ebpf_progs::{
-    Event, CGROUPS_MAX_ENTRIES, COMM_LEN, DATAPATH_ABI, EVENTS_DROPPED_TOTAL, EVENTS_RING_BYTES,
-    EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, MAP_CGROUPS,
-    MAP_EVENTS, MAP_RULES, MAP_SELF, PATH_LEN,
+    action_rank, action_refuses, kernel_rule_matches, kernel_verdict, Event, KernelRule,
+    CGROUPS_MAX_ENTRIES, COMM_LEN, DATAPATH_ABI, EVENTS_DROPPED_TOTAL, EVENTS_RING_BYTES,
+    EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED,
+    KRULE_FLAG_CONTAINER_ONLY, KRULE_FLAG_NOT_AGENT_SELF, KRULE_FLAG_USED, MAP_CGROUPS, MAP_EVENTS,
+    MAP_RULES, MAP_SELF, MAX_KERNEL_RULES, PATH_LEN,
 };
 pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
 pub use kernel::{
     elf_map_def, lsm_available, plan_cgroup_sync, verify_map_defs, CgroupSyncPlan, MapDef, Memlock,
-    SyncStats, MAP_DEF_LEN, REQUIRED_MAPS,
+    SyncStats, KERNEL_RULE_SIZE, MAP_DEF_LEN, REQUIRED_MAPS,
 };
 #[cfg(feature = "attach")]
 pub use kernel::{raise_memlock, KernelHandle, RingReader};
+pub use krules::{compile_kernel_rules, Excluded, KernelRuleSet, EXEC_SYSCALLS};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
 pub use prefilter::{prefilter_image, PrefilterImage, PATH_BEARING_SYSCALLS};
 pub use spec::{

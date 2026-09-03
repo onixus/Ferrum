@@ -31,7 +31,8 @@ use ferrum_common::{FerrumError, Result};
 #[cfg(feature = "attach")]
 use ferrum_ebpf_progs::EVENTS_DROPPED_TOTAL;
 use ferrum_ebpf_progs::{
-    CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_EVENTS, MAP_SELF,
+    KernelRule, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_EVENTS, MAP_RULES,
+    MAP_SELF, MAX_KERNEL_RULES,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -141,7 +142,27 @@ pub const REQUIRED_MAPS: &[MapDef] = &[
         value_size: 1,
         max_entries: CGROUPS_MAX_ENTRIES,
     },
+    MapDef {
+        // The rules the kernel decides on its own, one `KernelRule` per slot.
+        // An array and not a hash: the in-kernel walk visits every slot on
+        // every exec, and a fixed trip count is what keeps it inside the
+        // verifier's budget. `value_size` is the struct's size, so a field
+        // added to `KernelRule` without a matching ELF is a refused load
+        // rather than two sides writing past each other.
+        name: MAP_RULES,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        key_size: 4,
+        value_size: KERNEL_RULE_SIZE,
+        max_entries: MAX_KERNEL_RULES,
+    },
 ];
+
+/// Bytes of one `KernelRule`, as `REQUIRED_MAPS` declares it.
+///
+/// `size_of` and not a literal: the declaration and the struct cannot drift,
+/// and `ferrum-ebpf-progs` pins the number itself so a field added there is a
+/// failure in two places rather than a silent widening in one.
+pub const KERNEL_RULE_SIZE: u32 = core::mem::size_of::<KernelRule>() as u32;
 
 /// Read one map definition out of a compiled bpf ELF's `maps` section.
 ///
@@ -914,6 +935,74 @@ impl KernelHandle {
             .map_err(|err| degraded(MAP_CGROUPS, err))
     }
 
+    /// Publish the kernel-decidable part of a policy into `ferrum_rules`.
+    ///
+    /// **Every slot is written, always.** The slots the set does not fill are
+    /// written back as empty, which is what retires the previous policy: an
+    /// array map keeps what was put in it, so writing only the new rules would
+    /// leave the tail of a longer predecessor enforcing after the policy that
+    /// asked for it was replaced. That includes a refused set — a policy the
+    /// kernel may not enforce at all clears the map rather than leaving the
+    /// last one it could enforce in place.
+    ///
+    /// A failure part-way through leaves a mix of two policies in the map, so
+    /// it is not left there: the map is cleared and the error says whether
+    /// clearing worked. Clearing is the safe direction — the tracepoint path
+    /// still matches every rule and still reports, so what is lost is
+    /// prevention, not detection.
+    ///
+    /// Returns the number of occupied slots.
+    pub fn sync_kernel_rules(&mut self, set: &crate::KernelRuleSet) -> Result<usize> {
+        let filled = set.rules.len();
+        if filled > MAX_KERNEL_RULES as usize {
+            return Err(FerrumError::Degraded(format!(
+                "{filled} kernel rules for {MAX_KERNEL_RULES} slots in {MAP_RULES}; \
+                 compile_kernel_rules refuses this set and this handle will not truncate it"
+            )));
+        }
+        for index in 0..MAX_KERNEL_RULES {
+            let slot = set
+                .rules
+                .get(index as usize)
+                .copied()
+                .unwrap_or_else(KernelRule::empty);
+            if let Err(err) = self.write_rule_slot(index, slot) {
+                let cleared = self.clear_kernel_rules();
+                return Err(FerrumError::Degraded(match cleared {
+                    Ok(()) => format!(
+                        "{err}; slots up to {index} held a mix of two policies and the map was \
+                         cleared, so this node prevents nothing in kernel and keeps detecting"
+                    ),
+                    Err(second) => format!(
+                        "{err}; and clearing {MAP_RULES} failed too ({second}), so the map holds \
+                         a mix of two policies"
+                    ),
+                }));
+            }
+        }
+        Ok(filled)
+    }
+
+    /// Empty every slot. Used on its own when enforcement is withdrawn.
+    pub fn clear_kernel_rules(&mut self) -> Result<()> {
+        for index in 0..MAX_KERNEL_RULES {
+            self.write_rule_slot(index, KernelRule::empty())?;
+        }
+        Ok(())
+    }
+
+    fn write_rule_slot(&mut self, index: u32, rule: KernelRule) -> Result<()> {
+        let map = self
+            .bpf
+            .map_mut(MAP_RULES)
+            .ok_or_else(|| missing(MAP_RULES))?;
+        let mut rules: Array<_, RuleSlot> =
+            Array::try_from(map).map_err(|err| degraded(MAP_RULES, err))?;
+        rules
+            .set(index, RuleSlot(rule), 0)
+            .map_err(|err| degraded(MAP_RULES, err))
+    }
+
     /// Take ownership of the event ring wrapped in a [`RingReader`].
     pub fn take_ring_reader(&mut self) -> Result<RingReader> {
         self.take_ring().map(RingReader::new)
@@ -929,6 +1018,21 @@ impl KernelHandle {
         RingBuf::try_from(map).map_err(|err| degraded(MAP_EVENTS, err))
     }
 }
+
+/// `KernelRule` as an aya map value.
+///
+/// A newtype and not `unsafe impl aya::Pod for KernelRule`: both the struct
+/// and the trait are foreign to this crate, so the orphan rule refuses that
+/// impl. `repr(transparent)` keeps the bytes the map sees identical to the
+/// ones `REQUIRED_MAPS` declares, and the struct has no padding — four `u8`s
+/// then `[u8; 16]`, align 1 — which is what makes the `Pod` promise true.
+#[cfg(feature = "attach")]
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct RuleSlot(KernelRule);
+
+#[cfg(feature = "attach")]
+unsafe impl aya::Pod for RuleSlot {}
 
 /// Consumer side of `ferrum_events`.
 ///

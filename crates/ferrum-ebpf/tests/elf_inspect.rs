@@ -8,8 +8,9 @@
 //! free of ELF crates.
 
 use ferrum_ebpf::{
-    elf_map_def, verify_map_defs, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, LSM_PROGRAMS,
-    MAP_CGROUPS, MAP_DEF_LEN, MAP_EVENTS, MAP_SELF, REQUIRED_MAPS, TRACEPOINTS,
+    elf_map_def, verify_map_defs, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, KERNEL_RULE_SIZE,
+    LSM_PROGRAMS, MAP_CGROUPS, MAP_DEF_LEN, MAP_EVENTS, MAP_RULES, MAP_SELF, MAX_KERNEL_RULES,
+    REQUIRED_MAPS, TRACEPOINTS,
 };
 
 const SHT_SYMTAB: u32 = 2;
@@ -172,7 +173,11 @@ fn elf_contains_all_tracepoints() {
         assert_eq!(sym.section, section, "{prog} is in the wrong section");
     }
 
-    for map in [MAP_EVENTS, MAP_CGROUPS, MAP_SELF] {
+    // Over REQUIRED_MAPS and not a list written here: a map added to the
+    // userspace ABI and dropped by the bpf linker for want of a reader is
+    // exactly the failure this test exists for, and a hand-kept list would
+    // have to be remembered at the same moment it is needed.
+    for map in REQUIRED_MAPS.iter().map(|def| def.name) {
         let sym = syms
             .iter()
             .find(|s| s.name == map)
@@ -224,6 +229,33 @@ fn cgroups_map_definition_matches_the_userspace_abi() {
         def[3], CGROUPS_MAX_ENTRIES,
         "{MAP_CGROUPS} max_entries disagrees with CGROUPS_MAX_ENTRIES, which is what \
          plan_cgroup_sync refuses to overflow"
+    );
+}
+
+/// Static ABI check of `ferrum_rules`. The two sides both write and read
+/// `KernelRule` by its byte layout, so a slot that grew on one side and not
+/// the other has the kernel matching on fields that are not there. An array
+/// and not a hash on purpose: the in-kernel walk has a fixed trip count.
+#[test]
+fn rules_map_definition_matches_the_userspace_abi() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
+    let def = map_def_here(&elf, &path, MAP_RULES);
+    assert_eq!(
+        def[0], BPF_MAP_TYPE_ARRAY,
+        "{MAP_RULES} is not an array map"
+    );
+    assert_eq!(def[1], 4, "{MAP_RULES} key is not a u32 slot index");
+    assert_eq!(
+        def[2], KERNEL_RULE_SIZE,
+        "{MAP_RULES} value is not a KernelRule; the shipped object and this build disagree \
+         about the layout both of them write"
+    );
+    assert_eq!(
+        def[3], MAX_KERNEL_RULES,
+        "{MAP_RULES} max_entries disagrees with MAX_KERNEL_RULES, which is the bound \
+         compile_kernel_rules refuses to exceed and the trip count the hook walks"
     );
 }
 
