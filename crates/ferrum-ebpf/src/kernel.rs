@@ -20,9 +20,11 @@ use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 #[cfg(feature = "attach")]
 use aya::programs::links::FdLink;
 #[cfg(feature = "attach")]
+use aya::programs::lsm::LsmLinkId;
+#[cfg(feature = "attach")]
 use aya::programs::trace_point::TracePointLinkId;
 #[cfg(feature = "attach")]
-use aya::programs::TracePoint;
+use aya::programs::{Lsm, TracePoint};
 #[cfg(feature = "attach")]
 use aya::Bpf;
 use ferrum_common::{FerrumError, Result};
@@ -32,8 +34,9 @@ use ferrum_ebpf_progs::{
     CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_EVENTS, MAP_SELF,
 };
 use std::collections::BTreeSet;
+use std::path::Path;
 #[cfg(feature = "attach")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// One diff to apply to `ferrum_cgroups`: which cgroup ids gain the container
 /// flag and which lose it.
@@ -172,6 +175,23 @@ pub fn verify_map_defs(elf: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Where the kernel exposes its active Linux Security Modules list.
+const LSM_PATH: &str = "/sys/kernel/security/lsm";
+/// Kernel BTF path, required for BPF LSM programs.
+const BTF_VMLINUX_PATH: &str = "/sys/kernel/btf/vmlinux";
+
+/// Check whether BPF LSM is active/available in this kernel.
+///
+/// Checks `/sys/kernel/security/lsm` to verify `bpf` is in the active LSM list,
+/// or falls back to checking whether BTF (`/sys/kernel/btf/vmlinux`) exists if
+/// securityfs is not mounted.
+pub fn lsm_available() -> bool {
+    if let Ok(content) = std::fs::read_to_string(LSM_PATH) {
+        return content.split(',').any(|s| s.trim() == "bpf");
+    }
+    Path::new(BTF_VMLINUX_PATH).exists()
 }
 
 /// The seven u32s of `name`'s `bpf_map_def`.
@@ -455,6 +475,10 @@ pub struct KernelHandle {
     /// the hook back — see [`Self::pin_at`].
     #[cfg(feature = "attach")]
     links: Vec<(&'static str, &'static str, &'static str, TracePointLinkId)>,
+    /// Whether BPF LSM programs are active and attached.
+    lsm_attached: bool,
+    /// LSM program attachments owned by this handle: (prog symbol, hook name, link id).
+    lsm_links: Vec<(&'static str, &'static str, LsmLinkId)>,
 }
 
 #[cfg(feature = "attach")]
@@ -535,11 +559,45 @@ impl KernelHandle {
                 .map_err(|err| degraded(prog, err))?;
             links.push((*prog, *category, *name, id));
         }
+        let mut lsm_attached = false;
+        let mut lsm_links = Vec::new();
+        if lsm_available() {
+            let mut all_ok = true;
+            for (prog, hook) in crate::LSM_PROGRAMS {
+                let Some(program) = bpf.program_mut(prog) else {
+                    all_ok = false;
+                    break;
+                };
+                let lsm: Result<&mut Lsm, _> = program.try_into();
+                let Ok(lsm) = lsm else {
+                    all_ok = false;
+                    break;
+                };
+                if lsm.load().is_err() {
+                    all_ok = false;
+                    break;
+                }
+                match lsm.attach() {
+                    Ok(id) => lsm_links.push((*prog, *hook, id)),
+                    Err(_) => {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if all_ok && !lsm_links.is_empty() {
+                lsm_attached = true;
+            } else {
+                lsm_links.clear();
+            }
+        }
         Ok(Self {
             bpf,
             container_cgroups: BTreeSet::new(),
             unhooked_syscalls: unhooked,
             links,
+            lsm_attached,
+            lsm_links,
         })
     }
 
@@ -651,6 +709,36 @@ impl KernelHandle {
                 }
             }
         }
+
+        for (prog, hook, id) in std::mem::take(&mut self.lsm_links) {
+            let path = links_dir.join(prog);
+            if let Err(err) = refuse_if_occupied(&path) {
+                self.lsm_links.push((prog, hook, id));
+                return Err(err);
+            }
+            let program = self.bpf.program_mut(prog).ok_or_else(|| {
+                FerrumError::Degraded(format!("program {prog} missing from this handle"))
+            })?;
+            let lsm: &mut Lsm = program.try_into().map_err(|err| degraded(prog, err))?;
+            let link = lsm.take_link(id).map_err(|err| degraded(prog, err))?;
+            let fd_link = match FdLink::try_from(link) {
+                Ok(fd_link) => fd_link,
+                Err(err) => {
+                    let reason = format!(
+                        "this kernel gives no bpf_link for LSM {hook}, so \
+                         {prog} cannot be pinned: {err}"
+                    );
+                    return Err(self.reattach_lsm(prog, hook, reason));
+                }
+            };
+            match fd_link.pin(&path) {
+                Ok(_pinned) => pinned.push(path),
+                Err(err) => {
+                    let reason = format!("pin {prog} at {}: {err}", path.display());
+                    return Err(self.reattach_lsm(prog, hook, reason));
+                }
+            }
+        }
         Ok(pinned)
     }
 
@@ -690,6 +778,47 @@ impl KernelHandle {
                  on this node: {err}"
             )),
         }
+    }
+
+    /// Put an LSM hook back after a failed pin, and say so in the error.
+    fn reattach_lsm(
+        &mut self,
+        prog: &'static str,
+        hook: &'static str,
+        reason: String,
+    ) -> FerrumError {
+        let program = match self.bpf.program_mut(prog) {
+            Some(program) => program,
+            None => {
+                return FerrumError::Degraded(format!("{reason}; {prog} is gone from the handle"))
+            }
+        };
+        let lsm: &mut Lsm = match program.try_into() {
+            Ok(lsm) => lsm,
+            Err(err) => {
+                return FerrumError::Degraded(format!(
+                    "{reason}; and {prog} could not be re-attached: {err}"
+                ))
+            }
+        };
+        match lsm.attach() {
+            Ok(id) => {
+                self.lsm_links.push((prog, hook, id));
+                FerrumError::Degraded(format!("{reason}; {prog} stays attached, unpinned"))
+            }
+            Err(err) => {
+                self.lsm_attached = false;
+                FerrumError::Degraded(format!(
+                    "{reason}; and re-attaching {prog} failed, so LSM {hook} is now unhooked \
+                     on this node: {err}"
+                ))
+            }
+        }
+    }
+
+    /// Whether BPF LSM programs are active and attached in this handle.
+    pub fn is_lsm_attached(&self) -> bool {
+        self.lsm_attached
     }
 
     /// Datapath syscalls with no hook on this node — absent from the arch, or

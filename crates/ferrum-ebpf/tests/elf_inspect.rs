@@ -8,8 +8,8 @@
 //! free of ELF crates.
 
 use ferrum_ebpf::{
-    elf_map_def, verify_map_defs, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_DEF_LEN,
-    MAP_EVENTS, MAP_SELF, REQUIRED_MAPS, TRACEPOINTS,
+    elf_map_def, verify_map_defs, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, LSM_PROGRAMS,
+    MAP_CGROUPS, MAP_DEF_LEN, MAP_EVENTS, MAP_SELF, REQUIRED_MAPS, TRACEPOINTS,
 };
 
 const SHT_SYMTAB: u32 = 2;
@@ -158,6 +158,16 @@ fn elf_contains_all_tracepoints() {
             .iter()
             .find(|s| s.name == *prog)
             .unwrap_or_else(|| panic!("program symbol {prog} missing from {path}"));
+        assert_eq!(sym.kind, STT_FUNC, "{prog} is not a function");
+        assert_eq!(sym.section, section, "{prog} is in the wrong section");
+    }
+
+    for (prog, hook) in LSM_PROGRAMS {
+        let section = format!("lsm/{hook}");
+        let sym = syms
+            .iter()
+            .find(|s| s.name == *prog)
+            .unwrap_or_else(|| panic!("LSM program symbol {prog} missing from {path}"));
         assert_eq!(sym.kind, STT_FUNC, "{prog} is not a function");
         assert_eq!(sym.section, section, "{prog} is in the wrong section");
     }

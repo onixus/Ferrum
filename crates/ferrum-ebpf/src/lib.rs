@@ -26,8 +26,8 @@ pub use ferrum_ebpf_progs::{
 };
 pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
 pub use kernel::{
-    elf_map_def, plan_cgroup_sync, verify_map_defs, CgroupSyncPlan, MapDef, Memlock, SyncStats,
-    MAP_DEF_LEN, REQUIRED_MAPS,
+    elf_map_def, lsm_available, plan_cgroup_sync, verify_map_defs, CgroupSyncPlan, MapDef, Memlock,
+    SyncStats, MAP_DEF_LEN, REQUIRED_MAPS,
 };
 #[cfg(feature = "attach")]
 pub use kernel::{raise_memlock, KernelHandle, RingReader};
@@ -40,6 +40,14 @@ pub use spec::{
 
 use ferrum_common::Result;
 use ferrum_ids::Digest;
+
+pub const LSM_HOOK_BPRM_CHECK: &str = "bprm_check_security";
+
+/// (program symbol in the ELF, LSM hook name).
+///
+/// Lives outside the `attach` gate so ELF inspection (CI symbol check,
+/// `tests/elf_inspect.rs`) can use the same list without CAP_BPF or aya.
+pub const LSM_PROGRAMS: &[(&str, &str)] = &[("ferrum_bprm_check_security", LSM_HOOK_BPRM_CHECK)];
 
 /// (program symbol in the ELF, tracepoint category, tracepoint name).
 ///
@@ -218,6 +226,17 @@ mod tests {
         }
         // A category that is not there at all is absent, not a panic.
         assert_ne!(tracepoint_in_tracefs("ferrum", "nothing"), Some(true));
+    }
+
+    #[test]
+    fn lsm_constants_and_availability() {
+        assert_eq!(LSM_HOOK_BPRM_CHECK, "bprm_check_security");
+        assert_eq!(
+            LSM_PROGRAMS,
+            &[("ferrum_bprm_check_security", "bprm_check_security")]
+        );
+        // lsm_available() must run without panicking on any environment.
+        let _ = lsm_available();
     }
 
     struct Writer(Vec<u8>);

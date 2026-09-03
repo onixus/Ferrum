@@ -22,13 +22,13 @@ mod progs {
             bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user_str_bytes,
             gen::bpf_get_current_cgroup_id,
         },
-        macros::{map, tracepoint},
+        macros::{lsm, map, tracepoint},
         maps::{Array, HashMap, PerCpuArray, RingBuf},
-        programs::TracePointContext,
+        programs::{LsmContext, TracePointContext},
     };
     use ferrum_ebpf_progs::{
-        Event, ACTION_AUDIT, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, EVENT_FLAG_AGENT_SELF,
-        EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, PATH_LEN,
+        Event, ACTION_AUDIT, ACTION_DENY, ACTION_KILL, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES,
+        EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, PATH_LEN,
     };
 
     // The `#[map(name = ...)]` literals must stay equal to the MAP_* /
@@ -86,6 +86,17 @@ mod progs {
     #[tracepoint(category = "syscalls", name = "sys_enter_finit_module")]
     pub fn ferrum_sys_enter_finit_module(ctx: TracePointContext) -> u32 {
         emit(&ctx, None)
+    }
+
+    #[lsm(hook = "bprm_check_security")]
+    pub fn ferrum_bprm_check_security(_ctx: LsmContext) -> i32 {
+        let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+        if let Some(action) = FERRUM_CGROUPS.get_ptr(&cgroup_id) {
+            if unsafe { *action } == ACTION_DENY || unsafe { *action } == ACTION_KILL {
+                return -1;
+            }
+        }
+        0
     }
 
     #[inline(always)]
