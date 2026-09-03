@@ -22,7 +22,9 @@
 //!    over the same three scans `boundary_gate.rs` uses to find reasons.
 //! 4. **Code nobody collects.** A port the binary opens and no manifest names,
 //!    or a manifest that opens a port with nothing in front of it. Held by
-//!    `the_shipped_manifests_open_and_govern_every_metrics_port`.
+//!    `the_shipped_manifests_open_and_govern_every_metrics_port`, over all
+//!    three workloads: the controller was the last one publishing only a
+//!    file, and a file on the Pod is the reader `kubectl exec` reaches.
 //!
 //! And the endpoint itself is exercised rather than argued about:
 //! `the_metrics_endpoint_answers_a_read_and_refuses_everything_else` binds a
@@ -39,7 +41,7 @@ const DASHBOARD: &str = "deploy/observability/grafana-dashboard.json";
 /// in `deploy_gate.rs` is one: a family drops out of the dashboard by
 /// oversight exactly as easily as by decision, and the only difference between
 /// the two is a written reason. A short one fails.
-const NOT_CHARTED: [(&str, &str); 14] = [
+const NOT_CHARTED: [(&str, &str); 15] = [
     (
         "ferrum_agent_info",
         "идентичность процесса, не измерение: версия и роль нужны как ярлык на \
@@ -116,6 +118,13 @@ const NOT_CHARTED: [(&str, &str); 14] = [
          `records_decode_failed_total`, который на дашборде есть",
     ),
     (
+        "ferrum_controller_status_write_failures_total",
+        "накопительная половина `ferrum_controller_status_write_failed`, который \
+         на дашборде есть булевом, рядом с той же метрикой агента: контроллер, \
+         у которого не пишется status.json, важен как факт — порт становится \
+         единственным читателем его состояния, — а не как частота",
+    ),
+    (
         "ferrum_agent_status_write_failed_total",
         "накопительная половина `status_write_failed`, который на дашборде \
          есть булевом: узел, у которого файл не пишется, важен как факт, а не \
@@ -172,10 +181,28 @@ fn admission_families() -> (Vec<String>, String) {
     (exposition.family_names(), text)
 }
 
+/// The controller in the state a fresh Pod is in: nothing reconciled, no class
+/// failed, no bundle signed. Same reason the other two are built this way —
+/// the set of families must not depend on what happened to have run.
+fn controller_families() -> (Vec<String>, String) {
+    use ferrum_controller::{ControllerHealth, ControllerMetrics};
+
+    let metrics = ControllerMetrics::new();
+    let health = ControllerHealth::new();
+    let exposition = ferrum_controller::exposition(&metrics, &health);
+    let text = exposition.render();
+    (exposition.family_names(), text)
+}
+
 fn exported_families() -> BTreeSet<String> {
     let (agent, _) = agent_families();
     let (admission, _) = admission_families();
-    agent.into_iter().chain(admission).collect()
+    let (controller, _) = controller_families();
+    agent
+        .into_iter()
+        .chain(admission)
+        .chain(controller)
+        .collect()
 }
 
 /// Every `ferrum_*` identifier in every `expr` of the dashboard.
@@ -589,6 +616,7 @@ fn the_shipped_manifests_open_and_govern_every_metrics_port() {
     let workloads = [
         ("deploy/admission/deployment.yaml", "ferrum-admission"),
         ("deploy/agent/daemonset.yaml", "ferrum-agent"),
+        ("deploy/controller/deployment.yaml", "ferrum-controller"),
     ];
     for (file, name) in workloads {
         let doc: Value = serde_yaml::from_str(&read(file)).expect("workload is not valid YAML");
@@ -685,6 +713,7 @@ fn the_shipped_manifests_open_and_govern_every_metrics_port() {
     for (file, kind) in [
         ("deploy/admission/service.yaml", "ClusterIP"),
         ("deploy/agent/metrics-service.yaml", "headless"),
+        ("deploy/controller/metrics-service.yaml", "ClusterIP"),
     ] {
         let doc: Value = serde_yaml::from_str(&read(file)).expect("service is not valid YAML");
         let ports = doc
@@ -977,4 +1006,92 @@ fn known_constants() -> Vec<(&'static str, &'static str)> {
         ("TARGET_NEVER_PROVEN", TARGET_NEVER_PROVEN),
         ("WAIVERS_UNJOINED", WAIVERS_UNJOINED),
     ]
+}
+
+/// The controller's port, on a real socket, with state that changed while it
+/// was open.
+///
+/// Separate from the webhook's test above rather than folded into it, because
+/// what is measured is not the same thing. There the question was the HTTP
+/// behaviour of `ferrum-metrics` — 405 on a write, 404 elsewhere, no body ever
+/// read — and it is answered once for the shared server. Here the question is
+/// the controller's own wiring: `spawn_metrics` holds `Arc`s to two live
+/// objects and renders on each scrape, so a scrape taken after a class started
+/// failing has to say so. A renderer that closed over a snapshot at startup
+/// would pass every unit test in `metrics.rs` and serve a frozen page forever,
+/// which is the one failure this port cannot have: it exists to be read during
+/// an incident.
+///
+/// What this does **not** claim: that the shipped image serves this from a
+/// Pod. `ROADMAP` says so in the same words — the agent and the webhook have
+/// that run and the controller does not.
+#[test]
+fn the_controllers_port_answers_with_state_that_changed_after_it_opened() {
+    use ferrum_controller::{ControllerHealth, ControllerMetrics, FailureClass};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+
+    let metrics = Arc::new(ControllerMetrics::new());
+    let health = Arc::new(ControllerHealth::new());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    ferrum_controller::spawn_metrics(listener, Arc::clone(&metrics), Arc::clone(&health));
+
+    let scrape = || -> String {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .expect("write");
+        let mut out = String::new();
+        stream.read_to_string(&mut out).expect("read");
+        out
+    };
+
+    let first = scrape();
+    assert!(first.starts_with("HTTP/1.1 200 OK\r\n"), "{first}");
+    assert!(
+        first.contains("ferrum_controller_degraded 0\n"),
+        "the endpoint answered without the exposition:\n{first}"
+    );
+    assert!(
+        first.contains("ferrum_controller_reconcile_total 0\n"),
+        "{first}"
+    );
+
+    // The state moves under the open port, exactly as it does when a
+    // deployment is wrong: a class fails repeatedly and has never worked.
+    metrics.record_reconcile();
+    metrics.set_bundle_digest("f00dcafef00dcafef00dcafef00dcafe");
+    for _ in 0..4 {
+        health
+            .note_failure(FailureClass::StatusPatch, "403 Forbidden")
+            .expect("four is under the terminal run");
+    }
+
+    let second = scrape();
+    assert!(
+        second.contains("ferrum_controller_reconcile_total 1\n"),
+        "the port is serving a snapshot taken at startup:\n{second}"
+    );
+    assert!(
+        second.contains("ferrum_controller_failure_run{class=\"status_patch\"} 4\n"),
+        "the failing class did not reach the port:\n{second}"
+    );
+    assert!(
+        second.contains("ferrum_controller_degraded 1\n"),
+        "{second}"
+    );
+    assert!(
+        second.contains(
+            "ferrum_controller_bundle_info{digest=\"f00dcafef00dcafef00dcafef00dcafe\"} 1\n"
+        ),
+        "{second}"
+    );
+    // And still no cause text on the wire, on the path an operator actually
+    // reads rather than in a unit test of the renderer.
+    assert!(
+        !second.contains("403 Forbidden"),
+        "a cause string reached the metrics port:\n{second}"
+    );
 }

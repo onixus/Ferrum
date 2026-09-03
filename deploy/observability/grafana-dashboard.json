@@ -493,6 +493,11 @@
           "refId": "F",
           "expr": "sum(ferrum_agent_status_keys_unmapped)",
           "legendFormat": "counters this dashboard cannot see"
+        },
+        {
+          "refId": "G",
+          "expr": "sum(ferrum_controller_status_write_failed)",
+          "legendFormat": "controller whose status file will not write"
         }
       ],
       "fieldConfig": {
@@ -542,6 +547,138 @@
           "refId": "F",
           "expr": "sum(ferrum_admission_break_glass_journal_broken)",
           "legendFormat": "replicas whose journal stopped accepting entries"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 27,
+      "type": "row",
+      "title": "Control plane",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 77 }
+    },
+    {
+      "id": 28,
+      "type": "stat",
+      "title": "Bundle digests the controller has signed",
+      "description": "One digest is a converged rollout. Two means the controller signed something the fleet has not taken up yet — compare with the two digest counts at the top of this dashboard: controller, webhook and agents disagreeing is a rollout that did not land, and it is invisible from any one of the three alone.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 78 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (digest) (ferrum_controller_bundle_info))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 29,
+      "type": "stat",
+      "title": "Controller degraded",
+      "description": "The whole degraded state as one bool, the same one status.json reports. Which class and why is the panel to the right; the cause text stays in the file on the Pod, which is deliberate — a reason is prose and would be an unbounded label.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 78 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_controller_degraded)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Is the control plane converging",
+      "description": "Reconciles taken up against the ways they end. A policy that did not compile is the policy author's and the object carries the reason in its own status; the four failure classes are requests to the API server that did not answer, and those are the operator's. Two lines and not one sum, because they send different people.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 78 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(ferrum_controller_reconcile_total[5m]))",
+          "legendFormat": "reconciles/s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(ferrum_controller_compile_failures_total[5m]))",
+          "legendFormat": "policies that did not compile/s"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(ferrum_controller_reconcile_failures_total[5m]))",
+          "legendFormat": "reconcile failures/s"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(ferrum_controller_status_patch_failures_total[5m]))",
+          "legendFormat": "status_patch failures/s"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(ferrum_controller_watch_errors_total[5m]))",
+          "legendFormat": "watch errors/s"
+        },
+        {
+          "refId": "F",
+          "expr": "sum(rate(ferrum_controller_exception_publish_failures_total[5m]))",
+          "legendFormat": "exception_publish failures/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Where the controller is stuck",
+      "description": "A run climbing towards ferrum_controller_terminal_run in a class that has never succeeded is the deployment being wrong — a mis-edited RBAC, a CRD never applied — and the process ends itself when it arrives, which is why the threshold is charted beside the run instead of restated in an alert. Unactionable objects are the other kind: work that stays undone until a human edits something, and no retry will mend it.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 86 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (class) (ferrum_controller_failure_run)",
+          "legendFormat": "run: {{class}}"
+        },
+        {
+          "refId": "B",
+          "expr": "max(ferrum_controller_terminal_run)",
+          "legendFormat": "terminal run"
+        },
+        {
+          "refId": "C",
+          "expr": "max by (class) (ferrum_controller_class_never_succeeded)",
+          "legendFormat": "never succeeded: {{class}}"
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (class) (ferrum_controller_unactionable_objects)",
+          "legendFormat": "unactionable: {{class}}"
         }
       ],
       "fieldConfig": {

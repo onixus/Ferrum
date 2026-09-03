@@ -31,8 +31,7 @@ pub use key::{
     parse_seed_hex, SEED_ENV, SEED_FILE_ENV,
 };
 pub use metrics::{
-    bind_metrics_listener, exposition, metrics_text, spawn_metrics, ControllerMetrics,
-    DEFAULT_METRICS_PORT,
+    exposition, metrics_text, spawn_metrics, ControllerMetrics, SHIPPED_METRICS_PORT,
 };
 pub use watch::{
     cluster_security_policy_gvk, cluster_security_policy_resource, observe_exception,
@@ -243,8 +242,11 @@ pub struct WatchConfig {
     /// reader outside the process, which is the shipped default for anyone
     /// running this binary by hand; the manifest passes `--status-dir`.
     pub status_dir: Option<PathBuf>,
-    /// Port on which Prometheus `/metrics` is exposed. `None` means no metrics port is opened.
-    pub metrics_port: Option<u16>,
+    /// The address `GET /metrics` is answered on, from `--metrics-listen`.
+    /// `None` — the default — opens no port at all: `status.json` needs none,
+    /// and a socket nobody asked for is a second surface on the one workload
+    /// that holds the signing key.
+    pub metrics_listen: Option<String>,
 }
 
 pub struct ReconcileInput<'a> {

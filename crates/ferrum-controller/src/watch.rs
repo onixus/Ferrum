@@ -7,7 +7,7 @@ use crate::apply::{
     plan_apply_namespaced, secret_name, ApplyPlan,
 };
 use crate::health::{ControllerHealth, FailureClass, Requested};
-use crate::metrics::{bind_metrics_listener, spawn_metrics, ControllerMetrics};
+use crate::metrics::{spawn_metrics, ControllerMetrics};
 use crate::{
     compile_status_err, exception_status_patch, reconcile, reconcile_exception,
     reconcile_namespaced, NamespacedReconcileInput, ObservedException, ObservedNamespacedPolicy,
@@ -236,13 +236,22 @@ pub async fn run_watch(cfg: WatchConfig) -> Result<()> {
         .await
         .map_err(|e| FerrumError::Degraded(format!("kube client: {e}")))?;
     let exceptions: ExceptionSet = Arc::new(Mutex::new(BTreeMap::new()));
-    let health = ControllerHealth::new();
+    let health = Arc::new(ControllerHealth::new());
     let metrics = Arc::new(ControllerMetrics::new());
 
-    if let Some(port) = cfg.metrics_port {
-        let listener = bind_metrics_listener(port)
-            .map_err(|e| FerrumError::Degraded(format!("bind metrics port {port}: {e}")))?;
-        spawn_metrics(listener, Arc::clone(&metrics));
+    // Bound before the first watch is opened, and a failure to bind ends the
+    // process rather than being logged: an operator who asked for a port and
+    // got a running controller with no port has a scrape target that never
+    // appears, which reads the same as a controller that is not running. The
+    // same choice `ferrum-admission` makes for the same flag.
+    if let Some(addr) = cfg.metrics_listen.as_deref() {
+        let listener = std::net::TcpListener::bind(addr)
+            .map_err(|e| FerrumError::Degraded(format!("bind --metrics-listen {addr}: {e}")))?;
+        eprintln!(
+            "ferrum-controller: metrics on {addr}{}",
+            ferrum_metrics::METRICS_PATH
+        );
+        spawn_metrics(listener, Arc::clone(&metrics), Arc::clone(&health));
     }
 
     // Published before the first event, so an operator who finds no file at
@@ -288,7 +297,6 @@ async fn run_cluster_policy_watch(
                     reconcile_object(client, cfg, exceptions, health, metrics, obj).await
                 {
                     eprintln!("ferrum-controller: {}", failure.err);
-                    metrics.record_reconcile_error();
                     health.note_failure(failure.class, &failure.err)?;
                 }
             }
@@ -322,7 +330,6 @@ async fn run_namespaced_policy_watch(
                     reconcile_namespaced_object(client, cfg, exceptions, health, metrics, obj).await
                 {
                     eprintln!("ferrum-controller: {}", failure.err);
-                    metrics.record_reconcile_error();
                     health.note_failure(failure.class, &failure.err)?;
                 }
             }
@@ -619,7 +626,7 @@ async fn reconcile_object(
     };
     if failed_status_already_recorded(&obj, generation, &plan) {
         if compile_failed {
-            metrics.record_reconcile_error();
+            metrics.record_compile_failure();
         }
         return Ok(());
     }
@@ -634,7 +641,7 @@ async fn reconcile_object(
         .map_err(as_class(FailureClass::ExceptionPublish))?;
     health.note_success(attached);
     if compile_failed {
-        metrics.record_reconcile_error();
+        metrics.record_compile_failure();
     }
     Ok(())
 }
@@ -712,7 +719,7 @@ async fn reconcile_namespaced_object(
     };
     if failed_status_already_recorded(&obj, generation, &plan) {
         if compile_failed {
-            metrics.record_reconcile_error();
+            metrics.record_compile_failure();
         }
         return Ok(());
     }
@@ -732,7 +739,7 @@ async fn reconcile_namespaced_object(
         .map_err(as_class(FailureClass::ExceptionPublish))?;
     health.note_success(attached);
     if compile_failed {
-        metrics.record_reconcile_error();
+        metrics.record_compile_failure();
     }
     Ok(())
 }
@@ -1452,7 +1459,7 @@ mod tests {
             library: None,
             clusters: Vec::new(),
             status_dir: None,
-            metrics_port: None,
+            metrics_listen: None,
         }
     }
 
