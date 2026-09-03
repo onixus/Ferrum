@@ -9,8 +9,8 @@
 
 use ferrum_ebpf::{
     elf_map_def, verify_map_defs, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, KERNEL_RULE_SIZE,
-    LSM_PROGRAMS, MAP_CGROUPS, MAP_DEF_LEN, MAP_EVENTS, MAP_RULES, MAP_SELF, MAX_KERNEL_RULES,
-    REQUIRED_MAPS, TRACEPOINTS,
+    LSM_PROGRAMS, MAP_CGROUPS, MAP_DEF_LEN, MAP_EVENTS, MAP_RULES, MAP_SELECTED, MAP_SELF,
+    MAX_KERNEL_RULES, REQUIRED_MAPS, TRACEPOINTS,
 };
 
 const SHT_SYMTAB: u32 = 2;
@@ -229,6 +229,29 @@ fn cgroups_map_definition_matches_the_userspace_abi() {
         def[3], CGROUPS_MAX_ENTRIES,
         "{MAP_CGROUPS} max_entries disagrees with CGROUPS_MAX_ENTRIES, which is what \
          plan_cgroup_sync refuses to overflow"
+    );
+}
+
+/// Static ABI check of `ferrum_selected`. Same shape as `ferrum_cgroups`, and
+/// a drift here is the dangerous direction: a set the hook reads as membership
+/// while userspace writes something else makes a selected policy fire in
+/// containers it does not select, or in none at all.
+#[test]
+fn selected_map_definition_matches_the_userspace_abi() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
+    let def = map_def_here(&elf, &path, MAP_SELECTED);
+    assert_eq!(
+        def[0], BPF_MAP_TYPE_HASH,
+        "{MAP_SELECTED} is not a hash map"
+    );
+    assert_eq!(def[1], 8, "{MAP_SELECTED} key is not a u64 cgroup id");
+    assert_eq!(def[2], 1, "{MAP_SELECTED} value is not a u8 flag");
+    assert_eq!(
+        def[3], CGROUPS_MAX_ENTRIES,
+        "{MAP_SELECTED} max_entries disagrees with CGROUPS_MAX_ENTRIES, which is what \
+         plan_cgroup_sync refuses to overflow for this set too"
     );
 }
 

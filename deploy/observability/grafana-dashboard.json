@@ -558,7 +558,7 @@
       "id": 32,
       "type": "timeseries",
       "title": "Prevented, or only detected",
-      "description": "Which half of the loaded policy this fleet stops before it happens. Rules the in-kernel hook cannot decide stay on the tracepoint path and are excluded — a rule naming a path is excluded by construction, the toolchain cannot read one, and the §D acceptance rule «exec + /bin/sh -> kill» is among them — so a non-zero excluded count is the ordinary state and not a fault. `refused` counts nodes whose whole policy may not be enforced in kernel (a selector, a non-enforce mode); `unsynced` is the one that is a fault: the map was cleared, so those nodes prevent nothing and keep detecting.",
+      "description": "Which half of the loaded policy this fleet stops before it happens. Rules the in-kernel hook cannot decide stay on the tracepoint path and are excluded — a rule naming a path is excluded by construction, the toolchain cannot read one, and the §D acceptance rule «exec + /bin/sh -> kill» is among them — so a non-zero excluded count is the ordinary state and not a fault. `refused` counts nodes whose whole policy may not be enforced in kernel (a non-enforce mode, a disabled policy); `unsynced` is the one that is a fault: the map was cleared, so those nodes prevent nothing and keep detecting.",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 77 },
       "targets": [
         {
@@ -585,6 +585,11 @@
           "refId": "E",
           "expr": "sum(ferrum_agent_kernel_rules_unsynced)",
           "legendFormat": "nodes whose rule set failed to publish"
+        },
+        {
+          "refId": "F",
+          "expr": "sum(ferrum_agent_selected_cgroups)",
+          "legendFormat": "pods the policy selects (0 under an unselected policy)"
         }
       ],
       "fieldConfig": {

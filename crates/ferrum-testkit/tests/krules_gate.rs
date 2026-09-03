@@ -27,19 +27,26 @@ fn shipped_policy() -> ferrum_api::ClusterSecurityPolicy {
     serde_yaml::from_str(yaml).expect("prod-restricted yaml")
 }
 
-/// The shipped policy with the two attributes that refuse it in kernel taken
-/// off: `mode: audit` and the namespace selector.
+/// The shipped policy with `mode: audit` and the namespace selector taken off.
 ///
-/// Both refusals are correct, and both are asserted on their own below. This
-/// helper exists so the *rules* can be measured at all — without it every
-/// assertion about what the kernel would enforce would be made against an
-/// empty set, and would pass for the wrong reason forever.
+/// The mode is still a wholesale refusal and is asserted on its own; the
+/// selector no longer is, and is also asserted on its own. It is dropped here
+/// so the rule assertions below are about rules: with it in place every one of
+/// them would additionally depend on the selected set, and a rule that stopped
+/// matching would be indistinguishable from a cgroup that stopped being
+/// selected.
 fn shipped_policy_made_enforceable() -> ferrum_api::ClusterSecurityPolicy {
     let mut policy = shipped_policy();
     policy.spec.mode = PolicyMode::Enforce;
     policy.spec.selector = Default::default();
     policy
 }
+
+/// Every cgroup is selected. The tests below that measure *rules* pass this,
+/// so a rule that stopped matching for want of a selected cgroup fails as a
+/// rule failure and not as a set-membership one; the selector's own effect is
+/// measured on its own, above.
+const SELECTED: bool = true;
 
 fn kernel_set_of(policy: &ferrum_api::ClusterSecurityPolicy) -> KernelRuleSet {
     let bundle =
@@ -78,16 +85,17 @@ fn the_shipped_policy_as_shipped_enforces_nothing_in_kernel_and_says_why() {
     assert!(set.is_empty());
 }
 
-/// And in enforce it is still refused, for the second reason: it selects.
+/// In enforce, the shipped policy reaches the kernel **with its selector**,
+/// and every slot says so.
 ///
-/// This is the bound on the whole feature as it stands, stated where it will
-/// be read rather than left to be discovered on a cluster. The kernel has no
-/// pod identity, so a selected policy enforced there would refuse execs in
-/// workloads it never selected. Until the agent publishes the *selected*
-/// cgroups — it already resolves them, the map does not exist yet — a policy
-/// with any selector prevents nothing in kernel and detects exactly as before.
+/// This was a wholesale refusal one commit ago, and the refusal was right for
+/// as long as the kernel had no way to know which pods a policy selects. It
+/// now has one: `ferrum_selected`, filled by userspace resolving this same
+/// selector against the cgroup→pod index. What the refusal protected must
+/// still hold, and the second half of this test is that: a rule of a selected
+/// policy fires only where the policy selects.
 #[test]
-fn a_selected_policy_still_prevents_nothing_in_kernel_and_that_is_the_current_bound() {
+fn the_shipped_selector_reaches_the_kernel_and_its_rules_fire_only_where_it_selects() {
     let mut policy = shipped_policy();
     policy.spec.mode = PolicyMode::Enforce;
     assert!(
@@ -99,13 +107,36 @@ fn a_selected_policy_still_prevents_nothing_in_kernel_and_that_is_the_current_bo
             .is_empty(),
         "prod-restricted no longer selects a namespace; this test is about that selector"
     );
+
     let set = kernel_set_of(&policy);
-    let reason = set
-        .refused
-        .as_deref()
-        .expect("a selected policy must not be enforced against every container");
-    assert!(reason.contains("селектор"), "{reason}");
-    assert!(set.is_empty());
+    assert!(
+        !set.is_refused(),
+        "a selected policy is refused again: {:?}",
+        set.refused
+    );
+    assert!(
+        set.selected_only,
+        "the set does not tell its caller that the selected cgroups must be published too"
+    );
+    assert_eq!(set.len(), 5, "the five shells of no-shell: {set:#?}");
+    for slot in &set.rules {
+        assert!(
+            slot.selected_only(),
+            "a slot of a selected policy would fire in every container"
+        );
+    }
+
+    // Selected: refused, as §D asks. Not selected: untouched, which is the
+    // property the wholesale refusal used to buy and this flag now buys.
+    assert_eq!(
+        kernel_verdict(&set.rules, &comm("sh"), true, false, true),
+        ACTION_KILL
+    );
+    assert_eq!(
+        kernel_verdict(&set.rules, &comm("sh"), true, false, false),
+        ACTION_ALLOW,
+        "the shipped policy refused a shell in a container it never selected"
+    );
 }
 
 /// Made enforceable, the shipped policy reaches the kernel, and the §D shell
@@ -162,12 +193,12 @@ fn the_acceptance_shell_is_refused_in_a_container_and_untouched_outside_one() {
 
     for shell in ["sh", "bash", "ash", "dash", "zsh"] {
         assert_eq!(
-            kernel_verdict(&set.rules, &comm(shell), true, false),
+            kernel_verdict(&set.rules, &comm(shell), true, false, SELECTED),
             ACTION_KILL,
             "{shell} in a container is not refused by the kernel set"
         );
         assert_eq!(
-            kernel_verdict(&set.rules, &comm(shell), false, false),
+            kernel_verdict(&set.rules, &comm(shell), false, false, SELECTED),
             ACTION_ALLOW,
             "{shell} outside a container was refused; containerOnly is not being honoured, and \
              the node's own shells would stop working"
@@ -177,7 +208,7 @@ fn the_acceptance_shell_is_refused_in_a_container_and_untouched_outside_one() {
         // does not grant. This is the userspace answer too, which is the
         // whole point of the two matchers being one function.
         assert_eq!(
-            kernel_verdict(&set.rules, &comm(shell), true, true),
+            kernel_verdict(&set.rules, &comm(shell), true, true, SELECTED),
             ACTION_KILL,
             "{shell} run by the agent was exempted by a rule that grants no exemption"
         );
@@ -186,7 +217,7 @@ fn the_acceptance_shell_is_refused_in_a_container_and_untouched_outside_one() {
     // A name that merely starts with one of them is not one of them.
     for other in ["shred", "bashful", "cat"] {
         assert_eq!(
-            kernel_verdict(&set.rules, &comm(other), true, false),
+            kernel_verdict(&set.rules, &comm(other), true, false, SELECTED),
             ACTION_ALLOW,
             "{other} was refused by a rule that names only shells"
         );

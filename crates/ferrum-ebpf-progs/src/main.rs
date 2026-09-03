@@ -48,6 +48,12 @@ mod progs {
     #[map(name = "ferrum_cgroups")]
     static FERRUM_CGROUPS: HashMap<u64, u8> = HashMap::with_max_entries(CGROUPS_MAX_ENTRIES, 0);
 
+    // The cgroups the loaded policy's selector selects, resolved in userspace
+    // and published here. Absence means "not selected", which is fail-open —
+    // see `kernel_rule_matches`, where the trade is written down.
+    #[map(name = "ferrum_selected")]
+    static FERRUM_SELECTED: HashMap<u64, u8> = HashMap::with_max_entries(CGROUPS_MAX_ENTRIES, 0);
+
     // The rules this side decides on its own. Userspace fills every slot on
     // every policy change — including the ones a shorter policy leaves over,
     // which is what retires the previous one; see `sync_kernel_rules`.
@@ -113,6 +119,12 @@ mod progs {
     /// acceptance case among them — never reach this map and stay on the
     /// tracepoint path, which still matches and still reports them.
     ///
+    /// A rule of a *selected* policy also asks `ferrum_selected`, which
+    /// userspace fills by resolving the selector against the same cgroup→pod
+    /// index it already keeps. That is what makes a selected policy
+    /// enforceable here at all: the kernel never learns what a pod is, it is
+    /// handed the answer.
+    ///
     /// The walk visits every slot and never breaks early: a fixed trip count
     /// is what makes this shape acceptable to the verifier. `kernel_rule_matches`
     /// is the same function userspace tests against `eval::rule_matches`, so
@@ -122,6 +134,7 @@ mod progs {
     pub fn ferrum_bprm_check_security(_ctx: LsmContext) -> i32 {
         let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
         let in_container = FERRUM_CGROUPS.get_ptr(&cgroup_id).is_some();
+        let selected = FERRUM_SELECTED.get_ptr(&cgroup_id).is_some();
         let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
         let agent_self = match FERRUM_SELF.get(0) {
             Some(self_tgid) => *self_tgid != 0 && *self_tgid == u64::from(tgid),
@@ -137,7 +150,7 @@ mod progs {
         let mut index = 0;
         while index < MAX_KERNEL_RULES {
             if let Some(rule) = FERRUM_RULES.get(index) {
-                if kernel_rule_matches(rule, &comm, in_container, agent_self)
+                if kernel_rule_matches(rule, &comm, in_container, agent_self, selected)
                     && action_rank(rule.action) > action_rank(verdict)
                 {
                     verdict = rule.action;

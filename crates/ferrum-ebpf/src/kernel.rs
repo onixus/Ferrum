@@ -32,7 +32,7 @@ use ferrum_common::{FerrumError, Result};
 use ferrum_ebpf_progs::EVENTS_DROPPED_TOTAL;
 use ferrum_ebpf_progs::{
     KernelRule, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_EVENTS, MAP_RULES,
-    MAP_SELF, MAX_KERNEL_RULES,
+    MAP_SELECTED, MAP_SELF, MAX_KERNEL_RULES,
 };
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -137,6 +137,17 @@ pub const REQUIRED_MAPS: &[MapDef] = &[
     },
     MapDef {
         name: MAP_CGROUPS,
+        map_type: BPF_MAP_TYPE_HASH,
+        key_size: 8,
+        value_size: 1,
+        max_entries: CGROUPS_MAX_ENTRIES,
+    },
+    MapDef {
+        // The cgroups the loaded policy selects. Same shape as MAP_CGROUPS
+        // and deliberately a second map rather than a second bit in that
+        // one's value: that map's diff carries the container flag, and this
+        // set changes when the policy changes rather than only when pods do.
+        name: MAP_SELECTED,
         map_type: BPF_MAP_TYPE_HASH,
         key_size: 8,
         value_size: 1,
@@ -484,6 +495,9 @@ pub struct KernelHandle {
     /// Mirror of what this handle actually wrote into `ferrum_cgroups`; the
     /// next plan is diffed against it, so a failed sync is not forgotten.
     container_cgroups: BTreeSet<u64>,
+    /// Mirror of what this handle wrote into `ferrum_selected`, diffed the
+    /// same way and for the same reason.
+    selected_cgroups: BTreeSet<u64>,
     /// Syscalls with no tracepoint on this arch or in this kernel's tracefs,
     /// hence unhooked here.
     unhooked_syscalls: Vec<&'static str>,
@@ -615,6 +629,7 @@ impl KernelHandle {
         Ok(Self {
             bpf,
             container_cgroups: BTreeSet::new(),
+            selected_cgroups: BTreeSet::new(),
             unhooked_syscalls: unhooked,
             links,
             lsm_attached,
@@ -933,6 +948,67 @@ impl KernelHandle {
         cgroups
             .remove(&cgroup_id)
             .map_err(|err| degraded(MAP_CGROUPS, err))
+    }
+
+    /// The cgroups the loaded policy selects, as `ferrum_selected` holds them.
+    ///
+    /// Mirrors `container_cgroups`: this handle keeps what it wrote so the
+    /// next plan is a diff and a failed sync is not forgotten.
+    pub fn selected_cgroups(&self) -> &BTreeSet<u64> {
+        &self.selected_cgroups
+    }
+
+    /// Apply a diff to `ferrum_selected`.
+    ///
+    /// Built on the same `plan_cgroup_sync` the container set uses, for the
+    /// same reason it refuses a truncated plan: a set that does not fit would
+    /// leave arbitrary pods *unselected*, and an unselected pod is one this
+    /// node stops preventing for — silently, since absence is not
+    /// distinguishable from "not selected" on the other side.
+    pub fn sync_selected_cgroups(&mut self, plan: &CgroupSyncPlan) -> Result<SyncStats> {
+        let mut stats = SyncStats::default();
+        for id in &plan.remove {
+            if let Err(err) = self.remove_selected_cgroup(*id) {
+                stats.entries = self.selected_cgroups.len();
+                return Err(partial_sync(stats, err));
+            }
+            self.selected_cgroups.remove(id);
+            stats.removed += 1;
+        }
+        for id in &plan.insert {
+            if let Err(err) = self.insert_selected_cgroup(*id) {
+                stats.entries = self.selected_cgroups.len();
+                return Err(partial_sync(stats, err));
+            }
+            self.selected_cgroups.insert(*id);
+            stats.inserted += 1;
+        }
+        stats.entries = self.selected_cgroups.len();
+        Ok(stats)
+    }
+
+    pub fn insert_selected_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
+        let map = self
+            .bpf
+            .map_mut(MAP_SELECTED)
+            .ok_or_else(|| missing(MAP_SELECTED))?;
+        let mut selected: HashMap<_, u64, u8> =
+            HashMap::try_from(map).map_err(|err| degraded(MAP_SELECTED, err))?;
+        selected
+            .insert(cgroup_id, 1, 0)
+            .map_err(|err| degraded(MAP_SELECTED, err))
+    }
+
+    pub fn remove_selected_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
+        let map = self
+            .bpf
+            .map_mut(MAP_SELECTED)
+            .ok_or_else(|| missing(MAP_SELECTED))?;
+        let mut selected: HashMap<_, u64, u8> =
+            HashMap::try_from(map).map_err(|err| degraded(MAP_SELECTED, err))?;
+        selected
+            .remove(&cgroup_id)
+            .map_err(|err| degraded(MAP_SELECTED, err))
     }
 
     /// Publish the kernel-decidable part of a policy into `ferrum_rules`.

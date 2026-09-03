@@ -41,11 +41,19 @@
 //! matches `pathSuffix`. `krules_gate.rs` compiles the shipped policy and
 //! holds both halves of that.
 //!
-//! **A selector.** Label selectors are resolved against a pod identity the
-//! kernel does not have. Enforcing a selected policy against every container
-//! is over-enforcement: it refuses execs in workloads the policy never
-//! selected, which is an outage caused by a security control. So a policy
-//! carrying any selector is refused whole.
+//! **A selector — no longer.** Label selectors are resolved against a pod
+//! identity the kernel does not have, and enforcing a selected policy against
+//! every container would refuse execs in workloads the policy never selected.
+//! That was a wholesale refusal here for exactly as long as the kernel had no
+//! way to know which pods a policy selects. It now has one: every rule of a
+//! selected policy carries `KRULE_FLAG_SELECTED_ONLY`, and the hook answers
+//! that from `ferrum_selected`, a set userspace fills by resolving this same
+//! selector against the cgroup→pod index it already keeps. The kernel never
+//! learns what a pod is; it is handed the answer.
+//!
+//! The caller has an obligation that comes with it, and `selected_only` on the
+//! returned set is what states it: publish the rules **and** the selected set,
+//! or the rules match nothing.
 //!
 //! **Anything but enforce.** Observe and Audit modes must not refuse a
 //! syscall, and a disabled policy must not either.
@@ -56,8 +64,8 @@
 
 use crate::spec::{Action, EbpfSpec, Mode, Rule};
 use ferrum_ebpf_progs::{
-    KernelRule, COMM_LEN, KRULE_FLAG_CONTAINER_ONLY, KRULE_FLAG_NOT_AGENT_SELF, KRULE_FLAG_USED,
-    MAX_KERNEL_RULES,
+    KernelRule, COMM_LEN, KRULE_FLAG_CONTAINER_ONLY, KRULE_FLAG_NOT_AGENT_SELF,
+    KRULE_FLAG_SELECTED_ONLY, KRULE_FLAG_USED, MAX_KERNEL_RULES,
 };
 
 /// Syscalls the exec hook decides. A rule naming none of them decides nothing
@@ -79,6 +87,11 @@ pub struct KernelRuleSet {
     pub rules: Vec<KernelRule>,
     /// Rules that stay on the tracepoint path, each with its reason.
     pub excluded: Vec<Excluded>,
+    /// Every slot carries `KRULE_FLAG_SELECTED_ONLY`, so the rules apply only
+    /// to cgroups in `ferrum_selected`. True exactly when the policy carries a
+    /// selector, and it is what tells the caller that publishing the rules
+    /// without also publishing the selected set would enforce nothing.
+    pub selected_only: bool,
     /// Set when no rule of this policy may be enforced in kernel, with the
     /// reason. `Some` and an empty `rules` are not the same statement as
     /// `None` and an empty `rules`: the first is a decision, the second is a
@@ -92,6 +105,7 @@ impl KernelRuleSet {
         Self {
             rules: Vec::new(),
             excluded: Vec::new(),
+            selected_only: false,
             refused: Some(reason.into()),
         }
     }
@@ -121,12 +135,7 @@ pub fn compile_kernel_rules(spec: &EbpfSpec) -> KernelRuleSet {
             spec.mode
         ));
     }
-    if !spec.selector.is_empty() {
-        return KernelRuleSet::refuse(
-            "политика несёт селектор, а ядро не знает identity пода: enforcement в ядре \
-             применился бы к каждому контейнеру, включая те, которые политика не выбирала",
-        );
-    }
+
     // Only a default that would itself refuse an exec is unrepresentable:
     // «всё несовпавшее» списком совпадающих правил не выражается. `allow` и
     // `audit` не предотвращают ничего, поэтому предотвращение целиком
@@ -140,9 +149,24 @@ pub fn compile_kernel_rules(spec: &EbpfSpec) -> KernelRuleSet {
         ));
     }
 
-    let mut out = KernelRuleSet::default();
+    // A selected policy is enforceable in kernel, and the selector is what
+    // decides *where*: every rule of it carries KRULE_FLAG_SELECTED_ONLY, and
+    // the hook answers that flag from `ferrum_selected` — a set userspace
+    // fills by resolving this same selector against the cgroup→pod index.
+    //
+    // This used to be a wholesale refusal, and the refusal was correct for as
+    // long as the kernel had no way to know which pods a policy selects:
+    // enforcing a selected policy against every container refuses execs in
+    // workloads it never selected. What changed is not the judgement, it is
+    // that the answer can now be handed to the kernel instead of the question.
+    let selected_only = !spec.selector.is_empty();
+
+    let mut out = KernelRuleSet {
+        selected_only,
+        ..Default::default()
+    };
     for rule in &spec.rules {
-        match kernel_slots(rule) {
+        match kernel_slots(rule, selected_only) {
             Ok(slots) => out.rules.extend(slots),
             Err(reason) => out.excluded.push(Excluded {
                 rule: rule.id.clone(),
@@ -169,7 +193,7 @@ pub fn compile_kernel_rules(spec: &EbpfSpec) -> KernelRuleSet {
 ///
 /// A rule naming several `comm`s becomes one slot per name: `KernelRule` holds
 /// one, which keeps the in-kernel walk flat.
-fn kernel_slots(rule: &Rule) -> Result<Vec<KernelRule>, String> {
+fn kernel_slots(rule: &Rule, selected_only: bool) -> Result<Vec<KernelRule>, String> {
     if !matches!(rule.action, Action::Deny | Action::Kill) {
         return Err(format!(
             "действие {} не отказывает exec'у; в ядре ему нечего делать",
@@ -196,6 +220,11 @@ fn kernel_slots(rule: &Rule) -> Result<Vec<KernelRule>, String> {
     }
 
     let flags = KRULE_FLAG_USED
+        | if selected_only {
+            KRULE_FLAG_SELECTED_ONLY
+        } else {
+            0
+        }
         | if rule.container_only {
             KRULE_FLAG_CONTAINER_ONLY
         } else {
@@ -319,14 +348,17 @@ mod tests {
 
         // And it decides, on the same function the kernel walks.
         let comm = [0u8; COMM_LEN];
-        assert_eq!(kernel_verdict(&set.rules, &comm, true, false), ACTION_KILL);
         assert_eq!(
-            kernel_verdict(&set.rules, &comm, false, false),
+            kernel_verdict(&set.rules, &comm, true, false, true),
+            ACTION_KILL
+        );
+        assert_eq!(
+            kernel_verdict(&set.rules, &comm, false, false, true),
             ACTION_ALLOW,
             "container_only decided outside a container"
         );
         assert_eq!(
-            kernel_verdict(&set.rules, &comm, true, true),
+            kernel_verdict(&set.rules, &comm, true, true, true),
             ACTION_ALLOW,
             "the rule matched the agent itself"
         );
@@ -394,9 +426,12 @@ mod tests {
         bash[..4].copy_from_slice(b"bash");
         let mut other = [0u8; COMM_LEN];
         other[..3].copy_from_slice(b"cat");
-        assert_eq!(kernel_verdict(&set.rules, &bash, true, false), ACTION_KILL);
         assert_eq!(
-            kernel_verdict(&set.rules, &other, true, false),
+            kernel_verdict(&set.rules, &bash, true, false, true),
+            ACTION_KILL
+        );
+        assert_eq!(
+            kernel_verdict(&set.rules, &other, true, false, true),
             ACTION_ALLOW
         );
     }
@@ -406,16 +441,6 @@ mod tests {
     /// "this policy asks for nothing".
     #[test]
     fn a_policy_the_kernel_may_not_enforce_at_all_is_refused_and_not_emptied() {
-        let selected = {
-            let mut s = spec(vec![rule("keeps", Action::Kill)]);
-            s.selector.namespace_selector.match_labels = [(
-                "kubernetes.io/metadata.name".to_string(),
-                "prod".to_string(),
-            )]
-            .into_iter()
-            .collect();
-            s
-        };
         let observing = {
             let mut s = spec(vec![rule("keeps", Action::Kill)]);
             s.mode = Mode::Observe;
@@ -445,7 +470,6 @@ mod tests {
         }
 
         for (name, spec) in [
-            ("selector", selected),
             ("observe", observing),
             ("disabled", disabled),
             ("default", defaulted),
@@ -491,32 +515,93 @@ mod tests {
             for comm in ["sh", "shred", "cat", ""] {
                 for in_container in [true, false] {
                     for agent_self in [true, false] {
-                        let event = crate::eval::SyscallEvent {
-                            syscall: "execve",
-                            comm,
-                            path: "/usr/bin/whatever",
-                            in_container,
-                            agent_self,
-                            path_truncated: false,
-                        };
-                        let userspace = crate::eval::matched_action(&spec, &event);
+                        // Both values of the selected bit, because none of
+                        // these policies selects: a slot that grew a
+                        // KRULE_FLAG_SELECTED_ONLY it was not asked for would
+                        // silently stop matching on nodes whose index is
+                        // still filling, and this is what catches that.
+                        for selected in [true, false] {
+                            let event = crate::eval::SyscallEvent {
+                                syscall: "execve",
+                                comm,
+                                path: "/usr/bin/whatever",
+                                in_container,
+                                agent_self,
+                                path_truncated: false,
+                            };
+                            let userspace = crate::eval::matched_action(&spec, &event);
 
-                        let mut raw = [0u8; COMM_LEN];
-                        raw[..comm.len()].copy_from_slice(comm.as_bytes());
-                        let kernel = kernel_verdict(&set.rules, &raw, in_container, agent_self);
+                            let mut raw = [0u8; COMM_LEN];
+                            raw[..comm.len()].copy_from_slice(comm.as_bytes());
+                            let kernel = kernel_verdict(
+                                &set.rules,
+                                &raw,
+                                in_container,
+                                agent_self,
+                                selected,
+                            );
 
-                        assert_eq!(
-                            kernel,
-                            userspace.action.as_u8(),
-                            "{}/{comm}/{in_container}/{agent_self}: kernel says {kernel}, \
-                             userspace says {}",
-                            spec.rules[0].id,
-                            userspace.action.as_str()
-                        );
+                            assert_eq!(
+                                kernel,
+                                userspace.action.as_u8(),
+                                "{}/{comm}/{in_container}/{agent_self}/selected={selected}: \
+                             kernel says {kernel}, userspace says {}",
+                                spec.rules[0].id,
+                                userspace.action.as_str()
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// A selected policy is enforceable now, and every slot of it says where.
+    ///
+    /// This replaced a wholesale refusal. The refusal was right while the
+    /// kernel had no way to know which pods a policy selects; the flag is
+    /// right now that userspace can hand it the answer. What must not change
+    /// is the property the refusal protected: a rule of a selected policy
+    /// must never fire on a cgroup the policy does not select.
+    #[test]
+    fn a_selected_policy_carries_the_flag_on_every_slot_and_fires_only_where_it_selects() {
+        let mut selected = spec(vec![rule("keeps", Action::Kill)]);
+        selected.selector.namespace_selector.match_labels = [(
+            "kubernetes.io/metadata.name".to_string(),
+            "prod".to_string(),
+        )]
+        .into_iter()
+        .collect();
+
+        let set = compile_kernel_rules(&selected);
+        assert!(!set.is_refused(), "{set:?}");
+        assert!(
+            set.selected_only,
+            "the set does not tell its caller that the selected cgroups must be published too"
+        );
+        assert_eq!(set.len(), 1);
+        assert!(set.rules[0].selected_only());
+
+        let comm = [0u8; COMM_LEN];
+        assert_eq!(
+            kernel_verdict(&set.rules, &comm, true, false, true),
+            ACTION_KILL
+        );
+        assert_eq!(
+            kernel_verdict(&set.rules, &comm, true, false, false),
+            ACTION_ALLOW,
+            "a selected policy fired on a cgroup it does not select"
+        );
+
+        // A policy with no selector must not carry the flag, or it would match
+        // nothing at all: `ferrum_selected` is empty for an unselected policy.
+        let plain = compile_kernel_rules(&spec(vec![rule("keeps", Action::Kill)]));
+        assert!(!plain.selected_only);
+        assert!(!plain.rules[0].selected_only());
+        assert_eq!(
+            kernel_verdict(&plain.rules, &comm, true, false, false),
+            ACTION_KILL
+        );
     }
 
     /// Overflow is refused whole. A truncated set prevents part of a policy

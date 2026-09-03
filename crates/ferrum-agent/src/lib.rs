@@ -621,6 +621,14 @@ pub struct Agent {
     /// and charted.
     kernel_rules_installed: AtomicU64,
     kernel_rules_excluded: AtomicU64,
+    /// Cgroups published into `ferrum_selected` — the pods the loaded
+    /// policy's selector actually selects, resolved here and handed to the
+    /// kernel as an answer rather than a question.
+    ///
+    /// Zero under an unselected policy is correct and means "every cgroup",
+    /// not "none": the flag that consults this set is only set on rules of a
+    /// policy that selects.
+    selected_cgroups: AtomicU64,
     /// Why no rule of the loaded policy may be enforced in kernel at all — a
     /// selector, a non-enforce mode, a non-allow default. Also not a
     /// degradation: it is the ordinary state of most policies.
@@ -761,6 +769,7 @@ impl Agent {
             lsm_attached: AtomicBool::new(false),
             kernel_rules_installed: AtomicU64::new(0),
             kernel_rules_excluded: AtomicU64::new(0),
+            selected_cgroups: AtomicU64::new(0),
             kernel_rules_refused: Mutex::new(None),
             kernel_rules_unsynced: Mutex::new(None),
             identity_unknown: AtomicU64::new(0),
@@ -1189,6 +1198,42 @@ impl Agent {
 
     pub fn kernel_rules_excluded(&self) -> u64 {
         self.kernel_rules_excluded.load(Ordering::Relaxed)
+    }
+
+    pub fn selected_cgroups(&self) -> u64 {
+        self.selected_cgroups.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_selected_cgroups(&self, entries: u64) {
+        self.selected_cgroups.store(entries, Ordering::Relaxed);
+    }
+
+    /// The cgroups the loaded policy selects, resolved against the same index
+    /// the event path resolves identities against.
+    ///
+    /// Empty for a policy with no selector, and that is not "nothing is
+    /// selected": rules of such a policy carry no `KRULE_FLAG_SELECTED_ONLY`
+    /// and never consult the set. Empty also for a node whose index has not
+    /// filled yet, which *is* "nothing is selected" — and it is the
+    /// fail-open half of the trade written down in `kernel_rule_matches`:
+    /// prevention waits for the index, detection does not.
+    ///
+    /// `LabelsUnknown` counts as not selected here, for the same reason. The
+    /// userspace path fails closed on it and degrades the node; the kernel
+    /// cannot, because it cannot say why it refused.
+    pub fn selected_cgroups_for_last_good(&self) -> std::collections::BTreeSet<u64> {
+        let Some(bundle) = self.loader.last_good() else {
+            return std::collections::BTreeSet::new();
+        };
+        if bundle.spec.selector.is_empty() {
+            return std::collections::BTreeSet::new();
+        }
+        self.cgroups
+            .snapshot()
+            .iter()
+            .filter(|(_, identity)| ferrum_ebpf::selector_matches(&bundle.spec.selector, identity))
+            .map(|(inode, _)| *inode)
+            .collect()
     }
 
     pub fn kernel_rules_refused(&self) -> Option<String> {
@@ -6846,6 +6891,78 @@ mod tests {
         assert!(agent.unproven_window_len() <= CONTAINER_FLAG_TRACKED_MAX);
     }
 
+    /// The selected set is resolved from the index, and an unselected policy
+    /// asks for nobody rather than for everybody.
+    ///
+    /// The distinction is the whole safety of the feature: an empty set under
+    /// a policy that *does* select means "prevent nowhere", and the same empty
+    /// set under a policy that does not select must not be read as "prevent
+    /// nowhere" — those rules carry no `KRULE_FLAG_SELECTED_ONLY` and never
+    /// consult it.
+    #[test]
+    fn the_selected_set_is_resolved_from_the_index_and_an_unselected_policy_asks_for_nobody() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.insert_cgroup(8, identity("pod-b"));
+
+        // The MVP spec carries no selector: the set is empty, and the compiled
+        // rules say why that is not "nowhere".
+        assert!(agent.selected_cgroups_for_last_good().is_empty());
+        let set = agent
+            .kernel_rules_for_last_good()
+            .expect("a bundle is loaded");
+        assert!(
+            !set.selected_only,
+            "an unselected policy asked for a selected set it would then match nothing against"
+        );
+
+        // And the accounting the surface publishes is what was handed to the
+        // map, not what was computed: a set that failed to publish must not
+        // report itself present.
+        agent.mark_selected_cgroups(2);
+        assert_eq!(agent.selected_cgroups(), 2);
+        assert_eq!(
+            status_json(&agent, None, None, &agent.degraded_state_at(Instant::now()))
+                .get("selectedCgroups")
+                .and_then(|v| v.as_u64()),
+            Some(2)
+        );
+    }
+
+    /// A failed publish of the rule set is the one degradation this feature
+    /// raises, and it recovers.
+    #[test]
+    fn an_unpublished_rule_set_degrades_the_node_and_a_later_success_clears_it() {
+        let agent = healthy_agent();
+        assert!(!agent.is_degraded());
+
+        agent.mark_kernel_rules_unsynced("ferrum_rules: EPERM");
+        assert!(agent.is_degraded());
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with(DEG_KERNEL_RULES_UNSYNCED)),
+            "{reasons:?}"
+        );
+        // The installed count goes with it: reporting the previous number
+        // would name rules this node is no longer enforcing.
+        assert_eq!(agent.kernel_rules_installed(), 0);
+
+        let set = agent
+            .kernel_rules_for_last_good()
+            .expect("a bundle is loaded");
+        agent.mark_kernel_rules_synced(&set, set.rules.len() as u64);
+        assert!(
+            !agent.is_degraded(),
+            "a node that recovered still says it did not: {:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+        assert!(agent.kernel_rules_unsynced().is_none());
+    }
+
     /// A8. Waivers that name another policy are signed, verified, in scope,
     /// counted, logged as reloaded — and apply to nothing. The join cannot be
     /// proven here (the FRMB carries no policy name), so it is stated.
@@ -7477,7 +7594,7 @@ mod tests {
         /// problem, not a gate problem — which is why the rows are written to
         /// be read, and why each says where the state goes instead of that it
         /// is fine.
-        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 24] = [
+        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 25] = [
             (
                 "lsm_attached",
                 "not a count and not a fault in either direction: a kernel without CONFIG_BPF_LSM \
@@ -7485,6 +7602,16 @@ mod tests {
                  alone is doing what this product has always done. What would be a fault is the \
                  rule set failing to reach a node that *is* attached, and that has its own reason \
                  — `DEG_KERNEL_RULES_UNSYNCED`, raised from `kernel_rules_unsynced`.",
+            ),
+            (
+                "selected_cgroups",
+                "how many pods on this node the loaded policy selects. Zero is two different \
+                 correct states — an unselected policy, whose rules carry no \
+                 `KRULE_FLAG_SELECTED_ONLY` and never read the set, and a node whose index has \
+                 not filled yet — and neither is a fault. The second is the fail-open window \
+                 named in `selected_cgroups_for_last_good`: prevention waits for the index, \
+                 detection does not. A failure to publish the set is a fault, and it raises \
+                 `DEG_KERNEL_RULES_UNSYNCED` like any other unpublished map.",
             ),
             (
                 "kernel_rules_installed",

@@ -16,6 +16,21 @@ pub const MAP_SELF: &str = "ferrum_self";
 /// cgroup ids known to belong to pod containers (fed from the userspace
 /// cgroup→pod index); programs flag matching events `EVENT_FLAG_CONTAINER`.
 pub const MAP_CGROUPS: &str = "ferrum_cgroups";
+/// cgroup ids the loaded policy's selector actually selects, resolved in
+/// userspace against the same cgroup→pod index and published here.
+///
+/// The kernel has no pod identity and cannot get one: labels live on objects
+/// only the apiserver knows about. What it can have is the *answer* — this
+/// set — computed by the side that does know, which is how a selected policy
+/// becomes enforceable in kernel without the kernel learning anything about
+/// pods.
+///
+/// Separate from [`MAP_CGROUPS`] rather than a second bit in its value: that
+/// map's diff is what carries the container flag, the most consequential
+/// thing in the datapath, and it is proven by its own gate. This set also has
+/// a different lifetime — it changes when the *policy* changes, not only when
+/// pods do.
+pub const MAP_SELECTED: &str = "ferrum_selected";
 
 /// In-kernel drop counter (per-CPU, single slot; userspace sums the CPUs).
 /// Userspace must surface this; never fail-open on flood.
@@ -90,6 +105,14 @@ pub const KRULE_FLAG_USED: u8 = 1 << 0;
 pub const KRULE_FLAG_CONTAINER_ONLY: u8 = 1 << 1;
 /// Never matches the agent's own thread group, by `ferrum_self`.
 pub const KRULE_FLAG_NOT_AGENT_SELF: u8 = 1 << 2;
+/// Matches only cgroups the loaded policy's selector selects, by presence in
+/// `ferrum_selected`.
+///
+/// Set on every rule of a policy that carries any selector, and on none of a
+/// policy that carries none. Absence from the set is treated as *not
+/// selected*, so an exec in a container whose cgroup has not been published
+/// yet is not refused — see `kernel_rule_matches`.
+pub const KRULE_FLAG_SELECTED_ONLY: u8 = 1 << 3;
 
 /// The `-EPERM` an LSM hook returns to refuse. Named, because `-1` at a return
 /// site is a number and this is a decision.
@@ -153,6 +176,10 @@ impl KernelRule {
     pub const fn not_agent_self(self) -> bool {
         self.flags & KRULE_FLAG_NOT_AGENT_SELF != 0
     }
+
+    pub const fn selected_only(self) -> bool {
+        self.flags & KRULE_FLAG_SELECTED_ONLY != 0
+    }
 }
 
 impl Default for KernelRule {
@@ -170,11 +197,29 @@ impl Default for KernelRule {
 /// `comm` is the caller's, which is what `comm_in` has always meant: at
 /// `sys_enter_execve` and at `bprm_check_security` alike the new program has
 /// not taken over the name yet.
+/// `selected` is presence in `ferrum_selected`, and its absence is read as
+/// **not selected** rather than as unknown.
+///
+/// That is fail-open, and it is the deliberate opposite of what userspace
+/// does with the same question: `selector_match` fails *closed* on labels it
+/// has not observed, applies the rules and degrades the node. The kernel
+/// cannot make that trade. It cannot tell "this pod is not selected" from
+/// "this pod's cgroup has not been published yet", and the second is the
+/// ordinary state for the first seconds of every container's life. Failing
+/// closed there would refuse every exec in every starting container — an
+/// outage caused by a security control, on a path with no way to say why.
+///
+/// What is given up is prevention during that window, not detection: the
+/// tracepoint path sees the same exec, applies the same rules with the
+/// userspace fail-closed semantics, and still kills. So the node under-
+/// prevents for a moment and reports exactly as much as it did before this
+/// map existed.
 pub fn kernel_rule_matches(
     rule: &KernelRule,
     comm: &[u8; COMM_LEN],
     in_container: bool,
     agent_self: bool,
+    selected: bool,
 ) -> bool {
     if !rule.is_used() {
         return false;
@@ -204,6 +249,9 @@ pub fn kernel_rule_matches(
     if rule.container_only() && !in_container {
         return false;
     }
+    if rule.selected_only() && !selected {
+        return false;
+    }
     true
 }
 
@@ -219,12 +267,13 @@ pub fn kernel_verdict(
     comm: &[u8; COMM_LEN],
     in_container: bool,
     agent_self: bool,
+    selected: bool,
 ) -> u8 {
     let mut best = ACTION_ALLOW;
     let mut i = 0;
     while i < rules.len() {
         let rule = rules[i];
-        if kernel_rule_matches(&rule, comm, in_container, agent_self)
+        if kernel_rule_matches(&rule, comm, in_container, agent_self, selected)
             && action_rank(rule.action) > action_rank(best)
         {
             best = rule.action;
@@ -324,7 +373,8 @@ mod tests {
             &KernelRule::empty(),
             &[0; COMM_LEN],
             true,
-            false
+            false,
+            true
         ));
     }
 
@@ -344,8 +394,8 @@ mod tests {
         let mut shred = [0u8; COMM_LEN];
         shred[..5].copy_from_slice(b"shred");
 
-        assert!(kernel_rule_matches(&rule, &sh, false, false));
-        assert!(!kernel_rule_matches(&rule, &shred, false, false));
+        assert!(kernel_rule_matches(&rule, &sh, false, false, true));
+        assert!(!kernel_rule_matches(&rule, &shred, false, false, true));
     }
 
     /// The two gates the kernel *can* answer, each on its own.
@@ -356,14 +406,52 @@ mod tests {
         rule.action = ACTION_KILL;
         let comm = [0u8; COMM_LEN];
 
-        assert!(kernel_rule_matches(&rule, &comm, true, false));
+        assert!(kernel_rule_matches(&rule, &comm, true, false, true));
         assert!(
-            !kernel_rule_matches(&rule, &comm, false, false),
+            !kernel_rule_matches(&rule, &comm, false, false, true),
             "container_only matched outside a container"
         );
         assert!(
-            !kernel_rule_matches(&rule, &comm, true, true),
+            !kernel_rule_matches(&rule, &comm, true, true, true),
             "not_agent_self matched the agent itself"
+        );
+    }
+
+    /// Absence from the selected set reads as "not selected", never as
+    /// "unknown" — and the cost of that choice is bounded to prevention.
+    ///
+    /// A container whose cgroup has not been published yet is absent from the
+    /// set, and a hook that refused on absence would refuse every exec in
+    /// every starting container. The tracepoint path still sees the same exec
+    /// and still applies the userspace fail-closed rules, so what this gives
+    /// up is a moment of prevention and nothing of detection.
+    #[test]
+    fn an_unpublished_cgroup_is_not_selected_rather_than_unknown() {
+        let mut selected = KernelRule::empty();
+        selected.flags = KRULE_FLAG_USED | KRULE_FLAG_SELECTED_ONLY;
+        selected.action = ACTION_KILL;
+        let mut unselected = KernelRule::empty();
+        unselected.flags = KRULE_FLAG_USED;
+        unselected.action = ACTION_KILL;
+        let comm = [0u8; COMM_LEN];
+
+        assert!(kernel_rule_matches(&selected, &comm, true, false, true));
+        assert!(
+            !kernel_rule_matches(&selected, &comm, true, false, false),
+            "a rule of a selected policy fired on a cgroup the policy does not select"
+        );
+        // A policy with no selector carries no such flag and is unaffected by
+        // the set in either direction.
+        assert!(kernel_rule_matches(&unselected, &comm, true, false, false));
+        assert!(kernel_rule_matches(&unselected, &comm, true, false, true));
+
+        assert_eq!(
+            kernel_verdict(&[selected], &comm, true, false, false),
+            ACTION_ALLOW
+        );
+        assert_eq!(
+            kernel_verdict(&[selected], &comm, true, false, true),
+            ACTION_KILL
         );
     }
 
@@ -379,18 +467,30 @@ mod tests {
         };
         let comm = [0u8; COMM_LEN];
 
-        assert_eq!(kernel_verdict(&[], &comm, true, false), ACTION_ALLOW);
+        assert_eq!(kernel_verdict(&[], &comm, true, false, true), ACTION_ALLOW);
         assert_eq!(
-            kernel_verdict(&[KernelRule::empty(); 4], &comm, true, false),
+            kernel_verdict(&[KernelRule::empty(); 4], &comm, true, false, true),
             ACTION_ALLOW,
             "an untouched array must not decide anything"
         );
         assert_eq!(
-            kernel_verdict(&[used(ACTION_DENY), used(ACTION_KILL)], &comm, true, false),
+            kernel_verdict(
+                &[used(ACTION_DENY), used(ACTION_KILL)],
+                &comm,
+                true,
+                false,
+                true
+            ),
             ACTION_KILL
         );
         assert_eq!(
-            kernel_verdict(&[used(ACTION_KILL), used(ACTION_DENY)], &comm, true, false),
+            kernel_verdict(
+                &[used(ACTION_KILL), used(ACTION_DENY)],
+                &comm,
+                true,
+                false,
+                true
+            ),
             ACTION_KILL,
             "the order of the slots decided the verdict"
         );

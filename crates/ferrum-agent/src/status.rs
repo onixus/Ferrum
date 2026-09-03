@@ -158,6 +158,7 @@ pub fn status_json(
             "kernelRulesExcluded".into(),
             json!(agent.kernel_rules_excluded()),
         );
+        map.insert("selectedCgroups".into(), json!(agent.selected_cgroups()));
         map.insert(
             "kernelRulesRefused".into(),
             json!(agent.kernel_rules_refused().is_some()),

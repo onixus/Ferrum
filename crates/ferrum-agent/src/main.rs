@@ -546,6 +546,12 @@ fn run(
         // ones that matter, and leaving it unchanged after a failure is what
         // makes the next tick retry.
         let mut synced_digest: Option<String> = None;
+        // The selected set has two inputs — the policy and the pods — so it is
+        // recomputed when either moves and not on every tick: resolving a
+        // selector against every entry of the index is O(pods) and the answer
+        // does not change on its own. True to begin with, so the first pass
+        // publishes.
+        let mut selected_stale = true;
         loop {
             // The rule set follows the bundle. Polled here rather than pushed
             // from the poller thread for the reason the cgroup set is pushed:
@@ -562,6 +568,10 @@ fn run(
                             Ok(installed) => {
                                 guard.mark_kernel_rules_synced(&set, installed as u64);
                                 synced_digest = current;
+                                // A new policy selects a different set of pods,
+                                // and rules keyed on the old one would fire in
+                                // the wrong containers.
+                                selected_stale = true;
                             }
                             Err(err) => {
                                 eprintln!("ferrum-agent: {err}");
@@ -576,6 +586,7 @@ fn run(
                                 let empty = ferrum_ebpf::KernelRuleSet::default();
                                 guard.mark_kernel_rules_synced(&empty, 0);
                                 synced_digest = current;
+                                selected_stale = true;
                             }
                             Err(err) => {
                                 eprintln!("ferrum-agent: {err}");
@@ -585,10 +596,60 @@ fn run(
                     }
                 }
             }
+            // The pods the policy selects, handed to the kernel as an answer.
+            // Ordered after the rules on purpose only in the sense that both
+            // are idempotent: publishing rules before the set leaves them
+            // matching nothing for one tick, which is the fail-open direction
+            // and costs prevention rather than causing enforcement anywhere
+            // the policy did not ask for.
+            if selected_stale {
+                let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
+                let want = guard.selected_cgroups_for_last_good();
+                let planned = plan_cgroup_sync(handle.selected_cgroups(), &want);
+                match planned {
+                    Ok(plan) if plan.is_empty() => {
+                        guard.mark_selected_cgroups(handle.selected_cgroups().len() as u64);
+                        selected_stale = false;
+                    }
+                    Ok(plan) => match handle.sync_selected_cgroups(&plan) {
+                        Ok(stats) => {
+                            guard.mark_selected_cgroups(stats.entries as u64);
+                            selected_stale = false;
+                        }
+                        Err(err) => {
+                            // A half-applied selected set is the one failure
+                            // here that can *over*-enforce: a pod dropped from
+                            // the policy whose removal did not land keeps
+                            // matching. So the rules go rather than the set
+                            // stays — clearing costs prevention, and leaving
+                            // it costs execs in workloads nobody selected.
+                            eprintln!("ferrum-agent: {err}");
+                            let cleared = handle.clear_kernel_rules();
+                            guard.mark_kernel_rules_unsynced(match cleared {
+                                Ok(()) => format!(
+                                    "{err}; the rules were cleared rather than left keyed on a \
+                                     half-published selected set"
+                                ),
+                                Err(second) => format!(
+                                    "{err}; and clearing the rules failed too ({second}), so \
+                                     they may fire in containers this policy does not select"
+                                ),
+                            });
+                            synced_digest = None;
+                        }
+                    },
+                    Err(err) => {
+                        eprintln!("ferrum-agent: {err}");
+                        guard.mark_kernel_rules_unsynced(err);
+                    }
+                }
+            }
             if publisher_alive {
                 let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
                 publisher_alive =
                     ferrum_agent::drain_cgroup_updates(&cgroup_rx, &guard, |agent, next| {
+                        // The pod set moved, so the selected set may have too.
+                        selected_stale = true;
                         // The health stamp is the publisher's resolve time, not
                         // now: an unchanged set republished from a frozen index
                         // must not reaffirm the map.
