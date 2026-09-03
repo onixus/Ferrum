@@ -273,6 +273,17 @@ pub const DEG_DATAPATH: &str =
     "datapath degraded: a record carried a syscall nr this build cannot name";
 pub const DEG_CGROUP_INDEX_EMPTY: &str =
     "cgroup index empty: every namespaced selector misses, whatever the policy says";
+/// The kernel-side rule set could not be published, so `ferrum_rules` was
+/// cleared rather than left holding a mix of two policies.
+///
+/// A degradation and the only one this feature raises: prevention is off on
+/// this node while the loaded policy says it should be on. Detection is not
+/// affected — every rule is still matched on the tracepoint path — which is
+/// why this is Degraded and not terminal.
+pub const DEG_KERNEL_RULES_UNSYNCED: &str =
+    "kernel rule set unpublished: ferrum_rules was cleared, so this node prevents nothing in \
+     kernel and keeps detecting";
+
 pub const DEG_CONTAINER_MAP: &str =
     "container map not ready: EVENT_FLAG_CONTAINER cannot be trusted, so containerOnly rules miss";
 pub const DEG_EXPORT_DEAD: &str = "export writer dead: enforcement runs and nothing records it";
@@ -596,6 +607,29 @@ pub struct Agent {
     /// EVENT_FLAG_CONTAINER. Every one of these is a `container_only` rule
     /// that did not match on a real container.
     container_flag_disagreement: AtomicU64,
+    /// Whether this node's datapath has BPF LSM programs attached. False on a
+    /// kernel without `CONFIG_BPF_LSM` and on every build that never asked.
+    lsm_attached: AtomicBool,
+    /// Slots this node published into `ferrum_rules`, and rules that stayed on
+    /// the tracepoint path because the kernel cannot decide them.
+    ///
+    /// Neither is a degradation, and that is a decision rather than an
+    /// oversight: a rule naming a path is excluded by construction — the hook
+    /// cannot read one — so the §D acceptance rule is excluded on every
+    /// healthy node, and a reason raised by every node at all times is a
+    /// signal operators stop reading. What they are is *counted*, published,
+    /// and charted.
+    kernel_rules_installed: AtomicU64,
+    kernel_rules_excluded: AtomicU64,
+    /// Why no rule of the loaded policy may be enforced in kernel at all — a
+    /// selector, a non-enforce mode, a non-allow default. Also not a
+    /// degradation: it is the ordinary state of most policies.
+    kernel_rules_refused: Mutex<Option<String>>,
+    /// The last attempt to publish the rules into the map failed. This one
+    /// *is* a degradation: the map was cleared to keep two policies from
+    /// mixing, so this node prevents nothing in kernel while its policy says
+    /// it should.
+    kernel_rules_unsynced: Mutex<Option<String>>,
     identity_unknown: AtomicU64,
     identity_unknown_at: Mutex<Option<Instant>>,
     /// When the last whole sync plan was accepted. Freshness, not just
@@ -724,6 +758,11 @@ impl Agent {
             container_map_entries: AtomicU64::new(0),
             container_map_error: Mutex::new(None),
             container_flag_disagreement: AtomicU64::new(0),
+            lsm_attached: AtomicBool::new(false),
+            kernel_rules_installed: AtomicU64::new(0),
+            kernel_rules_excluded: AtomicU64::new(0),
+            kernel_rules_refused: Mutex::new(None),
+            kernel_rules_unsynced: Mutex::new(None),
             identity_unknown: AtomicU64::new(0),
             identity_unknown_at: Mutex::new(None),
             container_map_synced_at: Mutex::new(None),
@@ -819,6 +858,9 @@ impl Agent {
                 Some(err) => out.push(format!("{DEG_CONTAINER_MAP}: {err}")),
                 None => out.push(DEG_CONTAINER_MAP.to_string()),
             }
+        }
+        if let Some(err) = self.kernel_rules_unsynced() {
+            out.push(format!("{DEG_KERNEL_RULES_UNSYNCED}: {err}"));
         }
         if self.export_dead.load(Ordering::Relaxed) {
             out.push(DEG_EXPORT_DEAD.to_string());
@@ -1131,6 +1173,81 @@ impl Agent {
     /// rule silently not matching.
     pub fn container_map_ready(&self) -> bool {
         self.container_map_ready_at(Instant::now())
+    }
+
+    pub fn lsm_attached(&self) -> bool {
+        self.lsm_attached.load(Ordering::Relaxed)
+    }
+
+    pub fn set_lsm_attached(&self, attached: bool) {
+        self.lsm_attached.store(attached, Ordering::Relaxed);
+    }
+
+    pub fn kernel_rules_installed(&self) -> u64 {
+        self.kernel_rules_installed.load(Ordering::Relaxed)
+    }
+
+    pub fn kernel_rules_excluded(&self) -> u64 {
+        self.kernel_rules_excluded.load(Ordering::Relaxed)
+    }
+
+    pub fn kernel_rules_refused(&self) -> Option<String> {
+        self.kernel_rules_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn kernel_rules_unsynced(&self) -> Option<String> {
+        self.kernel_rules_unsynced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What this agent would publish into `ferrum_rules` for the bundle it is
+    /// currently enforcing.
+    ///
+    /// Derived from the loaded spec on every call rather than cached: the
+    /// cached copy would be the thing that goes stale across a reload, and
+    /// this is called once per bundle change.
+    pub fn kernel_rules_for_last_good(&self) -> Option<ferrum_ebpf::KernelRuleSet> {
+        self.loader
+            .last_good()
+            .map(|bundle| ferrum_ebpf::compile_kernel_rules(&bundle.spec))
+    }
+
+    /// Record a rule set that reached the map.
+    ///
+    /// `installed` is what the handle reported writing, not what the set
+    /// holds: the two are equal on success and this takes the observed number
+    /// so a future partial write cannot be reported as a whole one.
+    pub fn mark_kernel_rules_synced(&self, set: &ferrum_ebpf::KernelRuleSet, installed: u64) {
+        self.kernel_rules_installed
+            .store(installed, Ordering::Relaxed);
+        self.kernel_rules_excluded
+            .store(set.excluded.len() as u64, Ordering::Relaxed);
+        *self
+            .kernel_rules_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = set.refused.clone();
+        // A sync that worked clears the failure: this is a state, not a
+        // count, and a node that recovered must stop saying it did not.
+        *self
+            .kernel_rules_unsynced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Record that publishing failed. The installed count goes to zero
+    /// because that is what a cleared map holds, and reporting the previous
+    /// number would name rules this node is no longer enforcing.
+    pub fn mark_kernel_rules_unsynced(&self, err: impl std::fmt::Display) {
+        self.kernel_rules_installed.store(0, Ordering::Relaxed);
+        *self
+            .kernel_rules_unsynced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
     }
 
     pub fn container_map_ready_at(&self, now: Instant) -> bool {
@@ -7360,7 +7477,42 @@ mod tests {
         /// problem, not a gate problem — which is why the rows are written to
         /// be read, and why each says where the state goes instead of that it
         /// is fine.
-        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 20] = [
+        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 24] = [
+            (
+                "lsm_attached",
+                "not a count and not a fault in either direction: a kernel without CONFIG_BPF_LSM \
+                 is the supported majority of the fleet, and a node that runs the tracepoint path \
+                 alone is doing what this product has always done. What would be a fault is the \
+                 rule set failing to reach a node that *is* attached, and that has its own reason \
+                 — `DEG_KERNEL_RULES_UNSYNCED`, raised from `kernel_rules_unsynced`.",
+            ),
+            (
+                "kernel_rules_installed",
+                "how much of the loaded policy this node prevents rather than only detects. Zero \
+                 is the ordinary state — of the shipped prod-restricted, every exec rule names a \
+                 path — so a reason on it would be raised by every node at all times, which is a \
+                 signal operators stop reading. The failure that deserves a reason is the set not \
+                 reaching the map, and `DEG_KERNEL_RULES_UNSYNCED` is it.",
+            ),
+            (
+                "kernel_rules_excluded",
+                "rules that stay on the tracepoint path because the hook cannot decide them, and \
+                 the largest class of those is a path predicate, which the hook cannot read at \
+                 all with this toolchain. So this climbs on every healthy node carrying the §D \
+                 acceptance rule. It is published because \"which half of this policy is \
+                 prevented\" has no other answer, and it is charted; degrading on it would be \
+                 degrading on the design. `mark_kernel_rules_synced` is what writes it.",
+            ),
+            (
+                "kernel_rules_refused",
+                "the loaded policy may not be enforced in kernel at all — it carries a selector, \
+                 or is not in enforce mode, or has a non-allow default. Ordinary for most \
+                 policies, and the refusal is the safe direction: enforcing a selected policy \
+                 against every container refuses execs in workloads it never selected, which is \
+                 an outage caused by a security control. A node doing the right thing does not \
+                 report itself degraded for it. `mark_kernel_rules_synced` records the refusal \
+                 verbatim, and `kernel_rules_for_last_good` is what produced it.",
+            ),
             (
                 "respond_refused",
                 "the aggregate of every guard that said no. A refusal is the guards working, and \

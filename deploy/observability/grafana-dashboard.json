@@ -555,17 +555,55 @@
       }
     },
     {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Prevented, or only detected",
+      "description": "Which half of the loaded policy this fleet stops before it happens. Rules the in-kernel hook cannot decide stay on the tracepoint path and are excluded — a rule naming a path is excluded by construction, the toolchain cannot read one, and the §D acceptance rule «exec + /bin/sh -> kill» is among them — so a non-zero excluded count is the ordinary state and not a fault. `refused` counts nodes whose whole policy may not be enforced in kernel (a selector, a non-enforce mode); `unsynced` is the one that is a fault: the map was cleared, so those nodes prevent nothing and keep detecting.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 77 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ferrum_agent_lsm_attached)",
+          "legendFormat": "nodes with the LSM hook attached"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(ferrum_agent_kernel_rules_installed)",
+          "legendFormat": "rules prevented in kernel"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(ferrum_agent_kernel_rules_excluded)",
+          "legendFormat": "rules only detected (expected non-zero)"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(ferrum_agent_kernel_rules_refused)",
+          "legendFormat": "nodes whose policy the kernel may not enforce"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(ferrum_agent_kernel_rules_unsynced)",
+          "legendFormat": "nodes whose rule set failed to publish"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
+    },
+    {
       "id": 27,
       "type": "row",
       "title": "Control plane",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 77 }
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 85 }
     },
     {
       "id": 28,
       "type": "stat",
       "title": "Bundle digests the controller has signed",
       "description": "One digest is a converged rollout. Two means the controller signed something the fleet has not taken up yet — compare with the two digest counts at the top of this dashboard: controller, webhook and agents disagreeing is a rollout that did not land, and it is invisible from any one of the three alone.",
-      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 78 },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 86 },
       "targets": [
         {
           "refId": "A",
@@ -590,7 +628,7 @@
       "type": "stat",
       "title": "Controller degraded",
       "description": "The whole degraded state as one bool, the same one status.json reports. Which class and why is the panel to the right; the cause text stays in the file on the Pod, which is deliberate — a reason is prose and would be an unbounded label.",
-      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 78 },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 86 },
       "targets": [
         {
           "refId": "A",
@@ -615,7 +653,7 @@
       "type": "timeseries",
       "title": "Is the control plane converging",
       "description": "Reconciles taken up against the ways they end. A policy that did not compile is the policy author's and the object carries the reason in its own status; the four failure classes are requests to the API server that did not answer, and those are the operator's. Two lines and not one sum, because they send different people.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 78 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 86 },
       "targets": [
         {
           "refId": "A",
@@ -658,7 +696,7 @@
       "type": "timeseries",
       "title": "Where the controller is stuck",
       "description": "A run climbing towards ferrum_controller_terminal_run in a class that has never succeeded is the deployment being wrong — a mis-edited RBAC, a CRD never applied — and the process ends itself when it arrives, which is why the threshold is charted beside the run instead of restated in an alert. Unactionable objects are the other kind: work that stays undone until a human edits something, and no retry will mend it.",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 86 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 94 },
       "targets": [
         {
           "refId": "A",

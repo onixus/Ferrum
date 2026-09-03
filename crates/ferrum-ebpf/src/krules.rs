@@ -30,9 +30,16 @@
 //! version, and `aya-ebpf-bindings` declares `linux_binprm` opaque
 //! deliberately. A hand-written offset refuses to load on a kernel whose
 //! layout differs, or matches on garbage when it lands on another field of the
-//! same width. **This is not a corner case:** the §D acceptance case of
-//! RFC-02, «`exec` + `/bin/sh` → kill», names a path, so the flagship runtime
-//! case is one of the excluded ones and stays detect-then-kill.
+//! same width.
+//!
+//! What this does *not* cost, contrary to the first reading of it: the §D
+//! acceptance case of RFC-02, «`exec` + `/bin/sh` → kill», is caught by
+//! `no-shell` in the shipped `prod-restricted`, and that rule matches on
+//! `commIn: [sh, bash, ash, dash, zsh]` with `containerOnly` — no path
+//! predicate at all. Both are answerable in the hook, so the flagship runtime
+//! case *is* representable here. `no-runtime-sock` is the one that is not: it
+//! matches `pathSuffix`. `krules_gate.rs` compiles the shipped policy and
+//! holds both halves of that.
 //!
 //! **A selector.** Label selectors are resolved against a pod identity the
 //! kernel does not have. Enforcing a selected policy against every container
@@ -120,7 +127,13 @@ pub fn compile_kernel_rules(spec: &EbpfSpec) -> KernelRuleSet {
              применился бы к каждому контейнеру, включая те, которые политика не выбирала",
         );
     }
-    if spec.default_action != Action::Allow {
+    // Only a default that would itself refuse an exec is unrepresentable:
+    // «всё несовпавшее» списком совпадающих правил не выражается. `allow` и
+    // `audit` не предотвращают ничего, поэтому предотвращение целиком
+    // определяется совпавшими правилами, и отказывать из-за них значило бы
+    // отказывать поставляемой `prod-restricted`, у которой `defaultAction:
+    // audit`.
+    if !matches!(spec.default_action, Action::Allow | Action::Audit) {
         return KernelRuleSet::refuse(format!(
             "defaultAction = {}: «всё несовпавшее» списком совпадающих правил не выражается",
             spec.default_action.as_str()
@@ -350,8 +363,6 @@ mod tests {
                 excluded.rule
             );
         }
-        // The §D acceptance case is one of them, and this is the assertion
-        // that keeps that fact from being quietly lost in a later edit.
         assert!(
             set.excluded[0].reason.contains("путь"),
             "{}",
@@ -420,6 +431,18 @@ mod tests {
             s.default_action = Action::Kill;
             s
         };
+        // And the two defaults that must NOT refuse: neither prevents
+        // anything, so prevention stays fully determined by the rules.
+        for default in [Action::Allow, Action::Audit] {
+            let mut permissive = spec(vec![rule("keeps", Action::Kill)]);
+            permissive.default_action = default;
+            let set = compile_kernel_rules(&permissive);
+            assert!(
+                !set.is_refused() && set.len() == 1,
+                "defaultAction {} refused a policy it does not affect: {set:?}",
+                default.as_str()
+            );
+        }
 
         for (name, spec) in [
             ("selector", selected),
