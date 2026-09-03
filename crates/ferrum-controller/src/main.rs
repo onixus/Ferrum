@@ -77,6 +77,7 @@ struct RunOpts {
     min_agent_abi: u32,
     min_admission_abi: u32,
     trust_root: Option<String>,
+    metrics_listen: Option<String>,
 }
 
 fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> {
@@ -88,6 +89,7 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
         min_agent_abi: 0,
         min_admission_abi: 0,
         trust_root: None,
+        metrics_listen: None,
     };
     let mut it = args;
     while let Some(arg) = it.next() {
@@ -101,6 +103,9 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
             }
             "--status-dir" => {
                 opts.status_dir = Some(PathBuf::from(require_val("--status-dir", it.next())?));
+            }
+            "--metrics-listen" => {
+                opts.metrics_listen = Some(require_val("--metrics-listen", it.next())?);
             }
             "--cluster" => {
                 opts.clusters
@@ -149,6 +154,7 @@ fn parse_run(args: impl Iterator<Item = String>) -> Result<WatchConfig, String> 
         library,
         clusters: opts.clusters,
         status_dir: opts.status_dir,
+        metrics_listen: opts.metrics_listen,
     })
 }
 
@@ -233,7 +239,7 @@ fn yaml_kind(raw: &str) -> Result<String, String> {
 }
 
 fn usage() -> String {
-    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--status-dir /run/ferrum] [--cluster name:agentAbi:admissionAbi]...".into()
+    "usage: ferrum-controller <policy.yaml> <ed25519-seed-hex> [signed-bundle.fsig]\n       ferrum-controller run --seed-file <path> [--namespace ferrum] [--status-dir /run/ferrum] [--metrics-listen 0.0.0.0:9104] [--cluster name:agentAbi:admissionAbi]...".into()
 }
 
 #[cfg(test)]
@@ -288,6 +294,7 @@ mod tests {
             "--min-agent-abi",
             "--min-admission-abi",
             "--trust-root",
+            "--metrics-listen",
         ] {
             let err = parse_run(argv(&[flag, "--trust-root"]).into_iter())
                 .err()
@@ -378,6 +385,40 @@ mod tests {
              nowhere, and a pod with no status file is indistinguishable from one that was \
              never asked for one"
         );
+        let _ = fs::remove_file(&seed);
+    }
+
+    /// The port is off unless it is asked for, and what is asked for is
+    /// passed through untouched.
+    ///
+    /// No parsing of the address here on purpose: `TcpListener::bind` is the
+    /// thing that decides whether `0.0.0.0:9104`, `[::1]:9104` or a hostname
+    /// resolves, and a second opinion in this function would be a grammar
+    /// that disagrees with the one that runs. The failure an operator gets
+    /// for a bad address is a bind error naming it, at startup.
+    #[test]
+    fn the_metrics_port_is_off_until_asked_for() {
+        let seed = seed_file();
+        let seed_str = seed.to_string_lossy().into_owned();
+
+        let cfg = parse_run(argv(&["--seed-file", &seed_str]).into_iter())
+            .expect("parse without --metrics-listen");
+        assert_eq!(
+            cfg.metrics_listen, None,
+            "a controller that was not asked for a port must not open one"
+        );
+
+        for addr in ["0.0.0.0:9104", "127.0.0.1:9104", "[::1]:9104"] {
+            let cfg =
+                parse_run(argv(&["--seed-file", &seed_str, "--metrics-listen", addr]).into_iter())
+                    .unwrap_or_else(|e| panic!("parse with --metrics-listen {addr}: {e}"));
+            assert_eq!(cfg.metrics_listen.as_deref(), Some(addr));
+        }
+
+        let err = parse_run(argv(&["--seed-file", &seed_str, "--metrics-listen"]).into_iter())
+            .expect_err("a flag with no value");
+        assert!(err.contains("--metrics-listen requires a value"), "{err}");
+
         let _ = fs::remove_file(&seed);
     }
 }

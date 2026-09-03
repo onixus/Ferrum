@@ -16,6 +16,11 @@ spec:
       labels:
         app.kubernetes.io/name: ferrum-controller
         app.kubernetes.io/part-of: ferrum
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9104"
+        prometheus.io/path: /metrics
+        prometheus.io/scheme: http
     spec:
       serviceAccountName: ferrum-controller
       automountServiceAccountToken: true
@@ -41,15 +46,32 @@ spec:
             - ferrum
             # Where this controller publishes what it knows about itself:
             # counters per failure class, the run of each, and the reasons.
-            # Deliberately a file and not a port — a listening socket is a
-            # second attack surface and an HTTP stack a dependency this crate's
-            # boundary does not carry — and deliberately not wired to any
-            # probe. Every degradation here is either recoverable, in which
-            # case a restart is a crash loop, or the deployment being wrong, in
-            # which case the process ends itself once and says which class
-            # failed. See `crates/ferrum-controller/src/health.rs`.
+            # Deliberately not wired to any probe. Every degradation here is
+            # either recoverable, in which case a restart is a crash loop, or
+            # the deployment being wrong, in which case the process ends itself
+            # once and says which class failed. See
+            # `crates/ferrum-controller/src/health.rs`.
             - --status-dir
             - /run/ferrum
+            # The same state, on a port, because the file is mode 0600 on this
+            # Pod: without this an operator asking "is policy converging" has
+            # to `kubectl exec` into the workload that holds the signing key.
+            #
+            # This used to say a port was refused here on principle — a second
+            # attack surface, and an HTTP stack this crate's boundary does not
+            # carry. Half of that stopped being true: `ferrum-metrics` is
+            # `std::net`, no runtime, no TLS, and answers `GET /metrics` and
+            # nothing else, with every request body unread. The other half is
+            # still true and is paid rather than argued away: it is a surface,
+            # so it is read-only, it publishes ids and never the free-text
+            # causes (those stay in status.json), and
+            # deploy/observability/networkpolicy.yaml stands in front of it.
+            # Drop these two lines and the controller is exactly what it was.
+            - --metrics-listen
+            - 0.0.0.0:9104
+          ports:
+            - name: metrics
+              containerPort: 9104
           resources:
             requests:
               cpu: 100m

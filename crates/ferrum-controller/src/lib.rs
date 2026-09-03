@@ -7,6 +7,7 @@ mod apply;
 mod bundle;
 mod health;
 mod key;
+mod metrics;
 #[cfg(test)]
 mod testapi;
 mod watch;
@@ -28,6 +29,9 @@ pub use health::{
 pub use key::{
     hex_decode, hex_encode, load_seed, load_seed_file, parse_public_key_hex, parse_seed_bytes,
     parse_seed_hex, SEED_ENV, SEED_FILE_ENV,
+};
+pub use metrics::{
+    exposition, metrics_text, spawn_metrics, ControllerMetrics, SHIPPED_METRICS_PORT,
 };
 pub use watch::{
     cluster_security_policy_gvk, cluster_security_policy_resource, observe_exception,
@@ -238,6 +242,11 @@ pub struct WatchConfig {
     /// reader outside the process, which is the shipped default for anyone
     /// running this binary by hand; the manifest passes `--status-dir`.
     pub status_dir: Option<PathBuf>,
+    /// The address `GET /metrics` is answered on, from `--metrics-listen`.
+    /// `None` — the default — opens no port at all: `status.json` needs none,
+    /// and a socket nobody asked for is a second surface on the one workload
+    /// that holds the signing key.
+    pub metrics_listen: Option<String>,
 }
 
 pub struct ReconcileInput<'a> {
