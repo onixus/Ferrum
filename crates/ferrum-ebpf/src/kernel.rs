@@ -73,11 +73,25 @@ pub struct SyncStats {
 /// leave an arbitrary subset of pods unflagged, and `container_only` rules
 /// would then allow in exactly those pods.
 pub fn plan_cgroup_sync(current: &BTreeSet<u64>, next: &BTreeSet<u64>) -> Result<CgroupSyncPlan> {
+    plan_map_sync(current, next, MAP_CGROUPS)
+}
+
+/// [`plan_cgroup_sync`], told which map it is planning for.
+///
+/// Two maps are keyed by cgroup id now — the container set and the selected
+/// set — and they fail differently: an overflowed container map leaves pods
+/// unflagged, an overflowed selected map leaves them unselected, which stops
+/// prevention rather than detection. A message naming the wrong one sends an
+/// operator to inspect a map that is healthy.
+pub fn plan_map_sync(
+    current: &BTreeSet<u64>,
+    next: &BTreeSet<u64>,
+    map: &'static str,
+) -> Result<CgroupSyncPlan> {
     if next.len() > CGROUPS_MAX_ENTRIES as usize {
         return Err(FerrumError::Degraded(format!(
-            "cgroup sync: {} container cgroups do not fit the {CGROUPS_MAX_ENTRIES}-entry \
-             {MAP_CGROUPS} map; refusing a truncated sync that would leave arbitrary pods \
-             unflagged",
+            "cgroup sync: {} cgroups do not fit the {CGROUPS_MAX_ENTRIES}-entry {map} map; \
+             refusing a truncated sync that would leave arbitrary pods out of it",
             next.len()
         )));
     }

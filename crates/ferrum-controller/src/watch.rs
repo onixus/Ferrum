@@ -574,7 +574,7 @@ async fn reconcile_object(
     let (og, ready, digest) = status_compile(&obj);
     if ready {
         if !digest.is_empty() {
-            metrics.set_bundle_digest(&digest);
+            metrics.set_bundle_digest(&name, &digest);
         }
         let loaded = load_bundle_secret(client, &cfg.namespace, &secret_name(&name))
             .await
@@ -607,7 +607,7 @@ async fn reconcile_object(
             });
             let failed = matches!(outcome, ReconcileOutcome::Failed(_));
             if let ReconcileOutcome::Applied(ref applied) = outcome {
-                metrics.set_bundle_digest(applied.bundle.digest.as_str());
+                metrics.set_bundle_digest(&observed.name, applied.bundle.digest.as_str());
             }
             (
                 plan_apply(&observed.name, &cfg.namespace, &outcome, &cfg.trust_root),
@@ -624,10 +624,15 @@ async fn reconcile_object(
             true,
         ),
     };
+    // Counted here, before the three fallible calls below: a policy that
+    // failed to compile *and* whose status PATCH is refused used to reach
+    // neither of the two later call sites, so the compile failure a policy
+    // author needs to see was lost behind an RBAC fault that belongs to
+    // somebody else.
+    if compile_failed {
+        metrics.record_compile_failure();
+    }
     if failed_status_already_recorded(&obj, generation, &plan) {
-        if compile_failed {
-            metrics.record_compile_failure();
-        }
         return Ok(());
     }
     let persisted = persist(client, &name, &cfg.namespace, &plan)
@@ -640,9 +645,6 @@ async fn reconcile_object(
         .await
         .map_err(as_class(FailureClass::ExceptionPublish))?;
     health.note_success(attached);
-    if compile_failed {
-        metrics.record_compile_failure();
-    }
     Ok(())
 }
 
@@ -661,7 +663,7 @@ async fn reconcile_namespaced_object(
     let (og, ready, digest) = status_compile(&obj);
     if ready {
         if !digest.is_empty() {
-            metrics.set_bundle_digest(&digest);
+            metrics.set_bundle_digest(format!("{policy_namespace}/{name}"), &digest);
         }
         let loaded = load_bundle_secret(
             client,
@@ -693,7 +695,10 @@ async fn reconcile_namespaced_object(
             });
             let failed = matches!(outcome, ReconcileOutcome::Failed(_));
             if let ReconcileOutcome::Applied(ref applied) = outcome {
-                metrics.set_bundle_digest(applied.bundle.digest.as_str());
+                metrics.set_bundle_digest(
+                    format!("{}/{}", observed.namespace, observed.name),
+                    applied.bundle.digest.as_str(),
+                );
             }
             (
                 plan_apply_namespaced(
@@ -717,10 +722,15 @@ async fn reconcile_namespaced_object(
             true,
         ),
     };
+    // Counted here, before the three fallible calls below: a policy that
+    // failed to compile *and* whose status PATCH is refused used to reach
+    // neither of the two later call sites, so the compile failure a policy
+    // author needs to see was lost behind an RBAC fault that belongs to
+    // somebody else.
+    if compile_failed {
+        metrics.record_compile_failure();
+    }
     if failed_status_already_recorded(&obj, generation, &plan) {
-        if compile_failed {
-            metrics.record_compile_failure();
-        }
         return Ok(());
     }
     let persisted = persist_dynamic(
@@ -738,9 +748,6 @@ async fn reconcile_namespaced_object(
         .await
         .map_err(as_class(FailureClass::ExceptionPublish))?;
     health.note_success(attached);
-    if compile_failed {
-        metrics.record_compile_failure();
-    }
     Ok(())
 }
 
@@ -1676,7 +1683,10 @@ mod tests {
                 .is_ok(),
             "a converged object is not a failure"
         );
-        assert_eq!(metrics.bundle_digest().as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            metrics.bundle_digest_of("prod-restricted").as_deref(),
+            Some(digest.as_str())
+        );
         assert_eq!(
             stub.seen_matching("GET", "secrets").len(),
             1,

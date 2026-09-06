@@ -30,6 +30,7 @@
 
 use crate::health::{ControllerHealth, FailureClass, TERMINAL_RUN};
 use ferrum_metrics::Exposition;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -54,7 +55,18 @@ pub const SHIPPED_METRICS_PORT: u16 = 9104;
 pub struct ControllerMetrics {
     reconcile_total: AtomicU64,
     compile_failures_total: AtomicU64,
-    bundle_digest: RwLock<Option<String>>,
+    /// Digest per policy, keyed by the policy this controller signed it for.
+    ///
+    /// A map and not one slot. This process reconciles every policy in the
+    /// cluster, and a single slot held whichever object reconciled last — so
+    /// on a cluster with two policies the series flapped between two digests
+    /// at watch cadence, and the panel that reads "the controller, the webhook
+    /// and the agents disagree" as a stuck rollout could not tell a real one
+    /// from that flapping. The key never leaves this process: what is
+    /// published is one series per *distinct digest*, carrying how many
+    /// policies are on it, so an operator-chosen policy name is not put on the
+    /// wire — the same refusal `ferrum-agent` makes for `policyName`.
+    bundle_digests: RwLock<BTreeMap<String, String>>,
 }
 
 impl ControllerMetrics {
@@ -70,11 +82,28 @@ impl ControllerMetrics {
         self.compile_failures_total.load(Ordering::Relaxed)
     }
 
-    pub fn bundle_digest(&self) -> Option<String> {
-        self.bundle_digest
+    /// Digests in force, each with the number of policies on it.
+    pub fn bundle_digests(&self) -> BTreeMap<String, u64> {
+        let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        for digest in self
+            .bundle_digests
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .values()
+        {
+            *out.entry(digest.clone()).or_default() += 1;
+        }
+        out
+    }
+
+    /// The digest of one policy, for tests and for a caller that knows which
+    /// policy it means.
+    pub fn bundle_digest_of(&self, policy: &str) -> Option<String> {
+        self.bundle_digests
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(policy)
+            .cloned()
     }
 
     /// One watch event taken up for reconciliation.
@@ -91,12 +120,16 @@ impl ControllerMetrics {
         self.compile_failures_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn set_bundle_digest(&self, digest: impl Into<String>) {
-        let mut held = self
-            .bundle_digest
+    /// Record the digest this controller signed for one policy.
+    ///
+    /// `policy` is the key the caller uses to name that object — the
+    /// cluster-scoped name, or `namespace/name` for a namespaced one — and it
+    /// is never published.
+    pub fn set_bundle_digest(&self, policy: impl Into<String>, digest: impl Into<String>) {
+        self.bundle_digests
             .write()
-            .unwrap_or_else(|e| e.into_inner());
-        *held = Some(digest.into());
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(policy.into(), digest.into());
     }
 }
 
@@ -210,17 +243,24 @@ pub fn exposition(metrics: &ControllerMetrics, health: &ControllerHealth) -> Exp
     // Named like its two siblings, and charted beside them: the controller
     // signs a bundle, the webhook and the agents load one, and a rollout that
     // did not land is those three digests disagreeing.
+    // One series per distinct digest, always at least one. A family that
+    // disappears when nothing is loaded cannot be told from a scrape that
+    // failed, and "is every policy on the same bundle" is a question asked
+    // before the incident.
+    let digests = metrics.bundle_digests();
+    let series: Vec<(Vec<(String, String)>, u64)> = if digests.is_empty() {
+        vec![(vec![("digest".to_string(), String::new())], 0)]
+    } else {
+        digests
+            .into_iter()
+            .map(|(digest, policies)| (vec![("digest".to_string(), digest)], policies))
+            .collect()
+    };
     out.labelled_gauge(
         "ferrum_controller_bundle_info",
-        "1, labelled with the digest of the bundle this controller last signed or observed \
-         converged; empty means it has signed none since it started",
-        vec![(
-            vec![(
-                "digest".to_string(),
-                metrics.bundle_digest().unwrap_or_default(),
-            )],
-            1,
-        )],
+        "how many policies this controller has signed onto each bundle digest; empty digest with \
+         0 means it has signed none since it started",
+        series,
     );
 
     out
@@ -316,7 +356,7 @@ mod tests {
             );
         }
         assert!(
-            text.contains("ferrum_controller_bundle_info{digest=\"\"} 1"),
+            text.contains("ferrum_controller_bundle_info{digest=\"\"} 0"),
             "{text}"
         );
     }
@@ -331,7 +371,7 @@ mod tests {
         metrics.record_reconcile();
         metrics.record_reconcile();
         metrics.record_compile_failure();
-        metrics.set_bundle_digest("abcdef1234567890abcdef1234567890");
+        metrics.set_bundle_digest("prod-restricted", "abcdef1234567890abcdef1234567890");
         health.note_success(Requested::of(FailureClass::Watch));
         for _ in 0..3 {
             health
@@ -379,6 +419,55 @@ mod tests {
         // And the prose stays where the prose belongs: no cause text reached
         // a label.
         assert!(!text.contains("403 Forbidden"), "{text}");
+    }
+
+    /// Every policy keeps its own digest, and what goes on the wire is one
+    /// series per distinct one.
+    ///
+    /// A single slot held whichever object reconciled last, so on a cluster
+    /// with two policies the series flapped between two digests at watch
+    /// cadence — and the panel that reads three disagreeing digests as a stuck
+    /// rollout could not tell a real one from that.
+    #[test]
+    fn two_policies_are_two_digests_and_not_one_overwriting_the_other() {
+        let metrics = ControllerMetrics::new();
+        let health = ControllerHealth::new();
+
+        metrics.set_bundle_digest("prod-restricted", "aaaa");
+        metrics.set_bundle_digest("dev-permissive", "bbbb");
+        assert_eq!(
+            metrics.bundle_digest_of("prod-restricted").as_deref(),
+            Some("aaaa")
+        );
+        assert_eq!(
+            metrics.bundle_digest_of("dev-permissive").as_deref(),
+            Some("bbbb")
+        );
+
+        let text = metrics_text(&metrics, &health);
+        assert!(
+            text.contains("ferrum_controller_bundle_info{digest=\"aaaa\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ferrum_controller_bundle_info{digest=\"bbbb\"} 1"),
+            "{text}"
+        );
+
+        // Both onto the same bundle: one series, and the value is how many
+        // policies are on it — which is what makes a rollout readable.
+        metrics.set_bundle_digest("dev-permissive", "aaaa");
+        let text = metrics_text(&metrics, &health);
+        assert!(
+            text.contains("ferrum_controller_bundle_info{digest=\"aaaa\"} 2"),
+            "{text}"
+        );
+        assert!(!text.contains("digest=\"bbbb\""), "{text}");
+
+        // And no policy name reaches the wire, which is the same refusal
+        // `ferrum-agent` makes for `policyName`.
+        assert!(!text.contains("prod-restricted"), "{text}");
+        assert!(!text.contains("dev-permissive"), "{text}");
     }
 
     /// A class added to the enum has to appear on the port without this file

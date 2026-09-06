@@ -1063,7 +1063,7 @@ fn the_controllers_port_answers_with_state_that_changed_after_it_opened() {
     // The state moves under the open port, exactly as it does when a
     // deployment is wrong: a class fails repeatedly and has never worked.
     metrics.record_reconcile();
-    metrics.set_bundle_digest("f00dcafef00dcafef00dcafef00dcafe");
+    metrics.set_bundle_digest("prod-restricted", "f00dcafef00dcafef00dcafef00dcafe");
     for _ in 0..4 {
         health
             .note_failure(FailureClass::StatusPatch, "403 Forbidden")

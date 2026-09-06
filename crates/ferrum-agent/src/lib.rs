@@ -1228,12 +1228,12 @@ impl Agent {
         if bundle.spec.selector.is_empty() {
             return std::collections::BTreeSet::new();
         }
+        // `select` and not `snapshot`: this runs on the thread that drains the
+        // event ring, once per pod refresh, and a deep copy of every identity
+        // — four label maps each — to ask a yes/no question of it is work
+        // taken directly out of the drain cadence.
         self.cgroups
-            .snapshot()
-            .iter()
-            .filter(|(_, identity)| ferrum_ebpf::selector_matches(&bundle.spec.selector, identity))
-            .map(|(inode, _)| *inode)
-            .collect()
+            .select(|identity| ferrum_ebpf::selector_matches(&bundle.spec.selector, identity))
     }
 
     pub fn kernel_rules_refused(&self) -> Option<String> {

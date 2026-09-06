@@ -30,8 +30,8 @@ pub use ferrum_ebpf_progs::{
 };
 pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
 pub use kernel::{
-    elf_map_def, lsm_available, plan_cgroup_sync, verify_map_defs, CgroupSyncPlan, MapDef, Memlock,
-    SyncStats, KERNEL_RULE_SIZE, MAP_DEF_LEN, REQUIRED_MAPS,
+    elf_map_def, lsm_available, plan_cgroup_sync, plan_map_sync, verify_map_defs, CgroupSyncPlan,
+    MapDef, Memlock, SyncStats, KERNEL_RULE_SIZE, MAP_DEF_LEN, REQUIRED_MAPS,
 };
 #[cfg(feature = "attach")]
 pub use kernel::{raise_memlock, KernelHandle, RingReader};

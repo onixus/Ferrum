@@ -180,11 +180,20 @@ pub fn compile_kernel_rules(spec: &EbpfSpec) -> KernelRuleSet {
     // the shape of that failure is the one `sync_container_cgroups` already
     // refuses for the cgroup map.
     if out.rules.len() > MAX_KERNEL_RULES as usize {
-        return KernelRuleSet::refuse(format!(
-            "правил для ядра {}, слотов {MAX_KERNEL_RULES}: усечённый набор предотвращал бы \
-             часть политики и молчал об остальной",
-            out.rules.len()
-        ));
+        // Refused, and the per-rule reasons kept: they were collected before
+        // the overflow was known, and throwing them away leaves the surface
+        // reporting `kernelRulesExcluded: 0` — indistinguishable from a policy
+        // that has nothing to exclude.
+        return KernelRuleSet {
+            rules: Vec::new(),
+            excluded: out.excluded,
+            selected_only,
+            refused: Some(format!(
+                "правил для ядра {}, слотов {MAX_KERNEL_RULES}: усечённый набор предотвращал бы \
+                 часть политики и молчал об остальной",
+                out.rules.len()
+            )),
+        };
     }
     out
 }
@@ -622,9 +631,26 @@ mod tests {
                 .map(|i| rule(&format!("r{i}"), Action::Kill))
                 .collect(),
         );
+        let mut over = over;
+        let mut excluded_too = rule("has-a-path", Action::Kill);
+        excluded_too.path_suffix = vec!["/bin/sh".to_string()];
+        over.rules.push(excluded_too);
+
         let set = compile_kernel_rules(&over);
         let reason = set.refused.as_deref().expect("overflow must refuse");
         assert!(reason.contains(&MAX_KERNEL_RULES.to_string()), "{reason}");
-        assert!(set.is_empty());
+        assert!(set.is_empty(), "refused and still emitted slots");
+        // The reasons collected before the overflow was known are kept: an
+        // empty `excluded` here would publish as "this policy has nothing to
+        // exclude", which is a different statement about a different policy.
+        assert_eq!(
+            set.excluded
+                .iter()
+                .map(|e| e.rule.as_str())
+                .collect::<Vec<_>>(),
+            ["has-a-path"],
+            "{:#?}",
+            set.excluded
+        );
     }
 }

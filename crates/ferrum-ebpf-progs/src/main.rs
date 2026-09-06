@@ -131,7 +131,21 @@ mod progs {
     /// the predicate cannot drift; only this loop is written twice, and it is
     /// three lines of "strongest wins".
     #[lsm(hook = "bprm_check_security")]
-    pub fn ferrum_bprm_check_security(_ctx: LsmContext) -> i32 {
+    pub fn ferrum_bprm_check_security(ctx: LsmContext) -> i32 {
+        // Defer to whoever ran before us. BPF LSM programs on one hook run as
+        // a chain and each is handed the previous program's verdict as the
+        // last BTF argument; aya's macro passes our return value through
+        // untouched, so returning 0 here after another program returned
+        // -EPERM would turn that refusal into an allow. On a node running a
+        // second LSM tool this code would be silently defeating it, which is
+        // the one thing a security control must never do to another one.
+        //
+        // `bprm_check_security(struct linux_binprm *bprm)`: arg 0 is the
+        // binprm, arg 1 is the phony `retval` every LSM probe gets last.
+        let previous: i32 = unsafe { ctx.arg(1) };
+        if previous != 0 {
+            return previous;
+        }
         let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
         let in_container = FERRUM_CGROUPS.get_ptr(&cgroup_id).is_some();
         let selected = FERRUM_SELECTED.get_ptr(&cgroup_id).is_some();

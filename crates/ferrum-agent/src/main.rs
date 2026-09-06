@@ -28,6 +28,86 @@ struct CgroupPublish {
     resolved_at: Instant,
 }
 
+/// Whether a republish actually wrote anything.
+#[cfg(feature = "attach")]
+enum KernelPolicy {
+    /// The maps already hold this policy and this pod set. Nothing was
+    /// touched, which is the answer on almost every tick.
+    Unchanged,
+    /// The maps now hold the named bundle. `None` is a node with no bundle in
+    /// force, whose maps were emptied.
+    Published(Option<String>),
+}
+
+/// Bring `ferrum_rules` and `ferrum_selected` to the policy now in force, in
+/// the one order that never leaves rules enforcing against a set they were not
+/// compiled against.
+///
+/// The order is the whole of this function, and it is not arbitrary.
+///
+/// 1. **Rules off first.** A rule set compiled for one selected set and
+///    applied against another refuses execs in containers the policy never
+///    selected — an outage caused by a security control. So while the two maps
+///    disagree, the safe state is no prevention at all. Nothing is lost from
+///    detection: the tracepoint path still matches every rule and still kills.
+/// 2. **Then the selected set**, for the bundle that is loaded right now.
+/// 3. **Then the rules**, which are compiled against that set.
+///
+/// Every failure leaves the sequence stopped with the rules off and returns
+/// `Err`, so the caller degrades the node and the next tick starts over.
+/// `mark_kernel_rules_synced` — which is what clears that degradation — is
+/// reached only after all three steps have.
+///
+/// The early return is what keeps this from being destructive: an unchanged
+/// digest and an empty plan mean the maps are already right, and rewriting
+/// them would open a prevention gap on every tick for no reason.
+#[cfg(feature = "attach")]
+fn republish_kernel_policy(
+    handle: &mut ferrum_ebpf::KernelHandle,
+    agent: &Agent,
+    published: &Option<String>,
+) -> ferrum_common::Result<KernelPolicy> {
+    let digest = agent.last_good_digest().map(|d| d.as_str().to_string());
+    let want = agent.selected_cgroups_for_last_good();
+    let plan =
+        ferrum_ebpf::plan_map_sync(handle.selected_cgroups(), &want, ferrum_ebpf::MAP_SELECTED)?;
+    let policy_changed = &digest != published;
+    if plan.is_empty() && !policy_changed {
+        return Ok(KernelPolicy::Unchanged);
+    }
+
+    // Rules off first — but only when the rules themselves are changing.
+    //
+    // The hazard is a rule set compiled for one selected set and applied
+    // against another. A pod entering or leaving the set under an *unchanged*
+    // rule set is not that: it moves the rules onto exactly the pods the
+    // policy already selects, which can only narrow or widen them to what was
+    // asked for. Clearing there would open a prevention gap on every pod start
+    // and stop, which on a busy node is most of the time.
+    if policy_changed {
+        handle.clear_kernel_rules()?;
+    }
+
+    if !plan.is_empty() {
+        handle.sync_selected_cgroups(&plan)?;
+    }
+    agent.mark_selected_cgroups(handle.selected_cgroups().len() as u64);
+
+    if policy_changed {
+        match agent.kernel_rules_for_last_good() {
+            Some(set) => {
+                let installed = handle.sync_kernel_rules(&set)?;
+                agent.mark_kernel_rules_synced(&set, installed as u64);
+            }
+            // No bundle in force: the maps must not keep the last one they
+            // had. A node enforcing a policy it can no longer name is worse
+            // than a node enforcing nothing.
+            None => agent.mark_kernel_rules_synced(&ferrum_ebpf::KernelRuleSet::default(), 0),
+        }
+    }
+    Ok(KernelPolicy::Published(digest))
+}
+
 /// Set from the SIGTERM/SIGINT handler, which may do nothing else.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -540,116 +620,16 @@ fn run(
         let mut publisher_alive = true;
         let mut drop_check_broken = false;
         let mut records_alive = true;
-        // The digest whose rule set is in `ferrum_rules` right now. `None`
-        // before the first bundle and after one that could not be published:
-        // an unchanged value is what makes this a no-op on every tick but the
-        // ones that matter, and leaving it unchanged after a failure is what
-        // makes the next tick retry.
-        let mut synced_digest: Option<String> = None;
-        // The selected set has two inputs — the policy and the pods — so it is
-        // recomputed when either moves and not on every tick: resolving a
-        // selector against every entry of the index is O(pods) and the answer
-        // does not change on its own. True to begin with, so the first pass
-        // publishes.
-        let mut selected_stale = true;
+        // The digest whose policy is in the two kernel maps right now. `None`
+        // before the first bundle, and after any failure to publish one: the
+        // maps then hold no rules, and the next tick redoes the whole
+        // sequence rather than trusting a half-applied one.
+        let mut published: Option<String> = None;
         loop {
-            // The rule set follows the bundle. Polled here rather than pushed
-            // from the poller thread for the reason the cgroup set is pushed:
-            // the handle owns `ferrum_rules` and stays in this thread, and a
-            // second writer is the failure `sync_container_cgroups` already
-            // guards against. The comparison is on the digest, so a reload
-            // that installed the same bundle writes nothing.
-            {
-                let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
-                let current = guard.last_good_digest().map(|d| d.as_str().to_string());
-                if current != synced_digest {
-                    match guard.kernel_rules_for_last_good() {
-                        Some(set) => match handle.sync_kernel_rules(&set) {
-                            Ok(installed) => {
-                                guard.mark_kernel_rules_synced(&set, installed as u64);
-                                synced_digest = current;
-                                // A new policy selects a different set of pods,
-                                // and rules keyed on the old one would fire in
-                                // the wrong containers.
-                                selected_stale = true;
-                            }
-                            Err(err) => {
-                                eprintln!("ferrum-agent: {err}");
-                                guard.mark_kernel_rules_unsynced(err);
-                            }
-                        },
-                        // No bundle in force: the map must not keep the last
-                        // one it had. A node enforcing a policy it can no
-                        // longer name is worse than a node enforcing nothing.
-                        None => match handle.clear_kernel_rules() {
-                            Ok(()) => {
-                                let empty = ferrum_ebpf::KernelRuleSet::default();
-                                guard.mark_kernel_rules_synced(&empty, 0);
-                                synced_digest = current;
-                                selected_stale = true;
-                            }
-                            Err(err) => {
-                                eprintln!("ferrum-agent: {err}");
-                                guard.mark_kernel_rules_unsynced(err);
-                            }
-                        },
-                    }
-                }
-            }
-            // The pods the policy selects, handed to the kernel as an answer.
-            // Ordered after the rules on purpose only in the sense that both
-            // are idempotent: publishing rules before the set leaves them
-            // matching nothing for one tick, which is the fail-open direction
-            // and costs prevention rather than causing enforcement anywhere
-            // the policy did not ask for.
-            if selected_stale {
-                let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
-                let want = guard.selected_cgroups_for_last_good();
-                let planned = plan_cgroup_sync(handle.selected_cgroups(), &want);
-                match planned {
-                    Ok(plan) if plan.is_empty() => {
-                        guard.mark_selected_cgroups(handle.selected_cgroups().len() as u64);
-                        selected_stale = false;
-                    }
-                    Ok(plan) => match handle.sync_selected_cgroups(&plan) {
-                        Ok(stats) => {
-                            guard.mark_selected_cgroups(stats.entries as u64);
-                            selected_stale = false;
-                        }
-                        Err(err) => {
-                            // A half-applied selected set is the one failure
-                            // here that can *over*-enforce: a pod dropped from
-                            // the policy whose removal did not land keeps
-                            // matching. So the rules go rather than the set
-                            // stays — clearing costs prevention, and leaving
-                            // it costs execs in workloads nobody selected.
-                            eprintln!("ferrum-agent: {err}");
-                            let cleared = handle.clear_kernel_rules();
-                            guard.mark_kernel_rules_unsynced(match cleared {
-                                Ok(()) => format!(
-                                    "{err}; the rules were cleared rather than left keyed on a \
-                                     half-published selected set"
-                                ),
-                                Err(second) => format!(
-                                    "{err}; and clearing the rules failed too ({second}), so \
-                                     they may fire in containers this policy does not select"
-                                ),
-                            });
-                            synced_digest = None;
-                        }
-                    },
-                    Err(err) => {
-                        eprintln!("ferrum-agent: {err}");
-                        guard.mark_kernel_rules_unsynced(err);
-                    }
-                }
-            }
             if publisher_alive {
                 let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
                 publisher_alive =
                     ferrum_agent::drain_cgroup_updates(&cgroup_rx, &guard, |agent, next| {
-                        // The pod set moved, so the selected set may have too.
-                        selected_stale = true;
                         // The health stamp is the publisher's resolve time, not
                         // now: an unchanged set republished from a frozen index
                         // must not reaffirm the map.
@@ -676,6 +656,27 @@ fn run(
                     });
                 if !publisher_alive {
                     eprintln!("ferrum-agent: {}", ferrum_agent::CGROUP_PUBLISHER_GONE);
+                }
+            }
+            // The two kernel maps, brought to the policy now in force. After
+            // the drain rather than before it, so a pod set that arrived this
+            // tick reaches `ferrum_selected` in the same tick it reaches
+            // `ferrum_cgroups` instead of one later.
+            {
+                let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
+                match republish_kernel_policy(&mut handle, &guard, &published) {
+                    Ok(KernelPolicy::Unchanged) => {}
+                    Ok(KernelPolicy::Published(digest)) => published = digest,
+                    Err(err) => {
+                        eprintln!("ferrum-agent: {err}");
+                        guard.mark_kernel_rules_unsynced(err);
+                        // Not `published = digest`: the maps do not hold this
+                        // policy, and saying they do would leave the next tick
+                        // seeing nothing to do. The rules are off either way —
+                        // step 1 of the sequence — so this node prevents
+                        // nothing and keeps detecting until a tick succeeds.
+                        published = None;
+                    }
                 }
             }
             let tick = ring.tick(
