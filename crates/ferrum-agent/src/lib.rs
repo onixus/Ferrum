@@ -33,6 +33,136 @@ static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A container that starts between two ticks is a lookup miss, not a wrong
 /// identity.
 pub const CGROUP_REFRESH: Duration = Duration::from_secs(2);
+
+/// Whether a republish actually wrote anything.
+#[cfg(feature = "attach")]
+pub enum KernelPolicy {
+    /// The maps already hold this policy and this pod set. Nothing was
+    /// touched, which is the answer on almost every tick.
+    Unchanged,
+    /// The maps now hold the named bundle. `None` is a node with no bundle in
+    /// force, whose maps were emptied.
+    Published(Option<String>),
+}
+
+/// Bring `ferrum_rules` and `ferrum_selected` to the policy now in force, in
+/// the one order that never leaves rules enforcing against a set they were not
+/// compiled against.
+///
+/// The order is the whole of this function, and it is not arbitrary.
+///
+/// 1. **Rules off first.** A rule set compiled for one selected set and
+///    applied against another refuses execs in containers the policy never
+///    selected — an outage caused by a security control. So while the two maps
+///    disagree, the safe state is no prevention at all. Nothing is lost from
+///    detection: the tracepoint path still matches every rule and still kills.
+/// 2. **Then the selected set**, for the bundle that is loaded right now.
+/// 3. **Then the rules**, which are compiled against that set.
+///
+/// Every failure leaves the sequence stopped with the rules off and returns
+/// `Err`, so the caller degrades the node and the next tick starts over.
+/// `mark_kernel_rules_synced` — which is what clears that degradation — is
+/// reached only after all three steps have.
+///
+/// The early return is what keeps this from being destructive: an unchanged
+/// digest and an empty plan mean the maps are already right, and rewriting
+/// them would open a prevention gap on every tick for no reason.
+#[cfg(feature = "attach")]
+pub fn republish_kernel_policy(
+    handle: &mut ferrum_ebpf::KernelHandle,
+    agent: &Agent,
+    published: &Option<String>,
+) -> Result<KernelPolicy> {
+    let digest = agent.last_good_digest().map(|d| d.as_str().to_string());
+    let want = agent.selected_cgroups_for_last_good();
+    let plan =
+        ferrum_ebpf::plan_map_sync(handle.selected_cgroups(), &want, ferrum_ebpf::MAP_SELECTED)?;
+    // The order is `plan_kernel_publish`'s to decide and this function's to
+    // carry out. Split so the judgement is held by tests rather than by the
+    // comments that used to stand in the agent binary's ring loop, where
+    // nothing could reach it — and where both of its defects lived.
+    let steps = plan_kernel_publish(digest.as_deref(), published.as_deref(), !plan.is_empty());
+    if steps.is_empty() {
+        return Ok(KernelPolicy::Unchanged);
+    }
+
+    for step in steps {
+        match step {
+            KernelPublishStep::RetireRules => handle.clear_kernel_rules()?,
+            KernelPublishStep::PublishSelected => {
+                handle.sync_selected_cgroups(&plan)?;
+            }
+            KernelPublishStep::PublishRules => match agent.kernel_rules_for_last_good() {
+                Some(set) => {
+                    let installed = handle.sync_kernel_rules(&set)?;
+                    agent.mark_kernel_rules_synced(&set, installed as u64);
+                }
+                // No bundle in force: the maps must not keep the last one
+                // they had. A node enforcing a policy it can no longer name
+                // is worse than a node enforcing nothing.
+                None => agent.mark_kernel_rules_synced(&ferrum_ebpf::KernelRuleSet::default(), 0),
+            },
+        }
+    }
+    agent.mark_selected_cgroups(handle.selected_cgroups().len() as u64);
+    Ok(KernelPolicy::Published(digest))
+}
+
+/// One write a republish of the two kernel maps makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelPublishStep {
+    /// Take the rules out of `ferrum_rules` **before** the set they are keyed
+    /// on moves.
+    RetireRules,
+    /// Apply the diff to `ferrum_selected`.
+    PublishSelected,
+    /// Put the rules back, compiled against the set now in force.
+    PublishRules,
+}
+
+/// The order in which the two kernel maps may be brought to a new policy.
+///
+/// A decision and not an action, so that the property this carries is held by
+/// a test rather than by a comment. It used to live inline in the agent
+/// binary's ring loop, where nothing could reach it — and the first version of
+/// that loop had two defects this function makes impossible to reintroduce
+/// silently.
+///
+/// **Rules come off before the selected set moves, and go back after.** A rule
+/// set compiled for one selected set and applied against another refuses execs
+/// in containers the policy never selected — an outage caused by a security
+/// control. While the two maps disagree, the safe state is no prevention at
+/// all; nothing is lost from detection, because the tracepoint path still
+/// matches every rule and still kills.
+///
+/// **Pods moving under an unchanged policy do not retire the rules.** That
+/// case is not the hazard above: it moves the same rules onto exactly the pods
+/// the policy already selects, which can only narrow or widen them to what was
+/// asked for. Retiring there would open a prevention gap on every pod start
+/// and stop, which on a busy node is most of the time.
+///
+/// `published` is the digest the maps currently hold, `None` after any failed
+/// publish — so recovery is a policy change and takes the full sequence.
+pub fn plan_kernel_publish(
+    digest: Option<&str>,
+    published: Option<&str>,
+    selected_changed: bool,
+) -> Vec<KernelPublishStep> {
+    let policy_changed = digest != published;
+    if !policy_changed {
+        return if selected_changed {
+            vec![KernelPublishStep::PublishSelected]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut steps = vec![KernelPublishStep::RetireRules];
+    if selected_changed {
+        steps.push(KernelPublishStep::PublishSelected);
+    }
+    steps.push(KernelPublishStep::PublishRules);
+    steps
+}
 /// A container map that has not been reaffirmed within this is not "quiet",
 /// it is unproven: something on the publish path (pod watch, refresher, sync
 /// thread) stopped, and the map now holds an arbitrarily old snapshot — dead
@@ -6889,6 +7019,108 @@ mod tests {
             agent.set_container_map_synced_at(1, base + Duration::from_millis(cgroup + 1));
         }
         assert!(agent.unproven_window_len() <= CONTAINER_FLAG_TRACKED_MAX);
+    }
+
+    /// The order the two kernel maps may be written in, pinned.
+    ///
+    /// Both halves were defects in the first version of the ring loop, and
+    /// both are the kind that no green test would have noticed: one opened a
+    /// window in which rules enforced against a set they were not compiled
+    /// against, the other opened a prevention gap on every pod start.
+    #[test]
+    fn rules_come_off_before_the_selected_set_moves_and_go_back_after() {
+        use KernelPublishStep::*;
+
+        // Nothing moved: nothing is written. This is the answer on almost
+        // every tick, and it is what keeps a republish from being destructive.
+        assert_eq!(plan_kernel_publish(Some("aaaa"), Some("aaaa"), false), []);
+
+        // Pods moved under an unchanged policy. The set is written and the
+        // rules are NOT retired: they move onto exactly the pods the policy
+        // already selects, and retiring here would stop prevention on every
+        // pod start and stop.
+        assert_eq!(
+            plan_kernel_publish(Some("aaaa"), Some("aaaa"), true),
+            [PublishSelected]
+        );
+
+        // The policy changed. Rules off first, back last, and the set moves
+        // in between — the order is the whole of the property.
+        assert_eq!(
+            plan_kernel_publish(Some("bbbb"), Some("aaaa"), true),
+            [RetireRules, PublishSelected, PublishRules]
+        );
+        // Same policy change with a set that happens not to move: the rules
+        // still go through the retire/publish pair, because they are what
+        // changed.
+        assert_eq!(
+            plan_kernel_publish(Some("bbbb"), Some("aaaa"), false),
+            [RetireRules, PublishRules]
+        );
+
+        // First bundle on a fresh node, and the bundle going away.
+        assert_eq!(
+            plan_kernel_publish(Some("aaaa"), None, true),
+            [RetireRules, PublishSelected, PublishRules]
+        );
+        assert_eq!(
+            plan_kernel_publish(None, Some("aaaa"), true),
+            [RetireRules, PublishSelected, PublishRules],
+            "a node with no bundle must not keep the last rules it had"
+        );
+
+        // Recovery. A failed publish sets `published` to None, so the next
+        // attempt is a policy change and redoes the whole sequence rather
+        // than trusting a half-applied one.
+        assert_eq!(
+            plan_kernel_publish(Some("aaaa"), None, false),
+            [RetireRules, PublishRules]
+        );
+    }
+
+    /// Whenever the rules are written at all, they are written last.
+    ///
+    /// Stated as a property over every input rather than as four literal
+    /// vectors, so a fifth case added later cannot quietly violate it.
+    #[test]
+    fn the_rules_are_never_written_before_the_set_they_are_compiled_against() {
+        for digest in [None, Some("aaaa"), Some("bbbb")] {
+            for published in [None, Some("aaaa"), Some("bbbb")] {
+                for selected_changed in [true, false] {
+                    let steps = plan_kernel_publish(digest, published, selected_changed);
+                    let publish = steps
+                        .iter()
+                        .position(|s| *s == KernelPublishStep::PublishRules);
+                    let Some(publish) = publish else {
+                        // Not writing the rules is always allowed; writing
+                        // them in the wrong place is not.
+                        continue;
+                    };
+                    assert_eq!(
+                        steps.first(),
+                        Some(&KernelPublishStep::RetireRules),
+                        "{digest:?}/{published:?}/{selected_changed}: the rules are written \
+                         without being retired first, so the old set enforces against the new one"
+                    );
+                    assert_eq!(
+                        publish,
+                        steps.len() - 1,
+                        "{digest:?}/{published:?}/{selected_changed}: the rules are not last, \
+                         so they enforce against a set that is still being written: {steps:?}"
+                    );
+                    if let Some(selected) = steps
+                        .iter()
+                        .position(|s| *s == KernelPublishStep::PublishSelected)
+                    {
+                        assert!(
+                            selected < publish,
+                            "{digest:?}/{published:?}/{selected_changed}: the set is written \
+                             after the rules that are keyed on it: {steps:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The selected set is resolved from the index, and an unselected policy

@@ -27,8 +27,8 @@ mod progs {
         programs::{LsmContext, TracePointContext},
     };
     use ferrum_ebpf_progs::{
-        action_rank, action_refuses, kernel_rule_matches, Event, KernelRule, ACTION_ALLOW,
-        ACTION_AUDIT, CGROUPS_MAX_ENTRIES, COMM_LEN, EPERM, EVENTS_RING_BYTES,
+        action_rank, action_refuses, kernel_rule_matches, lsm_verdict, Event, KernelRule,
+        ACTION_ALLOW, ACTION_AUDIT, CGROUPS_MAX_ENTRIES, COMM_LEN, EVENTS_RING_BYTES,
         EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, MAX_KERNEL_RULES,
         PATH_LEN,
     };
@@ -143,9 +143,6 @@ mod progs {
         // `bprm_check_security(struct linux_binprm *bprm)`: arg 0 is the
         // binprm, arg 1 is the phony `retval` every LSM probe gets last.
         let previous: i32 = unsafe { ctx.arg(1) };
-        if previous != 0 {
-            return previous;
-        }
         let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
         let in_container = FERRUM_CGROUPS.get_ptr(&cgroup_id).is_some();
         let selected = FERRUM_SELECTED.get_ptr(&cgroup_id).is_some();
@@ -172,11 +169,7 @@ mod progs {
             }
             index += 1;
         }
-        if action_refuses(verdict) {
-            -EPERM
-        } else {
-            0
-        }
+        lsm_verdict(previous, action_refuses(verdict))
     }
 
     #[inline(always)]

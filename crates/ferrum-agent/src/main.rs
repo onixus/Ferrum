@@ -28,86 +28,6 @@ struct CgroupPublish {
     resolved_at: Instant,
 }
 
-/// Whether a republish actually wrote anything.
-#[cfg(feature = "attach")]
-enum KernelPolicy {
-    /// The maps already hold this policy and this pod set. Nothing was
-    /// touched, which is the answer on almost every tick.
-    Unchanged,
-    /// The maps now hold the named bundle. `None` is a node with no bundle in
-    /// force, whose maps were emptied.
-    Published(Option<String>),
-}
-
-/// Bring `ferrum_rules` and `ferrum_selected` to the policy now in force, in
-/// the one order that never leaves rules enforcing against a set they were not
-/// compiled against.
-///
-/// The order is the whole of this function, and it is not arbitrary.
-///
-/// 1. **Rules off first.** A rule set compiled for one selected set and
-///    applied against another refuses execs in containers the policy never
-///    selected — an outage caused by a security control. So while the two maps
-///    disagree, the safe state is no prevention at all. Nothing is lost from
-///    detection: the tracepoint path still matches every rule and still kills.
-/// 2. **Then the selected set**, for the bundle that is loaded right now.
-/// 3. **Then the rules**, which are compiled against that set.
-///
-/// Every failure leaves the sequence stopped with the rules off and returns
-/// `Err`, so the caller degrades the node and the next tick starts over.
-/// `mark_kernel_rules_synced` — which is what clears that degradation — is
-/// reached only after all three steps have.
-///
-/// The early return is what keeps this from being destructive: an unchanged
-/// digest and an empty plan mean the maps are already right, and rewriting
-/// them would open a prevention gap on every tick for no reason.
-#[cfg(feature = "attach")]
-fn republish_kernel_policy(
-    handle: &mut ferrum_ebpf::KernelHandle,
-    agent: &Agent,
-    published: &Option<String>,
-) -> ferrum_common::Result<KernelPolicy> {
-    let digest = agent.last_good_digest().map(|d| d.as_str().to_string());
-    let want = agent.selected_cgroups_for_last_good();
-    let plan =
-        ferrum_ebpf::plan_map_sync(handle.selected_cgroups(), &want, ferrum_ebpf::MAP_SELECTED)?;
-    let policy_changed = &digest != published;
-    if plan.is_empty() && !policy_changed {
-        return Ok(KernelPolicy::Unchanged);
-    }
-
-    // Rules off first — but only when the rules themselves are changing.
-    //
-    // The hazard is a rule set compiled for one selected set and applied
-    // against another. A pod entering or leaving the set under an *unchanged*
-    // rule set is not that: it moves the rules onto exactly the pods the
-    // policy already selects, which can only narrow or widen them to what was
-    // asked for. Clearing there would open a prevention gap on every pod start
-    // and stop, which on a busy node is most of the time.
-    if policy_changed {
-        handle.clear_kernel_rules()?;
-    }
-
-    if !plan.is_empty() {
-        handle.sync_selected_cgroups(&plan)?;
-    }
-    agent.mark_selected_cgroups(handle.selected_cgroups().len() as u64);
-
-    if policy_changed {
-        match agent.kernel_rules_for_last_good() {
-            Some(set) => {
-                let installed = handle.sync_kernel_rules(&set)?;
-                agent.mark_kernel_rules_synced(&set, installed as u64);
-            }
-            // No bundle in force: the maps must not keep the last one they
-            // had. A node enforcing a policy it can no longer name is worse
-            // than a node enforcing nothing.
-            None => agent.mark_kernel_rules_synced(&ferrum_ebpf::KernelRuleSet::default(), 0),
-        }
-    }
-    Ok(KernelPolicy::Published(digest))
-}
-
 /// Set from the SIGTERM/SIGINT handler, which may do nothing else.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -664,9 +584,9 @@ fn run(
             // `ferrum_cgroups` instead of one later.
             {
                 let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
-                match republish_kernel_policy(&mut handle, &guard, &published) {
-                    Ok(KernelPolicy::Unchanged) => {}
-                    Ok(KernelPolicy::Published(digest)) => published = digest,
+                match ferrum_agent::republish_kernel_policy(&mut handle, &guard, &published) {
+                    Ok(ferrum_agent::KernelPolicy::Unchanged) => {}
+                    Ok(ferrum_agent::KernelPolicy::Published(digest)) => published = digest,
                     Err(err) => {
                         eprintln!("ferrum-agent: {err}");
                         guard.mark_kernel_rules_unsynced(err);

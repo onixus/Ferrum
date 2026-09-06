@@ -57,11 +57,14 @@ mod gate {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use ferrum_ebpf::{
-        decode_event, syscall_name, tracepoint_syscall, tracepoints_absent_on_arch,
-        tracepoints_for_arch, Event, KernelHandle, RingReader, SyscallArch, DATAPATH_ABI,
-        EVENT_FLAG_AGENT_SELF, EVENT_FLAG_PATH_TRUNCATED, PATH_LEN,
+        decode_event, plan_map_sync, syscall_name, tracepoint_syscall, tracepoints_absent_on_arch,
+        tracepoints_for_arch, Event, KernelHandle, KernelRuleSet, RingReader, SyscallArch,
+        DATAPATH_ABI, EVENT_FLAG_AGENT_SELF, EVENT_FLAG_PATH_TRUNCATED, MAP_SELECTED, PATH_LEN,
     };
-    use ferrum_ebpf_progs::ACTION_AUDIT;
+    use ferrum_ebpf_progs::{
+        KernelRule, ACTION_AUDIT, ACTION_KILL, COMM_LEN, KRULE_FLAG_SELECTED_ONLY, KRULE_FLAG_USED,
+        MAX_KERNEL_RULES,
+    };
 
     /// Every test attaches system-wide tracepoints and then filters the ring by
     /// tgid — the *same* tgid for every test in this binary. Two at once would put
@@ -848,6 +851,232 @@ mod gate {
              accident",
             after.rlim_cur, before.rlim_max
         );
+    }
+
+    /// A rule set that refuses `execve` for this process, in this cgroup.
+    ///
+    /// Built by hand rather than compiled from a policy: the compiler is
+    /// tested where it lives, and what is under test here is the kernel's
+    /// half — that a slot written through `sync_kernel_rules` is one the
+    /// verifier-loaded program actually reads.
+    fn refusing_set(comm: &str, selected_only: bool) -> KernelRuleSet {
+        let mut slot = KernelRule::empty();
+        slot.action = ACTION_KILL;
+        slot.flags = KRULE_FLAG_USED
+            | if selected_only {
+                KRULE_FLAG_SELECTED_ONLY
+            } else {
+                0
+            };
+        let bytes = comm.as_bytes();
+        assert!(
+            bytes.len() < COMM_LEN,
+            "comm {comm:?} cannot be a predicate"
+        );
+        slot.comm_len = bytes.len() as u8;
+        slot.comm[..bytes.len()].copy_from_slice(bytes);
+        KernelRuleSet {
+            rules: vec![slot],
+            excluded: Vec::new(),
+            selected_only,
+            refused: None,
+        }
+    }
+
+    /// This process's cgroup id, the one the datapath stamps on its records.
+    ///
+    /// Read off a record rather than parsed out of `/proc`: the number that
+    /// matters is the one `bpf_get_current_cgroup_id()` returns, and the only
+    /// way to learn it is to ask the datapath.
+    fn own_cgroup_id(live: &mut Live) -> u64 {
+        // `openat`, the way the openat test does it: a path that cannot exist,
+        // so this reaches `sys_enter` and leaves no descriptor behind.
+        // `fs::metadata` would not do — it is `statx`, which the datapath does
+        // not hook, and the ring would stay empty.
+        let target = format!("/tmp/ferrum-attach-live-{}-cgroup", std::process::id());
+        let c_target = CString::new(target).expect("path has no NUL");
+        let observed = live.observe(|| {
+            let fd = unsafe { libc::openat(libc::AT_FDCWD, c_target.as_ptr(), libc::O_RDONLY) };
+            assert_eq!(fd, -1, "the probe path must not exist");
+        });
+        let event = observed
+            .events
+            .first()
+            .copied()
+            .expect("this process made a syscall and the ring carried no record for it");
+        assert_ne!(event.cgroup_id, 0, "the datapath stamped no cgroup id");
+        event.cgroup_id
+    }
+
+    /// The two maps the kernel decides with take a rule set and a selected set
+    /// from a live handle, and hold what was written.
+    ///
+    /// Read back out of the kernel, not off the handle's mirror: a write the
+    /// kernel dropped and one it kept look identical from userspace otherwise,
+    /// and this is the map every prevention decision is made against.
+    #[test]
+    fn the_rule_and_selected_maps_hold_what_a_live_handle_writes() {
+        let _serial = serialized();
+        let Some(mut live) = live() else {
+            return;
+        };
+        let cgroup = own_cgroup_id(&mut live);
+        let handle = &mut live.handle;
+
+        let set = refusing_set("nobody-at-all", true);
+        let installed = handle
+            .sync_kernel_rules(&set)
+            .expect("publish a rule set into ferrum_rules");
+        assert_eq!(installed, 1, "one slot was published");
+
+        let slot = handle.kernel_rule_at(0).expect("read slot 0 back");
+        assert_eq!(
+            slot, set.rules[0],
+            "the slot the kernel holds is not the slot that was written"
+        );
+        assert!(slot.is_used() && slot.selected_only());
+
+        // Every slot the set does not fill is empty, which is what retires a
+        // longer predecessor: an array map keeps what was put in it.
+        for index in 1..MAX_KERNEL_RULES {
+            assert_eq!(
+                handle.kernel_rule_at(index).expect("read a slot back"),
+                KernelRule::empty(),
+                "slot {index} was left holding something after a one-rule set was published"
+            );
+        }
+
+        // The selected set, through the plan the agent builds.
+        let want: std::collections::BTreeSet<u64> = [cgroup].into_iter().collect();
+        let plan = plan_map_sync(handle.selected_cgroups(), &want, MAP_SELECTED)
+            .expect("a one-entry selected set fits");
+        handle
+            .sync_selected_cgroups(&plan)
+            .expect("publish the selected set");
+        assert!(
+            handle
+                .selected_cgroup_present(cgroup)
+                .expect("read ferrum_selected back"),
+            "the cgroup this process runs in was published as selected and the map does not hold it"
+        );
+        assert!(
+            !handle
+                .selected_cgroup_present(cgroup ^ 0xffff)
+                .expect("read ferrum_selected back"),
+            "ferrum_selected answers for a cgroup nothing put in it"
+        );
+
+        // And withdrawing enforcement empties the rules without touching the
+        // selected set, which is the shape `RetireRules` has.
+        handle.clear_kernel_rules().expect("clear ferrum_rules");
+        assert_eq!(
+            handle.kernel_rule_at(0).expect("read slot 0 back"),
+            KernelRule::empty(),
+            "clear_kernel_rules left a rule in the map"
+        );
+        assert!(
+            handle
+                .selected_cgroup_present(cgroup)
+                .expect("read ferrum_selected back"),
+            "retiring the rules also emptied the selected set"
+        );
+    }
+
+    /// The criterion phase 2 closes on: a policy that refuses `execve` makes
+    /// `execve` fail with `EPERM`, and only where the policy selects.
+    ///
+    /// Both halves matter and the second is not a formality. A hook that
+    /// refuses everything satisfies the first on its own, and a green test
+    /// with only that half would not be able to tell working enforcement from
+    /// a datapath that has stopped letting anything run.
+    ///
+    /// Skips rather than fails where BPF LSM is not available: a kernel
+    /// without `CONFIG_BPF_LSM` is a supported deployment, and the tracepoint
+    /// path is what runs there. Under `FERRUM_BPF_ELF_REQUIRED` that skip is a
+    /// failure, because the stage that sets it is the one claiming to have
+    /// tested prevention.
+    #[test]
+    fn a_selected_container_cannot_exec_what_the_policy_refuses() {
+        let _serial = serialized();
+        let Some(mut live) = live() else {
+            return;
+        };
+        if !live.handle.is_lsm_attached() {
+            if required() {
+                panic!(
+                    "FERRUM_BPF_ELF_REQUIRED is set and the LSM hook is not attached on this \
+                     kernel, so nothing here tested prevention. Run this stage on a kernel with \
+                     CONFIG_BPF_LSM and `bpf` in /sys/kernel/security/lsm."
+                );
+            }
+            println!("skipping: no BPF LSM on this kernel, so there is no prevention to measure");
+            return;
+        }
+        let cgroup = own_cgroup_id(&mut live);
+        let handle = &mut live.handle;
+
+        // The rule names this process's own comm, because this process is what
+        // is about to try to exec.
+        let own_comm = std::fs::read_to_string("/proc/self/comm").expect("read /proc/self/comm");
+        let own_comm = own_comm.trim();
+        handle
+            .sync_kernel_rules(&refusing_set(own_comm, true))
+            .expect("publish the refusing rule set");
+
+        // Not selected yet: the exec must go through. This is the half that
+        // separates a working selector from a hook that refuses everything.
+        assert!(
+            exec_true_succeeds(),
+            "execve was refused before this cgroup was selected, so the rule is firing outside \
+             the policy's scope and `ferrum_selected` is not being honoured"
+        );
+
+        let want: std::collections::BTreeSet<u64> = [cgroup].into_iter().collect();
+        let plan = plan_map_sync(handle.selected_cgroups(), &want, MAP_SELECTED)
+            .expect("a one-entry selected set fits");
+        handle
+            .sync_selected_cgroups(&plan)
+            .expect("publish the selected set");
+
+        assert!(
+            !exec_true_succeeds(),
+            "execve succeeded in a selected cgroup under a rule that refuses it: this node \
+             detects and does not prevent, which is the state phase 2 exists to leave"
+        );
+
+        // Withdrawn, and the node goes back to letting work run. A test that
+        // stopped here would leave the map refusing execs for whatever runs
+        // next in this cgroup.
+        handle.clear_kernel_rules().expect("clear ferrum_rules");
+        assert!(
+            exec_true_succeeds(),
+            "execve is still refused after the rules were withdrawn"
+        );
+    }
+
+    /// `fork` + `execve(/bin/true)`, and whether the child got to run.
+    ///
+    /// A child rather than this process, for the obvious reason. The exec is
+    /// judged by the child's exit status: `EPERM` from `execve` leaves the
+    /// child in this test binary's code, which exits 42, and a successful exec
+    /// leaves `/bin/true`, which exits 0.
+    fn exec_true_succeeds() -> bool {
+        let path = CString::new("/bin/true").expect("no NUL");
+        let argv = [path.as_ptr(), std::ptr::null()];
+        // Safety: between fork and exec the child touches nothing that needs a
+        // lock — it calls execve and, if that returns, _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::execv(path.as_ptr(), argv.as_ptr());
+                libc::_exit(42);
+            }
+        }
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid did not reap the child");
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
     }
 
     /// The cgroup map the agent rewrites on every index tick takes inserts and

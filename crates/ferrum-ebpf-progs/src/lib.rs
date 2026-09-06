@@ -283,6 +283,33 @@ pub fn kernel_verdict(
     best
 }
 
+/// What an LSM hook must return, given what ran before it.
+///
+/// Two rules, and the first is not ours to break. BPF LSM programs attached to
+/// one hook run as a chain, and each is handed the previous program's verdict
+/// as the last BTF argument; the value this function returns is the value the
+/// kernel sees, untouched. So returning `0` after another program returned
+/// `-EPERM` turns that refusal into an allow — a security control silently
+/// defeating another one, which is the single thing it must never do. A
+/// non-zero `previous` is therefore passed through whatever we would have
+/// decided ourselves.
+///
+/// The second is ours: refuse with `-EPERM`, allow with `0`.
+///
+/// This lives here rather than inline in the hook because nothing compiles
+/// that hook except a bpf-target build, and a rule this consequential may not
+/// be held only by code no test can reach.
+pub const fn lsm_verdict(previous: i32, refuses: bool) -> i32 {
+    if previous != 0 {
+        return previous;
+    }
+    if refuses {
+        -EPERM
+    } else {
+        0
+    }
+}
+
 /// Whether this action refuses the exec.
 pub const fn action_refuses(action: u8) -> bool {
     action == ACTION_DENY || action == ACTION_KILL
@@ -415,6 +442,34 @@ mod tests {
             !kernel_rule_matches(&rule, &comm, true, true, true),
             "not_agent_self matched the agent itself"
         );
+    }
+
+    /// A verdict from an earlier program in the chain survives ours.
+    ///
+    /// The failure this pins is not hypothetical: the first version of the
+    /// hook ignored the argument entirely and returned `0` on every exec no
+    /// rule of ours matched, so a node running a second BPF-LSM tool had that
+    /// tool's refusals turned into allows by us.
+    #[test]
+    fn an_earlier_lsm_refusal_is_never_turned_into_an_allow() {
+        // Ours to decide, because nobody decided before us.
+        assert_eq!(lsm_verdict(0, false), 0);
+        assert_eq!(lsm_verdict(0, true), -EPERM);
+
+        // Somebody did. Their answer stands either way — including when we
+        // would have allowed, which is the case that was broken.
+        assert_eq!(lsm_verdict(-EPERM, false), -EPERM);
+        assert_eq!(lsm_verdict(-EPERM, true), -EPERM);
+        // Not just EPERM: any non-zero verdict is a decision already taken,
+        // and this must not narrow it to the one errno we happen to use.
+        for previous in [-1, -2, -13, -1000, 7] {
+            assert_eq!(
+                lsm_verdict(previous, false),
+                previous,
+                "verdict {previous} from an earlier program was replaced"
+            );
+            assert_eq!(lsm_verdict(previous, true), previous);
+        }
     }
 
     /// Absence from the selected set reads as "not selected", never as

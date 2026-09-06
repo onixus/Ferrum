@@ -1073,6 +1073,38 @@ impl KernelHandle {
         Ok(filled)
     }
 
+    /// One slot of `ferrum_rules`, read back out of the kernel.
+    ///
+    /// The mirror this handle keeps says what it *wrote*; this says what the
+    /// map *holds*. Only the second can tell a write that landed from one that
+    /// was accepted by userspace and dropped by the kernel, which is what a
+    /// live test of this map has to be able to do.
+    pub fn kernel_rule_at(&self, index: u32) -> Result<KernelRule> {
+        let map = self.bpf.map(MAP_RULES).ok_or_else(|| missing(MAP_RULES))?;
+        let rules: Array<_, RuleSlot> =
+            Array::try_from(map).map_err(|err| degraded(MAP_RULES, err))?;
+        rules
+            .get(&index, 0)
+            .map(|slot| slot.0)
+            .map_err(|err| degraded(MAP_RULES, err))
+    }
+
+    /// Whether the kernel's `ferrum_selected` holds this cgroup, read back out
+    /// of the map rather than off this handle's mirror.
+    pub fn selected_cgroup_present(&self, cgroup_id: u64) -> Result<bool> {
+        let map = self
+            .bpf
+            .map(MAP_SELECTED)
+            .ok_or_else(|| missing(MAP_SELECTED))?;
+        let selected: HashMap<_, u64, u8> =
+            HashMap::try_from(map).map_err(|err| degraded(MAP_SELECTED, err))?;
+        match selected.get(&cgroup_id, 0) {
+            Ok(_) => Ok(true),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(false),
+            Err(err) => Err(degraded(MAP_SELECTED, err)),
+        }
+    }
+
     /// Empty every slot. Used on its own when enforcement is withdrawn.
     pub fn clear_kernel_rules(&mut self) -> Result<()> {
         for index in 0..MAX_KERNEL_RULES {
