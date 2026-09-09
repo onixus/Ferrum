@@ -64,10 +64,10 @@ mod gate {
 
     use ferrum_agent::TargetCheck;
     use ferrum_agent::{
-        encode_fsig, pump_records, Agent, AgentConfig, AgentRole, ProcCgroupCheck, SignalResponder,
-        DEGRADED_RECOVERY, DEG_PATH_TRUNCATED, MAX_TGID, REFUSE_STALE_TARGET,
-        RESPOND_SIGNAL_FAILING, RESPOND_SIGNAL_FAILING_MIN, TARGET_CHECK_UNPROVABLE,
-        TARGET_NEVER_PROVEN,
+        encode_fsig, pump_records, republish_kernel_policy, Agent, AgentConfig, AgentRole,
+        KernelPolicy, ProcCgroupCheck, SignalResponder, DEGRADED_RECOVERY, DEG_PATH_TRUNCATED,
+        MAX_TGID, REFUSE_STALE_TARGET, RESPOND_SIGNAL_FAILING, RESPOND_SIGNAL_FAILING_MIN,
+        TARGET_CHECK_UNPROVABLE, TARGET_NEVER_PROVEN,
     };
     use ferrum_api::PolicyMode;
     use ferrum_compiler::{bundle_digest_material, compile_cluster_policy};
@@ -627,6 +627,101 @@ mod gate {
 
     /// RFC §D: `kubectl exec` + `/bin/sh` → kill.
     ///
+    /// The agent's own publish path leaves the two kernel maps holding exactly
+    /// what the loaded bundle says, and doing it again writes nothing.
+    ///
+    /// The second half is the one that matters. The first version of the ring
+    /// loop republished the rules on every tick after a failure, so the maps
+    /// were rewritten continuously and there was a window in each rewrite
+    /// where rules enforced against a selected set that was still moving.
+    /// Idempotence is what closes that, and it cannot be asserted anywhere but
+    /// against a real handle: the mirror this handle keeps would say
+    /// "unchanged" even if every write had been dropped by the kernel.
+    ///
+    /// Mode-agnostic on purpose. Whether the signed bundle yields rules or is
+    /// refused outright — `prod-restricted` ships `mode: audit`, and an
+    /// auditing policy must reach the kernel with nothing — the assertion is
+    /// that the maps agree with `compile_kernel_rules` of that same bundle,
+    /// which is true either way and stays true when the fixture changes.
+    #[test]
+    fn the_agents_publish_path_leaves_the_maps_agreeing_with_the_bundle_and_is_idempotent() {
+        let _serial = serialized();
+        let Some(mut live) = live("publish") else {
+            return;
+        };
+        let agent = join_agent(&live);
+        let handle = &mut live.handle;
+
+        let expected = agent
+            .kernel_rules_for_last_good()
+            .expect("the join agent holds a signed bundle");
+        let selected = agent.selected_cgroups_for_last_good();
+
+        let published = match republish_kernel_policy(handle, &agent, &None)
+            .expect("publish the loaded policy into the kernel maps")
+        {
+            KernelPolicy::Published(digest) => digest,
+            KernelPolicy::Unchanged => {
+                panic!("the first publish on a fresh handle wrote nothing")
+            }
+        };
+        assert_eq!(
+            published.as_deref(),
+            agent.last_good_digest().map(|d| d.as_str()),
+            "the publish reported a digest that is not the one in force"
+        );
+
+        // The rules map holds the compiled set and nothing beyond it.
+        for (index, want) in expected.rules.iter().enumerate() {
+            assert_eq!(
+                &handle
+                    .kernel_rule_at(index as u32)
+                    .expect("read a rule slot back"),
+                want,
+                "slot {index} does not hold the rule compile_kernel_rules produced"
+            );
+        }
+        for index in expected.rules.len() as u32..ferrum_ebpf::MAX_KERNEL_RULES {
+            assert_eq!(
+                handle.kernel_rule_at(index).expect("read a rule slot back"),
+                ferrum_ebpf::KernelRule::empty(),
+                "slot {index} is beyond this policy and is not empty"
+            );
+        }
+
+        // And the selected map holds exactly the cgroups the selector resolved
+        // to — including, for a policy with no selector, none at all.
+        for cgroup in &selected {
+            assert!(
+                handle
+                    .selected_cgroup_present(*cgroup)
+                    .expect("read ferrum_selected back"),
+                "cgroup {cgroup} is selected by this policy and the map does not hold it"
+            );
+        }
+        if !selected.contains(&live.cgroup.id) {
+            assert!(
+                !handle
+                    .selected_cgroup_present(live.cgroup.id)
+                    .expect("read ferrum_selected back"),
+                "the probe cgroup is not selected by this policy and the map holds it anyway, so \
+                 the rules would fire in a container the policy never selected"
+            );
+        }
+
+        // Again, with nothing moved: no write, no prevention gap.
+        match republish_kernel_policy(handle, &agent, &published)
+            .expect("a second publish with nothing moved")
+        {
+            KernelPolicy::Unchanged => {}
+            KernelPolicy::Published(_) => panic!(
+                "republishing an unchanged policy rewrote the maps. Every rewrite retires the \
+                 rules before it moves the set, so on a busy node this is a prevention gap per \
+                 tick for no reason"
+            ),
+        }
+    }
+
     /// The shell is a real `/bin/sh`, not a process renamed to look like one:
     /// the child execs it, and the record the `no-shell` rule decides on is the
     /// shell's own `execve` of the command it was given, which is where `comm`

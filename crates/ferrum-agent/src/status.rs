@@ -141,6 +141,40 @@ pub fn status_json(
         // one it loaded long ago and every counter beside it stands still,
         // which is indistinguishable from a cluster nobody has republished.
         map.insert("bundleUnreadable".into(), json!(agent.bundle_unreadable()));
+        // What this node publishes into `ferrum_rules`, and what it does not.
+        //
+        // `kernelRulesExcluded` is not a fault: a rule naming a path cannot be
+        // decided by the hook, so it is excluded on every healthy node — the
+        // §D acceptance rule among them. It is here because "which half of
+        // this policy is prevented and which is only detected" is a question
+        // an operator cannot answer from anywhere else, and a number nobody
+        // publishes is the defect this surface exists to close.
+        map.insert("lsmAttached".into(), json!(agent.lsm_attached()));
+        map.insert(
+            "kernelRulesInstalled".into(),
+            json!(agent.kernel_rules_installed()),
+        );
+        map.insert(
+            "kernelRulesExcluded".into(),
+            json!(agent.kernel_rules_excluded()),
+        );
+        map.insert("selectedCgroups".into(), json!(agent.selected_cgroups()));
+        map.insert(
+            "kernelRulesRefused".into(),
+            json!(agent.kernel_rules_refused().is_some()),
+        );
+        map.insert(
+            "kernelRulesRefusedReason".into(),
+            json!(agent.kernel_rules_refused()),
+        );
+        map.insert(
+            "kernelRulesUnsynced".into(),
+            json!(agent.kernel_rules_unsynced().is_some()),
+        );
+        map.insert(
+            "kernelRulesError".into(),
+            json!(agent.kernel_rules_unsynced()),
+        );
         map.insert(
             "bundleStatFailedTotal".into(),
             json!(agent.bundle_stat_failed_total()),

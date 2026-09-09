@@ -8,8 +8,9 @@
 //! free of ELF crates.
 
 use ferrum_ebpf::{
-    elf_map_def, verify_map_defs, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_DEF_LEN,
-    MAP_EVENTS, MAP_SELF, REQUIRED_MAPS, TRACEPOINTS,
+    elf_map_def, verify_map_defs, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, KERNEL_RULE_SIZE,
+    LSM_PROGRAMS, MAP_CGROUPS, MAP_DEF_LEN, MAP_EVENTS, MAP_RULES, MAP_SELECTED, MAP_SELF,
+    MAX_KERNEL_RULES, REQUIRED_MAPS, TRACEPOINTS,
 };
 
 const SHT_SYMTAB: u32 = 2;
@@ -162,7 +163,21 @@ fn elf_contains_all_tracepoints() {
         assert_eq!(sym.section, section, "{prog} is in the wrong section");
     }
 
-    for map in [MAP_EVENTS, MAP_CGROUPS, MAP_SELF] {
+    for (prog, hook) in LSM_PROGRAMS {
+        let section = format!("lsm/{hook}");
+        let sym = syms
+            .iter()
+            .find(|s| s.name == *prog)
+            .unwrap_or_else(|| panic!("LSM program symbol {prog} missing from {path}"));
+        assert_eq!(sym.kind, STT_FUNC, "{prog} is not a function");
+        assert_eq!(sym.section, section, "{prog} is in the wrong section");
+    }
+
+    // Over REQUIRED_MAPS and not a list written here: a map added to the
+    // userspace ABI and dropped by the bpf linker for want of a reader is
+    // exactly the failure this test exists for, and a hand-kept list would
+    // have to be remembered at the same moment it is needed.
+    for map in REQUIRED_MAPS.iter().map(|def| def.name) {
         let sym = syms
             .iter()
             .find(|s| s.name == map)
@@ -214,6 +229,56 @@ fn cgroups_map_definition_matches_the_userspace_abi() {
         def[3], CGROUPS_MAX_ENTRIES,
         "{MAP_CGROUPS} max_entries disagrees with CGROUPS_MAX_ENTRIES, which is what \
          plan_cgroup_sync refuses to overflow"
+    );
+}
+
+/// Static ABI check of `ferrum_selected`. Same shape as `ferrum_cgroups`, and
+/// a drift here is the dangerous direction: a set the hook reads as membership
+/// while userspace writes something else makes a selected policy fire in
+/// containers it does not select, or in none at all.
+#[test]
+fn selected_map_definition_matches_the_userspace_abi() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
+    let def = map_def_here(&elf, &path, MAP_SELECTED);
+    assert_eq!(
+        def[0], BPF_MAP_TYPE_HASH,
+        "{MAP_SELECTED} is not a hash map"
+    );
+    assert_eq!(def[1], 8, "{MAP_SELECTED} key is not a u64 cgroup id");
+    assert_eq!(def[2], 1, "{MAP_SELECTED} value is not a u8 flag");
+    assert_eq!(
+        def[3], CGROUPS_MAX_ENTRIES,
+        "{MAP_SELECTED} max_entries disagrees with CGROUPS_MAX_ENTRIES, which is what \
+         plan_cgroup_sync refuses to overflow for this set too"
+    );
+}
+
+/// Static ABI check of `ferrum_rules`. The two sides both write and read
+/// `KernelRule` by its byte layout, so a slot that grew on one side and not
+/// the other has the kernel matching on fields that are not there. An array
+/// and not a hash on purpose: the in-kernel walk has a fixed trip count.
+#[test]
+fn rules_map_definition_matches_the_userspace_abi() {
+    let Some((path, elf)) = elf_or_skip() else {
+        return;
+    };
+    let def = map_def_here(&elf, &path, MAP_RULES);
+    assert_eq!(
+        def[0], BPF_MAP_TYPE_ARRAY,
+        "{MAP_RULES} is not an array map"
+    );
+    assert_eq!(def[1], 4, "{MAP_RULES} key is not a u32 slot index");
+    assert_eq!(
+        def[2], KERNEL_RULE_SIZE,
+        "{MAP_RULES} value is not a KernelRule; the shipped object and this build disagree \
+         about the layout both of them write"
+    );
+    assert_eq!(
+        def[3], MAX_KERNEL_RULES,
+        "{MAP_RULES} max_entries disagrees with MAX_KERNEL_RULES, which is the bound \
+         compile_kernel_rules refuses to exceed and the trip count the hook walks"
     );
 }
 

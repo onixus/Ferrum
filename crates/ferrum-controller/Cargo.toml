@@ -13,6 +13,7 @@ ferrum-common.workspace = true
 ferrum-compiler.workspace = true
 ferrum-crypto.workspace = true
 ferrum-ids.workspace = true
+ferrum-metrics.workspace = true
 ferrum-policy.workspace = true
 futures.workspace = true
 home.workspace = true

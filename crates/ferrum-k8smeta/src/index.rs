@@ -43,6 +43,25 @@ impl SharedCgroupIndex {
         self.read().clone()
     }
 
+    /// The inodes whose identity satisfies `keep`, resolved under the read
+    /// lock without copying anything.
+    ///
+    /// `snapshot()` deep-clones every identity, and an identity carries four
+    /// label maps; a caller that only wants to *ask a question* of each one
+    /// pays for a full copy of the index to do it. This runs the predicate in
+    /// place, which matters because the caller is the thread that drains the
+    /// event ring and repeats this on every pod refresh.
+    pub fn select<F>(&self, keep: F) -> std::collections::BTreeSet<u64>
+    where
+        F: Fn(&WorkloadIdentity) -> bool,
+    {
+        self.read()
+            .iter()
+            .filter(|(_, identity)| keep(identity))
+            .map(|(inode, _)| *inode)
+            .collect()
+    }
+
     pub fn lookup_cgroup(&self, inode: u64) -> Result<WorkloadIdentity> {
         self.read()
             .get(&inode)
@@ -70,6 +89,21 @@ mod tests {
             container: "app".into(),
             ..Default::default()
         }
+    }
+
+    /// `select` answers over the live map and copies no identity.
+    #[test]
+    fn select_resolves_in_place_and_returns_only_the_matching_inodes() {
+        let index = SharedCgroupIndex::new();
+        index.insert(7, ident("pod-a"));
+        index.insert(8, ident("pod-b"));
+
+        let all = index.select(|_| true);
+        assert_eq!(all, [7, 8].into_iter().collect());
+        let none = index.select(|_| false);
+        assert!(none.is_empty());
+        let one = index.select(|identity| identity.pod == "pod-b");
+        assert_eq!(one, [8].into_iter().collect());
     }
 
     #[test]

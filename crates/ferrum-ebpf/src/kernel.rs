@@ -20,20 +20,24 @@ use aya::maps::{Array, HashMap, MapData, PerCpuArray, RingBuf};
 #[cfg(feature = "attach")]
 use aya::programs::links::FdLink;
 #[cfg(feature = "attach")]
+use aya::programs::lsm::LsmLinkId;
+#[cfg(feature = "attach")]
 use aya::programs::trace_point::TracePointLinkId;
 #[cfg(feature = "attach")]
-use aya::programs::TracePoint;
+use aya::programs::{Lsm, TracePoint};
 #[cfg(feature = "attach")]
 use aya::Bpf;
 use ferrum_common::{FerrumError, Result};
 #[cfg(feature = "attach")]
 use ferrum_ebpf_progs::EVENTS_DROPPED_TOTAL;
 use ferrum_ebpf_progs::{
-    CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_EVENTS, MAP_SELF,
+    KernelRule, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_EVENTS, MAP_RULES,
+    MAP_SELECTED, MAP_SELF, MAX_KERNEL_RULES,
 };
 use std::collections::BTreeSet;
+use std::path::Path;
 #[cfg(feature = "attach")]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// One diff to apply to `ferrum_cgroups`: which cgroup ids gain the container
 /// flag and which lose it.
@@ -69,11 +73,25 @@ pub struct SyncStats {
 /// leave an arbitrary subset of pods unflagged, and `container_only` rules
 /// would then allow in exactly those pods.
 pub fn plan_cgroup_sync(current: &BTreeSet<u64>, next: &BTreeSet<u64>) -> Result<CgroupSyncPlan> {
+    plan_map_sync(current, next, MAP_CGROUPS)
+}
+
+/// [`plan_cgroup_sync`], told which map it is planning for.
+///
+/// Two maps are keyed by cgroup id now — the container set and the selected
+/// set — and they fail differently: an overflowed container map leaves pods
+/// unflagged, an overflowed selected map leaves them unselected, which stops
+/// prevention rather than detection. A message naming the wrong one sends an
+/// operator to inspect a map that is healthy.
+pub fn plan_map_sync(
+    current: &BTreeSet<u64>,
+    next: &BTreeSet<u64>,
+    map: &'static str,
+) -> Result<CgroupSyncPlan> {
     if next.len() > CGROUPS_MAX_ENTRIES as usize {
         return Err(FerrumError::Degraded(format!(
-            "cgroup sync: {} container cgroups do not fit the {CGROUPS_MAX_ENTRIES}-entry \
-             {MAP_CGROUPS} map; refusing a truncated sync that would leave arbitrary pods \
-             unflagged",
+            "cgroup sync: {} cgroups do not fit the {CGROUPS_MAX_ENTRIES}-entry {map} map; \
+             refusing a truncated sync that would leave arbitrary pods out of it",
             next.len()
         )));
     }
@@ -138,7 +156,38 @@ pub const REQUIRED_MAPS: &[MapDef] = &[
         value_size: 1,
         max_entries: CGROUPS_MAX_ENTRIES,
     },
+    MapDef {
+        // The cgroups the loaded policy selects. Same shape as MAP_CGROUPS
+        // and deliberately a second map rather than a second bit in that
+        // one's value: that map's diff carries the container flag, and this
+        // set changes when the policy changes rather than only when pods do.
+        name: MAP_SELECTED,
+        map_type: BPF_MAP_TYPE_HASH,
+        key_size: 8,
+        value_size: 1,
+        max_entries: CGROUPS_MAX_ENTRIES,
+    },
+    MapDef {
+        // The rules the kernel decides on its own, one `KernelRule` per slot.
+        // An array and not a hash: the in-kernel walk visits every slot on
+        // every exec, and a fixed trip count is what keeps it inside the
+        // verifier's budget. `value_size` is the struct's size, so a field
+        // added to `KernelRule` without a matching ELF is a refused load
+        // rather than two sides writing past each other.
+        name: MAP_RULES,
+        map_type: BPF_MAP_TYPE_ARRAY,
+        key_size: 4,
+        value_size: KERNEL_RULE_SIZE,
+        max_entries: MAX_KERNEL_RULES,
+    },
 ];
+
+/// Bytes of one `KernelRule`, as `REQUIRED_MAPS` declares it.
+///
+/// `size_of` and not a literal: the declaration and the struct cannot drift,
+/// and `ferrum-ebpf-progs` pins the number itself so a field added there is a
+/// failure in two places rather than a silent widening in one.
+pub const KERNEL_RULE_SIZE: u32 = core::mem::size_of::<KernelRule>() as u32;
 
 /// Read one map definition out of a compiled bpf ELF's `maps` section.
 ///
@@ -172,6 +221,23 @@ pub fn verify_map_defs(elf: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Where the kernel exposes its active Linux Security Modules list.
+const LSM_PATH: &str = "/sys/kernel/security/lsm";
+/// Kernel BTF path, required for BPF LSM programs.
+const BTF_VMLINUX_PATH: &str = "/sys/kernel/btf/vmlinux";
+
+/// Check whether BPF LSM is active/available in this kernel.
+///
+/// Checks `/sys/kernel/security/lsm` to verify `bpf` is in the active LSM list,
+/// or falls back to checking whether BTF (`/sys/kernel/btf/vmlinux`) exists if
+/// securityfs is not mounted.
+pub fn lsm_available() -> bool {
+    if let Ok(content) = std::fs::read_to_string(LSM_PATH) {
+        return content.split(',').any(|s| s.trim() == "bpf");
+    }
+    Path::new(BTF_VMLINUX_PATH).exists()
 }
 
 /// The seven u32s of `name`'s `bpf_map_def`.
@@ -443,6 +509,9 @@ pub struct KernelHandle {
     /// Mirror of what this handle actually wrote into `ferrum_cgroups`; the
     /// next plan is diffed against it, so a failed sync is not forgotten.
     container_cgroups: BTreeSet<u64>,
+    /// Mirror of what this handle wrote into `ferrum_selected`, diffed the
+    /// same way and for the same reason.
+    selected_cgroups: BTreeSet<u64>,
     /// Syscalls with no tracepoint on this arch or in this kernel's tracefs,
     /// hence unhooked here.
     unhooked_syscalls: Vec<&'static str>,
@@ -455,6 +524,19 @@ pub struct KernelHandle {
     /// the hook back — see [`Self::pin_at`].
     #[cfg(feature = "attach")]
     links: Vec<(&'static str, &'static str, &'static str, TracePointLinkId)>,
+    /// Whether BPF LSM programs are active and attached.
+    lsm_attached: bool,
+    /// LSM program attachments owned by this handle: (prog symbol, hook name, link id).
+    lsm_links: Vec<(&'static str, &'static str, LsmLinkId)>,
+    /// Why the LSM hook is not attached, when it is not.
+    ///
+    /// `lsm_attached: false` alone is the least useful thing this handle can
+    /// say. Every refusal below was originally an `all_ok = false` with the
+    /// error dropped, so a node that could not attach reported exactly what a
+    /// node without CONFIG_BPF_LSM reports, and the CI stage that caught it
+    /// could only guess at the kernel. `None` where the hook is attached, or
+    /// where `lsm_available()` said this kernel has no BPF LSM at all.
+    lsm_unattached: Option<String>,
 }
 
 #[cfg(feature = "attach")]
@@ -535,11 +617,84 @@ impl KernelHandle {
                 .map_err(|err| degraded(prog, err))?;
             links.push((*prog, *category, *name, id));
         }
+        let mut lsm_attached = false;
+        let mut lsm_links = Vec::new();
+        let mut lsm_unattached = None;
+        if lsm_available() {
+            // BTF is not optional here: aya 0.12 takes the hook name and a
+            // `Btf` on `Lsm::load`, because an LSM program is attached by BTF
+            // id and not by name. `lsm_available()` accepts a kernel that has
+            // vmlinux BTF *or* lists bpf in the LSM set, so the read can still
+            // fail on a kernel that passed that check — and a failure here is
+            // the same non-event as every other one in this loop: the tracepoint
+            // links stay, `lsm_attached` stays false, and the agent runs blind
+            // to bprm_check rather than refusing to start. What it is not is
+            // silent: each refusal names itself, because the difference between
+            // "this kernel has no BPF LSM" and "the load was refused" is the
+            // whole diagnosis.
+            let btf = match aya::Btf::from_sys_fs() {
+                Ok(btf) => Some(btf),
+                Err(err) => {
+                    lsm_unattached = Some(format!(
+                        "read vmlinux BTF: {err} [{BTF_VMLINUX_PATH};                          Lsm::load attaches by BTF id, so there is nothing to attach to]"
+                    ));
+                    None
+                }
+            };
+            if let Some(btf) = btf {
+                let mut all_ok = true;
+                for (prog, hook) in crate::LSM_PROGRAMS {
+                    let Some(program) = bpf.program_mut(prog) else {
+                        lsm_unattached = Some(format!("program {prog} missing from the eBPF ELF"));
+                        all_ok = false;
+                        break;
+                    };
+                    // Fully-qualified: `Result` in this crate is
+                    // `ferrum_common::Result<T>`, a one-parameter alias, and the
+                    // error here is aya's `ProgramError`.
+                    let lsm: core::result::Result<&mut Lsm, _> = program.try_into();
+                    let lsm = match lsm {
+                        Ok(lsm) => lsm,
+                        Err(err) => {
+                            lsm_unattached = Some(format!("{prog} is not an LSM program: {err}"));
+                            all_ok = false;
+                            break;
+                        }
+                    };
+                    if let Err(err) = lsm.load(hook, &btf) {
+                        lsm_unattached = Some(format!("load {prog} onto {hook}: {err}"));
+                        all_ok = false;
+                        break;
+                    }
+                    match lsm.attach() {
+                        Ok(id) => lsm_links.push((*prog, *hook, id)),
+                        Err(err) => {
+                            lsm_unattached = Some(format!("attach {prog} to {hook}: {err}"));
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_ok && !lsm_links.is_empty() {
+                    lsm_attached = true;
+                } else {
+                    lsm_links.clear();
+                }
+            }
+        } else {
+            lsm_unattached = Some(format!(
+                "this kernel reports no BPF LSM: {LSM_PATH} does not list `bpf` and                  {BTF_VMLINUX_PATH} is absent"
+            ));
+        }
         Ok(Self {
             bpf,
             container_cgroups: BTreeSet::new(),
+            selected_cgroups: BTreeSet::new(),
             unhooked_syscalls: unhooked,
             links,
+            lsm_attached,
+            lsm_links,
+            lsm_unattached,
         })
     }
 
@@ -651,6 +806,32 @@ impl KernelHandle {
                 }
             }
         }
+
+        for (prog, hook, id) in std::mem::take(&mut self.lsm_links) {
+            let path = links_dir.join(prog);
+            if let Err(err) = refuse_if_occupied(&path) {
+                self.lsm_links.push((prog, hook, id));
+                return Err(err);
+            }
+            let program = self.bpf.program_mut(prog).ok_or_else(|| {
+                FerrumError::Degraded(format!("program {prog} missing from this handle"))
+            })?;
+            let lsm: &mut Lsm = program.try_into().map_err(|err| degraded(prog, err))?;
+            let link = lsm.take_link(id).map_err(|err| degraded(prog, err))?;
+            // Infallible, unlike the tracepoint case above: an LSM program is
+            // attached through a bpf_link on every kernel that can attach it at
+            // all, so aya gives `From` and not `TryFrom`. The fallback that used
+            // to stand here — reattach and report "this kernel gives no
+            // bpf_link" — described a state that cannot arise.
+            let fd_link = FdLink::from(link);
+            match fd_link.pin(&path) {
+                Ok(_pinned) => pinned.push(path),
+                Err(err) => {
+                    let reason = format!("pin {prog} at {}: {err}", path.display());
+                    return Err(self.reattach_lsm(prog, hook, reason));
+                }
+            }
+        }
         Ok(pinned)
     }
 
@@ -690,6 +871,59 @@ impl KernelHandle {
                  on this node: {err}"
             )),
         }
+    }
+
+    /// Put an LSM hook back after a failed pin, and say so in the error.
+    fn reattach_lsm(
+        &mut self,
+        prog: &'static str,
+        hook: &'static str,
+        reason: String,
+    ) -> FerrumError {
+        let program = match self.bpf.program_mut(prog) {
+            Some(program) => program,
+            None => {
+                return FerrumError::Degraded(format!("{reason}; {prog} is gone from the handle"))
+            }
+        };
+        let lsm: &mut Lsm = match program.try_into() {
+            Ok(lsm) => lsm,
+            Err(err) => {
+                return FerrumError::Degraded(format!(
+                    "{reason}; and {prog} could not be re-attached: {err}"
+                ))
+            }
+        };
+        match lsm.attach() {
+            Ok(id) => {
+                self.lsm_links.push((prog, hook, id));
+                FerrumError::Degraded(format!("{reason}; {prog} stays attached, unpinned"))
+            }
+            Err(err) => {
+                self.lsm_attached = false;
+                self.lsm_unattached = Some(format!(
+                    "re-attach {prog} to {hook} after a failed pin: {err}"
+                ));
+                FerrumError::Degraded(format!(
+                    "{reason}; and re-attaching {prog} failed, so LSM {hook} is now unhooked \
+                     on this node: {err}"
+                ))
+            }
+        }
+    }
+
+    /// Whether BPF LSM programs are active and attached in this handle.
+    pub fn is_lsm_attached(&self) -> bool {
+        self.lsm_attached
+    }
+
+    /// Why the LSM hook is not attached here, when it is not.
+    ///
+    /// `None` means it is attached. The string names the step that refused —
+    /// BTF, load, or attach — so a red CI stage says whether the kernel lacks
+    /// BPF LSM or the load was denied, instead of leaving both indistinguishable.
+    pub fn lsm_unattached_reason(&self) -> Option<&str> {
+        self.lsm_unattached.as_deref()
     }
 
     /// Datapath syscalls with no hook on this node — absent from the arch, or
@@ -785,6 +1019,167 @@ impl KernelHandle {
             .map_err(|err| degraded(MAP_CGROUPS, err))
     }
 
+    /// The cgroups the loaded policy selects, as `ferrum_selected` holds them.
+    ///
+    /// Mirrors `container_cgroups`: this handle keeps what it wrote so the
+    /// next plan is a diff and a failed sync is not forgotten.
+    pub fn selected_cgroups(&self) -> &BTreeSet<u64> {
+        &self.selected_cgroups
+    }
+
+    /// Apply a diff to `ferrum_selected`.
+    ///
+    /// Built on the same `plan_cgroup_sync` the container set uses, for the
+    /// same reason it refuses a truncated plan: a set that does not fit would
+    /// leave arbitrary pods *unselected*, and an unselected pod is one this
+    /// node stops preventing for — silently, since absence is not
+    /// distinguishable from "not selected" on the other side.
+    pub fn sync_selected_cgroups(&mut self, plan: &CgroupSyncPlan) -> Result<SyncStats> {
+        let mut stats = SyncStats::default();
+        for id in &plan.remove {
+            if let Err(err) = self.remove_selected_cgroup(*id) {
+                stats.entries = self.selected_cgroups.len();
+                return Err(partial_sync(stats, err));
+            }
+            self.selected_cgroups.remove(id);
+            stats.removed += 1;
+        }
+        for id in &plan.insert {
+            if let Err(err) = self.insert_selected_cgroup(*id) {
+                stats.entries = self.selected_cgroups.len();
+                return Err(partial_sync(stats, err));
+            }
+            self.selected_cgroups.insert(*id);
+            stats.inserted += 1;
+        }
+        stats.entries = self.selected_cgroups.len();
+        Ok(stats)
+    }
+
+    pub fn insert_selected_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
+        let map = self
+            .bpf
+            .map_mut(MAP_SELECTED)
+            .ok_or_else(|| missing(MAP_SELECTED))?;
+        let mut selected: HashMap<_, u64, u8> =
+            HashMap::try_from(map).map_err(|err| degraded(MAP_SELECTED, err))?;
+        selected
+            .insert(cgroup_id, 1, 0)
+            .map_err(|err| degraded(MAP_SELECTED, err))
+    }
+
+    pub fn remove_selected_cgroup(&mut self, cgroup_id: u64) -> Result<()> {
+        let map = self
+            .bpf
+            .map_mut(MAP_SELECTED)
+            .ok_or_else(|| missing(MAP_SELECTED))?;
+        let mut selected: HashMap<_, u64, u8> =
+            HashMap::try_from(map).map_err(|err| degraded(MAP_SELECTED, err))?;
+        selected
+            .remove(&cgroup_id)
+            .map_err(|err| degraded(MAP_SELECTED, err))
+    }
+
+    /// Publish the kernel-decidable part of a policy into `ferrum_rules`.
+    ///
+    /// **Every slot is written, always.** The slots the set does not fill are
+    /// written back as empty, which is what retires the previous policy: an
+    /// array map keeps what was put in it, so writing only the new rules would
+    /// leave the tail of a longer predecessor enforcing after the policy that
+    /// asked for it was replaced. That includes a refused set — a policy the
+    /// kernel may not enforce at all clears the map rather than leaving the
+    /// last one it could enforce in place.
+    ///
+    /// A failure part-way through leaves a mix of two policies in the map, so
+    /// it is not left there: the map is cleared and the error says whether
+    /// clearing worked. Clearing is the safe direction — the tracepoint path
+    /// still matches every rule and still reports, so what is lost is
+    /// prevention, not detection.
+    ///
+    /// Returns the number of occupied slots.
+    pub fn sync_kernel_rules(&mut self, set: &crate::KernelRuleSet) -> Result<usize> {
+        let filled = set.rules.len();
+        if filled > MAX_KERNEL_RULES as usize {
+            return Err(FerrumError::Degraded(format!(
+                "{filled} kernel rules for {MAX_KERNEL_RULES} slots in {MAP_RULES}; \
+                 compile_kernel_rules refuses this set and this handle will not truncate it"
+            )));
+        }
+        for index in 0..MAX_KERNEL_RULES {
+            let slot = set
+                .rules
+                .get(index as usize)
+                .copied()
+                .unwrap_or_else(KernelRule::empty);
+            if let Err(err) = self.write_rule_slot(index, slot) {
+                let cleared = self.clear_kernel_rules();
+                return Err(FerrumError::Degraded(match cleared {
+                    Ok(()) => format!(
+                        "{err}; slots up to {index} held a mix of two policies and the map was \
+                         cleared, so this node prevents nothing in kernel and keeps detecting"
+                    ),
+                    Err(second) => format!(
+                        "{err}; and clearing {MAP_RULES} failed too ({second}), so the map holds \
+                         a mix of two policies"
+                    ),
+                }));
+            }
+        }
+        Ok(filled)
+    }
+
+    /// One slot of `ferrum_rules`, read back out of the kernel.
+    ///
+    /// The mirror this handle keeps says what it *wrote*; this says what the
+    /// map *holds*. Only the second can tell a write that landed from one that
+    /// was accepted by userspace and dropped by the kernel, which is what a
+    /// live test of this map has to be able to do.
+    pub fn kernel_rule_at(&self, index: u32) -> Result<KernelRule> {
+        let map = self.bpf.map(MAP_RULES).ok_or_else(|| missing(MAP_RULES))?;
+        let rules: Array<_, RuleSlot> =
+            Array::try_from(map).map_err(|err| degraded(MAP_RULES, err))?;
+        rules
+            .get(&index, 0)
+            .map(|slot| slot.0)
+            .map_err(|err| degraded(MAP_RULES, err))
+    }
+
+    /// Whether the kernel's `ferrum_selected` holds this cgroup, read back out
+    /// of the map rather than off this handle's mirror.
+    pub fn selected_cgroup_present(&self, cgroup_id: u64) -> Result<bool> {
+        let map = self
+            .bpf
+            .map(MAP_SELECTED)
+            .ok_or_else(|| missing(MAP_SELECTED))?;
+        let selected: HashMap<_, u64, u8> =
+            HashMap::try_from(map).map_err(|err| degraded(MAP_SELECTED, err))?;
+        match selected.get(&cgroup_id, 0) {
+            Ok(_) => Ok(true),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(false),
+            Err(err) => Err(degraded(MAP_SELECTED, err)),
+        }
+    }
+
+    /// Empty every slot. Used on its own when enforcement is withdrawn.
+    pub fn clear_kernel_rules(&mut self) -> Result<()> {
+        for index in 0..MAX_KERNEL_RULES {
+            self.write_rule_slot(index, KernelRule::empty())?;
+        }
+        Ok(())
+    }
+
+    fn write_rule_slot(&mut self, index: u32, rule: KernelRule) -> Result<()> {
+        let map = self
+            .bpf
+            .map_mut(MAP_RULES)
+            .ok_or_else(|| missing(MAP_RULES))?;
+        let mut rules: Array<_, RuleSlot> =
+            Array::try_from(map).map_err(|err| degraded(MAP_RULES, err))?;
+        rules
+            .set(index, RuleSlot(rule), 0)
+            .map_err(|err| degraded(MAP_RULES, err))
+    }
+
     /// Take ownership of the event ring wrapped in a [`RingReader`].
     pub fn take_ring_reader(&mut self) -> Result<RingReader> {
         self.take_ring().map(RingReader::new)
@@ -800,6 +1195,27 @@ impl KernelHandle {
         RingBuf::try_from(map).map_err(|err| degraded(MAP_EVENTS, err))
     }
 }
+
+/// `KernelRule` as an aya map value.
+///
+/// A newtype and not `unsafe impl aya::Pod for KernelRule`: both the struct
+/// and the trait are foreign to this crate, so the orphan rule refuses that
+/// impl. `repr(transparent)` keeps the bytes the map sees identical to the
+/// ones `REQUIRED_MAPS` declares, and the struct has no padding — four `u8`s
+/// then `[u8; 16]`, align 1 — which is what makes the `Pod` promise true.
+#[cfg(feature = "attach")]
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+struct RuleSlot(KernelRule);
+
+// SAFETY: `repr(transparent)` over a `KernelRule` that is four `u8`s then
+// `[u8; 16]` — align 1, no padding, every bit pattern valid — which is the
+// whole of what `Pod` promises. `#[allow]` for the same reason as the two
+// `libc` calls above: the crate denies `unsafe_code`, and each exception is
+// named at its own site rather than by widening the lint.
+#[cfg(feature = "attach")]
+#[allow(unsafe_code)]
+unsafe impl aya::Pod for RuleSlot {}
 
 /// Consumer side of `ferrum_events`.
 ///
