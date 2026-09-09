@@ -252,11 +252,26 @@ pub fn kernel_rule_matches(
         // A sixteen-byte name has no terminator to compare, but userspace
         // refuses a literal that long, so no slot can name one: such an exec
         // matches nothing here, which is what the terminator test also did.
+        // XOR-накопление, а не сравнение на каждом байте, и это единственная
+        // форма из трёх опробованных, которую верификатор принимает.
+        //
+        // Ранние `return` внутри цикла давали по форку на байт: 202 состояния на
+        // инструкцию. Побайтовое `matches &= a == b` форки убрало, но LLVM
+        // развернул его в шестнадцать независимых булевых значений на стеке,
+        // сведённых цепочкой `r2 &= ...`, — и верификатор принялся перебирать их
+        // комбинации: 14422 состояния и тот же отказ по размеру. Измерено на
+        // ноде: с 16 слотами вместо 64 счёт не изменился совсем, то есть цена
+        // была не в числе правил, а в форме сравнения имени.
+        //
+        // Здесь состояние ровно одно: `diff` — скаляр, инструкции безветвевые,
+        // сравнение единственное и стоит после цикла.
+        let mut diff = 0u8;
         let mut i = 0;
         while i < COMM_LEN {
-            matches &= rule.comm[i] == comm[i];
+            diff |= rule.comm[i] ^ comm[i];
             i += 1;
         }
+        matches &= diff == 0;
     }
     matches &= !(rule.not_agent_self() && agent_self);
     matches &= !(rule.container_only() && !in_container);
