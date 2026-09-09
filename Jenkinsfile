@@ -257,6 +257,13 @@ pipeline {
                             RUSTFLAGS="-L $shim -L $sysroot/lib -C link-arg=-Wl,-rpath,$sysroot/lib" \
                                 cargo +nightly install bpf-linker --locked
                         fi
+                        # bpf_loop требует BTF: колбэк обязан быть подпрограммой
+                        # с func_info, иначе загрузка отвергается с "missing btf
+                        # func_info" — сам верификатор при этом доволен, 208
+                        # инструкций вместо миллиона. Релизная сборка BTF не
+                        # несёт: нужны и отладочная информация, и --btf у
+                        # bpf-linker, который иначе её не эмитит.
+                        export RUSTFLAGS="-C debuginfo=2 -C link-arg=--btf"
                         cargo +nightly build -p ferrum-ebpf-progs \
                             --target bpfel-unknown-none -Z build-std=core --release
                         elf="$CARGO_TARGET_DIR/bpfel-unknown-none/release/ferrum-ebpf-progs"
