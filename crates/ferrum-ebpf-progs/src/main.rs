@@ -130,6 +130,41 @@ mod progs {
     /// is the same function userspace tests against `eval::rule_matches`, so
     /// the predicate cannot drift; only this loop is written twice, and it is
     /// three lines of "strongest wins".
+    /// Состояние обхода слотов: то, что колбэку `bpf_loop` нужно знать, и
+    /// единственное, что он меняет.
+    #[repr(C)]
+    struct RuleWalk {
+        comm: [u8; COMM_LEN],
+        in_container: u8,
+        agent_self: u8,
+        selected: u8,
+        verdict: u8,
+    }
+
+    /// Одна итерация обхода. Возврат 0 — продолжать; ненулевой останавливает
+    /// цикл, и здесь он не нужен: ранний выход по найденному правилу сделал бы
+    /// вердикт зависящим от порядка слотов, а он выбирается по силе действия.
+    unsafe extern "C" fn walk_rules(index: u32, ctx: *mut aya_ebpf::cty::c_void) -> i64 {
+        let walk = &mut *(ctx as *mut RuleWalk);
+        if let Some(rule) = FERRUM_RULES.get(index) {
+            let matches = kernel_rule_mask(
+                rule,
+                &walk.comm,
+                walk.in_container != 0,
+                walk.agent_self != 0,
+                walk.selected != 0,
+            );
+            // "Сильнейший побеждает" той же арифметикой, что и раньше: ранги
+            // 0..=4, поэтому вычитание уходит в знаковый бит ровно тогда, когда
+            // кандидат сильнее текущего.
+            let candidate = action_rank(rule.action) * matches;
+            let current = action_rank(walk.verdict);
+            let stronger = (current.wrapping_sub(candidate) >> 7) & 1;
+            walk.verdict ^= (walk.verdict ^ rule.action) & stronger.wrapping_neg();
+        }
+        0
+    }
+
     #[lsm(hook = "bprm_check_security")]
     pub fn ferrum_bprm_check_security(ctx: LsmContext) -> i32 {
         // Defer to whoever ran before us. BPF LSM programs on one hook run as
@@ -157,29 +192,37 @@ mod progs {
         // that stops answering the helper.
         let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
 
-        // "Strongest wins", written without a comparison in the body. The
-        // `&&` and `>` this used to carry were two jumps per slot, and BPF has
-        // no conditional move to lower them to: across the trip count they put
-        // the verifier past its instruction budget and the program did not
-        // load. See `kernel_rule_mask` for what was measured.
-        let mut verdict = ACTION_ALLOW;
-        let mut index = 0;
-        while index < MAX_KERNEL_RULES {
-            if let Some(rule) = FERRUM_RULES.get(index) {
-                let matches = kernel_rule_mask(rule, &comm, in_container, agent_self, selected);
-                // Ranks are 0..=4, so the subtraction below cannot wrap into
-                // the sign bit for any other reason than the one it tests.
-                let candidate = action_rank(rule.action) * matches;
-                let current = action_rank(verdict);
-                // 1 exactly when `candidate > current`: the subtraction borrows
-                // out of the high bit.
-                let stronger = (current.wrapping_sub(candidate) >> 7) & 1;
-                // Arithmetic select: `verdict` becomes `rule.action` when
-                // `stronger`, and keeps its value otherwise.
-                verdict ^= (verdict ^ rule.action) & stronger.wrapping_neg();
-            }
-            index += 1;
+        // Обход слотов отдан ядру: bpf_loop проверяется верификатором один раз,
+        // сколько бы итераций ни было, а развёрнутый на месте цикл он обязан
+        // пройти целиком.
+        //
+        // Это разница не в скорости, а в том, грузится ли программа. Ядро ноды
+        // (7.2.3) принимало и цикл на месте — после того, как из его тела ушли
+        // все сравнения. Ядро mac-VM (6.12.76-linuxkit) ту же программу
+        // отвергало: 36404 состояния, тот же отказ по размеру. У более старого
+        // верификатора слабее отсечение, и полагаться на его силу — значит
+        // привязать загрузку датапейса к версии ядра узла. С bpf_loop стоимость
+        // проверки перестаёт зависеть от MAX_KERNEL_RULES вовсе.
+        //
+        // Хелпер есть с 5.17. Ядро без него не загрузит эту программу, и это
+        // тот же исход, что и раньше, но названный: KernelHandle сообщит отказ
+        // загрузки, а трейспойнты продолжат работать.
+        let mut walk = RuleWalk {
+            comm,
+            in_container: in_container as u8,
+            agent_self: agent_self as u8,
+            selected: selected as u8,
+            verdict: ACTION_ALLOW,
+        };
+        unsafe {
+            aya_ebpf::helpers::gen::bpf_loop(
+                MAX_KERNEL_RULES,
+                walk_rules as *mut aya_ebpf::cty::c_void,
+                &mut walk as *mut RuleWalk as *mut aya_ebpf::cty::c_void,
+                0,
+            );
         }
+        let verdict = walk.verdict;
         lsm_verdict(previous, action_refuses(verdict))
     }
 
