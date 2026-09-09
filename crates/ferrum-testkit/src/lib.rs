@@ -79,6 +79,32 @@ pub fn prod_restricted() -> ClusterSecurityPolicy {
     cluster_policy_from_yaml(PROD_RESTRICTED_YAML)
 }
 
+/// [`EXCEPTION_OK_YAML`] с датой истечения, которая валидна прямо сейчас.
+///
+/// Файл на диске несёт записанную дату, и валидатор зажимает её с обеих сторон:
+/// прошлое — «исключение родилось мёртвым», больше 90 дней вперёд — «уже не
+/// исключение, а новая политика без комитета». То есть любая записанная дата
+/// протухает не позже чем через 90 дней, и 2026-09-09 это уронило CI посреди
+/// дня: пример истёк в 18:00, сборка шла в 18:35.
+///
+/// Тесты, которые проверяют *правила*, а не календарь, берут пример отсюда.
+/// Тот, что проверяет сам файл как поставляемый документ, — из константы.
+pub fn exception_ok_yaml_valid_now() -> String {
+    let expires = chrono::Utc::now() + chrono::Duration::days(30);
+    EXCEPTION_OK_YAML
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("expiresAt:") {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                format!("{indent}expiresAt: \"{}\"", expires.format("%Y-%m-%dT%H:%M:%SZ"))
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn exception_ok() -> PolicyException {
     exception_from_yaml(EXCEPTION_OK_YAML)
 }

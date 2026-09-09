@@ -145,8 +145,15 @@ fn verify_rejects_wrong_pin_and_tampered_payload() {
 fn validate_examples_keep_their_verdicts() {
     let out = ferrumctl(&["validate", &example("prod-restricted.yaml")]);
     assert!(out.status.success(), "{out:?}");
-    let out = ferrumctl(&["validate", &example("exception-ok.yaml")]);
+    // Дата подставляется свежая, потому что она в примере записана, а правило
+    // проверяет её по стенным часам: иначе этот тест ломается не от поломки
+    // кода, а от того, что наступило завтра.
+    let dir = temp_dir("exception-ok");
+    let dated = dir.join("exception-ok.yaml");
+    fs::write(&dated, ferrum_testkit::exception_ok_yaml_valid_now()).expect("write dated example");
+    let out = ferrumctl(&["validate", dated.to_str().expect("utf-8 path")]);
     assert!(out.status.success(), "{out:?}");
+    let _ = fs::remove_dir_all(&dir);
     let out = ferrumctl(&["validate", &example("exception-bad-no-ticket.yaml")]);
     assert!(!out.status.success(), "bad example must keep failing");
 }
