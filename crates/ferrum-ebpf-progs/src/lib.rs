@@ -224,6 +224,19 @@ pub fn kernel_rule_matches(
     if !rule.is_used() {
         return false;
     }
+    // One exit, and no `return` inside the byte loop. This is not style: with
+    // early returns here the LSM program did not load at all. Each `return`
+    // inside a 16-trip loop is a fork the verifier must explore, the loop runs
+    // once per slot, and 64 slots put it past its budget --
+    // `BPF_PROG_LOAD failed: BPF program is too large. Processed 1000001 insn
+    // (limit 1000000)`, 57877 states, seven seconds of verification. The
+    // tracepoint path was never affected, so the shape looked fine for as long
+    // as nothing loaded this predicate into a kernel through an LSM hook.
+    //
+    // Accumulating into `matches` keeps the trip count fixed *and* the path
+    // count flat, and costs a handful of instructions that always run instead
+    // of branches that usually do not.
+    let mut matches = true;
     if rule.comm_len != 0 {
         let len = rule.comm_len as usize;
         if len > COMM_LEN {
@@ -231,28 +244,19 @@ pub fn kernel_rule_matches(
         }
         let mut i = 0;
         while i < COMM_LEN {
-            if i < len && rule.comm[i] != comm[i] {
-                return false;
-            }
+            let differs = i < len && rule.comm[i] != comm[i];
             // The predicate is the whole name: a rule for `sh` must not match
             // `shred`, so the byte after the last one has to be the
             // terminator rather than anything at all.
-            if i == len && comm[i] != 0 {
-                return false;
-            }
+            let unterminated = i == len && comm[i] != 0;
+            matches &= !differs && !unterminated;
             i += 1;
         }
     }
-    if rule.not_agent_self() && agent_self {
-        return false;
-    }
-    if rule.container_only() && !in_container {
-        return false;
-    }
-    if rule.selected_only() && !selected {
-        return false;
-    }
-    true
+    matches &= !(rule.not_agent_self() && agent_self);
+    matches &= !(rule.container_only() && !in_container);
+    matches &= !(rule.selected_only() && !selected);
+    matches
 }
 
 /// The action of the strongest slot that applies, or `ACTION_ALLOW` when none
