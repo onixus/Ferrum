@@ -21,7 +21,11 @@ def RUST_IMAGE = 'rust:1-bookworm'
 // запускает под uid агента, и первый прогон умер на `Permission denied` при
 // записи в /usr/local/cargo/registry. Кэш живёт в воркспейсе: он на ноде
 // сохраняется между билдами и принадлежит тому же пользователю.
-def RUST_DOCKER_ARGS = ''
+// Единственный том — bare-репо ноды, только на чтение. Шаги пайплайна идут
+// внутри контейнера, а он монтирует лишь воркспейс: без этой строки `git fetch`
+// не видел /home/onixus/Git/Ferrum.git и падал с "does not appear to be a git
+// repository", хотя на самой ноде репозиторий на месте.
+def RUST_DOCKER_ARGS = '-v /home/onixus/Git/Ferrum.git:/srv/ferrum.git:ro'
 
 pipeline {
     agent none
@@ -69,7 +73,7 @@ pipeline {
                         sh '''
                             set -eu
                             git init -q .
-                            git fetch -q --depth 1 /home/onixus/Git/Ferrum.git main
+                            git fetch -q --depth 1 /srv/ferrum.git main
                             git checkout -q -f FETCH_HEAD
                             git log --oneline -1
                         '''
