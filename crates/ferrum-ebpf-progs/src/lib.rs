@@ -238,18 +238,23 @@ pub fn kernel_rule_matches(
     // of branches that usually do not.
     let mut matches = true;
     if rule.comm_len != 0 {
-        let len = rule.comm_len as usize;
-        if len > COMM_LEN {
+        if rule.comm_len as usize > COMM_LEN {
             return false;
         }
+        // Plain equality of all sixteen bytes, and it is the *whole* predicate:
+        // `compile_kernel_rules` writes the name into a zeroed slot, and
+        // `bpf_get_current_comm` pads with NULs, so two names are equal exactly
+        // when their sixteen bytes are. The `i < len` and `i == len` tests this
+        // loop used to carry said nothing more -- the terminator they checked is
+        // one of the zeroes compared here -- and each cost the verifier a fork
+        // per byte per slot.
+        //
+        // A sixteen-byte name has no terminator to compare, but userspace
+        // refuses a literal that long, so no slot can name one: such an exec
+        // matches nothing here, which is what the terminator test also did.
         let mut i = 0;
         while i < COMM_LEN {
-            let differs = i < len && rule.comm[i] != comm[i];
-            // The predicate is the whole name: a rule for `sh` must not match
-            // `shred`, so the byte after the last one has to be the
-            // terminator rather than anything at all.
-            let unterminated = i == len && comm[i] != 0;
-            matches &= !differs && !unterminated;
+            matches &= rule.comm[i] == comm[i];
             i += 1;
         }
     }
