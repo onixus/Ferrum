@@ -27,7 +27,7 @@ mod progs {
         programs::{LsmContext, TracePointContext},
     };
     use ferrum_ebpf_progs::{
-        action_rank, action_refuses, kernel_rule_matches, lsm_verdict, Event, KernelRule,
+        action_rank, action_refuses, kernel_rule_mask, lsm_verdict, Event, KernelRule,
         ACTION_ALLOW, ACTION_AUDIT, CGROUPS_MAX_ENTRIES, COMM_LEN, EVENTS_RING_BYTES,
         EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, MAX_KERNEL_RULES,
         PATH_LEN,
@@ -157,15 +157,26 @@ mod progs {
         // that stops answering the helper.
         let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
 
+        // "Strongest wins", written without a comparison in the body. The
+        // `&&` and `>` this used to carry were two jumps per slot, and BPF has
+        // no conditional move to lower them to: across the trip count they put
+        // the verifier past its instruction budget and the program did not
+        // load. See `kernel_rule_mask` for what was measured.
         let mut verdict = ACTION_ALLOW;
         let mut index = 0;
         while index < MAX_KERNEL_RULES {
             if let Some(rule) = FERRUM_RULES.get(index) {
-                if kernel_rule_matches(rule, &comm, in_container, agent_self, selected)
-                    && action_rank(rule.action) > action_rank(verdict)
-                {
-                    verdict = rule.action;
-                }
+                let matches = kernel_rule_mask(rule, &comm, in_container, agent_self, selected);
+                // Ranks are 0..=4, so the subtraction below cannot wrap into
+                // the sign bit for any other reason than the one it tests.
+                let candidate = action_rank(rule.action) * matches;
+                let current = action_rank(verdict);
+                // 1 exactly when `candidate > current`: the subtraction borrows
+                // out of the high bit.
+                let stronger = (current.wrapping_sub(candidate) >> 7) & 1;
+                // Arithmetic select: `verdict` becomes `rule.action` when
+                // `stronger`, and keeps its value otherwise.
+                verdict ^= (verdict ^ rule.action) & stronger.wrapping_neg();
             }
             index += 1;
         }

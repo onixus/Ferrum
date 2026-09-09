@@ -221,62 +221,72 @@ pub fn kernel_rule_matches(
     agent_self: bool,
     selected: bool,
 ) -> bool {
-    if !rule.is_used() {
-        return false;
+    kernel_rule_mask(rule, comm, in_container, agent_self, selected) != 0
+}
+
+/// The same predicate as [`kernel_rule_matches`], as 1 or 0, computed without
+/// a single comparison.
+///
+/// This shape is not a micro-optimisation; it is what makes the LSM program
+/// loadable at all. BPF has no conditional move, so every `if`, `&&` and `==`
+/// becomes a jump, and this predicate runs once per slot inside a 64-trip
+/// loop: the branches multiply across iterations until the verifier walks past
+/// its budget and refuses the program --
+/// `BPF program is too large. Processed 1000001 insn (limit 1000000)`.
+///
+/// Measured on the CI node, one change at a time. Early `return`s inside the
+/// byte loop: 202 states per instruction. Replacing them with `matches &= a ==
+/// b`: LLVM kept sixteen booleans on the stack and ANDed them, 14400 states,
+/// still refused. Comparing the names as one `u128`: 39113 states, refused.
+/// Cutting the slot count from 64 to 2 changed nothing, which is what finally
+/// ruled the loop out as the cause. A loop body of one flag test loads; three
+/// do not. Only removing the comparisons themselves loads the whole predicate.
+///
+/// Every operand below is a bit: flags are masked and shifted rather than
+/// tested, the name comparison XOR-accumulates into `diff` and folds it to
+/// "was it zero" arithmetically, and the results are ANDed. The one comparison
+/// left is in `kernel_rule_matches` above, outside the loop's hot shape.
+pub fn kernel_rule_mask(
+    rule: &KernelRule,
+    comm: &[u8; COMM_LEN],
+    in_container: bool,
+    agent_self: bool,
+    selected: bool,
+) -> u8 {
+    let flags = rule.flags;
+    let used = flags & KRULE_FLAG_USED;
+    let container_only = (flags & KRULE_FLAG_CONTAINER_ONLY) >> 1;
+    let not_agent_self = (flags & KRULE_FLAG_NOT_AGENT_SELF) >> 2;
+    let selected_only = (flags & KRULE_FLAG_SELECTED_ONLY) >> 3;
+    // `as u8` on a bool is a zero-extension, not a comparison.
+    let in_container = in_container as u8;
+    let agent_self = agent_self as u8;
+    let selected = selected as u8;
+
+    // The whole name, always sixteen bytes. `compile_kernel_rules` writes into
+    // a zeroed slot and `bpf_get_current_comm` pads with NULs, so equality of
+    // the sixteen bytes is equality of the names, terminator included -- a rule
+    // for `sh` cannot match `shred`, because byte 2 is `r` against `\0`.
+    let mut diff = 0u8;
+    let mut i = 0;
+    while i < COMM_LEN {
+        diff |= rule.comm[i] ^ comm[i];
+        i += 1;
     }
-    // One exit, and no `return` inside the byte loop. This is not style: with
-    // early returns here the LSM program did not load at all. Each `return`
-    // inside a 16-trip loop is a fork the verifier must explore, the loop runs
-    // once per slot, and 64 slots put it past its budget --
-    // `BPF_PROG_LOAD failed: BPF program is too large. Processed 1000001 insn
-    // (limit 1000000)`, 57877 states, seven seconds of verification. The
-    // tracepoint path was never affected, so the shape looked fine for as long
-    // as nothing loaded this predicate into a kernel through an LSM hook.
-    //
-    // Accumulating into `matches` keeps the trip count fixed *and* the path
-    // count flat, and costs a handful of instructions that always run instead
-    // of branches that usually do not.
-    let mut matches = true;
-    if rule.comm_len != 0 {
-        if rule.comm_len as usize > COMM_LEN {
-            return false;
-        }
-        // Plain equality of all sixteen bytes, and it is the *whole* predicate:
-        // `compile_kernel_rules` writes the name into a zeroed slot, and
-        // `bpf_get_current_comm` pads with NULs, so two names are equal exactly
-        // when their sixteen bytes are. The `i < len` and `i == len` tests this
-        // loop used to carry said nothing more -- the terminator they checked is
-        // one of the zeroes compared here -- and each cost the verifier a fork
-        // per byte per slot.
-        //
-        // A sixteen-byte name has no terminator to compare, but userspace
-        // refuses a literal that long, so no slot can name one: such an exec
-        // matches nothing here, which is what the terminator test also did.
-        // XOR-накопление, а не сравнение на каждом байте, и это единственная
-        // форма из трёх опробованных, которую верификатор принимает.
-        //
-        // Ранние `return` внутри цикла давали по форку на байт: 202 состояния на
-        // инструкцию. Побайтовое `matches &= a == b` форки убрало, но LLVM
-        // развернул его в шестнадцать независимых булевых значений на стеке,
-        // сведённых цепочкой `r2 &= ...`, — и верификатор принялся перебирать их
-        // комбинации: 14422 состояния и тот же отказ по размеру. Измерено на
-        // ноде: с 16 слотами вместо 64 счёт не изменился совсем, то есть цена
-        // была не в числе правил, а в форме сравнения имени.
-        //
-        // Здесь состояние ровно одно: `diff` — скаляр, инструкции безветвевые,
-        // сравнение единственное и стоит после цикла.
-        let mut diff = 0u8;
-        let mut i = 0;
-        while i < COMM_LEN {
-            diff |= rule.comm[i] ^ comm[i];
-            i += 1;
-        }
-        matches &= diff == 0;
-    }
-    matches &= !(rule.not_agent_self() && agent_self);
-    matches &= !(rule.container_only() && !in_container);
-    matches &= !(rule.selected_only() && !selected);
-    matches
+    // `is_zero(x)`: for a byte, `x | -x` has its top bit set unless `x` is 0.
+    let comm_equal = (((diff | diff.wrapping_neg()) >> 7) & 1) ^ 1;
+    let names_a_comm = ((rule.comm_len | rule.comm_len.wrapping_neg()) >> 7) & 1;
+    let comm_ok = comm_equal | (names_a_comm ^ 1);
+    // A slot claiming more name bytes than the kernel reports is corrupt and
+    // matches nothing -- the same refusal the old `len > COMM_LEN` guard made,
+    // as a borrow out of the high bit instead of a jump.
+    let comm_len_ok = ((COMM_LEN as u8).wrapping_sub(rule.comm_len) >> 7) ^ 1;
+
+    used & comm_ok
+        & comm_len_ok
+        & ((not_agent_self & agent_self) ^ 1)
+        & ((container_only & (in_container ^ 1)) ^ 1)
+        & ((selected_only & (selected ^ 1)) ^ 1)
 }
 
 /// The action of the strongest slot that applies, or `ACTION_ALLOW` when none
@@ -346,14 +356,19 @@ pub const fn action_refuses(action: u8) -> bool {
 /// `krules.rs::the_two_action_ranks_are_one_order` fails the build if the two
 /// ever disagree, which is the only thing that makes a duplicate acceptable.
 pub const fn action_rank(action: u8) -> u8 {
-    match action {
-        ACTION_ALLOW => 0,
-        ACTION_AUDIT => 1,
-        ACTION_DENY => 2,
-        ACTION_ISOLATE => 3,
-        ACTION_KILL => 4,
-        _ => 0,
-    }
+    // A packed nibble table, not a `match`, and the reason is the verifier.
+    // BPF has no conditional move: every comparison is a jump, and this
+    // function is called twice per slot inside a 64-trip loop, so a `match`
+    // here multiplied the paths the verifier had to walk until it gave up --
+    // see `kernel_rule_mask`. One shift and one mask have a single path.
+    //
+    // Nibble `i` holds the rank of action `i`: allow 0, audit 1, deny 2,
+    // kill 4, isolate 3. The mask keeps the shift inside the word for any
+    // byte, so a corrupt action reads a nibble of the table rather than
+    // shifting past its end; every nibble above isolate is 0, which is the
+    // rank the `_` arm gave.
+    const RANKS: u64 = 0x0003_4210;
+    ((RANKS >> ((action & 7) * 4)) & 0xf) as u8
 }
 
 /// Ring-buffer record. No `String`; fixed buffers only.
