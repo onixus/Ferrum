@@ -96,7 +96,10 @@ pub fn exception_ok_yaml_valid_now() -> String {
         .map(|line| {
             if line.trim_start().starts_with("expiresAt:") {
                 let indent = &line[..line.len() - line.trim_start().len()];
-                format!("{indent}expiresAt: \"{}\"", expires.format("%Y-%m-%dT%H:%M:%SZ"))
+                format!(
+                    "{indent}expiresAt: \"{}\"",
+                    expires.format("%Y-%m-%dT%H:%M:%SZ")
+                )
             } else {
                 line.to_string()
             }
