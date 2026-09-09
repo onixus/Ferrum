@@ -38,6 +38,20 @@ def ROOT_DOCKER_ARGS = RUST_DOCKER_ARGS + ' -u 0:0'
 def DATAPATH_DOCKER_ARGS = ROOT_DOCKER_ARGS +
                            ' -v /sys/kernel/tracing:/sys/kernel/tracing:ro' +
                            ' --cap-add=BPF --cap-add=PERFMON --pid=host'
+// Стык: тесты создают собственные cgroup, то есть пишут в cgroupfs.
+//
+// На маке это стоило отдельной группы с долгоживущим контейнером и remount'ом
+// через привилегированный nsenter: Docker Desktop монтирует cgroupfs внутрь
+// только на чтение. Здесь узел нативный, cgroup2 на нём уже rw, и достаточно
+// смонтировать её как есть, отдав контейнеру хостовый cgroup namespace —
+// иначе `/sys/fs/cgroup` внутри окажется поддеревом контейнера, а датапейс
+// ключуется на идентификаторах из корня. CAP_SYS_ADMIN по-прежнему не даётся.
+def JOIN_DOCKER_ARGS = DATAPATH_DOCKER_ARGS +
+                       ' --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw'
+// Пины живут на bpffs, и монтирует её узел, а не контейнер: mount требует
+// CAP_SYS_ADMIN, а этот контейнер исполняет код репозитория.
+def PINS_DOCKER_ARGS = JOIN_DOCKER_ARGS +
+                       ' -v /run/ferrum-bpffs:/run/ferrum-bpffs:rw'
 
 pipeline {
     agent none
@@ -278,6 +292,158 @@ pipeline {
                             # он ни отчитал пройденными.
                             grep -q "attached through KernelHandle on " "$out"
                             cargo test -p ferrum-ebpf --features attach --lib
+                        '''
+                    }
+                }
+                stage('Стык cgroup') {
+                    agent {
+                        docker {
+                            image RUST_IMAGE
+                            args JOIN_DOCKER_ARGS
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        sh '''
+                            set -eu
+                            # Проверка — настоящие mkdir/rmdir, а не `mount | grep rw`:
+                            # «смонтировано rw» и «сюда можно писать» различает только
+                            # попытка записи. Корень в mountinfo сверяется потому же,
+                            # почему нужен --cgroupns=host: поддерево контейнера
+                            # выглядело бы рабочим и давало бы чужие идентификаторы.
+                            grep -qE " / /sys/fs/cgroup rw," /proc/self/mountinfo \
+                                || { echo "cgroup2 не rw, либо его корень в mountinfo уже не /" >&2; exit 1; }
+                            mkdir /sys/fs/cgroup/ferrum-cgroup-rw-probe
+                            rmdir /sys/fs/cgroup/ferrum-cgroup-rw-probe
+                            echo "ok: cgroup2 писабельна в контейнере датапейса, корень в mountinfo — /"
+                        '''
+                    }
+                }
+
+                stage('BPF join') {
+                    agent {
+                        docker {
+                            image RUST_IMAGE
+                            args JOIN_DOCKER_ARGS
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        sh '''
+                            set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-root-home"
+                            export RUSTUP_HOME="$WORKSPACE/.cargo-root-rustup"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-root-target"
+                            elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
+                            test -f "$elf"
+                            out=/tmp/ferrum-attach-join.out
+                            if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
+                                cargo test -p ferrum-agent --features attach,apiserver \
+                                --test attach_join -- --show-output > "$out" 2>&1
+                            then
+                                cat "$out"
+                                exit 1
+                            fi
+                            cat "$out"
+                            # Те же два гейта, что и на маке, и по той же причине:
+                            # каждый пропуск в live() — ранний return из #[test], и
+                            # счётчик passed у пустого прогона совпадает с настоящим
+                            # символ в символ. Число берётся из исходника, а не
+                            # записывается сюда, чтобы новый тест требовался этой
+                            # стадией с момента, как он появился.
+                            passed="$(sed -n 's/^test result: ok\\. \\([0-9][0-9]*\\) passed.*/\\1/p' "$out" | head -1)"
+                            src=crates/ferrum-agent/tests/attach_join.rs
+                            expected="$(sed -n '/^mod gate {/,$p' "$src" \
+                                | grep -cE '^[[:space:]]*#\\[test\\][[:space:]]*$')"
+                            if [ "${expected:-0}" -lt 1 ]; then
+                                echo "в $src не нашлось ни одного #[test] под mod gate: стадия" >&2
+                                echo "потеряла собственное представление о том, что обязана прогнать" >&2
+                                exit 1
+                            fi
+                            if [ "${passed:-0}" -ne "$expected" ]; then
+                                echo "BPF join прогнала ${passed:-0} из $expected тестов в $src" >&2
+                                exit 1
+                            fi
+                            names=/tmp/ferrum-join-evidence.txt
+                            anchor=crates/ferrum-agent/tests/join_evidence.rs
+                            sed -n 's/^ *evidence: "\\(.*\\)",$/\\1/p' "$anchor" | sort -u > "$names"
+                            if [ ! -s "$names" ]; then
+                                echo "в $anchor не нашлось меток доказательства: требовать нечего" >&2
+                                exit 1
+                            fi
+                            while read -r what; do
+                                if ! grep -q "$what: kernel record" "$out"; then
+                                    echo "BPF join отчиталась $passed пройденными без строки" >&2
+                                    echo "доказательства для '$what' — она печатается только с" >&2
+                                    echo "дальнего конца пути запись → вердикт → сигнал" >&2
+                                    exit 1
+                                fi
+                            done < "$names"
+                            echo "ok: все $passed join-тестов исполнились против этого ядра"
+                            # Юнит-тесты агента под той парой фич, с которой едет
+                            # DaemonSet: `cargo test --workspace` идёт на дефолтных,
+                            # и обе выключены.
+                            cargo test -p ferrum-agent --features attach,apiserver --lib
+                        '''
+                    }
+                }
+
+                // bpffs монтирует узел: mount требует CAP_SYS_ADMIN, которого
+                // контейнеру с кодом репозитория не дают. Стадия без docker-агента,
+                // то есть исполняется прямо на ноде.
+                stage('bpffs на ноде') {
+                    steps {
+                        sh '''
+                            set -eu
+                            sudo -n mkdir -p /run/ferrum-bpffs
+                            mountpoint -q /run/ferrum-bpffs \
+                                || sudo -n mount -t bpf bpffs /run/ferrum-bpffs
+                            mountpoint -q /run/ferrum-bpffs
+                            sudo -n chmod 0777 /run/ferrum-bpffs
+                            echo "ok: bpffs смонтирована на узле"
+                        '''
+                    }
+                }
+
+                stage('BPF pins') {
+                    agent {
+                        docker {
+                            image RUST_IMAGE
+                            args PINS_DOCKER_ARGS
+                            reuseNode true
+                        }
+                    }
+                    steps {
+                        sh '''
+                            set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-root-home"
+                            export RUSTUP_HOME="$WORKSPACE/.cargo-root-rustup"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-root-target"
+                            elf="$PWD/dist/ferrum-ebpf-progs.bpf.o"
+                            test -f "$elf"
+                            grep -q " - bpf bpffs " /proc/self/mountinfo \
+                                || { echo "bpffs не смонтирована в контейнере датапейса" >&2; exit 1; }
+                            out=/tmp/ferrum-attach-pins.out
+                            if ! FERRUM_BPF_ELF_REQUIRED=1 FERRUM_BPF_ELF="$elf" \
+                                FERRUM_BPF_PIN_ROOT=/run/ferrum-bpffs \
+                                cargo test -p ferrum-ebpf --features attach \
+                                --test attach_pins -- --show-output > "$out" 2>&1
+                            then
+                                cat "$out"
+                                exit 1
+                            fi
+                            cat "$out"
+                            # Строка печатается только после того, как пин переоткрыт
+                            # при уже уничтоженном handle — с дальнего конца того
+                            # единственного утверждения, ради которого стадия есть.
+                            if ! grep -q "pins outlived the handle:" "$out"; then
+                                echo "BPF pins прошла, не напечатав строку про переживший handle пин" >&2
+                                exit 1
+                            fi
+                            if ! grep -q "^test result: ok[.] 3 passed" "$out"; then
+                                echo "BPF pins прогнала не все три ядерных теста" >&2
+                                exit 1
+                            fi
                         '''
                     }
                 }
