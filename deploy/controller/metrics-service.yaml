@@ -1,0 +1,28 @@
+# Endpoints for the controller, so a scraper has something to discover.
+#
+# A ClusterIP and not headless, unlike the agent's: there is one controller.
+# `replicas: 1` is not an accident to be smoothed over by a load balancer —
+# two of them would both sign and both write the same bundle Secret — so
+# there is nothing here for a per-node series to be averaged away into.
+#
+# Its own Service and not a port on another, because the controller has no
+# other: it serves no traffic at all, which is why it had no Service until
+# this port existed.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferrum-controller-metrics
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-controller
+    app.kubernetes.io/part-of: ferrum
+spec:
+  selector:
+    app.kubernetes.io/name: ferrum-controller
+  ports:
+    # By name, like the other two: the number lives in the Deployment and the
+    # NetworkPolicy addresses it as `metrics`, so moving it moves everything.
+    - name: metrics
+      port: 9104
+      targetPort: metrics
+      protocol: TCP

@@ -68,7 +68,7 @@ pub const PREFIX: &str = "ferrum_agent";
 /// holds about *what it is enforcing* or *what went wrong on which cgroup* is
 /// reconnaissance for whoever is already inside. Those stay in `status.json`,
 /// which is a 0600 file on the node.
-pub const NON_NUMERIC_KEYS: [(&str, Disposition); 9] = [
+pub const NON_NUMERIC_KEYS: [(&str, Disposition); 11] = [
     // The scrape has its own timestamp, and a metric of "when this process
     // last looked at the clock" is one an operator would have to diff against
     // the scraper's own to read at all.
@@ -103,6 +103,13 @@ pub const NON_NUMERIC_KEYS: [(&str, Disposition); 9] = [
     ("terminalFault", Disposition::Withheld),
     ("respondDisabledReason", Disposition::Withheld),
     ("containerMapError", Disposition::Withheld),
+    // The same trade for the two kernel-rule texts. The refusal names why a
+    // policy may not be enforced in kernel — it can quote a selector — and the
+    // sync error carries a map name and an errno. Both are reachable here as
+    // facts (`kernelRulesRefused`, `kernelRulesUnsynced` are bools, and the
+    // second is a reason id besides); the sentences stay in the 0600 file.
+    ("kernelRulesRefusedReason", Disposition::Withheld),
+    ("kernelRulesError", Disposition::Withheld),
 ];
 
 /// The tenth non-numeric key. Kept out of the array above only because
@@ -141,7 +148,7 @@ pub enum Disposition {
 ///
 /// Matched by prefix, longest first: `DEG_CONTAINER_MAP` and several others
 /// reach `degraded_reasons_at` with a fault text appended.
-pub const DEGRADED_REASON_IDS: [(&str, &str); 30] = [
+pub const DEGRADED_REASON_IDS: [(&str, &str); 31] = [
     (crate::CGROUP_ROOT_UNDERIVABLE, "cgroup_root_underivable"),
     (crate::DATAPATH_ABI_MISMATCH, "datapath_abi_mismatch"),
     (crate::DATAPATH_UNDECODABLE, "datapath_undecodable"),
@@ -160,6 +167,7 @@ pub const DEGRADED_REASON_IDS: [(&str, &str); 30] = [
     (crate::DEG_EXPORT_DEAD, "export_dead"),
     (crate::DEG_EXPORT_LOSSY, "export_lossy"),
     (crate::DEG_IDENTITY_UNKNOWN, "identity_unknown"),
+    (crate::DEG_KERNEL_RULES_UNSYNCED, "kernel_rules_unsynced"),
     (crate::DEG_LABELS_UNKNOWN, "labels_unknown"),
     (crate::DEG_LKG_PARTIAL, "lkg_partial"),
     (crate::DEG_LOADER, "loader_degraded"),

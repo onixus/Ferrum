@@ -33,6 +33,136 @@ static LKG_SNAP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A container that starts between two ticks is a lookup miss, not a wrong
 /// identity.
 pub const CGROUP_REFRESH: Duration = Duration::from_secs(2);
+
+/// Whether a republish actually wrote anything.
+#[cfg(feature = "attach")]
+pub enum KernelPolicy {
+    /// The maps already hold this policy and this pod set. Nothing was
+    /// touched, which is the answer on almost every tick.
+    Unchanged,
+    /// The maps now hold the named bundle. `None` is a node with no bundle in
+    /// force, whose maps were emptied.
+    Published(Option<String>),
+}
+
+/// Bring `ferrum_rules` and `ferrum_selected` to the policy now in force, in
+/// the one order that never leaves rules enforcing against a set they were not
+/// compiled against.
+///
+/// The order is the whole of this function, and it is not arbitrary.
+///
+/// 1. **Rules off first.** A rule set compiled for one selected set and
+///    applied against another refuses execs in containers the policy never
+///    selected — an outage caused by a security control. So while the two maps
+///    disagree, the safe state is no prevention at all. Nothing is lost from
+///    detection: the tracepoint path still matches every rule and still kills.
+/// 2. **Then the selected set**, for the bundle that is loaded right now.
+/// 3. **Then the rules**, which are compiled against that set.
+///
+/// Every failure leaves the sequence stopped with the rules off and returns
+/// `Err`, so the caller degrades the node and the next tick starts over.
+/// `mark_kernel_rules_synced` — which is what clears that degradation — is
+/// reached only after all three steps have.
+///
+/// The early return is what keeps this from being destructive: an unchanged
+/// digest and an empty plan mean the maps are already right, and rewriting
+/// them would open a prevention gap on every tick for no reason.
+#[cfg(feature = "attach")]
+pub fn republish_kernel_policy(
+    handle: &mut ferrum_ebpf::KernelHandle,
+    agent: &Agent,
+    published: &Option<String>,
+) -> Result<KernelPolicy> {
+    let digest = agent.last_good_digest().map(|d| d.as_str().to_string());
+    let want = agent.selected_cgroups_for_last_good();
+    let plan =
+        ferrum_ebpf::plan_map_sync(handle.selected_cgroups(), &want, ferrum_ebpf::MAP_SELECTED)?;
+    // The order is `plan_kernel_publish`'s to decide and this function's to
+    // carry out. Split so the judgement is held by tests rather than by the
+    // comments that used to stand in the agent binary's ring loop, where
+    // nothing could reach it — and where both of its defects lived.
+    let steps = plan_kernel_publish(digest.as_deref(), published.as_deref(), !plan.is_empty());
+    if steps.is_empty() {
+        return Ok(KernelPolicy::Unchanged);
+    }
+
+    for step in steps {
+        match step {
+            KernelPublishStep::RetireRules => handle.clear_kernel_rules()?,
+            KernelPublishStep::PublishSelected => {
+                handle.sync_selected_cgroups(&plan)?;
+            }
+            KernelPublishStep::PublishRules => match agent.kernel_rules_for_last_good() {
+                Some(set) => {
+                    let installed = handle.sync_kernel_rules(&set)?;
+                    agent.mark_kernel_rules_synced(&set, installed as u64);
+                }
+                // No bundle in force: the maps must not keep the last one
+                // they had. A node enforcing a policy it can no longer name
+                // is worse than a node enforcing nothing.
+                None => agent.mark_kernel_rules_synced(&ferrum_ebpf::KernelRuleSet::default(), 0),
+            },
+        }
+    }
+    agent.mark_selected_cgroups(handle.selected_cgroups().len() as u64);
+    Ok(KernelPolicy::Published(digest))
+}
+
+/// One write a republish of the two kernel maps makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelPublishStep {
+    /// Take the rules out of `ferrum_rules` **before** the set they are keyed
+    /// on moves.
+    RetireRules,
+    /// Apply the diff to `ferrum_selected`.
+    PublishSelected,
+    /// Put the rules back, compiled against the set now in force.
+    PublishRules,
+}
+
+/// The order in which the two kernel maps may be brought to a new policy.
+///
+/// A decision and not an action, so that the property this carries is held by
+/// a test rather than by a comment. It used to live inline in the agent
+/// binary's ring loop, where nothing could reach it — and the first version of
+/// that loop had two defects this function makes impossible to reintroduce
+/// silently.
+///
+/// **Rules come off before the selected set moves, and go back after.** A rule
+/// set compiled for one selected set and applied against another refuses execs
+/// in containers the policy never selected — an outage caused by a security
+/// control. While the two maps disagree, the safe state is no prevention at
+/// all; nothing is lost from detection, because the tracepoint path still
+/// matches every rule and still kills.
+///
+/// **Pods moving under an unchanged policy do not retire the rules.** That
+/// case is not the hazard above: it moves the same rules onto exactly the pods
+/// the policy already selects, which can only narrow or widen them to what was
+/// asked for. Retiring there would open a prevention gap on every pod start
+/// and stop, which on a busy node is most of the time.
+///
+/// `published` is the digest the maps currently hold, `None` after any failed
+/// publish — so recovery is a policy change and takes the full sequence.
+pub fn plan_kernel_publish(
+    digest: Option<&str>,
+    published: Option<&str>,
+    selected_changed: bool,
+) -> Vec<KernelPublishStep> {
+    let policy_changed = digest != published;
+    if !policy_changed {
+        return if selected_changed {
+            vec![KernelPublishStep::PublishSelected]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut steps = vec![KernelPublishStep::RetireRules];
+    if selected_changed {
+        steps.push(KernelPublishStep::PublishSelected);
+    }
+    steps.push(KernelPublishStep::PublishRules);
+    steps
+}
 /// A container map that has not been reaffirmed within this is not "quiet",
 /// it is unproven: something on the publish path (pod watch, refresher, sync
 /// thread) stopped, and the map now holds an arbitrarily old snapshot — dead
@@ -273,6 +403,17 @@ pub const DEG_DATAPATH: &str =
     "datapath degraded: a record carried a syscall nr this build cannot name";
 pub const DEG_CGROUP_INDEX_EMPTY: &str =
     "cgroup index empty: every namespaced selector misses, whatever the policy says";
+/// The kernel-side rule set could not be published, so `ferrum_rules` was
+/// cleared rather than left holding a mix of two policies.
+///
+/// A degradation and the only one this feature raises: prevention is off on
+/// this node while the loaded policy says it should be on. Detection is not
+/// affected — every rule is still matched on the tracepoint path — which is
+/// why this is Degraded and not terminal.
+pub const DEG_KERNEL_RULES_UNSYNCED: &str =
+    "kernel rule set unpublished: ferrum_rules was cleared, so this node prevents nothing in \
+     kernel and keeps detecting";
+
 pub const DEG_CONTAINER_MAP: &str =
     "container map not ready: EVENT_FLAG_CONTAINER cannot be trusted, so containerOnly rules miss";
 pub const DEG_EXPORT_DEAD: &str = "export writer dead: enforcement runs and nothing records it";
@@ -596,6 +737,37 @@ pub struct Agent {
     /// EVENT_FLAG_CONTAINER. Every one of these is a `container_only` rule
     /// that did not match on a real container.
     container_flag_disagreement: AtomicU64,
+    /// Whether this node's datapath has BPF LSM programs attached. False on a
+    /// kernel without `CONFIG_BPF_LSM` and on every build that never asked.
+    lsm_attached: AtomicBool,
+    /// Slots this node published into `ferrum_rules`, and rules that stayed on
+    /// the tracepoint path because the kernel cannot decide them.
+    ///
+    /// Neither is a degradation, and that is a decision rather than an
+    /// oversight: a rule naming a path is excluded by construction — the hook
+    /// cannot read one — so the §D acceptance rule is excluded on every
+    /// healthy node, and a reason raised by every node at all times is a
+    /// signal operators stop reading. What they are is *counted*, published,
+    /// and charted.
+    kernel_rules_installed: AtomicU64,
+    kernel_rules_excluded: AtomicU64,
+    /// Cgroups published into `ferrum_selected` — the pods the loaded
+    /// policy's selector actually selects, resolved here and handed to the
+    /// kernel as an answer rather than a question.
+    ///
+    /// Zero under an unselected policy is correct and means "every cgroup",
+    /// not "none": the flag that consults this set is only set on rules of a
+    /// policy that selects.
+    selected_cgroups: AtomicU64,
+    /// Why no rule of the loaded policy may be enforced in kernel at all — a
+    /// selector, a non-enforce mode, a non-allow default. Also not a
+    /// degradation: it is the ordinary state of most policies.
+    kernel_rules_refused: Mutex<Option<String>>,
+    /// The last attempt to publish the rules into the map failed. This one
+    /// *is* a degradation: the map was cleared to keep two policies from
+    /// mixing, so this node prevents nothing in kernel while its policy says
+    /// it should.
+    kernel_rules_unsynced: Mutex<Option<String>>,
     identity_unknown: AtomicU64,
     identity_unknown_at: Mutex<Option<Instant>>,
     /// When the last whole sync plan was accepted. Freshness, not just
@@ -724,6 +896,12 @@ impl Agent {
             container_map_entries: AtomicU64::new(0),
             container_map_error: Mutex::new(None),
             container_flag_disagreement: AtomicU64::new(0),
+            lsm_attached: AtomicBool::new(false),
+            kernel_rules_installed: AtomicU64::new(0),
+            kernel_rules_excluded: AtomicU64::new(0),
+            selected_cgroups: AtomicU64::new(0),
+            kernel_rules_refused: Mutex::new(None),
+            kernel_rules_unsynced: Mutex::new(None),
             identity_unknown: AtomicU64::new(0),
             identity_unknown_at: Mutex::new(None),
             container_map_synced_at: Mutex::new(None),
@@ -819,6 +997,9 @@ impl Agent {
                 Some(err) => out.push(format!("{DEG_CONTAINER_MAP}: {err}")),
                 None => out.push(DEG_CONTAINER_MAP.to_string()),
             }
+        }
+        if let Some(err) = self.kernel_rules_unsynced() {
+            out.push(format!("{DEG_KERNEL_RULES_UNSYNCED}: {err}"));
         }
         if self.export_dead.load(Ordering::Relaxed) {
             out.push(DEG_EXPORT_DEAD.to_string());
@@ -1131,6 +1312,117 @@ impl Agent {
     /// rule silently not matching.
     pub fn container_map_ready(&self) -> bool {
         self.container_map_ready_at(Instant::now())
+    }
+
+    pub fn lsm_attached(&self) -> bool {
+        self.lsm_attached.load(Ordering::Relaxed)
+    }
+
+    pub fn set_lsm_attached(&self, attached: bool) {
+        self.lsm_attached.store(attached, Ordering::Relaxed);
+    }
+
+    pub fn kernel_rules_installed(&self) -> u64 {
+        self.kernel_rules_installed.load(Ordering::Relaxed)
+    }
+
+    pub fn kernel_rules_excluded(&self) -> u64 {
+        self.kernel_rules_excluded.load(Ordering::Relaxed)
+    }
+
+    pub fn selected_cgroups(&self) -> u64 {
+        self.selected_cgroups.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_selected_cgroups(&self, entries: u64) {
+        self.selected_cgroups.store(entries, Ordering::Relaxed);
+    }
+
+    /// The cgroups the loaded policy selects, resolved against the same index
+    /// the event path resolves identities against.
+    ///
+    /// Empty for a policy with no selector, and that is not "nothing is
+    /// selected": rules of such a policy carry no `KRULE_FLAG_SELECTED_ONLY`
+    /// and never consult the set. Empty also for a node whose index has not
+    /// filled yet, which *is* "nothing is selected" — and it is the
+    /// fail-open half of the trade written down in `kernel_rule_matches`:
+    /// prevention waits for the index, detection does not.
+    ///
+    /// `LabelsUnknown` counts as not selected here, for the same reason. The
+    /// userspace path fails closed on it and degrades the node; the kernel
+    /// cannot, because it cannot say why it refused.
+    pub fn selected_cgroups_for_last_good(&self) -> std::collections::BTreeSet<u64> {
+        let Some(bundle) = self.loader.last_good() else {
+            return std::collections::BTreeSet::new();
+        };
+        if bundle.spec.selector.is_empty() {
+            return std::collections::BTreeSet::new();
+        }
+        // `select` and not `snapshot`: this runs on the thread that drains the
+        // event ring, once per pod refresh, and a deep copy of every identity
+        // — four label maps each — to ask a yes/no question of it is work
+        // taken directly out of the drain cadence.
+        self.cgroups
+            .select(|identity| ferrum_ebpf::selector_matches(&bundle.spec.selector, identity))
+    }
+
+    pub fn kernel_rules_refused(&self) -> Option<String> {
+        self.kernel_rules_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn kernel_rules_unsynced(&self) -> Option<String> {
+        self.kernel_rules_unsynced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What this agent would publish into `ferrum_rules` for the bundle it is
+    /// currently enforcing.
+    ///
+    /// Derived from the loaded spec on every call rather than cached: the
+    /// cached copy would be the thing that goes stale across a reload, and
+    /// this is called once per bundle change.
+    pub fn kernel_rules_for_last_good(&self) -> Option<ferrum_ebpf::KernelRuleSet> {
+        self.loader
+            .last_good()
+            .map(|bundle| ferrum_ebpf::compile_kernel_rules(&bundle.spec))
+    }
+
+    /// Record a rule set that reached the map.
+    ///
+    /// `installed` is what the handle reported writing, not what the set
+    /// holds: the two are equal on success and this takes the observed number
+    /// so a future partial write cannot be reported as a whole one.
+    pub fn mark_kernel_rules_synced(&self, set: &ferrum_ebpf::KernelRuleSet, installed: u64) {
+        self.kernel_rules_installed
+            .store(installed, Ordering::Relaxed);
+        self.kernel_rules_excluded
+            .store(set.excluded.len() as u64, Ordering::Relaxed);
+        *self
+            .kernel_rules_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = set.refused.clone();
+        // A sync that worked clears the failure: this is a state, not a
+        // count, and a node that recovered must stop saying it did not.
+        *self
+            .kernel_rules_unsynced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Record that publishing failed. The installed count goes to zero
+    /// because that is what a cleared map holds, and reporting the previous
+    /// number would name rules this node is no longer enforcing.
+    pub fn mark_kernel_rules_unsynced(&self, err: impl std::fmt::Display) {
+        self.kernel_rules_installed.store(0, Ordering::Relaxed);
+        *self
+            .kernel_rules_unsynced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
     }
 
     pub fn container_map_ready_at(&self, now: Instant) -> bool {
@@ -6729,6 +7021,180 @@ mod tests {
         assert!(agent.unproven_window_len() <= CONTAINER_FLAG_TRACKED_MAX);
     }
 
+    /// The order the two kernel maps may be written in, pinned.
+    ///
+    /// Both halves were defects in the first version of the ring loop, and
+    /// both are the kind that no green test would have noticed: one opened a
+    /// window in which rules enforced against a set they were not compiled
+    /// against, the other opened a prevention gap on every pod start.
+    #[test]
+    fn rules_come_off_before_the_selected_set_moves_and_go_back_after() {
+        use KernelPublishStep::*;
+
+        // Nothing moved: nothing is written. This is the answer on almost
+        // every tick, and it is what keeps a republish from being destructive.
+        assert_eq!(plan_kernel_publish(Some("aaaa"), Some("aaaa"), false), []);
+
+        // Pods moved under an unchanged policy. The set is written and the
+        // rules are NOT retired: they move onto exactly the pods the policy
+        // already selects, and retiring here would stop prevention on every
+        // pod start and stop.
+        assert_eq!(
+            plan_kernel_publish(Some("aaaa"), Some("aaaa"), true),
+            [PublishSelected]
+        );
+
+        // The policy changed. Rules off first, back last, and the set moves
+        // in between — the order is the whole of the property.
+        assert_eq!(
+            plan_kernel_publish(Some("bbbb"), Some("aaaa"), true),
+            [RetireRules, PublishSelected, PublishRules]
+        );
+        // Same policy change with a set that happens not to move: the rules
+        // still go through the retire/publish pair, because they are what
+        // changed.
+        assert_eq!(
+            plan_kernel_publish(Some("bbbb"), Some("aaaa"), false),
+            [RetireRules, PublishRules]
+        );
+
+        // First bundle on a fresh node, and the bundle going away.
+        assert_eq!(
+            plan_kernel_publish(Some("aaaa"), None, true),
+            [RetireRules, PublishSelected, PublishRules]
+        );
+        assert_eq!(
+            plan_kernel_publish(None, Some("aaaa"), true),
+            [RetireRules, PublishSelected, PublishRules],
+            "a node with no bundle must not keep the last rules it had"
+        );
+
+        // Recovery. A failed publish sets `published` to None, so the next
+        // attempt is a policy change and redoes the whole sequence rather
+        // than trusting a half-applied one.
+        assert_eq!(
+            plan_kernel_publish(Some("aaaa"), None, false),
+            [RetireRules, PublishRules]
+        );
+    }
+
+    /// Whenever the rules are written at all, they are written last.
+    ///
+    /// Stated as a property over every input rather than as four literal
+    /// vectors, so a fifth case added later cannot quietly violate it.
+    #[test]
+    fn the_rules_are_never_written_before_the_set_they_are_compiled_against() {
+        for digest in [None, Some("aaaa"), Some("bbbb")] {
+            for published in [None, Some("aaaa"), Some("bbbb")] {
+                for selected_changed in [true, false] {
+                    let steps = plan_kernel_publish(digest, published, selected_changed);
+                    let publish = steps
+                        .iter()
+                        .position(|s| *s == KernelPublishStep::PublishRules);
+                    let Some(publish) = publish else {
+                        // Not writing the rules is always allowed; writing
+                        // them in the wrong place is not.
+                        continue;
+                    };
+                    assert_eq!(
+                        steps.first(),
+                        Some(&KernelPublishStep::RetireRules),
+                        "{digest:?}/{published:?}/{selected_changed}: the rules are written \
+                         without being retired first, so the old set enforces against the new one"
+                    );
+                    assert_eq!(
+                        publish,
+                        steps.len() - 1,
+                        "{digest:?}/{published:?}/{selected_changed}: the rules are not last, \
+                         so they enforce against a set that is still being written: {steps:?}"
+                    );
+                    if let Some(selected) = steps
+                        .iter()
+                        .position(|s| *s == KernelPublishStep::PublishSelected)
+                    {
+                        assert!(
+                            selected < publish,
+                            "{digest:?}/{published:?}/{selected_changed}: the set is written \
+                             after the rules that are keyed on it: {steps:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The selected set is resolved from the index, and an unselected policy
+    /// asks for nobody rather than for everybody.
+    ///
+    /// The distinction is the whole safety of the feature: an empty set under
+    /// a policy that *does* select means "prevent nowhere", and the same empty
+    /// set under a policy that does not select must not be read as "prevent
+    /// nowhere" — those rules carry no `KRULE_FLAG_SELECTED_ONLY` and never
+    /// consult it.
+    #[test]
+    fn the_selected_set_is_resolved_from_the_index_and_an_unselected_policy_asks_for_nobody() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.insert_cgroup(8, identity("pod-b"));
+
+        // The MVP spec carries no selector: the set is empty, and the compiled
+        // rules say why that is not "nowhere".
+        assert!(agent.selected_cgroups_for_last_good().is_empty());
+        let set = agent
+            .kernel_rules_for_last_good()
+            .expect("a bundle is loaded");
+        assert!(
+            !set.selected_only,
+            "an unselected policy asked for a selected set it would then match nothing against"
+        );
+
+        // And the accounting the surface publishes is what was handed to the
+        // map, not what was computed: a set that failed to publish must not
+        // report itself present.
+        agent.mark_selected_cgroups(2);
+        assert_eq!(agent.selected_cgroups(), 2);
+        assert_eq!(
+            status_json(&agent, None, None, &agent.degraded_state_at(Instant::now()))
+                .get("selectedCgroups")
+                .and_then(|v| v.as_u64()),
+            Some(2)
+        );
+    }
+
+    /// A failed publish of the rule set is the one degradation this feature
+    /// raises, and it recovers.
+    #[test]
+    fn an_unpublished_rule_set_degrades_the_node_and_a_later_success_clears_it() {
+        let agent = healthy_agent();
+        assert!(!agent.is_degraded());
+
+        agent.mark_kernel_rules_unsynced("ferrum_rules: EPERM");
+        assert!(agent.is_degraded());
+        let reasons = agent.degraded_reasons_at(Instant::now());
+        assert!(
+            reasons
+                .iter()
+                .any(|r| r.starts_with(DEG_KERNEL_RULES_UNSYNCED)),
+            "{reasons:?}"
+        );
+        // The installed count goes with it: reporting the previous number
+        // would name rules this node is no longer enforcing.
+        assert_eq!(agent.kernel_rules_installed(), 0);
+
+        let set = agent
+            .kernel_rules_for_last_good()
+            .expect("a bundle is loaded");
+        agent.mark_kernel_rules_synced(&set, set.rules.len() as u64);
+        assert!(
+            !agent.is_degraded(),
+            "a node that recovered still says it did not: {:?}",
+            agent.degraded_reasons_at(Instant::now())
+        );
+        assert!(agent.kernel_rules_unsynced().is_none());
+    }
+
     /// A8. Waivers that name another policy are signed, verified, in scope,
     /// counted, logged as reloaded — and apply to nothing. The join cannot be
     /// proven here (the FRMB carries no policy name), so it is stated.
@@ -7360,7 +7826,52 @@ mod tests {
         /// problem, not a gate problem — which is why the rows are written to
         /// be read, and why each says where the state goes instead of that it
         /// is fine.
-        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 20] = [
+        const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 25] = [
+            (
+                "lsm_attached",
+                "not a count and not a fault in either direction: a kernel without CONFIG_BPF_LSM \
+                 is the supported majority of the fleet, and a node that runs the tracepoint path \
+                 alone is doing what this product has always done. What would be a fault is the \
+                 rule set failing to reach a node that *is* attached, and that has its own reason \
+                 — `DEG_KERNEL_RULES_UNSYNCED`, raised from `kernel_rules_unsynced`.",
+            ),
+            (
+                "selected_cgroups",
+                "how many pods on this node the loaded policy selects. Zero is two different \
+                 correct states — an unselected policy, whose rules carry no \
+                 `KRULE_FLAG_SELECTED_ONLY` and never read the set, and a node whose index has \
+                 not filled yet — and neither is a fault. The second is the fail-open window \
+                 named in `selected_cgroups_for_last_good`: prevention waits for the index, \
+                 detection does not. A failure to publish the set is a fault, and it raises \
+                 `DEG_KERNEL_RULES_UNSYNCED` like any other unpublished map.",
+            ),
+            (
+                "kernel_rules_installed",
+                "how much of the loaded policy this node prevents rather than only detects. Zero \
+                 is the ordinary state — of the shipped prod-restricted, every exec rule names a \
+                 path — so a reason on it would be raised by every node at all times, which is a \
+                 signal operators stop reading. The failure that deserves a reason is the set not \
+                 reaching the map, and `DEG_KERNEL_RULES_UNSYNCED` is it.",
+            ),
+            (
+                "kernel_rules_excluded",
+                "rules that stay on the tracepoint path because the hook cannot decide them, and \
+                 the largest class of those is a path predicate, which the hook cannot read at \
+                 all with this toolchain. So this climbs on every healthy node carrying the §D \
+                 acceptance rule. It is published because \"which half of this policy is \
+                 prevented\" has no other answer, and it is charted; degrading on it would be \
+                 degrading on the design. `mark_kernel_rules_synced` is what writes it.",
+            ),
+            (
+                "kernel_rules_refused",
+                "the loaded policy may not be enforced in kernel at all — it carries a selector, \
+                 or is not in enforce mode, or has a non-allow default. Ordinary for most \
+                 policies, and the refusal is the safe direction: enforcing a selected policy \
+                 against every container refuses execs in workloads it never selected, which is \
+                 an outage caused by a security control. A node doing the right thing does not \
+                 report itself degraded for it. `mark_kernel_rules_synced` records the refusal \
+                 verbatim, and `kernel_rules_for_last_good` is what produced it.",
+            ),
             (
                 "respond_refused",
                 "the aggregate of every guard that said no. A refusal is the guards working, and \

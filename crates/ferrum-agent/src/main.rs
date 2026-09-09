@@ -515,6 +515,15 @@ fn run(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .set_attached(true);
+    // Published whichever way it went. False is the ordinary answer — a kernel
+    // without CONFIG_BPF_LSM is most of the fleet — and it has to be readable
+    // as an answer rather than as an absent series, because "does this node
+    // prevent or only detect" is the first question after an exec that should
+    // not have happened.
+    agent
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_lsm_attached(handle.is_lsm_attached());
 
     // Bounded: a full channel backpressures the reader, and the kernel drops
     // (counted in events_dropped_total) instead of userspace growing without
@@ -531,6 +540,11 @@ fn run(
         let mut publisher_alive = true;
         let mut drop_check_broken = false;
         let mut records_alive = true;
+        // The digest whose policy is in the two kernel maps right now. `None`
+        // before the first bundle, and after any failure to publish one: the
+        // maps then hold no rules, and the next tick redoes the whole
+        // sequence rather than trusting a half-applied one.
+        let mut published: Option<String> = None;
         loop {
             if publisher_alive {
                 let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
@@ -562,6 +576,27 @@ fn run(
                     });
                 if !publisher_alive {
                     eprintln!("ferrum-agent: {}", ferrum_agent::CGROUP_PUBLISHER_GONE);
+                }
+            }
+            // The two kernel maps, brought to the policy now in force. After
+            // the drain rather than before it, so a pod set that arrived this
+            // tick reaches `ferrum_selected` in the same tick it reaches
+            // `ferrum_cgroups` instead of one later.
+            {
+                let guard = drop_agent.read().unwrap_or_else(|e| e.into_inner());
+                match ferrum_agent::republish_kernel_policy(&mut handle, &guard, &published) {
+                    Ok(ferrum_agent::KernelPolicy::Unchanged) => {}
+                    Ok(ferrum_agent::KernelPolicy::Published(digest)) => published = digest,
+                    Err(err) => {
+                        eprintln!("ferrum-agent: {err}");
+                        guard.mark_kernel_rules_unsynced(err);
+                        // Not `published = digest`: the maps do not hold this
+                        // policy, and saying they do would leave the next tick
+                        // seeing nothing to do. The rules are off either way —
+                        // step 1 of the sequence — so this node prevents
+                        // nothing and keeps detecting until a tick succeeds.
+                        published = None;
+                    }
                 }
             }
             let tick = ring.tick(
