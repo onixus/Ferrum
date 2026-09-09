@@ -1,0 +1,80 @@
+// Прогон тестов Ferrum на нативном amd64-агенте (Arch Linux, метка `gaming`).
+//
+// Зачем отдельный файл, а не метки в основном Jenkinsfile: тот собирает на
+// mac-контроллере и завязан на его docker.sock и на SCM-путь /Users/onixus/Git/Ferrum,
+// которого на ноде нет. Linux-ноды в режиме EXCLUSIVE, то есть `agent any`
+// основного пайплайна туда не уедет даже случайно. Здесь всё наоборот: каждая
+// стадия явно просит метку, и джоба `ferrum-linux` берёт исходники из bare-репо
+// /home/onixus/Git/Ferrum.git на самой ноде — mac туда пушит.
+//
+// CARGO_TARGET_DIR на именованном томе: на ноде ext4 и гонки VirtioFS с потерей
+// записей cargo структурно нет, но том держит кэш между прогонами, иначе каждая
+// сборка холодная.
+//
+// Здесь только тесты. Стадии образов, BPF ELF и датапейс не портированы: они
+// требуют tracefs, cap-add и сборки bpf-linker, и это отдельная работа.
+
+def RUST_IMAGE = 'rust:1-bookworm'
+def RUST_DOCKER_ARGS = '-v ferrum-linux-cargo-home:/usr/local/cargo/registry' +
+                       ' -v ferrum-linux-cargo-target:/build-target'
+
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        // Джоба читает сам скрипт с mac-пути (lightweight checkout идёт на
+        // контроллере), а дерево для сборки берётся уже на ноде — из её
+        // собственного bare-репо. Неявный `checkout scm` в воркспейсе агента
+        // пошёл бы по mac-пути, которого там нет, поэтому он выключен.
+        skipDefaultCheckout()
+    }
+
+    environment {
+        CARGO_TARGET_DIR = '/build-target'
+        CARGO_TERM_COLOR = 'never'
+    }
+
+    stages {
+        stage('Test (linux/amd64)') {
+            agent {
+                docker {
+                    image RUST_IMAGE
+                    args RUST_DOCKER_ARGS
+                    label 'gaming'
+                    reuseNode false
+                }
+            }
+            stages {
+                stage('Toolchain') {
+                    steps {
+                        checkout([$class: 'GitSCM',
+                                  userRemoteConfigs: [[url: '/home/onixus/Git/Ferrum.git']],
+                                  branches: [[name: '*/main']]])
+                        sh '''
+                            set -eu
+                            rustc -vV
+                            cargo -V
+                        '''
+                    }
+                }
+
+                // Те же две строки, что и в основном Jenkinsfile: --workspace идёт
+                // на дефолтных фичах, а каждая продовая фича в этом дереве по
+                // умолчанию выключена, поэтому apiserver нужен отдельным прогоном.
+                stage('cargo test') {
+                    steps {
+                        sh '''
+                            set -eu
+                            cargo test --workspace
+                            cargo test -p ferrum-admission --features apiserver
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
