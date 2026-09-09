@@ -528,6 +528,15 @@ pub struct KernelHandle {
     lsm_attached: bool,
     /// LSM program attachments owned by this handle: (prog symbol, hook name, link id).
     lsm_links: Vec<(&'static str, &'static str, LsmLinkId)>,
+    /// Why the LSM hook is not attached, when it is not.
+    ///
+    /// `lsm_attached: false` alone is the least useful thing this handle can
+    /// say. Every refusal below was originally an `all_ok = false` with the
+    /// error dropped, so a node that could not attach reported exactly what a
+    /// node without CONFIG_BPF_LSM reports, and the CI stage that caught it
+    /// could only guess at the kernel. `None` where the hook is attached, or
+    /// where `lsm_available()` said this kernel has no BPF LSM at all.
+    lsm_unattached: Option<String>,
 }
 
 #[cfg(feature = "attach")]
@@ -610,8 +619,8 @@ impl KernelHandle {
         }
         let mut lsm_attached = false;
         let mut lsm_links = Vec::new();
+        let mut lsm_unattached = None;
         if lsm_available() {
-            let mut all_ok = true;
             // BTF is not optional here: aya 0.12 takes the hook name and a
             // `Btf` on `Lsm::load`, because an LSM program is attached by BTF
             // id and not by name. `lsm_available()` accepts a kernel that has
@@ -619,42 +628,65 @@ impl KernelHandle {
             // fail on a kernel that passed that check — and a failure here is
             // the same non-event as every other one in this loop: the tracepoint
             // links stay, `lsm_attached` stays false, and the agent runs blind
-            // to bprm_check rather than refusing to start.
-            let btf = aya::Btf::from_sys_fs().ok();
-            for (prog, hook) in crate::LSM_PROGRAMS {
-                let Some(btf) = btf.as_ref() else {
-                    all_ok = false;
-                    break;
-                };
-                let Some(program) = bpf.program_mut(prog) else {
-                    all_ok = false;
-                    break;
-                };
-                // Fully-qualified: `Result` in this crate is
-                // `ferrum_common::Result<T>`, a one-parameter alias, and the
-                // error here is aya's `ProgramError`.
-                let lsm: core::result::Result<&mut Lsm, _> = program.try_into();
-                let Ok(lsm) = lsm else {
-                    all_ok = false;
-                    break;
-                };
-                if lsm.load(hook, btf).is_err() {
-                    all_ok = false;
-                    break;
+            // to bprm_check rather than refusing to start. What it is not is
+            // silent: each refusal names itself, because the difference between
+            // "this kernel has no BPF LSM" and "the load was refused" is the
+            // whole diagnosis.
+            let btf = match aya::Btf::from_sys_fs() {
+                Ok(btf) => Some(btf),
+                Err(err) => {
+                    lsm_unattached = Some(format!(
+                        "read vmlinux BTF: {err} [{BTF_VMLINUX_PATH};                          Lsm::load attaches by BTF id, so there is nothing to attach to]"
+                    ));
+                    None
                 }
-                match lsm.attach() {
-                    Ok(id) => lsm_links.push((*prog, *hook, id)),
-                    Err(_) => {
+            };
+            if let Some(btf) = btf {
+                let mut all_ok = true;
+                for (prog, hook) in crate::LSM_PROGRAMS {
+                    let Some(program) = bpf.program_mut(prog) else {
+                        lsm_unattached =
+                            Some(format!("program {prog} missing from the eBPF ELF"));
+                        all_ok = false;
+                        break;
+                    };
+                    // Fully-qualified: `Result` in this crate is
+                    // `ferrum_common::Result<T>`, a one-parameter alias, and the
+                    // error here is aya's `ProgramError`.
+                    let lsm: core::result::Result<&mut Lsm, _> = program.try_into();
+                    let lsm = match lsm {
+                        Ok(lsm) => lsm,
+                        Err(err) => {
+                            lsm_unattached =
+                                Some(format!("{prog} is not an LSM program: {err}"));
+                            all_ok = false;
+                            break;
+                        }
+                    };
+                    if let Err(err) = lsm.load(hook, &btf) {
+                        lsm_unattached = Some(format!("load {prog} onto {hook}: {err}"));
                         all_ok = false;
                         break;
                     }
+                    match lsm.attach() {
+                        Ok(id) => lsm_links.push((*prog, *hook, id)),
+                        Err(err) => {
+                            lsm_unattached = Some(format!("attach {prog} to {hook}: {err}"));
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_ok && !lsm_links.is_empty() {
+                    lsm_attached = true;
+                } else {
+                    lsm_links.clear();
                 }
             }
-            if all_ok && !lsm_links.is_empty() {
-                lsm_attached = true;
-            } else {
-                lsm_links.clear();
-            }
+        } else {
+            lsm_unattached = Some(format!(
+                "this kernel reports no BPF LSM: {LSM_PATH} does not list `bpf` and                  {BTF_VMLINUX_PATH} is absent"
+            ));
         }
         Ok(Self {
             bpf,
@@ -664,6 +696,7 @@ impl KernelHandle {
             links,
             lsm_attached,
             lsm_links,
+            lsm_unattached,
         })
     }
 
@@ -870,6 +903,8 @@ impl KernelHandle {
             }
             Err(err) => {
                 self.lsm_attached = false;
+                self.lsm_unattached =
+                    Some(format!("re-attach {prog} to {hook} after a failed pin: {err}"));
                 FerrumError::Degraded(format!(
                     "{reason}; and re-attaching {prog} failed, so LSM {hook} is now unhooked \
                      on this node: {err}"
@@ -881,6 +916,15 @@ impl KernelHandle {
     /// Whether BPF LSM programs are active and attached in this handle.
     pub fn is_lsm_attached(&self) -> bool {
         self.lsm_attached
+    }
+
+    /// Why the LSM hook is not attached here, when it is not.
+    ///
+    /// `None` means it is attached. The string names the step that refused —
+    /// BTF, load, or attach — so a red CI stage says whether the kernel lacks
+    /// BPF LSM or the load was denied, instead of leaving both indistinguishable.
+    pub fn lsm_unattached_reason(&self) -> Option<&str> {
+        self.lsm_unattached.as_deref()
     }
 
     /// Datapath syscalls with no hook on this node — absent from the arch, or

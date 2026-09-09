@@ -1002,14 +1002,23 @@ mod gate {
             return;
         };
         if !live.handle.is_lsm_attached() {
+            // The reason, not just the fact. This message used to name a kernel
+            // without CONFIG_BPF_LSM as the explanation, and on the node that
+            // first hit it that was false: the kernel listed `bpf` in
+            // /sys/kernel/security/lsm and served vmlinux BTF, and the refusal
+            // was somewhere in the load. A message that guesses the cause sends
+            // whoever reads it to check the thing that is already fine.
+            let why = live
+                .handle
+                .lsm_unattached_reason()
+                .unwrap_or("no reason recorded");
             if required() {
                 panic!(
-                    "FERRUM_BPF_ELF_REQUIRED is set and the LSM hook is not attached on this \
-                     kernel, so nothing here tested prevention. Run this stage on a kernel with \
-                     CONFIG_BPF_LSM and `bpf` in /sys/kernel/security/lsm."
+                    "FERRUM_BPF_ELF_REQUIRED is set and the LSM hook is not attached, so \
+                     nothing here tested prevention: {why}"
                 );
             }
-            println!("skipping: no BPF LSM on this kernel, so there is no prevention to measure");
+            println!("skipping: no prevention to measure here: {why}");
             return;
         }
         let cgroup = own_cgroup_id(&mut live);
