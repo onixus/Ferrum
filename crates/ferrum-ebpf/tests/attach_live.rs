@@ -1024,9 +1024,17 @@ mod gate {
         let cgroup = own_cgroup_id(&mut live);
         let handle = &mut live.handle;
 
-        // The rule names this process's own comm, because this process is what
-        // is about to try to exec.
-        let own_comm = std::fs::read_to_string("/proc/self/comm").expect("read /proc/self/comm");
+        // The rule names this *thread's* comm, and the distinction is the whole
+        // reason this test could not pass. `bpf_get_current_comm` returns
+        // `current->comm`, which on Linux is per-thread, and the test harness
+        // renames each test's thread to the test's own name. Reading
+        // /proc/self/comm names the process instead -- the binary,
+        // `attach_live-<hash>` -- so the rule published here named something no
+        // exec on this path would ever be running under, the hook compared
+        // `gate::a_selecte` against `attach_live-8b`, and the exec went
+        // through. The datapath was right and the fixture was wrong.
+        let own_comm =
+            std::fs::read_to_string("/proc/thread-self/comm").expect("read /proc/thread-self/comm");
         let own_comm = own_comm.trim();
         handle
             .sync_kernel_rules(&refusing_set(own_comm, true))
