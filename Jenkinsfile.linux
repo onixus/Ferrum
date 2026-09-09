@@ -55,16 +55,24 @@ pipeline {
             stages {
                 stage('Toolchain') {
                     steps {
-                        // poll: false обязателен. Опрос SCM исполняется на
-                        // контроллере (в его логе git 2.47.3 — тот, что внутри
-                        // контейнера Jenkins, а не 2.55.0 с ноды), и путь этого
-                        // репозитория там не существует: поллинг падал с
-                        // "does not appear to be a git repository" и билд #2 не
-                        // стартовал вовсе. Триггером остаётся SCM джобы —
-                        // mac-путь, который контроллер видит.
-                        checkout(poll: false, changelog: true, scm: [$class: 'GitSCM',
-                                 userRemoteConfigs: [[url: '/home/onixus/Git/Ferrum.git']],
-                                 branches: [[name: '*/main']]])
+                        // Обычный `git` в sh, а не шаг `checkout`, и это
+                        // единственное, что здесь работает. Опрос SCM исполняется
+                        // на контроллере (git 2.47.3 из контейнера Jenkins против
+                        // 2.55.0 на ноде), и любой зарегистрированный SCM с путём
+                        // ноды он пытается опросить у себя: `ls-remote` падает с
+                        // "does not appear to be a git repository", опрос
+                        // прерывается целиком и джоба не строится вовсе. `poll:
+                        // false` на шаге checkout этого не предотвратил —
+                        // проверено, билд после правки так и не стартовал. Шаг sh
+                        // Jenkins как источник не видит, поэтому триггером
+                        // остаётся SCM самой джобы, то есть mac-путь.
+                        sh '''
+                            set -eu
+                            git init -q .
+                            git fetch -q --depth 1 /home/onixus/Git/Ferrum.git main
+                            git checkout -q -f FETCH_HEAD
+                            git log --oneline -1
+                        '''
                         sh '''
                             set -eu
                             export CARGO_HOME="$WORKSPACE/.cargo-home"
