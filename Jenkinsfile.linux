@@ -15,8 +15,13 @@
 // требуют tracefs, cap-add и сборки bpf-linker, и это отдельная работа.
 
 def RUST_IMAGE = 'rust:1-bookworm'
-def RUST_DOCKER_ARGS = '-v ferrum-linux-cargo-home:/usr/local/cargo/registry' +
-                       ' -v ferrum-linux-cargo-target:/build-target'
+// Именованных томов здесь нет намеренно, в отличие от основного Jenkinsfile.
+// Там они лечат VirtioFS: на mac bind-mount теряет записи cargo. На ноде ext4,
+// этой болезни нет, а тома создаются от root — контейнер же docker-агент
+// запускает под uid агента, и первый прогон умер на `Permission denied` при
+// записи в /usr/local/cargo/registry. Кэш живёт в воркспейсе: он на ноде
+// сохраняется между билдами и принадлежит тому же пользователю.
+def RUST_DOCKER_ARGS = ''
 
 pipeline {
     agent none
@@ -34,7 +39,6 @@ pipeline {
     }
 
     environment {
-        CARGO_TARGET_DIR = '/build-target'
         CARGO_TERM_COLOR = 'never'
     }
 
@@ -56,6 +60,7 @@ pipeline {
                                   branches: [[name: '*/main']]])
                         sh '''
                             set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-home"
                             rustc -vV
                             cargo -V
                         '''
@@ -69,6 +74,8 @@ pipeline {
                     steps {
                         sh '''
                             set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-home"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-target"
                             cargo test --workspace
                             cargo test -p ferrum-admission --features apiserver
                         '''
