@@ -263,7 +263,12 @@ pipeline {
                         # инструкций вместо миллиона. Релизная сборка BTF не
                         # несёт: нужны и отладочная информация, и --btf у
                         # bpf-linker, который иначе её не эмитит.
-                        export RUSTFLAGS="-C debuginfo=2 -C link-arg=--btf"
+                        #
+                        # Переменная именно target-специфичная. Обычный RUSTFLAGS
+                        # достаётся и build.rs, а те собираются для хоста обычным
+                        # cc: `cc: error: unrecognized command-line option
+                        # '--btf'` уронил libc на первой же сборке скрипта.
+                        export CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS="-C debuginfo=2 -C link-arg=--btf"
                         cargo +nightly build -p ferrum-ebpf-progs \
                             --target bpfel-unknown-none -Z build-std=core --release
                         elf="$CARGO_TARGET_DIR/bpfel-unknown-none/release/ferrum-ebpf-progs"
