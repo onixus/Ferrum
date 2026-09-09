@@ -645,8 +645,7 @@ impl KernelHandle {
                 let mut all_ok = true;
                 for (prog, hook) in crate::LSM_PROGRAMS {
                     let Some(program) = bpf.program_mut(prog) else {
-                        lsm_unattached =
-                            Some(format!("program {prog} missing from the eBPF ELF"));
+                        lsm_unattached = Some(format!("program {prog} missing from the eBPF ELF"));
                         all_ok = false;
                         break;
                     };
@@ -657,8 +656,7 @@ impl KernelHandle {
                     let lsm = match lsm {
                         Ok(lsm) => lsm,
                         Err(err) => {
-                            lsm_unattached =
-                                Some(format!("{prog} is not an LSM program: {err}"));
+                            lsm_unattached = Some(format!("{prog} is not an LSM program: {err}"));
                             all_ok = false;
                             break;
                         }
@@ -903,8 +901,9 @@ impl KernelHandle {
             }
             Err(err) => {
                 self.lsm_attached = false;
-                self.lsm_unattached =
-                    Some(format!("re-attach {prog} to {hook} after a failed pin: {err}"));
+                self.lsm_unattached = Some(format!(
+                    "re-attach {prog} to {hook} after a failed pin: {err}"
+                ));
                 FerrumError::Degraded(format!(
                     "{reason}; and re-attaching {prog} failed, so LSM {hook} is now unhooked \
                      on this node: {err}"
