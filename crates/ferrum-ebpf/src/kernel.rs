@@ -612,17 +612,33 @@ impl KernelHandle {
         let mut lsm_links = Vec::new();
         if lsm_available() {
             let mut all_ok = true;
+            // BTF is not optional here: aya 0.12 takes the hook name and a
+            // `Btf` on `Lsm::load`, because an LSM program is attached by BTF
+            // id and not by name. `lsm_available()` accepts a kernel that has
+            // vmlinux BTF *or* lists bpf in the LSM set, so the read can still
+            // fail on a kernel that passed that check — and a failure here is
+            // the same non-event as every other one in this loop: the tracepoint
+            // links stay, `lsm_attached` stays false, and the agent runs blind
+            // to bprm_check rather than refusing to start.
+            let btf = aya::Btf::from_sys_fs().ok();
             for (prog, hook) in crate::LSM_PROGRAMS {
+                let Some(btf) = btf.as_ref() else {
+                    all_ok = false;
+                    break;
+                };
                 let Some(program) = bpf.program_mut(prog) else {
                     all_ok = false;
                     break;
                 };
-                let lsm: Result<&mut Lsm, _> = program.try_into();
+                // Fully-qualified: `Result` in this crate is
+                // `ferrum_common::Result<T>`, a one-parameter alias, and the
+                // error here is aya's `ProgramError`.
+                let lsm: core::result::Result<&mut Lsm, _> = program.try_into();
                 let Ok(lsm) = lsm else {
                     all_ok = false;
                     break;
                 };
-                if lsm.load().is_err() {
+                if lsm.load(hook, btf).is_err() {
                     all_ok = false;
                     break;
                 }
@@ -1153,7 +1169,13 @@ impl KernelHandle {
 #[derive(Clone, Copy)]
 struct RuleSlot(KernelRule);
 
+// SAFETY: `repr(transparent)` over a `KernelRule` that is four `u8`s then
+// `[u8; 16]` — align 1, no padding, every bit pattern valid — which is the
+// whole of what `Pod` promises. `#[allow]` for the same reason as the two
+// `libc` calls above: the crate denies `unsafe_code`, and each exception is
+// named at its own site rather than by widening the lint.
 #[cfg(feature = "attach")]
+#[allow(unsafe_code)]
 unsafe impl aya::Pod for RuleSlot {}
 
 /// Consumer side of `ferrum_events`.
