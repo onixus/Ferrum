@@ -787,16 +787,12 @@ impl KernelHandle {
             })?;
             let lsm: &mut Lsm = program.try_into().map_err(|err| degraded(prog, err))?;
             let link = lsm.take_link(id).map_err(|err| degraded(prog, err))?;
-            let fd_link = match FdLink::try_from(link) {
-                Ok(fd_link) => fd_link,
-                Err(err) => {
-                    let reason = format!(
-                        "this kernel gives no bpf_link for LSM {hook}, so \
-                         {prog} cannot be pinned: {err}"
-                    );
-                    return Err(self.reattach_lsm(prog, hook, reason));
-                }
-            };
+            // Infallible, unlike the tracepoint case above: an LSM program is
+            // attached through a bpf_link on every kernel that can attach it at
+            // all, so aya gives `From` and not `TryFrom`. The fallback that used
+            // to stand here — reattach and report "this kernel gives no
+            // bpf_link" — described a state that cannot arise.
+            let fd_link = FdLink::from(link);
             match fd_link.pin(&path) {
                 Ok(_pinned) => pinned.push(path),
                 Err(err) => {
