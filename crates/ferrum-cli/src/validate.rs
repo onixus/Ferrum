@@ -151,9 +151,25 @@ mod tests {
         validate_yaml(PROD_RESTRICTED_YAML).expect("prod-restricted");
     }
 
+    /// Проверяет правила, а не календарь: дата подставляется свежая.
+    ///
+    /// Раньше здесь стоял файл как есть, и тест падал не когда ломались
+    /// правила, а когда истекала записанная в примере дата — что и случилось
+    /// 2026-09-09 в 18:35, через тридцать пять минут после её истечения.
     #[test]
     fn exception_ok_ok() {
-        validate_yaml(EXCEPTION_OK_YAML).expect("exception-ok");
+        validate_yaml(&ferrum_testkit::exception_ok_yaml_valid_now()).expect("exception-ok");
+    }
+
+    /// А это — про сам поставляемый файл: он обязан разбираться и нести всё,
+    /// что делает его примером. Дату здесь не проверяют: она иллюстрация, и
+    /// её истечение — не поломка кода.
+    #[test]
+    fn exception_ok_example_parses() {
+        let obj: ferrum_api::PolicyException =
+            serde_yaml::from_str(EXCEPTION_OK_YAML).expect("example yaml");
+        assert_eq!(obj.spec.ticket, "JIRA-18421");
+        assert!(!obj.spec.target.rules.is_empty());
     }
 
     #[test]

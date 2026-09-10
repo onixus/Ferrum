@@ -1222,8 +1222,24 @@ mod tests {
 
     #[test]
     fn example_exception_ok_validates() {
+        // Дата подставляется свежая: validate_exception сверяет её с Utc::now(),
+        // и с записанной в файле датой этот тест проверял не правила, а то,
+        // какое сегодня число. Здесь не testkit, чтобы крейт правил не зависел
+        // от библиотеки фикстур, — три строки замены дешевле такой связи.
         let yaml = include_str!("../../../policies/examples/exception-ok.yaml");
-        let obj: PolicyException = serde_yaml::from_str(yaml).expect("example yaml");
+        let fresh = Utc::now() + Days::new(30);
+        let yaml: String = yaml
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("expiresAt:") {
+                    format!("  expiresAt: \"{}\"", fresh.format("%Y-%m-%dT%H:%M:%SZ"))
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let obj: PolicyException = serde_yaml::from_str(&yaml).expect("example yaml");
         validate_exception(&obj.spec).expect("exception-ok");
         let now = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
         assert!(exception_applies(
