@@ -29,10 +29,19 @@
 //! subject to that list is a deliberate act with a reason beside it.
 //!
 //! What it cannot do: it checks that a cited `fn` is *defined* in the file, not
-//! that it asserts what the row says, and not that it is a `#[test]`. The
-//! marker is the author's word for where the test ran. Neither is closable by
-//! grep, and pretending otherwise here would be this project's own defect, one
-//! level up. It used to be weaker still — a substring search for `fn NAME(`,
+//! that it asserts what the row says, and not that it is a `#[test]`. That is
+//! not closable by grep, and pretending otherwise here would be this project's
+//! own defect, one level up.
+//!
+//! The marker is the author's word for where the test ran, and that word is now
+//! checked in the two places where it has a mechanical form: the same
+//! `source::name` carries the same marker in every row that cites it, and `A`
+//! is only available to a source that actually spawns `kubectl`. Both were
+//! written after a slice marked three kernel rows `A` — including the phase 2
+//! criterion, `execve` returning `EPERM` — and every citation in them resolved.
+//! Where the marker still goes unchecked is where `K` and `U` differ: whether
+//! the stand was a kernel is not visible in the source of the test that ran on
+//! one. It used to be weaker still — a substring search for `fn NAME(`,
 //! which a comment, a doc comment or a string literal satisfied, so a claim
 //! could be resolved by the prose describing the test that used to carry it.
 //! The match is now anchored at the start of a line.
@@ -415,6 +424,178 @@ fn every_claim_in_the_does_section_cites_something_that_exists() {
         }
     }
 
+    assert!(failures.is_empty(), "\n{}\n", failures.join("\n"));
+}
+
+/// Every citation under «Делает», paired with the line of the row that makes
+/// it.
+///
+/// Cells that do not parse are dropped rather than reported: the grammar is
+/// the business of the test above, and a cell that fails there would otherwise
+/// fail twice with two different explanations of the same defect.
+fn does_citations(doc: &str) -> Vec<(usize, Citation)> {
+    let mut out = Vec::new();
+    for row in rows(doc).into_iter().filter(|r| r.section == DOES_HEADING) {
+        let Some(evidence) = row.cells.last() else {
+            continue;
+        };
+        let Ok(citations) = parse_evidence(evidence) else {
+            continue;
+        };
+        for citation in citations {
+            out.push((row.line, citation));
+        }
+    }
+    out
+}
+
+/// The same `source::name`, cited twice, means the same thing both times.
+///
+/// The marker is the author's word for where a test ran, and this is the half
+/// of that word a reader can check without re-running anything: one test ran
+/// in one place, so two rows that cite it and disagree about where have a
+/// wrong one between them, whichever it is. Nothing else in this file would
+/// have said so — the citation resolves either way, and the row-level marker
+/// summarises whatever the cell happens to hold.
+///
+/// It found the defect it was written for. `attach_live.rs::a_selected_\
+/// container_cannot_exec_what_the_policy_refuses` — the phase 2 criterion,
+/// `execve` returning `EPERM` on a real kernel — went in marked `A`, which is
+/// the API server stand, together with the two rows beside it and the CI
+/// stages all three cited. `Jenkinsfile::BPF attach` was therefore `U` in four
+/// rows and `A` in two, and a reader asking the document what this tree has
+/// executed on a kernel was told, of the one row that answers it, that an API
+/// server had answered instead.
+#[test]
+fn a_cited_target_carries_one_marker_wherever_it_is_cited() {
+    let doc = document();
+    let mut seen: BTreeMap<String, BTreeMap<char, Vec<usize>>> = BTreeMap::new();
+    for (line, citation) in does_citations(&doc) {
+        seen.entry(format!("{}::{}", citation.source, citation.name))
+            .or_default()
+            .entry(citation.marker)
+            .or_default()
+            .push(line);
+    }
+    assert!(
+        seen.len() > 50,
+        "found {} distinct citations under {DOES_HEADING:?}: this gate is comparing almost \
+         nothing",
+        seen.len()
+    );
+    let failures: Vec<String> = seen
+        .iter()
+        .filter(|(_, markers)| markers.len() > 1)
+        .map(|(target, markers)| {
+            let where_ = markers
+                .iter()
+                .map(|(marker, lines)| {
+                    let lines: Vec<String> = lines.iter().map(usize::to_string).collect();
+                    format!("{marker} on MVP-1-BOUNDARY.md:{}", lines.join(", "))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "`{target}` is cited under two different markers: {where_}. One test ran in one \
+                 place; two rows cannot both be right about which stand it was"
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "\n{}\n", failures.join("\n"));
+}
+
+/// A CI stage is cited as `U`, and is never itself the decider.
+///
+/// From the legend, and not an addition to it: `U` is what a stage measures —
+/// the tree that ships — while `K` and `A` say who decided, a real kernel or a
+/// real API server. A stage that runs a kernel test is evidence that the test
+/// is run by this repository on every build, which is a claim about the tree;
+/// the kernel's answer is carried by the test citation beside it, and that is
+/// the one that may be `K`. Marking the stage itself `K` or `A` would let a
+/// row claim a kernel or a cluster from a `stage('...')` string alone, which
+/// is all the gate above can check about a stage.
+#[test]
+fn a_ci_stage_is_cited_in_userspace_and_never_as_the_decider() {
+    let doc = document();
+    let stages: Vec<(usize, Citation)> = does_citations(&doc)
+        .into_iter()
+        .filter(|(_, c)| c.source == "Jenkinsfile")
+        .collect();
+    assert!(
+        stages.len() > 10,
+        "found {} Jenkinsfile citations under {DOES_HEADING:?}: this gate is checking almost \
+         nothing",
+        stages.len()
+    );
+    let failures: Vec<String> = stages
+        .iter()
+        .filter(|(_, c)| c.marker != 'U')
+        .map(|(line, c)| {
+            format!(
+                "MVP-1-BOUNDARY.md:{line}: `Jenkinsfile::{}` is marked {:?}. A stage measures \
+                 the tree that ships, which is what `U` says; the kernel or the API server that \
+                 decided is carried by the test citation beside it, and all this file can check \
+                 about a stage is that a `stage('...')` of that name exists",
+                c.name, c.marker
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "\n{}\n", failures.join("\n"));
+}
+
+/// What a source has to do to be a witness of a real API server: start one.
+///
+/// `kubectl` rather than a kube client crate because that is how both stands
+/// in this tree talk to a cluster — the gate runs the binary the operator
+/// would run, so the evidence is the API server's own answer to an ordinary
+/// `kubectl apply`.
+const API_SERVER_CALL: &str = "Command::new(\"kubectl\")";
+
+/// `A` is only available to a file that actually reaches an API server.
+///
+/// The weakest mechanical form of "the marker is the author's word", and worth
+/// having because the way that word goes wrong is not invention but carry-over:
+/// three rows in a row took the marker of the row above them, and none of the
+/// three had anything to do with a cluster. A file that never spawns `kubectl`
+/// cannot have been answered by an API server, whatever the row says.
+///
+/// What it does not check: that the *cited test* is one of the ones that
+/// reaches the cluster. A file that talks to an API server somewhere may carry
+/// `A` on a test in it that does not, and no grep separates those.
+#[test]
+fn only_a_source_that_reaches_a_cluster_may_carry_the_api_server_marker() {
+    let doc = document();
+    let root = repo_root();
+    let crates = root.join("crates");
+    let mut sources = Vec::new();
+    rs_files(&crates, &mut sources);
+    let cited: Vec<(usize, Citation)> = does_citations(&doc)
+        .into_iter()
+        .filter(|(_, c)| c.marker == 'A' && c.source != "Jenkinsfile")
+        .collect();
+    assert!(
+        !cited.is_empty(),
+        "no row under {DOES_HEADING:?} carries `A` any more. Either every claim measured \
+         against a real API server was dropped, or the marker was renamed and this gate is \
+         checking nothing"
+    );
+    let mut failures: Vec<String> = Vec::new();
+    for (line, citation) in cited {
+        let Ok(path) = resolve(&citation.source, &sources, &crates) else {
+            continue;
+        };
+        let body = strip_rust_comments(&fs::read_to_string(&path).expect("source file"));
+        if !body.contains(API_SERVER_CALL) {
+            failures.push(format!(
+                "MVP-1-BOUNDARY.md:{line}: `{}::{}` is marked `A`, the API server stand, but {} \
+                 contains no {API_SERVER_CALL} outside its comments — it never reaches a \
+                 cluster, so nothing in it can have been decided by one",
+                citation.source,
+                citation.name,
+                path.strip_prefix(&root).unwrap_or(&path).display()
+            ));
+        }
+    }
     assert!(failures.is_empty(), "\n{}\n", failures.join("\n"));
 }
 
