@@ -1,9 +1,46 @@
 # FERRUM
 
-Self-hosted Kubernetes enforcement plane на Rust.
+**Self-hosted Kubernetes enforcement plane written in Rust.**
 
-Не CNAPP. Не «единое окно видимости». Admission + runtime enforcement,
-подписанные policy bundle, last-known-good вместо fail-open.
+Ferrum connects **admission-time policy** with **runtime eBPF enforcement**. Signed policy bundles are compiled outside the admission hot path, rolled out through Kubernetes, kept as last-known-good state on the node, and evaluated against runtime events before enforcement actions are taken.
+
+```text
+Kubernetes workload
+        │
+        ▼
+Admission webhook ──► signed policy bundle
+        │                       │
+        ▼                       ▼
+   workload runs          node LKG state
+        │                       │
+        ▼                       │
+ eBPF sys_enter ────────────────┘
+        │
+        ▼
+ runtime policy decision
+        │
+        └──► enforcement / event
+```
+
+## Quick start
+
+Validate the repository and example policy:
+
+```bash
+cargo test --workspace
+cargo run -p ferrum-cli -- validate policies/examples/prod-restricted.yaml
+cargo run -p ferrum-cli -- lint-deploy deploy
+```
+
+Install the Kubernetes manifests with Kustomize:
+
+```bash
+kubectl apply -k deploy
+```
+
+The default build intentionally has **no live datapath**. Real kernel attachment uses the `attach` feature and Kubernetes workload metadata uses `apiserver`; the product combination is `attach,apiserver` and is Linux-only because it depends on the kernel/eBPF stack. Read [MVP-1 Boundary](docs/MVP-1-BOUNDARY.md) before treating a capability as proven.
+
+## Evidence and scope
 
 Что именно MVP-1 делает, чего он не делает и что про него верят без
 доказательства — [docs/MVP-1-BOUNDARY.md](docs/MVP-1-BOUNDARY.md). Три колонки,
