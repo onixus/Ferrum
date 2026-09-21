@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 
 fn manifest() -> Value {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let raw = fs::read_to_string(root.join("apex-contract.json"))
+    let raw = fs::read_to_string(root.join("apex-contract").join("manifest.json"))
         .expect("apex-contract.json must exist at repository root");
     serde_json::from_str(&raw).expect("apex-contract.json must be valid JSON")
 }
