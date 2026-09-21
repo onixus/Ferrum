@@ -39,8 +39,6 @@ fn apex_contract_wraps_but_does_not_replace_ferrum_event_contract() {
     )
     .unwrap();
     assert_eq!(native["schema"], ferrum_proto::EVENT_SCHEMA);
-    assert_eq!(
-        native["version"].as_str().unwrap(),
-        ferrum_proto::EVENT_SCHEMA_VERSION.to_string()
-    );
+    let native_version = ferrum_proto::EVENT_SCHEMA_VERSION.to_string();
+    assert_eq!(native["version"].as_str(), Some(native_version.as_str()));
 }
