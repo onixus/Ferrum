@@ -48,9 +48,7 @@ fn apex_contract_publishes_stable_ferrum_boundary_names() {
     let event_types = m["integration"]["event_types"]
         .as_array()
         .expect("event_types array");
-    assert!(
-        event_types
-            .iter()
-            .any(|item| item == "apex.ferrum.enforcement.v1")
-    );
+    assert!(event_types
+        .iter()
+        .any(|item| item == "apex.ferrum.enforcement.v1"));
 }
