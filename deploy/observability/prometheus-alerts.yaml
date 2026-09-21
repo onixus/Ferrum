@@ -1,0 +1,194 @@
+# What is worth waking someone for, and nothing else.
+#
+# Not installed by anything, for the reason the Grafana dashboard beside it is
+# not: how rules reach a Prometheus is a decision about somebody else's stack —
+# a `PrometheusRule` for the operator, a file in `rule_files`, a ConfigMap they
+# template — and shipping one of those three as if it were the answer would be
+# a guess in a directory whose whole job is not to guess. The file is plain
+# Prometheus rule groups, which every one of those three accepts.
+#
+# What this tree does guarantee about it is executed rather than argued:
+# `alerts_gate.rs` holds every metric named here against a render of the real
+# binaries, and `prometheus-alerts-test.yaml` beside it is a `promtool test
+# rules` suite that feeds synthetic series and asserts which alerts fire and
+# which stay silent. A rule nobody has ever evaluated is a rule that fires in
+# the incident and not before it.
+#
+# ## Why so few
+#
+# Six, against seventy exported families, and the count is the design. This
+# product exports a lot of counters on purpose — an incident is reconstructed
+# from them — but a counter is evidence, not a page. Two rules decide what
+# appears here:
+#
+#   * **One fact, one page.** The agent publishes `ferrum_agent_degraded_reason`
+#     precisely so that an alert can be written against a stable id rather than
+#     against a reworded sentence. Alerting on `ferrum_agent_events_dropped_total`
+#     *and* on the `ring_drops` reason it raises means two pages for one fact,
+#     and the second one teaches the reader to ignore both.
+#   * **A signal that always burns stops being read.** The two degradation
+#     reasons a default install raises by construction are excluded by name
+#     below, with the runbook's own sentence as the reason. Everything else the
+#     duty table in `docs/runbooks/README.md` §3 lists is here, and the gate
+#     checks that set in both directions.
+#
+# ## What has no rule here, and why
+#
+#   * **The webhook being down.** That is runbook §2 and it is the loudest
+#     failure this product has, but it is not visible in these metrics: a
+#     replica that does not answer exports nothing, so the alert is `up == 0`
+#     against a scrape target whose job name lives in the operator's own
+#     config, not in this file. Writing one here would mean inventing their
+#     label.
+#   * **`ferrum_controller_degraded`.** It is 1 when the controller has at
+#     least one reason, and the reasons are prose that stays in `status.json`.
+#     An alert that can say something is wrong and cannot say what sends the
+#     reader to a 0600 file on a Pod — which is the access the metrics port
+#     exists to avoid needing. The controller's failure classes carry ids, and
+#     the rule below is written against those instead.
+#   * **Every other counter.** They are charted. The dashboard is where a
+#     number gets looked at; this file is where a number gets someone out of
+#     bed.
+groups:
+  - name: ferrum-agent
+    rules:
+      # One rule, one series per raised reason, and the id is in the label: the
+      # page says which of thirty-one states the node is in without the alert
+      # having to restate any of them.
+      #
+      # `not_attached` and `respond_no_host_pidns` are left out by name. Both
+      # are what a default install looks like — the shipped DaemonSet has
+      # neither the datapath features nor `hostPID` — so a fleet on the default
+      # install would page on every node, forever, for a state the runbook
+      # describes as correct. They stay on the dashboard, where "this node is
+      # not enforcing anything" is exactly what an operator goes to look at.
+      #
+      # Fifteen minutes because most of the rest recover on their own: cold
+      # caches after a restart, a container map that is not ready in the first
+      # seconds of a Pod, a burst of ring drops. A reason still standing after
+      # fifteen minutes is not a transient, and the runbook says what to do
+      # with each one.
+      - alert: FerrumAgentDegraded
+        expr: |
+          ferrum_agent_degraded_reason{reason=~"bundle_unreadable|cgroup_index_empty|clock_floor_unpersisted|clock_rollback|container_flag_disagreement|container_map_not_ready|control_plane_down|export_dead|export_lossy|kernel_rules_unsynced|labels_unknown|lkg_partial|loader_degraded|respond_signal_failing|ring_drops|status_unwritable|waivers_dropped|waivers_unjoined"} == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'узел {{ $labels.instance }} деградирован: {{ $labels.reason }}'
+          description: >-
+            Причина держится пятнадцать минут и сама не ушла. Что она значит и
+            что с ней делать — таблица в runbook §3 по этому же id; полный
+            текст причины лежит в status.json на узле, наружу он намеренно не
+            идёт.
+          runbook: 'docs/runbooks/README.md#3-runbook-агент-degraded'
+  - name: ferrum-admission
+    rules:
+      # Immediately, and without a `for`. Break-glass is a human suspending
+      # policy evaluation cluster-wide: every AdmissionReview is answered allow
+      # without evaluating anything. Fifteen minutes of that unnoticed is the
+      # window the whole journal exists to make impossible, and there is no
+      # transient version of this state — a grant is either in force or it is
+      # not.
+      - alert: FerrumBreakGlassActive
+        expr: ferrum_admission_break_glass_active == 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'enforcement приостановлен grant''ом на {{ $labels.instance }}'
+          description: >-
+            Вебхук отвечает allow на всё, не вычисляя политику. Сколько окна
+            осталось — ferrum_admission_break_glass_expires_in_seconds; кто и
+            по какому тикету — в журнале, и он же скажет, был ли grant отозван.
+          runbook: 'docs/runbooks/README.md#5-break-glass'
+      # The journal stopped taking entries after start-up. No grant can come
+      # into force while this stands — a suspension nobody can record is not
+      # taken — so the page is not about the suspension that is happening, it is
+      # about the one that will be refused in the middle of an incident.
+      - alert: FerrumBreakGlassJournalUnwritable
+        expr: ferrum_admission_break_glass_journal_broken == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'журнал break-glass не пишется на {{ $labels.instance }}'
+          description: >-
+            Аварийное отключение на этой реплике недоступно: grant, который
+            некому записать, не вступает в силу. Чинить до того, как он
+            понадобится.
+          runbook: 'docs/runbooks/README.md#5-break-glass'
+      # With failurePolicy=Fail a webhook that cannot read its bundle refuses
+      # every Pod in scope. Ten minutes of increase rather than a gauge because
+      # both families are counters: the question is whether it is still
+      # happening, not whether it ever happened.
+      - alert: FerrumAdmissionBundleUnusable
+        expr: |
+          increase(ferrum_admission_bundle_absent_total[10m]) > 0
+            or increase(ferrum_admission_bundle_unreadable_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'вебхук {{ $labels.instance }} не может прочитать bundle'
+          description: >-
+            При failurePolicy=Fail это отказ каждому Pod'у в scope. Три разных
+            отказа — Secret не примонтирован, примонтирован и нечитаем, подпись
+            не сходится — чинятся в разных местах, и runbook §4 их разделяет.
+          runbook: 'docs/runbooks/README.md#4-runbook-bundle-не-грузится'
+  - name: ferrum-controller
+    rules:
+      # Never succeeded *and* currently failing. The first half alone is what a
+      # freshly started Pod looks like — nothing of any class has succeeded yet
+      # — and an alert on it would fire on every rollout. Together they are the
+      # sentence the metric's own help text writes: the deployment is wrong
+      # rather than an object being bad.
+      - alert: FerrumControllerClassNeverWorked
+        expr: |
+          ferrum_controller_class_never_succeeded == 1
+            and ferrum_controller_failure_run > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'контроллер: класс {{ $labels.class }} не работал ни разу'
+          description: >-
+            Это установка, а не объект: RBAC, токен или адрес apiserver. При
+            достижении ferrum_controller_terminal_run процесс закончится сам, и
+            перезапуск даст то же самое.
+          runbook: 'docs/runbooks/README.md#4-runbook-bundle-не-грузится'
+  - name: ferrum-rollout
+    rules:
+      # The one thing no single plane can see. The controller signs a digest,
+      # the webhook loads one and every node loads one; a rollout that did not
+      # arrive is three numbers that disagree, and from any one of them alone
+      # it is indistinguishable from normal.
+      #
+      # Thirty minutes because disagreement is the *normal* state of a rollout
+      # in progress: nodes pick up a new Secret over tens of seconds, and a
+      # DaemonSet across a large fleet takes longer than that. What this rule
+      # is about is the disagreement that stops moving.
+      #
+      # The empty digest counts as a value, deliberately: a node that has
+      # loaded nothing is not on the current bundle, and all three families
+      # emit an empty label rather than disappearing precisely so that state is
+      # distinguishable from a scrape that failed.
+      - alert: FerrumBundleDigestDiverged
+        expr: |
+          count(
+            count by (digest) (
+              ferrum_agent_bundle_info
+                or ferrum_admission_bundle_info
+                or (ferrum_controller_bundle_info > 0)
+            )
+          ) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'плоскости разошлись по дайджесту bundle'
+          description: >-
+            Полчаса подряд контроллер, вебхук и узлы называют разные дайджесты.
+            Выкатка, которая не доехала, выглядит именно так; по любой из трёх
+            плоскостей поодиночке она неотличима от нормы.
+          runbook: 'docs/runbooks/README.md#4-runbook-bundle-не-грузится'

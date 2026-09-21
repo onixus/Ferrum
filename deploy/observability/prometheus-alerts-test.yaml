@@ -1,0 +1,281 @@
+# `promtool test rules` over the file beside this one.
+#
+# Every rule here is a claim about when someone gets woken up, and the half of
+# that claim which is easy to get wrong is the silent half: a rule that fires
+# correctly and also fires on a healthy cluster is worse than no rule, because
+# the reader learns to close it. So each case comes in pairs — the state that
+# must page, and the state next to it that must not.
+#
+# Run: promtool test rules deploy/observability/prometheus-alerts-test.yaml
+rule_files:
+  - prometheus-alerts.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # A duty-table reason that does not go away pages, and the same reason
+  # fifteen minutes earlier does not. The `for` is the whole rule: cold caches
+  # and container maps that are not ready yet look exactly like this for the
+  # first minutes of a Pod's life.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_agent_degraded_reason{reason="ring_drops",instance="node-a:9102"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FerrumAgentDegraded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: FerrumAgentDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: ring_drops
+              instance: node-a:9102
+            exp_annotations:
+              summary: 'узел node-a:9102 деградирован: ring_drops'
+              description: >-
+                Причина держится пятнадцать минут и сама не ушла. Что она значит и
+                что с ней делать — таблица в runbook §3 по этому же id; полный
+                текст причины лежит в status.json на узле, наружу он намеренно не
+                идёт.
+              runbook: 'docs/runbooks/README.md#3-runbook-агент-degraded'
+
+  # The two reasons a default install raises by construction never page, no
+  # matter how long they stand. This is the case that keeps the rule readable:
+  # a fleet on the shipped DaemonSet has both of these on every node.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_agent_degraded_reason{reason="not_attached",instance="node-a:9102"}'
+        values: '1+0x600'
+      - series: 'ferrum_agent_degraded_reason{reason="respond_no_host_pidns",instance="node-a:9102"}'
+        values: '1+0x600'
+    alert_rule_test:
+      - eval_time: 10h
+        alertname: FerrumAgentDegraded
+        exp_alerts: []
+
+  # A reason that is published as 0 — which is every reason on every scrape —
+  # is not a raised reason. The family emits all thirty-one ids always, so a
+  # rule matching on presence instead of on value would page on a healthy node.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_agent_degraded_reason{reason="kernel_rules_unsynced",instance="node-a:9102"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FerrumAgentDegraded
+        exp_alerts: []
+
+  # Break-glass pages on the first evaluation: there is no transient version of
+  # a grant being in force.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_admission_break_glass_active{instance="adm-1:9101"}'
+        values: '1+0x5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: FerrumBreakGlassActive
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: adm-1:9101
+            exp_annotations:
+              summary: 'enforcement приостановлен grant''ом на adm-1:9101'
+              description: >-
+                Вебхук отвечает allow на всё, не вычисляя политику. Сколько окна
+                осталось — ferrum_admission_break_glass_expires_in_seconds; кто и
+                по какому тикету — в журнале, и он же скажет, был ли grant отозван.
+              runbook: 'docs/runbooks/README.md#5-break-glass'
+
+  # An armed replica with no grant in force is the normal state of a cluster
+  # that has break-glass installed, and it must be silent.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_admission_break_glass_configured{instance="adm-1:9101"}'
+        values: '1+0x10'
+      - series: 'ferrum_admission_break_glass_active{instance="adm-1:9101"}'
+        values: '0+0x10'
+      - series: 'ferrum_admission_break_glass_journal_broken{instance="adm-1:9101"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FerrumBreakGlassActive
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: FerrumBreakGlassJournalUnwritable
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_admission_break_glass_journal_broken{instance="adm-1:9101"}'
+        values: '1+0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: FerrumBreakGlassJournalUnwritable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: adm-1:9101
+            exp_annotations:
+              summary: 'журнал break-glass не пишется на adm-1:9101'
+              description: >-
+                Аварийное отключение на этой реплике недоступно: grant, который
+                некому записать, не вступает в силу. Чинить до того, как он
+                понадобится.
+              runbook: 'docs/runbooks/README.md#5-break-glass'
+
+  # A counter that moved recently pages; the same counter standing still does
+  # not. A replica that failed once at start-up and has read its bundle ever
+  # since is not an incident, and a gauge-shaped rule could not tell the two
+  # apart.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_admission_bundle_absent_total{instance="adm-1:9101"}'
+        values: '0+1x30'
+      - series: 'ferrum_admission_bundle_unreadable_total{instance="adm-1:9101"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FerrumAdmissionBundleUnusable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              instance: adm-1:9101
+            exp_annotations:
+              summary: 'вебхук adm-1:9101 не может прочитать bundle'
+              description: >-
+                При failurePolicy=Fail это отказ каждому Pod'у в scope. Три разных
+                отказа — Secret не примонтирован, примонтирован и нечитаем, подпись
+                не сходится — чинятся в разных местах, и runbook §4 их разделяет.
+              runbook: 'docs/runbooks/README.md#4-runbook-bundle-не-грузится'
+
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_admission_bundle_absent_total{instance="adm-1:9101"}'
+        values: '3+0x60'
+      - series: 'ferrum_admission_bundle_unreadable_total{instance="adm-1:9101"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: FerrumAdmissionBundleUnusable
+        exp_alerts: []
+
+  # A freshly started controller has never succeeded at anything, and that must
+  # not page. The second half of the expression is what separates a Pod that is
+  # starting from a deployment that is wrong.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_controller_class_never_succeeded{class="watch",instance="ctl-1:9104"}'
+        values: '1+0x30'
+      - series: 'ferrum_controller_failure_run{class="watch",instance="ctl-1:9104"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FerrumControllerClassNeverWorked
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_controller_class_never_succeeded{class="watch",instance="ctl-1:9104"}'
+        values: '1+0x30'
+      - series: 'ferrum_controller_failure_run{class="watch",instance="ctl-1:9104"}'
+        values: '1+1x30'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: FerrumControllerClassNeverWorked
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              class: watch
+              instance: ctl-1:9104
+            exp_annotations:
+              summary: 'контроллер: класс watch не работал ни разу'
+              description: >-
+                Это установка, а не объект: RBAC, токен или адрес apiserver. При
+                достижении ferrum_controller_terminal_run процесс закончится сам, и
+                перезапуск даст то же самое.
+              runbook: 'docs/runbooks/README.md#4-runbook-bundle-не-грузится'
+
+  # A class that fails and has succeeded before is a bad object, not a broken
+  # install, and it is the runbook's job rather than the pager's.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_controller_class_never_succeeded{class="status_patch",instance="ctl-1:9104"}'
+        values: '0+0x30'
+      - series: 'ferrum_controller_failure_run{class="status_patch",instance="ctl-1:9104"}'
+        values: '5+0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: FerrumControllerClassNeverWorked
+        exp_alerts: []
+
+  # Three planes on one digest: silent, however long it stands.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_controller_bundle_info{digest="abc",instance="ctl-1:9104"}'
+        values: '2+0x60'
+      - series: 'ferrum_admission_bundle_info{digest="abc",instance="adm-1:9101"}'
+        values: '1+0x60'
+      - series: 'ferrum_agent_bundle_info{digest="abc",instance="node-a:9102"}'
+        values: '1+0x60'
+      - series: 'ferrum_agent_bundle_info{digest="abc",instance="node-b:9102"}'
+        values: '1+0x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: FerrumBundleDigestDiverged
+        exp_alerts: []
+
+  # One node left behind. Twenty minutes of that is a rollout; forty is a
+  # rollout that stopped.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_controller_bundle_info{digest="def",instance="ctl-1:9104"}'
+        values: '2+0x60'
+      - series: 'ferrum_admission_bundle_info{digest="def",instance="adm-1:9101"}'
+        values: '1+0x60'
+      - series: 'ferrum_agent_bundle_info{digest="def",instance="node-a:9102"}'
+        values: '1+0x60'
+      - series: 'ferrum_agent_bundle_info{digest="abc",instance="node-b:9102"}'
+        values: '1+0x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: FerrumBundleDigestDiverged
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: FerrumBundleDigestDiverged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'плоскости разошлись по дайджесту bundle'
+              description: >-
+                Полчаса подряд контроллер, вебхук и узлы называют разные дайджесты.
+                Выкатка, которая не доехала, выглядит именно так; по любой из трёх
+                плоскостей поодиночке она неотличима от нормы.
+              runbook: 'docs/runbooks/README.md#4-runbook-bundle-не-грузится'
+
+  # A node that has loaded nothing counts as a plane of its own. The empty
+  # digest is emitted rather than the series disappearing, and this is the case
+  # that would be invisible if it were not.
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_controller_bundle_info{digest="def",instance="ctl-1:9104"}'
+        values: '2+0x60'
+      - series: 'ferrum_admission_bundle_info{digest="def",instance="adm-1:9101"}'
+        values: '1+0x60'
+      - series: 'ferrum_agent_bundle_info{digest="",instance="node-b:9102"}'
+        values: '1+0x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: FerrumBundleDigestDiverged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: 'плоскости разошлись по дайджесту bundle'
+              description: >-
+                Полчаса подряд контроллер, вебхук и узлы называют разные дайджесты.
+                Выкатка, которая не доехала, выглядит именно так; по любой из трёх
+                плоскостей поодиночке она неотличима от нормы.
+              runbook: 'docs/runbooks/README.md#4-runbook-bundle-не-грузится'

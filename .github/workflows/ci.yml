@@ -405,6 +405,15 @@ jobs:
         run: |
           set -eu
           cargo test -p ferrum-admission --test mvp
+      - name: "Security: alert rules"
+        run: |
+          set -eu
+          docker run --rm -v "$PWD/deploy/observability":/rules:ro \
+              --entrypoint promtool prom/prometheus:v2.54.1 \
+              check rules /rules/prometheus-alerts.yaml
+          docker run --rm -v "$PWD/deploy/observability":/rules:ro \
+              --entrypoint promtool prom/prometheus:v2.54.1 \
+              test rules /rules/prometheus-alerts-test.yaml
       - name: "Security: metrics contract"
         run: |
           set -eu

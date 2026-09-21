@@ -449,6 +449,34 @@ fn every_kubernetes_object_the_runbook_names_is_one_this_tree_installs() {
     }
 }
 
+/// YAML under `deploy/` that is not a manifest and is therefore not part of
+/// any install, each with the reason.
+///
+/// One entry, and it costs more than a line to add: the scan below is a
+/// substring search over everything it collects, so a file admitted here is a
+/// file that may say `break-glass` without anything noticing. That is only
+/// safe while the file is genuinely not applied, and the test does not take
+/// that on faith — it re-derives it from the kustomization roots themselves.
+const NOT_A_MANIFEST: [(&str, &str); 2] = [
+    (
+        "prometheus-alerts.yaml",
+        "правила Prometheus, а не объекты Kubernetes: ими break-glass не \
+         армируется, ими он наблюдается — два из шести правил как раз про то, \
+         что enforcement приостановлен и что журнал не пишется. Алерта на \
+         аварийное отключение и не может не быть: это самое громкое состояние, \
+         в которое кластер приводят руками",
+    ),
+    (
+        "prometheus-alerts-test.yaml",
+        "набор `promtool test rules` для тех же правил: синтетические ряды, на \
+         которых проверяется, что алерт про приостановленный enforcement \
+         срабатывает сразу, а на реплике с армированным, но не выданным \
+         grant'ом молчит. Ни одного объекта Kubernetes в этом файле нет вовсе",
+    ),
+];
+
+/// Every `.yaml` under `dir`, concatenated, minus the files
+/// [`NOT_A_MANIFEST`] excuses.
 fn collect_yaml(dir: &Path, out: &mut String) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -458,6 +486,28 @@ fn collect_yaml(dir: &Path, out: &mut String) {
         if path.is_dir() {
             collect_yaml(&path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if NOT_A_MANIFEST.iter().any(|(excused, _)| *excused == name) {
+                continue;
+            }
+            out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+        }
+    }
+}
+
+/// Every `kustomization.yaml` under `deploy/`, concatenated.
+fn kustomizations(dir: &Path, out: &mut String) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            kustomizations(&path, out);
+        } else if path.file_name().and_then(|n| n.to_str()) == Some("kustomization.yaml") {
             out.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
         }
     }
@@ -563,10 +613,35 @@ fn the_shipped_overlay_arms_break_glass_with_flags_the_binary_parses() {
 /// sense respond is. An install somebody inherited must not carry it.
 #[test]
 fn no_default_install_arms_break_glass() {
+    let deploy = repo_root().join("deploy");
+    // The exemption is not taken on trust. A file the scan skips has to be one
+    // no kustomization lists, because the moment a root names it, it is part of
+    // an install again and the skip becomes the hole this test exists to
+    // refuse.
     let mut roots = String::new();
-    collect_yaml(&repo_root().join("deploy"), &mut roots);
+    kustomizations(&deploy, &mut roots);
+    for (excused, why) in NOT_A_MANIFEST {
+        assert!(
+            !roots.contains(excused),
+            "{excused} is skipped by this scan on the grounds that {why:?}, and a kustomization \
+             under deploy/ now lists it. It is part of an install again, and the skip is a hole"
+        );
+        assert!(
+            why.len() > 40,
+            "the reason {excused} is skipped is {} characters; a short one is what an oversight \
+             looks like once it is written down",
+            why.len()
+        );
+    }
+    let mut manifests = String::new();
+    collect_yaml(&deploy, &mut manifests);
     assert!(
-        !roots.contains("break-glass"),
+        manifests.contains("ferrum-admission"),
+        "the manifest scan came back without the webhook in it; it is reading nothing rather \
+         than finding nothing"
+    );
+    assert!(
+        !manifests.contains("break-glass"),
         "something under deploy/ names break-glass; arming is a separate, deliberate apply of \
          overlays/break-glass"
     );

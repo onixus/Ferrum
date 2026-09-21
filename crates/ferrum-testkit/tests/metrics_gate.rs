@@ -1,6 +1,6 @@
 //! `/metrics` may not outlive, precede or exceed what the binaries export.
 //!
-//! Four directions rot silently around a metrics surface, and this file closes
+//! Five directions rot silently around a metrics surface, and this file closes
 //! each of them. None is hypothetical: every one of them is the same shape as
 //! a failure this tree has already had.
 //!
@@ -25,6 +25,21 @@
 //!    `the_shipped_manifests_open_and_govern_every_metrics_port`, over all
 //!    three workloads: the controller was the last one publishing only a
 //!    file, and a file on the Pod is the reader `kubectl exec` reaches.
+//!
+//! 5. **A page nobody can act on, or a duty state nothing pages on.** The
+//!    alert rules beside the dashboard are the last copy of the metric names,
+//!    and the worst one: a rule on a renamed metric never fires, and an alert
+//!    list that is empty because the cluster is well looks exactly like one
+//!    that is empty because the rule is dead. Held by
+//!    `every_metric_an_alert_names_is_one_the_binaries_export`,
+//!    `every_alert_carries_a_severity_a_hold_and_a_runbook_that_exists`, and
+//!    `the_pager_covers_the_duty_table_and_names_what_it_leaves_out`, which
+//!    reads the duty table of `docs/runbooks/README.md` §3 rather than keeping
+//!    a second copy of it. What none of them can do is evaluate PromQL —
+//!    nothing in this tree does — so the expressions are exercised by a
+//!    `promtool test rules` suite instead, and
+//!    `every_alert_has_a_case_that_fires_and_a_case_that_does_not` requires
+//!    every rule to have both halves in it.
 //!
 //! And the endpoint itself is exercised rather than argued about:
 //! `the_metrics_endpoint_answers_a_read_and_refuses_everything_else` binds a
@@ -1095,4 +1110,446 @@ fn the_controllers_port_answers_with_state_that_changed_after_it_opened() {
         !second.contains("403 Forbidden"),
         "a cause string reached the metrics port:\n{second}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The fifth direction: a page nobody can act on, and a duty table nobody pages
+// on.
+// ---------------------------------------------------------------------------
+
+const ALERTS: &str = "deploy/observability/prometheus-alerts.yaml";
+const ALERTS_TEST: &str = "deploy/observability/prometheus-alerts-test.yaml";
+const RUNBOOKS: &str = "docs/runbooks/README.md";
+const PAGING_ALERT: &str = "FerrumAgentDegraded";
+const SEVERITIES: [&str; 2] = ["warning", "critical"];
+
+/// Reasons the §3 duty table lists and the pager deliberately leaves out, each
+/// with the reason, in the shape of [`NOT_CHARTED`] and for the same reason: a
+/// reason drops out of the alert by oversight exactly as easily as by
+/// decision.
+///
+/// Both of these are what a default install looks like rather than what a
+/// broken one does — the shipped DaemonSet carries neither the datapath
+/// features nor `hostPID` — so a fleet on the default install would page on
+/// every node forever, and a signal that always burns is one people stop
+/// reading. They stay on the dashboard, where "this node is not enforcing
+/// anything" is what an operator goes to look at rather than what wakes them.
+const NOT_PAGED: [(&str, &str); 2] = [
+    (
+        "not_attached",
+        "поставляемый DaemonSet собран без фич датапейса, и runbook §3 в графе \
+         «что делать» говорит ровно это: в базовой поставке узел и должен быть здесь",
+    ),
+    (
+        "respond_no_host_pidns",
+        "без `hostPID` агент не в initial pid namespace, роль падает в observe, \
+         и runbook §3 называет это ожидаемым и правильным",
+    ),
+];
+
+/// One alerting rule, reduced to what these tests ask of it.
+struct Alert {
+    name: String,
+    expr: String,
+    hold: String,
+    severity: String,
+    annotations: BTreeMap<String, String>,
+}
+
+fn yaml(rel: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(&read(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+}
+
+fn alerts() -> Vec<Alert> {
+    let doc = yaml(ALERTS);
+    let groups = doc
+        .get("groups")
+        .and_then(serde_yaml::Value::as_sequence)
+        .unwrap_or_else(|| panic!("{ALERTS} has no `groups`"));
+    let mut out = Vec::new();
+    for group in groups {
+        let rules = group
+            .get("rules")
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap_or_else(|| panic!("{ALERTS}: a group with no `rules`"));
+        for rule in rules {
+            let text = |key: &str| {
+                rule.get(key)
+                    .and_then(serde_yaml::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let annotations = rule
+                .get("annotations")
+                .and_then(serde_yaml::Value::as_mapping)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| {
+                            Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(Alert {
+                name: text("alert"),
+                expr: text("expr"),
+                hold: text("for"),
+                severity: rule
+                    .get("labels")
+                    .and_then(|l| l.get("severity"))
+                    .and_then(serde_yaml::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                annotations,
+            });
+        }
+    }
+    assert!(
+        out.len() >= 6,
+        "{ALERTS} parsed to {} rules; it held six when this floor was written, so the parse is \
+         broken rather than the file",
+        out.len()
+    );
+    out
+}
+
+/// A GitHub-style anchor for a markdown heading: lowercased, punctuation
+/// dropped, spaces to hyphens. Cyrillic survives, which is why this is not an
+/// ASCII slugifier.
+fn anchor(heading: &str) -> String {
+    heading
+        .trim_start_matches('#')
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            '-' | '_' => Some(c),
+            c if c.is_alphanumeric() => Some(c),
+            _ => None,
+        })
+        .collect()
+}
+
+fn runbook_anchors() -> BTreeSet<String> {
+    read(RUNBOOKS)
+        .lines()
+        .filter(|l| l.starts_with('#'))
+        .map(anchor)
+        .collect()
+}
+
+/// The reason ids in the §3 duty table, and the ones the same section sends to
+/// an incident review instead.
+///
+/// Read out of the runbook rather than listed here: the whole point of the
+/// pager rule is that it covers what the duty table covers, and a second copy
+/// of that table in this file would be the drift it exists to catch.
+fn runbook_reason_sets() -> (BTreeSet<String>, BTreeSet<String>) {
+    let doc = read(RUNBOOKS);
+    let section = doc
+        .split("## 3. Runbook: агент degraded")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{RUNBOOKS} has no «## 3. Runbook: агент degraded»"))
+        .split("\n## ")
+        .next()
+        .expect("a section body");
+    let mut duty = BTreeSet::new();
+    for line in section.lines() {
+        let line = line.trim();
+        if !line.starts_with("| `") {
+            continue;
+        }
+        // The whole first cell, not the first backticked token in it: one row
+        // is `waivers_dropped` / `waivers_unjoined`, and a reader that stops at
+        // the first would quietly drop a duty reason — the exact direction this
+        // test exists to catch, arriving through its own parser.
+        let cell = line[1..].split('|').next().unwrap_or_default();
+        duty.extend(backticked(cell));
+    }
+    let tail = section
+        .split("Остальные id из той же таблицы")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{RUNBOOKS} §3 no longer says which ids are not duty ids"))
+        .split("\n\n")
+        .next()
+        .expect("a paragraph");
+    (duty, backticked(tail))
+}
+
+/// Every `` `token` `` in a piece of markdown.
+fn backticked(text: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('`') {
+        rest = &rest[at + 1..];
+        let Some(end) = rest.find('`') else { break };
+        out.insert(rest[..end].to_string());
+        rest = &rest[end + 1..];
+    }
+    out
+}
+
+/// The ids a PromQL `reason=~"a|b|c"` matcher names.
+fn matched_reasons(expr: &str) -> BTreeSet<String> {
+    let at = expr
+        .find("reason=~\"")
+        .unwrap_or_else(|| panic!("{PAGING_ALERT} no longer matches on `reason=~`: {expr}"));
+    let rest = &expr[at + "reason=~\"".len()..];
+    let end = rest.find('"').expect("an unterminated matcher");
+    rest[..end].split('|').map(str::to_string).collect()
+}
+
+/// An alert may only query a family a render actually produced.
+///
+/// The same rule as the dashboard's and the same reader, because the failure is
+/// worse here: a panel that charts a renamed metric reads "No data", which
+/// somebody eventually notices. A rule written against one is a rule that never
+/// fires, and nothing anywhere goes red — the alert list looks exactly the same
+/// whether the cluster is healthy or the metric is gone.
+#[test]
+fn every_metric_an_alert_names_is_one_the_binaries_export() {
+    let exported = exported_families();
+    let mut failures = Vec::new();
+    let mut named = BTreeSet::new();
+    for alert in alerts() {
+        for family in identifiers(&alert.expr) {
+            named.insert(family.clone());
+            if !exported.contains(&family) {
+                failures.push(format!(
+                    "{}: `{family}` is not exported by any of the three binaries. A rule on a \
+                     metric nothing publishes never fires, and an alert that never fires is \
+                     indistinguishable from a cluster that is well",
+                    alert.name
+                ));
+            }
+        }
+    }
+    assert!(
+        named.len() >= 8,
+        "the rules name {} families between them; the identifier scan is broken rather than the \
+         file",
+        named.len()
+    );
+    assert!(failures.is_empty(), "\n{}\n", failures.join("\n"));
+}
+
+/// Every rule says how long, how bad, what happened and where to go.
+///
+/// The runbook annotation is the one that is not paperwork. This tree has six
+/// runbook sections and they are the product's answer to "it is three in the
+/// morning and this fired"; a rule that points at a section that has been
+/// renamed points at nothing, and the reader finds that out at three in the
+/// morning.
+#[test]
+fn every_alert_carries_a_severity_a_hold_and_a_runbook_that_exists() {
+    let anchors = runbook_anchors();
+    assert!(
+        anchors.len() > 5,
+        "{RUNBOOKS} parsed to {} headings; the anchor scan is broken",
+        anchors.len()
+    );
+    let mut failures = Vec::new();
+    for alert in alerts() {
+        let at = &alert.name;
+        if alert.hold.is_empty() {
+            failures.push(format!("{at}: no `for`; say 0m to mean immediately"));
+        }
+        if !SEVERITIES.contains(&alert.severity.as_str()) {
+            failures.push(format!(
+                "{at}: severity {:?} is not one of {SEVERITIES:?}",
+                alert.severity
+            ));
+        }
+        for key in ["summary", "description", "runbook"] {
+            match alert.annotations.get(key) {
+                None => failures.push(format!("{at}: no `{key}` annotation")),
+                Some(text) if text.trim().is_empty() => {
+                    failures.push(format!("{at}: `{key}` is empty"));
+                }
+                Some(_) => {}
+            }
+        }
+        let Some(runbook) = alert.annotations.get("runbook") else {
+            continue;
+        };
+        let (path, fragment) = match runbook.split_once('#') {
+            Some((path, fragment)) => (path, fragment),
+            None => {
+                failures.push(format!(
+                    "{at}: runbook {runbook:?} names no section — a whole document is not a \
+                     procedure"
+                ));
+                continue;
+            }
+        };
+        if path != RUNBOOKS {
+            failures.push(format!("{at}: runbook {runbook:?} is not {RUNBOOKS}"));
+            continue;
+        }
+        if !anchors.contains(fragment) {
+            failures.push(format!(
+                "{at}: {RUNBOOKS} has no section anchored `{fragment}` — the rule points at a \
+                 heading that was renamed or removed"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}\n", failures.join("\n"));
+}
+
+/// The pager covers the duty table, and what it leaves out is left out on
+/// purpose.
+///
+/// Three directions, and the runbook is the authority on all three because it
+/// is where the operational decision is already written down. A reason added to
+/// the duty table and not to the rule is a state somebody decided is worth
+/// standing a watch for and nothing watches. A reason in the rule that the
+/// runbook moved to «при разборе инцидента» is a page with no procedure. And a
+/// reason the agent can raise that the runbook places in neither list is a
+/// state nobody has decided about at all.
+#[test]
+fn the_pager_covers_the_duty_table_and_names_what_it_leaves_out() {
+    let (duty, reviewed) = runbook_reason_sets();
+    assert!(
+        duty.len() >= 15 && reviewed.len() >= 8,
+        "runbook §3 parsed to {} duty ids and {} review-only ids; the scan is broken rather than \
+         the document",
+        duty.len(),
+        reviewed.len()
+    );
+
+    let known: BTreeSet<String> = ferrum_agent::DEGRADED_REASON_IDS
+        .iter()
+        .map(|(_, id)| (*id).to_string())
+        .collect();
+    let mut both: BTreeSet<String> = duty.union(&reviewed).cloned().collect();
+    both.remove(ferrum_agent::UNMAPPED_REASON_ID);
+    assert_eq!(
+        both, known,
+        "runbook §3 and the agent disagree about which reasons exist. A reason in neither list \
+         is one nobody has decided about: it will be seen for the first time on a dashboard, by \
+         somebody who has to work out from the id alone whether it is a page"
+    );
+
+    let paged = alerts()
+        .into_iter()
+        .find(|a| a.name == PAGING_ALERT)
+        .unwrap_or_else(|| panic!("{ALERTS} no longer defines {PAGING_ALERT}"));
+    let matched = matched_reasons(&paged.expr);
+    let excused: BTreeSet<String> = NOT_PAGED.iter().map(|(id, _)| (*id).to_string()).collect();
+    for (id, why) in NOT_PAGED {
+        assert!(
+            duty.contains(id),
+            "`{id}` is excused from paging with the reason {why:?}, but runbook §3 does not list \
+             it as a duty reason at all — the exemption is answering a question nobody asked"
+        );
+        assert!(
+            why.len() > 40,
+            "the reason `{id}` is not paged on is {} characters. A short reason is the shape an \
+             oversight takes when it is written down",
+            why.len()
+        );
+    }
+    let covered: BTreeSet<String> = matched.union(&excused).cloned().collect();
+    assert_eq!(
+        covered, duty,
+        "the reasons {PAGING_ALERT} matches, plus the ones NOT_PAGED excuses, are not the duty \
+         table of runbook §3"
+    );
+    assert!(
+        matched.is_disjoint(&reviewed),
+        "{PAGING_ALERT} pages on a reason runbook §3 puts under «при разборе инцидента»: {:?}",
+        matched.intersection(&reviewed).collect::<Vec<_>>()
+    );
+}
+
+/// Every rule is exercised by the suite beside it, in both directions.
+///
+/// `promtool test rules` is what actually evaluates these expressions —
+/// nothing in this tree runs PromQL — and the direction that matters there is
+/// the silent one. A rule that fires when it should is half a rule; the other
+/// half is that it stays quiet on the state next to it, and a suite with only
+/// the firing case passes just as green for a rule that fires always.
+#[test]
+fn every_alert_has_a_case_that_fires_and_a_case_that_does_not() {
+    let doc = yaml(ALERTS_TEST);
+    let tests = doc
+        .get("tests")
+        .and_then(serde_yaml::Value::as_sequence)
+        .unwrap_or_else(|| panic!("{ALERTS_TEST} has no `tests`"));
+    let mut fires: BTreeSet<String> = BTreeSet::new();
+    let mut silent: BTreeSet<String> = BTreeSet::new();
+    for case in tests {
+        let checks = case
+            .get("alert_rule_test")
+            .and_then(serde_yaml::Value::as_sequence)
+            .cloned()
+            .unwrap_or_default();
+        for check in checks {
+            let Some(name) = check.get("alertname").and_then(serde_yaml::Value::as_str) else {
+                continue;
+            };
+            let expected = check
+                .get("exp_alerts")
+                .and_then(serde_yaml::Value::as_sequence)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            if expected > 0 {
+                fires.insert(name.to_string());
+            } else {
+                silent.insert(name.to_string());
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for alert in alerts() {
+        if !fires.contains(&alert.name) {
+            failures.push(format!(
+                "{}: no case in {ALERTS_TEST} expects it to fire",
+                alert.name
+            ));
+        }
+        if !silent.contains(&alert.name) {
+            failures.push(format!(
+                "{}: no case in {ALERTS_TEST} expects it to stay silent. The state next to the \
+                 one that pages is where a rule that fires always looks identical to a rule that \
+                 works",
+                alert.name
+            ));
+        }
+    }
+    let defined: BTreeSet<String> = alerts().into_iter().map(|a| a.name).collect();
+    for name in fires.union(&silent) {
+        if !defined.contains(name) {
+            failures.push(format!(
+                "{ALERTS_TEST} names {name:?}, which {ALERTS} does not define: promtool passes a \
+                 case for an alert that does not exist"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}\n", failures.join("\n"));
+}
+
+/// The anchor reader, on headings whose answer is known.
+///
+/// Without this, "every runbook link resolves" is equally what a slugifier that
+/// drops Cyrillic reports — every anchor would come out as digits and hyphens,
+/// the set would still be non-empty, and the floor above would still pass.
+#[test]
+fn the_anchor_reader_keeps_cyrillic_and_drops_punctuation() {
+    assert_eq!(anchor("## 5. Break-glass"), "5-break-glass");
+    assert_eq!(
+        anchor("## 3. Runbook: агент degraded"),
+        "3-runbook-агент-degraded"
+    );
+    assert_eq!(
+        anchor("## 4. Runbook: bundle не грузится"),
+        "4-runbook-bundle-не-грузится"
+    );
+    assert_eq!(matched_reasons("x{reason=~\"a|b\"} == 1"), {
+        let mut want = BTreeSet::new();
+        want.insert("a".to_string());
+        want.insert("b".to_string());
+        want
+    });
 }
