@@ -1,0 +1,65 @@
+{
+  "apex_contract_version": "1.0",
+  "canonical": {
+    "repo": "onixus/unified-platform",
+    "commit": "878d138c560cd4106ab0d6cccde804ddc3e5ae1d",
+    "path": "contracts/v1/CONTRACT.md"
+  },
+  "system": "ferrum",
+  "namespace": "ferrum",
+  "identity": {
+    "mode": "service-native",
+    "trust_unsigned_role_header": false
+  },
+  "boundaries": [
+    {
+      "name": "enforcement-event-v1",
+      "kind": "native-adapter",
+      "event_type": "apex.ferrum.enforcement.v1",
+      "payload_contract": "crates/ferrum-proto/schema/v1.1.json"
+    }
+  ],
+  "native_contracts": [
+    {
+      "path": "crates/ferrum-proto/schema/v1.1.json",
+      "kind": "frozen-schema"
+    },
+    {
+      "path": "crates/ferrum-testkit/tests/event_contract_gate.rs",
+      "kind": "compatibility-gate"
+    }
+  ],
+  "resources": {
+    "owns": [
+      "event",
+      "evidence",
+      "policy"
+    ],
+    "references": [
+      "asset"
+    ]
+  },
+  "source_guards": [
+    {
+      "path": "crates/ferrum-proto/src/lib.rs",
+      "contains": [
+        "ferrum.io/enforcement-event",
+        "EVENT_SCHEMA_VERSION"
+      ]
+    },
+    {
+      "path": "crates/ferrum-testkit/tests/event_contract_gate.rs",
+      "contains": [
+        "released record becoming unreadable"
+      ]
+    }
+  ],
+  "coverage": {
+    "identity": "service-native",
+    "api_versioning": "not-applicable",
+    "canonical_refs": "adapter",
+    "event_envelope": "adapter",
+    "observability": "partial",
+    "supply_chain": "partial"
+  }
+}
