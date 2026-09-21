@@ -448,6 +448,7 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 | Утверждение | Метка | Исполняется |
 |---|---|---|
 | Подписанный bundle: FSIG-кодек в четырёх копиях (controller, agent, admission, CLI) сходится на одних байтах | U | U `acceptance.rs::controller_signed_exceptions_are_accepted_by_agent_and_admission` |
+| APEX v1 оборачивает нативный Ferrum event contract, не подменяя его schema/version и source-of-truth | U | U `apex_contract_gate.rs::apex_contract_wraps_but_does_not_replace_ferrum_event_contract` |
 | С mount принимаются только подписанные exception | U | U `acceptance.rs::only_signed_exceptions_are_accepted_from_the_mount` |
 | Exception бьёт deny только в своём scope и до `expiresAt` | U | U `acceptance.rs::docker_sock_kill_is_waived_only_in_scope` · U `acceptance.rs::exception_without_ttl_is_rejected_and_scoped_exception_waives` |
 | CRD требует `expiresAt`; потолок 90 дней держит `ferrum-policy`, и схема его держать не может — в CEL валидации CRD нет часов | A+U | U `deploy_gate.rs::exception_expires_at_is_mandatory_in_cel_and_in_decode` · U `deploy_gate.rs::exception_ttl_ceiling_is_ninety_days_in_policy_and_no_schema_may_claim_it` · A `e2e_cluster.rs::the_shipped_crds_are_accepted_by_a_real_apiserver` |
