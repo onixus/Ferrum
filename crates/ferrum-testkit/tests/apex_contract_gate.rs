@@ -19,7 +19,10 @@ fn apex_contract_wraps_but_does_not_replace_ferrum_event_contract() {
     .unwrap();
 
     assert_eq!(manifest["apex_contract_version"], "1.0");
-    assert_eq!(manifest["canonical"]["commit"], "878d138c560cd4106ab0d6cccde804ddc3e5ae1d");
+    assert_eq!(
+        manifest["canonical"]["commit"],
+        "878d138c560cd4106ab0d6cccde804ddc3e5ae1d"
+    );
     assert_eq!(manifest["system"], "ferrum");
     assert_eq!(manifest["namespace"], "ferrum");
     assert_eq!(
@@ -42,3 +45,4 @@ fn apex_contract_wraps_but_does_not_replace_ferrum_event_contract() {
     let native_version = ferrum_proto::EVENT_SCHEMA_VERSION.to_string();
     assert_eq!(native["version"].as_str(), Some(native_version.as_str()));
 }
+
