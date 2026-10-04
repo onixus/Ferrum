@@ -13,11 +13,32 @@
 //! path: `no-shell` matches `commIn` and `containerOnly`, both of which the
 //! hook can answer. A sentence in a document said otherwise for a day; this
 //! file is what makes the same mistake a red build instead.
+//!
+//! Path predicates reach the kernel too, since the hook reads
+//! `linux_binprm::filename` at an offset taken from the node's BTF. That moved
+//! `no-runtime-sock` in, and this file also pins how little that buys: the
+//! rule names no syscall, so its exec half is what the hook decides, and
+//! opening the socket stays on the tracepoint path.
 
 use ferrum_api::{PolicyMode, RuntimeAction};
 use ferrum_ebpf::{
-    compile_kernel_rules, kernel_verdict, KernelRuleSet, ACTION_ALLOW, ACTION_KILL, COMM_LEN,
+    compile_kernel_rules, compile_kernel_rules_for, kernel_verdict, ExecPath, ExecPathLayout,
+    KernelRuleSet, ACTION_ALLOW, ACTION_KILL, COMM_LEN,
 };
+
+/// The binary a shell exec would ask for. No rule of the shipped policy names
+/// it, so the verdicts below are about `comm` and the container flag.
+fn shell_path() -> ExecPath {
+    ExecPath::from_bytes(b"/bin/sh", false)
+}
+
+/// Slots that came from `no-shell`: a comm and no path.
+fn shell_slots(set: &KernelRuleSet) -> usize {
+    set.rules
+        .iter()
+        .filter(|r| r.comm_len > 0 && !r.names_a_path())
+        .count()
+}
 
 fn shipped_policy() -> ferrum_api::ClusterSecurityPolicy {
     let yaml = include_str!(concat!(
@@ -49,10 +70,13 @@ fn shipped_policy_made_enforceable() -> ferrum_api::ClusterSecurityPolicy {
 const SELECTED: bool = true;
 
 fn kernel_set_of(policy: &ferrum_api::ClusterSecurityPolicy) -> KernelRuleSet {
+    compile_kernel_rules(&ebpf_spec_of(policy))
+}
+
+fn ebpf_spec_of(policy: &ferrum_api::ClusterSecurityPolicy) -> ferrum_ebpf::EbpfSpec {
     let bundle =
         ferrum_compiler::compile_cluster_policy(&policy.spec).expect("prod-restricted compiles");
-    let compiled = ferrum_ebpf::parse_febp(&bundle.ebpf_spec).expect("FEBP decodes");
-    compile_kernel_rules(&compiled)
+    ferrum_ebpf::parse_febp(&bundle.ebpf_spec).expect("FEBP decodes")
 }
 
 fn comm(name: &str) -> [u8; COMM_LEN] {
@@ -118,7 +142,11 @@ fn the_shipped_selector_reaches_the_kernel_and_its_rules_fire_only_where_it_sele
         set.selected_only,
         "the set does not tell its caller that the selected cgroups must be published too"
     );
-    assert_eq!(set.len(), 5, "the five shells of no-shell: {set:#?}");
+    assert_eq!(
+        set.len(),
+        5 + 3,
+        "the five shells of no-shell and the three sockets of no-runtime-sock: {set:#?}"
+    );
     for slot in &set.rules {
         assert!(
             slot.selected_only(),
@@ -129,20 +157,20 @@ fn the_shipped_selector_reaches_the_kernel_and_its_rules_fire_only_where_it_sele
     // Selected: refused, as §D asks. Not selected: untouched, which is the
     // property the wholesale refusal used to buy and this flag now buys.
     assert_eq!(
-        kernel_verdict(&set.rules, &comm("sh"), true, false, true),
+        kernel_verdict(&set.rules, &comm("sh"), true, false, true, &shell_path()),
         ACTION_KILL
     );
     assert_eq!(
-        kernel_verdict(&set.rules, &comm("sh"), true, false, false),
+        kernel_verdict(&set.rules, &comm("sh"), true, false, false, &shell_path()),
         ACTION_ALLOW,
         "the shipped policy refused a shell in a container it never selected"
     );
 }
 
-/// Made enforceable, the shipped policy reaches the kernel, and the §D shell
-/// case is the part that reaches it.
+/// Made enforceable, the shipped policy reaches the kernel: the §D shell case
+/// whole, and the exec half of the socket rule.
 #[test]
-fn the_shipped_policy_hands_the_shell_rule_to_the_kernel_and_the_socket_rule_stays_behind() {
+fn the_shipped_policy_hands_the_shell_rule_and_the_socket_rules_exec_half_to_the_kernel() {
     let set = kernel_set_of(&shipped_policy_made_enforceable());
     assert!(
         !set.is_refused(),
@@ -150,32 +178,68 @@ fn the_shipped_policy_hands_the_shell_rule_to_the_kernel_and_the_socket_rule_sta
         set.refused
     );
 
-    // `no-shell` names five comms, and a slot carries one, so five slots.
+    // `no-shell` names five comms, and a slot carries one, so five slots;
+    // `no-runtime-sock` names three suffixes, so three more.
     assert_eq!(
         set.len(),
-        5,
-        "the shipped policy produced {} slots, expected the five comms of no-shell: {set:#?}",
+        5 + 3,
+        "the shipped policy produced {} slots, expected five shells and three sockets: {set:#?}",
         set.len()
     );
+    assert_eq!(shell_slots(&set), 5, "{set:#?}");
 
-    // Every one of them kills, in a container, and never the agent itself.
+    // Every one of them kills, in a container. The shell slots carry a comm;
+    // the socket slots carry a suffix and no comm.
     for slot in &set.rules {
         assert_eq!(slot.action, ACTION_KILL);
-        assert!(slot.container_only(), "a shell slot lost containerOnly");
-        assert!(slot.comm_len > 0, "a shell slot lost its comm predicate");
+        assert!(slot.container_only(), "a slot lost containerOnly");
+        assert!(
+            (slot.comm_len > 0) != slot.names_a_path(),
+            "a slot is neither a shell nor a socket: {slot:?}"
+        );
     }
 
-    // And the ones that stay behind stay behind for a written reason.
+    // The socket rule's exec half, and only that: executing something named
+    // like the socket is refused, executing anything else is not.
+    let sock = ExecPath::from_bytes(b"/var/run/docker.sock", false);
+    assert_eq!(
+        kernel_verdict(&set.rules, &comm("x"), true, false, SELECTED, &sock),
+        ACTION_KILL
+    );
+    assert_eq!(
+        kernel_verdict(&set.rules, &comm("x"), true, false, SELECTED, &shell_path()),
+        ACTION_ALLOW
+    );
+
+    // And the one that stays behind stays behind for a written reason.
     let excluded: Vec<&str> = set.excluded.iter().map(|e| e.rule.as_str()).collect();
     assert_eq!(
         excluded,
-        ["no-runtime-sock", "no-module"],
+        ["no-module"],
         "the set of rules the kernel cannot decide changed: {:#?}",
         set.excluded
     );
+}
+
+/// On a node whose BTF could not say where the path is, the socket rule goes
+/// back to the tracepoint path — named, with the node's reason — and the
+/// shell rule is untouched by it.
+#[test]
+fn without_the_layout_the_socket_rule_stays_behind_and_says_why() {
+    let policy = shipped_policy_made_enforceable();
+    let set = compile_kernel_rules_for(
+        &ebpf_spec_of(&policy),
+        &ExecPathLayout::Unknown("no /sys/kernel/btf/vmlinux".to_string()),
+    );
+    assert_eq!(set.len(), 5, "{set:#?}");
+    assert_eq!(shell_slots(&set), 5);
+    let excluded: Vec<&str> = set.excluded.iter().map(|e| e.rule.as_str()).collect();
+    assert_eq!(excluded, ["no-runtime-sock", "no-module"]);
     assert!(
-        set.excluded[0].reason.contains("путь"),
-        "no-runtime-sock is excluded for its pathSuffix, and the reason should say so: {}",
+        set.excluded[0]
+            .reason
+            .contains("no /sys/kernel/btf/vmlinux"),
+        "{}",
         set.excluded[0].reason
     );
 }
@@ -193,12 +257,26 @@ fn the_acceptance_shell_is_refused_in_a_container_and_untouched_outside_one() {
 
     for shell in ["sh", "bash", "ash", "dash", "zsh"] {
         assert_eq!(
-            kernel_verdict(&set.rules, &comm(shell), true, false, SELECTED),
+            kernel_verdict(
+                &set.rules,
+                &comm(shell),
+                true,
+                false,
+                SELECTED,
+                &shell_path()
+            ),
             ACTION_KILL,
             "{shell} in a container is not refused by the kernel set"
         );
         assert_eq!(
-            kernel_verdict(&set.rules, &comm(shell), false, false, SELECTED),
+            kernel_verdict(
+                &set.rules,
+                &comm(shell),
+                false,
+                false,
+                SELECTED,
+                &shell_path()
+            ),
             ACTION_ALLOW,
             "{shell} outside a container was refused; containerOnly is not being honoured, and \
              the node's own shells would stop working"
@@ -208,7 +286,14 @@ fn the_acceptance_shell_is_refused_in_a_container_and_untouched_outside_one() {
         // does not grant. This is the userspace answer too, which is the
         // whole point of the two matchers being one function.
         assert_eq!(
-            kernel_verdict(&set.rules, &comm(shell), true, true, SELECTED),
+            kernel_verdict(
+                &set.rules,
+                &comm(shell),
+                true,
+                true,
+                SELECTED,
+                &shell_path()
+            ),
             ACTION_KILL,
             "{shell} run by the agent was exempted by a rule that grants no exemption"
         );
@@ -217,7 +302,14 @@ fn the_acceptance_shell_is_refused_in_a_container_and_untouched_outside_one() {
     // A name that merely starts with one of them is not one of them.
     for other in ["shred", "bashful", "cat"] {
         assert_eq!(
-            kernel_verdict(&set.rules, &comm(other), true, false, SELECTED),
+            kernel_verdict(
+                &set.rules,
+                &comm(other),
+                true,
+                false,
+                SELECTED,
+                &shell_path()
+            ),
             ACTION_ALLOW,
             "{other} was refused by a rule that names only shells"
         );

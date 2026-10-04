@@ -26,14 +26,14 @@ use aya::programs::trace_point::TracePointLinkId;
 #[cfg(feature = "attach")]
 use aya::programs::{Lsm, TracePoint};
 #[cfg(feature = "attach")]
-use aya::Bpf;
+use aya::{Bpf, BpfLoader};
 use ferrum_common::{FerrumError, Result};
-#[cfg(feature = "attach")]
-use ferrum_ebpf_progs::EVENTS_DROPPED_TOTAL;
 use ferrum_ebpf_progs::{
     KernelRule, CGROUPS_MAX_ENTRIES, EVENTS_RING_BYTES, MAP_CGROUPS, MAP_EVENTS, MAP_RULES,
     MAP_SELECTED, MAP_SELF, MAX_KERNEL_RULES,
 };
+#[cfg(feature = "attach")]
+use ferrum_ebpf_progs::{BPRM_FILENAME_OFFSET_GLOBAL, EVENTS_DROPPED_TOTAL};
 use std::collections::BTreeSet;
 use std::path::Path;
 #[cfg(feature = "attach")]
@@ -537,6 +537,11 @@ pub struct KernelHandle {
     /// could only guess at the kernel. `None` where the hook is attached, or
     /// where `lsm_available()` said this kernel has no BPF LSM at all.
     lsm_unattached: Option<String>,
+    /// Whether the exec hook was told where `linux_binprm::filename` is.
+    /// Rules naming a path are compiled against this, so a node whose BTF
+    /// could not answer reports them excluded instead of holding slots that
+    /// decide nothing.
+    exec_path: crate::ExecPathLayout,
 }
 
 #[cfg(feature = "attach")]
@@ -597,7 +602,21 @@ impl KernelHandle {
         // publishes, so a node that will not attach says why from 200 nodes
         // away.
         let memlock = raise_memlock();
-        let mut bpf = Bpf::load(elf).map_err(|err| {
+        // The one field of `linux_binprm` the exec hook reads, located in this
+        // kernel's BTF and written into the program before the verifier sees
+        // it. Not fatal when it fails: the global stays zero, the hook decides
+        // no path slot, and every rule that needed one is reported excluded
+        // with this reason.
+        let (exec_path, filename_offset) = match crate::btf::running_kernel_binprm_filename_offset()
+        {
+            Ok(offset) => (crate::ExecPathLayout::Known, offset),
+            Err(err) => (crate::ExecPathLayout::Unknown(err.to_string()), 0),
+        };
+        let mut loader = BpfLoader::new();
+        if filename_offset != 0 {
+            loader.set_global(BPRM_FILENAME_OFFSET_GLOBAL, &filename_offset, true);
+        }
+        let mut bpf = loader.load(elf).map_err(|err| {
             FerrumError::Degraded(format!(
                 "load eBPF ELF: {err} [{}; a kernel before 5.11 charges the {MAP_EVENTS} ring \
                  and the {MAP_CGROUPS} hash against it]",
@@ -695,7 +714,14 @@ impl KernelHandle {
             lsm_attached,
             lsm_links,
             lsm_unattached,
+            exec_path,
         })
+    }
+
+    /// Whether the exec hook can read the path it is deciding. Compile the
+    /// kernel rule set against this — `compile_kernel_rules_for`.
+    pub fn exec_path_layout(&self) -> &crate::ExecPathLayout {
+        &self.exec_path
     }
 
     /// Pin this handle's maps and attachments under `root` on bpffs.
@@ -1208,9 +1234,9 @@ impl KernelHandle {
 #[derive(Clone, Copy)]
 struct RuleSlot(KernelRule);
 
-// SAFETY: `repr(transparent)` over a `KernelRule` that is four `u8`s then
-// `[u8; 16]` — align 1, no padding, every bit pattern valid — which is the
-// whole of what `Pod` promises. `#[allow]` for the same reason as the two
+// SAFETY: `repr(transparent)` over a `KernelRule` made of `u8`s and `u8`
+// arrays only — align 1, no padding, every bit pattern valid — which is the
+// whole of what `Pod` promises. `ferrum-ebpf-progs` pins the size. `#[allow]` for the same reason as the two
 // `libc` calls above: the crate denies `unsafe_code`, and each exception is
 // named at its own site rather than by widening the lint.
 #[cfg(feature = "attach")]

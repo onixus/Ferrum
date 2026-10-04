@@ -2,6 +2,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod btf;
 mod envelope;
 mod eval;
 mod event;
@@ -21,12 +22,13 @@ pub use event::{
     syscall_name, SyscallArch, EVENT_FLAGS_OFFSET, EVENT_WIRE_LEN, SYSCALL_UNKNOWN,
 };
 pub use ferrum_ebpf_progs::{
-    action_rank, action_refuses, kernel_rule_matches, kernel_verdict, Event, KernelRule,
+    action_rank, action_refuses, kernel_rule_matches, kernel_verdict, Event, ExecPath, KernelRule,
     ACTION_ALLOW, ACTION_AUDIT, ACTION_DENY, ACTION_ISOLATE, ACTION_KILL, CGROUPS_MAX_ENTRIES,
     COMM_LEN, DATAPATH_ABI, EVENTS_DROPPED_TOTAL, EVENTS_RING_BYTES, EVENT_FLAG_AGENT_SELF,
-    EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, KRULE_FLAG_CONTAINER_ONLY,
-    KRULE_FLAG_NOT_AGENT_SELF, KRULE_FLAG_SELECTED_ONLY, KRULE_FLAG_USED, MAP_CGROUPS, MAP_EVENTS,
-    MAP_RULES, MAP_SELECTED, MAP_SELF, MAX_KERNEL_RULES, PATH_LEN,
+    EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, KPATH_LEN, KRULE_FLAG_CONTAINER_ONLY,
+    KRULE_FLAG_NOT_AGENT_SELF, KRULE_FLAG_PATH_PREFIX, KRULE_FLAG_PATH_SUFFIX,
+    KRULE_FLAG_SELECTED_ONLY, KRULE_FLAG_USED, MAP_CGROUPS, MAP_EVENTS, MAP_RULES, MAP_SELECTED,
+    MAP_SELF, MAX_KERNEL_RULES, PATH_LEN,
 };
 pub use ferrum_ids::{AGENT_ABI, DATAPATH_SYSCALLS};
 pub use kernel::{
@@ -35,7 +37,10 @@ pub use kernel::{
 };
 #[cfg(feature = "attach")]
 pub use kernel::{raise_memlock, KernelHandle, RingReader};
-pub use krules::{compile_kernel_rules, Excluded, KernelRuleSet, EXEC_SYSCALLS};
+pub use krules::{
+    compile_kernel_rules, compile_kernel_rules_for, Excluded, ExecPathLayout, KernelRuleSet,
+    EXEC_SYSCALLS,
+};
 pub use loader::{LoadedBundle, Loader, PIN_PATH};
 pub use prefilter::{prefilter_image, PrefilterImage, PATH_BEARING_SYSCALLS};
 pub use spec::{
