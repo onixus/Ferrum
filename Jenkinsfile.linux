@@ -1,4 +1,5 @@
-// Прогон тестов Ferrum на нативном amd64-агенте (Arch Linux, метка `gaming`).
+// Прогон тестов Ferrum на нативном amd64-агенте (метка `gaming`; с 2026-10-02 это
+// Fedora 43 в VirtualBox, ядро 6.17, а не Arch, стоявший рядом с виндой).
 //
 // Зачем отдельный файл, а не метки в основном Jenkinsfile: тот собирает на
 // mac-контроллере и завязан на его docker.sock и на SCM-путь /Users/onixus/Git/Ferrum,
@@ -144,7 +145,7 @@ pipeline {
         }
 
         // Ради чего нода вообще нужна. На mac-VM эта группа доходит до LSM и
-        // молча не цепляет его; здесь ядро 7.2.3 с CONFIG_BPF_LSM=y, `bpf` в
+        // молча не цепляет его; здесь ядро с CONFIG_BPF_LSM=y, `bpf` в
         // /sys/kernel/security/lsm и vmlinux BTF, то есть предотвращение можно
         // проверить, а не пропустить.
         //
@@ -184,6 +185,17 @@ pipeline {
                             export RUSTUP_HOME="$WORKSPACE/.cargo-root-rustup"
                             export CARGO_TARGET_DIR="$WORKSPACE/.cargo-root-target"
                             export PATH="$CARGO_HOME/bin:$PATH"
+                            # Свежий воркспейс: CARGO_HOME пуст, и `rustup toolchain
+                            # install` образа rust:1-bookworm (2026-10) отказывает
+                            # с «rustup is not installed at .cargo-root-home» —
+                            # воспроизведено на пустом каталоге на новой ноде. На
+                            # Arch-ноде этого не было видно, потому что кэш остался
+                            # от прогонов на старом образе. Засев из образа, один
+                            # раз; дальше каталог живёт в воркспейсе, как и был.
+                            if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+                                mkdir -p "$CARGO_HOME"
+                                cp -a /usr/local/cargo/. "$CARGO_HOME/"
+                            fi
                             rustup toolchain install nightly --profile minimal --component rust-src
                             if ! command -v bpf-linker >/dev/null 2>&1; then
                                 # Та же сверка мажора LLVM, что в основном
