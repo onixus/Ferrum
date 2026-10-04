@@ -26,7 +26,15 @@ def RUST_IMAGE = 'rust:1-bookworm'
 // внутри контейнера, а он монтирует лишь воркспейс: без этой строки `git fetch`
 // не видел /home/onixus/Git/Ferrum.git и падал с "does not appear to be a git
 // repository", хотя на самой ноде репозиторий на месте.
-def RUST_DOCKER_ARGS = '-v /home/onixus/Git/Ferrum.git:/srv/ferrum.git:ro'
+//
+// `z` — для Fedora-ноды с SELinux в enforcing: репо в домашнем каталоге несёт
+// метку user_home_t, и контейнер получал ту же самую "does not appear to be a
+// git repository" уже не из-за отсутствия тома, а из-за отказа в доступе
+// (проверено 2026-10-04: без `z` — отказ, с `z` — `git log` читается). Метка
+// перекрашивает каталог в container_file_t один раз и переживает прогоны; на
+// ноде без SELinux она ничего не делает. Тома /sys ниже её не несут намеренно:
+// sysfs перекрашивать нельзя, и доступ к ним на этой ноде измерен без неё.
+def RUST_DOCKER_ARGS = '-v /home/onixus/Git/Ferrum.git:/srv/ferrum.git:ro,z'
 // Сборка ELF ставит nightly, LLVM и bpf-linker, то есть пишет за пределы
 // воркспейса — под uid агента этого нельзя. Кэши у неё отдельные (.cargo-root-*)
 // именно потому, что каталоги останутся за root, и мешать их с теми, что
