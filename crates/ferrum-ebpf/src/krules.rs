@@ -24,22 +24,28 @@
 //!
 //! ## What cannot go to the kernel, and why
 //!
-//! **A path predicate.** The hook that would use these rules cannot read the
-//! executable's path: that means a field of `linux_binprm`, and the pinned
-//! toolchain has no CO-RE — `aya-ebpf` publishes no field relocation in any
-//! version, and `aya-ebpf-bindings` declares `linux_binprm` opaque
-//! deliberately. A hand-written offset refuses to load on a kernel whose
-//! layout differs, or matches on garbage when it lands on another field of the
-//! same width.
+//! **A path predicate — on a kernel whose BTF says where the path is.** The
+//! hook reads `linux_binprm::filename`, and the pinned toolchain has no CO-RE:
+//! `aya-ebpf` publishes no field relocation and `aya-ebpf-bindings` declares
+//! `linux_binprm` opaque deliberately. A hand-written offset refuses to load
+//! on a kernel whose layout differs, or matches on garbage when it lands on
+//! another field of the same width — so there is none. The agent reads the
+//! offset out of the running kernel's own vmlinux BTF (`crate::btf`), checks
+//! that the member is a `char *` called `filename`, and hands it to the
+//! program as a frozen read-only global. Where that fails the caller passes
+//! [`ExecPathLayout::Unknown`], and every rule that needs the path is excluded
+//! with the reason — the same outcome as before this existed, named.
 //!
-//! What this does *not* cost, contrary to the first reading of it: the §D
-//! acceptance case of RFC-02, «`exec` + `/bin/sh` → kill», is caught by
-//! `no-shell` in the shipped `prod-restricted`, and that rule matches on
-//! `commIn: [sh, bash, ash, dash, zsh]` with `containerOnly` — no path
-//! predicate at all. Both are answerable in the hook, so the flagship runtime
-//! case *is* representable here. `no-runtime-sock` is the one that is not: it
-//! matches `pathSuffix`. `krules_gate.rs` compiles the shipped policy and
-//! holds both halves of that.
+//! What a slot holds is a pattern of at most [`KPATH_LEN`] bytes; a longer
+//! one is excluded rather than cut, because a cut prefix is a wider rule. A
+//! pattern list becomes a slot per pattern, multiplied across `comm`s and
+//! across prefix × suffix, and the product is what counts against the slots.
+//!
+//! `no-runtime-sock` from the shipped policy now reaches the kernel, and what
+//! that buys is narrower than it reads: the rule names no syscall, so it
+//! covers exec, and the hook refuses executing a file whose name ends in
+//! `docker.sock`. The open of the socket — the half that rule exists for — is
+//! still `openat` on the tracepoint path, detected and killed after the fact.
 //!
 //! **A selector — no longer.** Label selectors are resolved against a pod
 //! identity the kernel does not have, and enforcing a selected policy against
@@ -64,9 +70,20 @@
 
 use crate::spec::{Action, EbpfSpec, Mode, Rule};
 use ferrum_ebpf_progs::{
-    KernelRule, COMM_LEN, KRULE_FLAG_CONTAINER_ONLY, KRULE_FLAG_NOT_AGENT_SELF,
+    KernelRule, COMM_LEN, KPATH_LEN, KRULE_FLAG_CONTAINER_ONLY, KRULE_FLAG_NOT_AGENT_SELF,
     KRULE_FLAG_SELECTED_ONLY, KRULE_FLAG_USED, MAX_KERNEL_RULES,
 };
+
+/// Whether the hook the rules go to can read the exec's path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecPathLayout {
+    /// The offset of `linux_binprm::filename` was resolved from this kernel's
+    /// BTF and handed to the program.
+    Known,
+    /// It was not, and this says why. Rules naming a path stay on the
+    /// tracepoint path with this as their reason.
+    Unknown(String),
+}
 
 /// Syscalls the exec hook decides. A rule naming none of them decides nothing
 /// here; a rule naming *no* syscalls at all applies to every one, exec
@@ -124,8 +141,14 @@ impl KernelRuleSet {
     }
 }
 
-/// The kernel-decidable part of `spec`, and a reason for everything else.
+/// The kernel-decidable part of `spec` for a hook that can read the exec's
+/// path, and a reason for everything else.
 pub fn compile_kernel_rules(spec: &EbpfSpec) -> KernelRuleSet {
+    compile_kernel_rules_for(spec, &ExecPathLayout::Known)
+}
+
+/// The kernel-decidable part of `spec` for a hook with this `layout`.
+pub fn compile_kernel_rules_for(spec: &EbpfSpec, layout: &ExecPathLayout) -> KernelRuleSet {
     if spec.disabled {
         return KernelRuleSet::refuse("политика отключена");
     }
@@ -166,7 +189,7 @@ pub fn compile_kernel_rules(spec: &EbpfSpec) -> KernelRuleSet {
         ..Default::default()
     };
     for rule in &spec.rules {
-        match kernel_slots(rule, selected_only) {
+        match kernel_slots(rule, selected_only, layout) {
             Ok(slots) => out.rules.extend(slots),
             Err(reason) => out.excluded.push(Excluded {
                 rule: rule.id.clone(),
@@ -202,7 +225,11 @@ pub fn compile_kernel_rules(spec: &EbpfSpec) -> KernelRuleSet {
 ///
 /// A rule naming several `comm`s becomes one slot per name: `KernelRule` holds
 /// one, which keeps the in-kernel walk flat.
-fn kernel_slots(rule: &Rule, selected_only: bool) -> Result<Vec<KernelRule>, String> {
+fn kernel_slots(
+    rule: &Rule,
+    selected_only: bool,
+    layout: &ExecPathLayout,
+) -> Result<Vec<KernelRule>, String> {
     if !matches!(rule.action, Action::Deny | Action::Kill) {
         return Err(format!(
             "действие {} не отказывает exec'у; в ядре ему нечего делать",
@@ -220,13 +247,15 @@ fn kernel_slots(rule: &Rule, selected_only: bool) -> Result<Vec<KernelRule>, Str
         ));
     }
     if !rule.path_prefix.is_empty() || !rule.path_suffix.is_empty() {
-        return Err(
-            "предикат по пути: хук не может прочитать путь исполняемого файла этим тулчейном \
-             (CO-RE в aya нет, linux_binprm непрозрачен), а правило по префиксу/суффиксу без \
-             пути — это правило по чему-то другому"
-                .to_string(),
-        );
+        if let ExecPathLayout::Unknown(why) = layout {
+            return Err(format!(
+                "предикат по пути, а хук не знает, где путь лежит в linux_binprm этого ядра: \
+                 {why}"
+            ));
+        }
     }
+    let prefixes = path_patterns(&rule.path_prefix, "pathPrefix")?;
+    let suffixes = path_patterns(&rule.path_suffix, "pathSuffix")?;
 
     let flags = KRULE_FLAG_USED
         | if selected_only {
@@ -246,14 +275,7 @@ fn kernel_slots(rule: &Rule, selected_only: bool) -> Result<Vec<KernelRule>, Str
         };
     let action = rule.action.as_u8();
 
-    if rule.comm_in.is_empty() {
-        let mut slot = KernelRule::empty();
-        slot.action = action;
-        slot.flags = flags;
-        return Ok(vec![slot]);
-    }
-
-    let mut slots = Vec::with_capacity(rule.comm_in.len());
+    let mut comms: Vec<Option<&[u8]>> = Vec::with_capacity(rule.comm_in.len().max(1));
     for comm in &rule.comm_in {
         let bytes = comm.as_bytes();
         if bytes.is_empty() {
@@ -271,14 +293,71 @@ fn kernel_slots(rule: &Rule, selected_only: bool) -> Result<Vec<KernelRule>, Str
                 COMM_LEN - 1
             ));
         }
-        let mut slot = KernelRule::empty();
-        slot.action = action;
-        slot.flags = flags;
-        slot.comm_len = bytes.len() as u8;
-        slot.comm[..bytes.len()].copy_from_slice(bytes);
-        slots.push(slot);
+        comms.push(Some(bytes));
+    }
+    if comms.is_empty() {
+        comms.push(None);
+    }
+
+    let mut slots = Vec::with_capacity(comms.len() * prefixes.len() * suffixes.len());
+    for comm in &comms {
+        for prefix in &prefixes {
+            for suffix in &suffixes {
+                let mut slot = KernelRule::empty();
+                slot.action = action;
+                slot.flags = flags;
+                if let Some(bytes) = comm {
+                    slot.comm_len = bytes.len() as u8;
+                    slot.comm[..bytes.len()].copy_from_slice(bytes);
+                }
+                if let Some(bytes) = prefix {
+                    slot.set_prefix(bytes);
+                }
+                if let Some(bytes) = suffix {
+                    slot.set_suffix(bytes);
+                }
+                slots.push(slot);
+            }
+        }
     }
     Ok(slots)
+}
+
+/// One list of path patterns as slot values: `[None]` for an empty list (no
+/// predicate), one entry per pattern otherwise.
+///
+/// Refused rather than adapted, each for the same reason the long `comm` is:
+/// an empty pattern is one `rule_matches` skips, so a slot for it would match
+/// where userspace does not; a NUL can never be in a path the kernel copied,
+/// and in the slot it would compare against the terminator; and a pattern
+/// longer than [`KPATH_LEN`] would have to be cut, which widens the rule.
+fn path_patterns<'a>(patterns: &'a [String], field: &str) -> Result<Vec<Option<&'a [u8]>>, String> {
+    if patterns.is_empty() {
+        return Ok(vec![None]);
+    }
+    let mut out = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        let bytes = pattern.as_bytes();
+        if bytes.is_empty() {
+            return Err(format!(
+                "пустой шаблон в {field}: userspace его пропускает, а слот совпадал бы с чем угодно"
+            ));
+        }
+        if bytes.contains(&0) {
+            return Err(format!(
+                "шаблон {pattern:?} в {field} содержит NUL: в пути, скопированном ядром, его \
+                 не бывает"
+            ));
+        }
+        if bytes.len() > KPATH_LEN {
+            return Err(format!(
+                "шаблон {pattern:?} в {field} длиннее {KPATH_LEN} байт слота: обрезанный шаблон \
+                 шире написанного"
+            ));
+        }
+        out.push(Some(bytes));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -286,8 +365,8 @@ mod tests {
     use super::*;
     use crate::spec::PolicySelector;
     use ferrum_ebpf_progs::{
-        action_rank, kernel_verdict, ACTION_ALLOW, ACTION_AUDIT, ACTION_DENY, ACTION_ISOLATE,
-        ACTION_KILL,
+        action_rank, kernel_verdict, ExecPath, ACTION_ALLOW, ACTION_AUDIT, ACTION_DENY,
+        ACTION_ISOLATE, ACTION_KILL, PATH_LEN,
     };
 
     fn rule(id: &str, action: Action) -> Rule {
@@ -358,16 +437,16 @@ mod tests {
         // And it decides, on the same function the kernel walks.
         let comm = [0u8; COMM_LEN];
         assert_eq!(
-            kernel_verdict(&set.rules, &comm, true, false, true),
+            kernel_verdict(&set.rules, &comm, true, false, true, &ExecPath::unknown()),
             ACTION_KILL
         );
         assert_eq!(
-            kernel_verdict(&set.rules, &comm, false, false, true),
+            kernel_verdict(&set.rules, &comm, false, false, true, &ExecPath::unknown()),
             ACTION_ALLOW,
             "container_only decided outside a container"
         );
         assert_eq!(
-            kernel_verdict(&set.rules, &comm, true, true, true),
+            kernel_verdict(&set.rules, &comm, true, true, true, &ExecPath::unknown()),
             ACTION_ALLOW,
             "the rule matched the agent itself"
         );
@@ -378,7 +457,7 @@ mod tests {
     #[test]
     fn every_rule_the_kernel_cannot_decide_is_named_with_its_reason() {
         let mut with_path = rule("no-shell", Action::Kill);
-        with_path.path_suffix = vec!["/bin/sh".to_string()];
+        with_path.path_suffix = vec!["/".repeat(KPATH_LEN + 1)];
         let mut other_syscall = rule("no-bpf", Action::Kill);
         other_syscall.syscalls = vec!["bpf".to_string()];
         let mut long_comm = rule("long-comm", Action::Kill);
@@ -405,10 +484,99 @@ mod tests {
             );
         }
         assert!(
-            set.excluded[0].reason.contains("путь"),
+            set.excluded[0].reason.contains("pathSuffix"),
             "{}",
             set.excluded[0].reason
         );
+    }
+
+    /// A path rule goes to a hook that knows where the path is, and stays on
+    /// the tracepoint path — named, with the reason it was handed — for one
+    /// that does not.
+    #[test]
+    fn a_path_rule_reaches_the_kernel_only_where_the_layout_is_known() {
+        let mut with_path = rule("no-tmp-exec", Action::Kill);
+        with_path.path_prefix = vec!["/tmp/".to_string(), "/dev/shm/".to_string()];
+        with_path.comm_in = vec!["sh".to_string(), "bash".to_string()];
+        let spec = spec(vec![with_path, rule("keeps", Action::Kill)]);
+
+        let known = compile_kernel_rules(&spec);
+        assert!(known.excluded.is_empty(), "{:?}", known.excluded);
+        assert_eq!(known.len(), 2 * 2 + 1, "comm × prefix, plus the plain rule");
+        assert!(known.rules[..4].iter().all(|r| r.names_a_path()));
+        assert!(!known.rules[4].names_a_path());
+
+        let unknown = compile_kernel_rules_for(
+            &spec,
+            &ExecPathLayout::Unknown("vmlinux BTF absent".to_string()),
+        );
+        assert_eq!(
+            unknown.len(),
+            1,
+            "only the plain rule went to a hook that cannot read paths"
+        );
+        assert_eq!(unknown.excluded.len(), 1);
+        assert_eq!(unknown.excluded[0].rule, "no-tmp-exec");
+        assert!(
+            unknown.excluded[0].reason.contains("vmlinux BTF absent"),
+            "the reason the layout is unknown did not reach the exclusion: {}",
+            unknown.excluded[0].reason
+        );
+    }
+
+    /// Prefix × suffix is a product, and the patterns land where the kernel
+    /// reads them.
+    #[test]
+    fn prefixes_and_suffixes_multiply_into_slots_that_carry_both() {
+        let mut both = rule("both", Action::Deny);
+        both.path_prefix = vec!["/usr/".to_string(), "/opt/".to_string()];
+        both.path_suffix = vec!["/sh".to_string(), "/bash".to_string(), "/zsh".to_string()];
+        let set = compile_kernel_rules(&spec(vec![both]));
+        assert_eq!(set.len(), 6);
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = set
+            .rules
+            .iter()
+            .map(|r| {
+                (
+                    r.prefix[..r.prefix_len as usize].to_vec(),
+                    r.suffix[..r.suffix_len as usize].to_vec(),
+                )
+            })
+            .collect();
+        assert!(
+            pairs.contains(&(b"/opt/".to_vec(), b"/zsh".to_vec())),
+            "{pairs:?}"
+        );
+        let path = |p: &str| ExecPath::from_bytes(p.as_bytes(), false);
+        let comm = [0u8; COMM_LEN];
+        assert_eq!(
+            kernel_verdict(&set.rules, &comm, true, false, true, &path("/opt/x/zsh")),
+            ACTION_DENY
+        );
+        assert_eq!(
+            kernel_verdict(&set.rules, &comm, true, false, true, &path("/bin/zsh")),
+            ACTION_ALLOW
+        );
+    }
+
+    /// The patterns a slot cannot hold faithfully are refused, each named.
+    #[test]
+    fn a_pattern_the_slot_would_have_to_change_is_excluded() {
+        for (name, pattern) in [
+            ("empty", String::new()),
+            ("nul", "/bin/\0sh".to_string()),
+            ("long", "x".repeat(KPATH_LEN + 1)),
+        ] {
+            let mut r = rule(name, Action::Kill);
+            r.path_prefix = vec!["/bin/".to_string(), pattern];
+            let set = compile_kernel_rules(&spec(vec![r]));
+            assert!(set.is_empty(), "{name}: {set:?}");
+            assert_eq!(set.excluded.len(), 1, "{name}");
+        }
+        // Exactly KPATH_LEN fits.
+        let mut r = rule("edge", Action::Kill);
+        r.path_suffix = vec!["y".repeat(KPATH_LEN)];
+        assert_eq!(compile_kernel_rules(&spec(vec![r])).len(), 1);
     }
 
     /// A rule naming no syscall at all applies to every one, exec included.
@@ -436,11 +604,11 @@ mod tests {
         let mut other = [0u8; COMM_LEN];
         other[..3].copy_from_slice(b"cat");
         assert_eq!(
-            kernel_verdict(&set.rules, &bash, true, false, true),
+            kernel_verdict(&set.rules, &bash, true, false, true, &ExecPath::unknown()),
             ACTION_KILL
         );
         assert_eq!(
-            kernel_verdict(&set.rules, &other, true, false, true),
+            kernel_verdict(&set.rules, &other, true, false, true, &ExecPath::unknown()),
             ACTION_ALLOW
         );
     }
@@ -515,49 +683,86 @@ mod tests {
         let mut anywhere = rule("host-too", Action::Kill);
         anywhere.container_only = false;
         anywhere.not_agent_self = false;
+        let mut by_prefix = rule("by-prefix", Action::Kill);
+        by_prefix.path_prefix = vec!["/tmp/".to_string(), "/dev/shm/".to_string()];
+        let mut by_suffix = rule("by-suffix", Action::Deny);
+        by_suffix.path_suffix = vec!["/sh".to_string(), "docker.sock".to_string()];
+        let mut by_both = rule("by-both", Action::Kill);
+        by_both.comm_in = vec!["sh".to_string()];
+        by_both.path_prefix = vec!["/tmp/".to_string()];
+        by_both.path_suffix = vec!["/sh".to_string()];
 
-        for rules in [vec![named], vec![anyone], vec![anywhere]] {
+        // The head of a path too long for the buffer, as the datapath would
+        // deliver it: PATH_LEN - 1 bytes and the truncation flag.
+        let long_tmp = format!("/tmp/{}", "a".repeat(PATH_LEN));
+        let long_head = &long_tmp[..PATH_LEN - 1];
+        let paths: [(&str, bool); 9] = [
+            ("/usr/bin/whatever", false),
+            ("/bin/sh", false),
+            ("/tmp/x/sh", false),
+            ("/tmp/", false),
+            ("/tmp", false),
+            ("/dev/shm/payload", false),
+            ("/run/docker.sock", false),
+            // Unreadable: nothing arrived and the flag says so.
+            ("", true),
+            (long_head, true),
+        ];
+
+        for rules in [
+            vec![named],
+            vec![anyone],
+            vec![anywhere],
+            vec![by_prefix],
+            vec![by_suffix],
+            vec![by_both],
+        ] {
             let spec = spec(rules);
             let set = compile_kernel_rules(&spec);
             assert!(!set.is_refused() && !set.is_empty(), "{set:?}");
 
-            for comm in ["sh", "shred", "cat", ""] {
-                for in_container in [true, false] {
-                    for agent_self in [true, false] {
-                        // Both values of the selected bit, because none of
-                        // these policies selects: a slot that grew a
-                        // KRULE_FLAG_SELECTED_ONLY it was not asked for would
-                        // silently stop matching on nodes whose index is
-                        // still filling, and this is what catches that.
-                        for selected in [true, false] {
-                            let event = crate::eval::SyscallEvent {
-                                syscall: "execve",
-                                comm,
-                                path: "/usr/bin/whatever",
-                                in_container,
-                                agent_self,
-                                path_truncated: false,
-                            };
-                            let userspace = crate::eval::matched_action(&spec, &event);
+            for (path, truncated) in paths {
+                let exec_path = ExecPath::from_bytes(path.as_bytes(), truncated);
+                for comm in ["sh", "shred", "cat", ""] {
+                    for in_container in [true, false] {
+                        for agent_self in [true, false] {
+                            // Both values of the selected bit, because none of
+                            // these policies selects: a slot that grew a
+                            // KRULE_FLAG_SELECTED_ONLY it was not asked for
+                            // would silently stop matching on nodes whose
+                            // index is still filling, and this catches that.
+                            for selected in [true, false] {
+                                let event = crate::eval::SyscallEvent {
+                                    syscall: "execve",
+                                    comm,
+                                    path,
+                                    in_container,
+                                    agent_self,
+                                    path_truncated: truncated,
+                                };
+                                let userspace = crate::eval::matched_action(&spec, &event);
 
-                            let mut raw = [0u8; COMM_LEN];
-                            raw[..comm.len()].copy_from_slice(comm.as_bytes());
-                            let kernel = kernel_verdict(
-                                &set.rules,
-                                &raw,
-                                in_container,
-                                agent_self,
-                                selected,
-                            );
+                                let mut raw = [0u8; COMM_LEN];
+                                raw[..comm.len()].copy_from_slice(comm.as_bytes());
+                                let kernel = kernel_verdict(
+                                    &set.rules,
+                                    &raw,
+                                    in_container,
+                                    agent_self,
+                                    selected,
+                                    &exec_path,
+                                );
 
-                            assert_eq!(
-                                kernel,
-                                userspace.action.as_u8(),
-                                "{}/{comm}/{in_container}/{agent_self}/selected={selected}: \
-                             kernel says {kernel}, userspace says {}",
-                                spec.rules[0].id,
-                                userspace.action.as_str()
-                            );
+                                assert_eq!(
+                                    kernel,
+                                    userspace.action.as_u8(),
+                                    "{}/{path:?}(truncated={truncated})/{comm}/{in_container}/\
+                                     {agent_self}/selected={selected}: kernel says {kernel}, \
+                                     userspace says {}",
+                                    spec.rules[0].id,
+                                    userspace.action.as_str()
+                                );
+                            }
                         }
                     }
                 }
@@ -593,11 +798,11 @@ mod tests {
 
         let comm = [0u8; COMM_LEN];
         assert_eq!(
-            kernel_verdict(&set.rules, &comm, true, false, true),
+            kernel_verdict(&set.rules, &comm, true, false, true, &ExecPath::unknown()),
             ACTION_KILL
         );
         assert_eq!(
-            kernel_verdict(&set.rules, &comm, true, false, false),
+            kernel_verdict(&set.rules, &comm, true, false, false, &ExecPath::unknown()),
             ACTION_ALLOW,
             "a selected policy fired on a cgroup it does not select"
         );
@@ -608,7 +813,14 @@ mod tests {
         assert!(!plain.selected_only);
         assert!(!plain.rules[0].selected_only());
         assert_eq!(
-            kernel_verdict(&plain.rules, &comm, true, false, false),
+            kernel_verdict(
+                &plain.rules,
+                &comm,
+                true,
+                false,
+                false,
+                &ExecPath::unknown()
+            ),
             ACTION_KILL
         );
     }
@@ -633,7 +845,7 @@ mod tests {
         );
         let mut over = over;
         let mut excluded_too = rule("has-a-path", Action::Kill);
-        excluded_too.path_suffix = vec!["/bin/sh".to_string()];
+        excluded_too.path_suffix = vec!["s".repeat(KPATH_LEN + 1)];
         over.rules.push(excluded_too);
 
         let set = compile_kernel_rules(&over);

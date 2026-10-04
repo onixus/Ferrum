@@ -113,6 +113,104 @@ pub const KRULE_FLAG_NOT_AGENT_SELF: u8 = 1 << 2;
 /// selected*, so an exec in a container whose cgroup has not been published
 /// yet is not refused — see `kernel_rule_matches`.
 pub const KRULE_FLAG_SELECTED_ONLY: u8 = 1 << 3;
+/// The slot carries a path prefix in `prefix`/`prefix_len`, matched against
+/// the path the exec was asked for.
+pub const KRULE_FLAG_PATH_PREFIX: u8 = 1 << 4;
+/// The slot carries a path suffix in `suffix`/`suffix_len`.
+pub const KRULE_FLAG_PATH_SUFFIX: u8 = 1 << 5;
+
+/// The read-only global the loader fills with the offset of
+/// `linux_binprm::filename` before the program is loaded. Equal to the symbol
+/// name in `src/main.rs`; attribute and symbol names cannot reference a const.
+pub const BPRM_FILENAME_OFFSET_GLOBAL: &str = "FERRUM_BPRM_FILENAME_OFF";
+
+/// Bytes of one path pattern a slot can hold.
+///
+/// Not `PATH_LEN`: a slot is walked on every exec and the map is
+/// `MAX_KERNEL_RULES` of them, so the pattern buffer is what the slot costs.
+/// Sixty-four bytes hold every pattern in the shipped policies with room to
+/// spare (`containerd.sock` is fifteen); a longer pattern is not truncated —
+/// a truncated prefix is a *wider* rule than the one written — but kept on
+/// the tracepoint path with a reason, by `compile_kernel_rules`.
+pub const KPATH_LEN: usize = 64;
+
+/// [`ExecPath::flags`]: the hook knows where the path lives in this kernel's
+/// `linux_binprm` and tried to read it. Without it, a slot with a path
+/// predicate matches nothing — see [`kernel_rule_mask`].
+pub const EXEC_PATH_KNOWN: u8 = 1 << 0;
+/// [`ExecPath::flags`]: `bytes` is not the whole path — the same statement
+/// [`EVENT_FLAG_PATH_TRUNCATED`] makes about a ring record, and decided the
+/// same way: a read that filled the buffer did not fit, and a read that
+/// failed left it empty.
+pub const EXEC_PATH_TRUNCATED: u8 = 1 << 1;
+
+/// The path an exec was asked for, as the LSM hook reads it.
+///
+/// It is `linux_binprm::filename`: the kernel's own copy of the string the
+/// caller passed to `execve`, taken by `getname()` before the hook runs. So it
+/// is the same string the `sys_enter_execve` record carries — which is what
+/// lets one matcher serve both sides — but read from kernel memory, after the
+/// copy, so a second thread rewriting the user buffer between the tracepoint
+/// and the exec has nothing left to rewrite. That is the double-fetch of the
+/// tracepoint path, closed for exec.
+///
+/// One place the two strings differ, and it is written down rather than
+/// smoothed over: `execveat` with a directory descriptor and a relative path.
+/// The record carries the relative path; the kernel builds `/dev/fd/<n>/<path>`
+/// for `filename`. A prefix rule therefore matches neither, and a suffix rule
+/// can match the kernel's string where it did not match the record's — the
+/// kernel side is the stricter of the two there, never the looser.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct ExecPath {
+    pub bytes: [u8; PATH_LEN],
+    /// Bytes before the terminator. At most `PATH_LEN - 1`.
+    pub len: u16,
+    pub flags: u8,
+    pub _pad: u8,
+}
+
+impl ExecPath {
+    /// A hook that does not know where the path is. Path predicates match
+    /// nothing against it.
+    pub const fn unknown() -> Self {
+        Self {
+            bytes: [0; PATH_LEN],
+            len: 0,
+            flags: 0,
+            _pad: 0,
+        }
+    }
+
+    /// The path as the userspace matcher sees it: `bytes` up to `len`, and the
+    /// truncation flag a ring record would carry.
+    ///
+    /// For tests and for the userspace side of the equivalence sweep; the hook
+    /// fills the struct itself.
+    pub fn from_bytes(path: &[u8], truncated: bool) -> Self {
+        let mut out = Self::unknown();
+        let len = if path.len() > PATH_LEN - 1 {
+            PATH_LEN - 1
+        } else {
+            path.len()
+        };
+        let mut i = 0;
+        while i < len {
+            out.bytes[i] = path[i];
+            i += 1;
+        }
+        out.len = len as u16;
+        // The datapath's own rule: a string that reached the last usable byte
+        // did not fit, whether or not it would have ended there.
+        out.flags = EXEC_PATH_KNOWN
+            | if truncated || path.len() >= PATH_LEN - 1 {
+                EXEC_PATH_TRUNCATED
+            } else {
+                0
+            };
+        out
+    }
+}
 
 /// The `-EPERM` an LSM hook returns to refuse. Named, because `-1` at a return
 /// site is a number and this is a decision.
@@ -124,23 +222,24 @@ pub const EPERM: i32 = 1;
 /// it is the part that needs nothing the hook cannot see. What is absent and
 /// why:
 ///
-/// * **No path predicate.** Reading the executable's path inside
-///   `bprm_check_security` means reading a field of `linux_binprm`, and the
-///   toolchain this tree pins has no CO-RE: `aya-ebpf` carries no field
-///   relocation in any published version, and `aya-ebpf-bindings` declares
-///   `linux_binprm` opaque on purpose. A hand-written offset would either
-///   refuse to load on a kernel whose layout differs or — worse, when the
-///   offset happens to land on another field of the same width — match on
-///   garbage. So rules naming a path are not represented here at all, are
-///   named as such by `compile_kernel_rules`, and stay on the tracepoint path.
-/// * **No selector.** Label selectors are resolved against a pod identity the
-///   kernel does not have. A policy carrying one is refused wholesale rather
-///   than enforced against every container, which is over-enforcement and
-///   breaks workloads the policy never selected.
+/// * **A path predicate, now, with one condition.** The hook reads
+///   `linux_binprm::filename`, and the pinned toolchain has no CO-RE: `aya-ebpf`
+///   carries no field relocation and `aya-ebpf-bindings` declares
+///   `linux_binprm` opaque on purpose. The offset is therefore not written
+///   here by hand — it is read by userspace out of *this kernel's* vmlinux BTF
+///   (`ferrum_ebpf::btf`), checked to be a `char *` named `filename` inside
+///   `struct linux_binprm`, and handed to the program as a read-only global
+///   before load. A kernel whose BTF does not answer that gets no path slots
+///   at all, and the rules that need them are named as excluded.
+/// * **No selector of its own.** Label selectors are resolved against a pod
+///   identity the kernel does not have; what the slot carries instead is
+///   `KRULE_FLAG_SELECTED_ONLY`, answered from `ferrum_selected`.
 ///
 /// `comm` is one value, not a list: a rule naming three `comm`s becomes three
 /// slots. It keeps this struct flat and the walk branch-free, and the cost is
-/// slots, which are counted and bounded.
+/// slots, which are counted and bounded. Path patterns follow the same rule:
+/// one prefix and one suffix per slot, so a rule naming two prefixes and three
+/// suffixes is six slots.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct KernelRule {
@@ -150,8 +249,16 @@ pub struct KernelRule {
     pub flags: u8,
     /// Bytes of `comm` that are the predicate. 0 means "any `comm`".
     pub comm_len: u8,
-    pub _pad: u8,
+    /// Bytes of `prefix` that are the predicate, under
+    /// `KRULE_FLAG_PATH_PREFIX`.
+    pub prefix_len: u8,
+    /// Bytes of `suffix` that are the predicate, under
+    /// `KRULE_FLAG_PATH_SUFFIX`.
+    pub suffix_len: u8,
+    pub _pad: [u8; 3],
     pub comm: [u8; COMM_LEN],
+    pub prefix: [u8; KPATH_LEN],
+    pub suffix: [u8; KPATH_LEN],
 }
 
 impl KernelRule {
@@ -160,9 +267,40 @@ impl KernelRule {
             action: ACTION_ALLOW,
             flags: 0,
             comm_len: 0,
-            _pad: 0,
+            prefix_len: 0,
+            suffix_len: 0,
+            _pad: [0; 3],
             comm: [0; COMM_LEN],
+            prefix: [0; KPATH_LEN],
+            suffix: [0; KPATH_LEN],
         }
+    }
+
+    /// Make this slot require the path to start with `pattern`. The caller
+    /// keeps `pattern` non-empty, NUL-free and at most [`KPATH_LEN`] bytes;
+    /// `compile_kernel_rules` refuses anything else before it gets here.
+    pub fn set_prefix(&mut self, pattern: &[u8]) {
+        let len = pattern.len().min(KPATH_LEN);
+        self.flags |= KRULE_FLAG_PATH_PREFIX;
+        self.prefix_len = len as u8;
+        self.prefix = [0; KPATH_LEN];
+        self.prefix[..len].copy_from_slice(&pattern[..len]);
+    }
+
+    /// Make this slot require the path to end with `pattern`, on the same
+    /// terms as [`Self::set_prefix`].
+    pub fn set_suffix(&mut self, pattern: &[u8]) {
+        let len = pattern.len().min(KPATH_LEN);
+        self.flags |= KRULE_FLAG_PATH_SUFFIX;
+        self.suffix_len = len as u8;
+        self.suffix = [0; KPATH_LEN];
+        self.suffix[..len].copy_from_slice(&pattern[..len]);
+    }
+
+    /// The slot names a path, so it can only be decided by a hook that knows
+    /// where the path is.
+    pub const fn names_a_path(self) -> bool {
+        self.flags & (KRULE_FLAG_PATH_PREFIX | KRULE_FLAG_PATH_SUFFIX) != 0
     }
 
     pub const fn is_used(self) -> bool {
@@ -214,14 +352,118 @@ impl Default for KernelRule {
 /// userspace fail-closed semantics, and still kills. So the node under-
 /// prevents for a moment and reports exactly as much as it did before this
 /// map existed.
+///
+/// `path` is the exec's path as the hook read it. Its two predicates mirror
+/// `rule_matches` exactly, fail-closed half included: a prefix on a path that
+/// could not be read at all, and a suffix on a path that did not fit, are
+/// *matches* — the same "unknown asserts" userspace applies, because a rule
+/// that skips on an unreadable path is a rule an attacker skips by making the
+/// path unreadable. A hook that does not know where the path lives
+/// ([`EXEC_PATH_KNOWN`] clear) is the opposite case and decides the other way:
+/// that is not an attacker's doing but a kernel this build could not read,
+/// and failing closed there would refuse every exec the rule's other
+/// predicates allow. Userspace never publishes path slots to such a hook; the
+/// flag is the second wall, not the first.
 pub fn kernel_rule_matches(
     rule: &KernelRule,
     comm: &[u8; COMM_LEN],
     in_container: bool,
     agent_self: bool,
     selected: bool,
+    path: &ExecPath,
 ) -> bool {
-    kernel_rule_mask(rule, comm, in_container, agent_self, selected) != 0
+    kernel_rule_mask(rule, comm, in_container, agent_self, selected, path) != 0
+}
+
+/// 1 when `x` is non-zero, as arithmetic.
+#[inline(always)]
+const fn nonzero(x: u8) -> u8 {
+    ((x | x.wrapping_neg()) >> 7) & 1
+}
+
+/// The XOR-accumulated difference between the slot's prefix and the head of
+/// the path: zero exactly when the path starts with the prefix.
+///
+/// The three comparisons of a slot — this, [`suffix_diff`] and [`comm_diff`]
+/// — are each a function of their own that is never inlined, and each returns
+/// the raw difference rather than a verdict. That shape is what loads, and
+/// every other one tried on Linux 6.17 did not:
+///
+/// * fully branch-free, bytes masked to the pattern length: LLVM compiled
+///   `i < len` to a compare and the masked XOR to a select, which BPF makes a
+///   jump — sixty-four per pattern, past the verifier's million instructions;
+/// * branch-free with the masks stored in the slot as data: no jumps (10 344
+///   instructions), but one basic block of some three hundred loads that LLVM
+///   hoisted and spilled — a 336-byte callback frame which with the hook's own
+///   went past the 512-byte limit on a call chain;
+/// * loops bounded by the pattern length, inlined: the frame was fine, but
+///   with the three comparisons in one function InstCombine turned the `comm`
+///   difference back into sixteen equality jumps, and their forks multiplied
+///   with the loop exits.
+///
+/// Behind a call boundary the caller only ever sees a byte, so nothing folds
+/// across it; and the loop exits inside collapse at the return, where the
+/// index is dead and the difference is the only thing left.
+#[inline(never)]
+fn prefix_diff(rule: &KernelRule, path: &ExecPath) -> u8 {
+    let len = rule.prefix_len as usize;
+    let mut diff = 0u8;
+    let mut i = 0;
+    while i < len && i < KPATH_LEN {
+        diff |= rule.prefix[i] ^ path.bytes[i];
+        i += 1;
+    }
+    diff
+}
+
+/// The same for the suffix, compared against the tail of the path. The path
+/// index is masked into the buffer rather than checked, so the access is
+/// bounded without a branch; a path shorter than the suffix wraps into its own
+/// zero padding, which a NUL-free pattern never equals, and the caller checks
+/// the length as well rather than leaning on the padding alone.
+#[inline(never)]
+fn suffix_diff(rule: &KernelRule, path: &ExecPath) -> u8 {
+    let len = rule.suffix_len as usize;
+    let start = path.len.wrapping_sub(rule.suffix_len as u16);
+    let mut diff = 0u8;
+    let mut i = 0;
+    while i < len && i < KPATH_LEN {
+        let at = (start.wrapping_add(i as u16) as usize) & (PATH_LEN - 1);
+        diff |= rule.suffix[i] ^ path.bytes[at];
+        i += 1;
+    }
+    diff
+}
+
+/// The whole sixteen bytes of the name, as one XOR-accumulated difference.
+#[inline(never)]
+fn comm_diff(rule: &[u8; COMM_LEN], comm: &[u8; COMM_LEN]) -> u8 {
+    let mut diff = 0u8;
+    let mut i = 0;
+    while i < COMM_LEN {
+        diff |= rule[i] ^ comm[i];
+        i += 1;
+    }
+    diff
+}
+
+/// Whether the path starts with the slot's prefix, as 1 or 0. A path shorter
+/// than the pattern compares its zero padding against pattern bytes, and
+/// patterns carry no NUL (`compile_kernel_rules` refuses one), so a short
+/// path differs rather than matching on what it lacks.
+#[inline(always)]
+fn prefix_hit(rule: &KernelRule, path: &ExecPath) -> u8 {
+    let fits = ((KPATH_LEN as u8).wrapping_sub(rule.prefix_len) >> 7) ^ 1;
+    (nonzero(prefix_diff(rule, path)) ^ 1) & nonzero(rule.prefix_len) & fits
+}
+
+/// Whether the path ends with the slot's suffix, as 1 or 0.
+#[inline(always)]
+fn suffix_hit(rule: &KernelRule, path: &ExecPath) -> u8 {
+    let start = path.len.wrapping_sub(rule.suffix_len as u16);
+    let long_enough = ((start >> 15) as u8 & 1) ^ 1;
+    let fits = ((KPATH_LEN as u8).wrapping_sub(rule.suffix_len) >> 7) ^ 1;
+    (nonzero(suffix_diff(rule, path)) ^ 1) & nonzero(rule.suffix_len) & long_enough & fits
 }
 
 /// The same predicate as [`kernel_rule_matches`], as 1 or 0, computed without
@@ -252,6 +494,7 @@ pub fn kernel_rule_mask(
     in_container: bool,
     agent_self: bool,
     selected: bool,
+    path: &ExecPath,
 ) -> u8 {
     let flags = rule.flags;
     let used = flags & KRULE_FLAG_USED;
@@ -267,12 +510,7 @@ pub fn kernel_rule_mask(
     // a zeroed slot and `bpf_get_current_comm` pads with NULs, so equality of
     // the sixteen bytes is equality of the names, terminator included -- a rule
     // for `sh` cannot match `shred`, because byte 2 is `r` against `\0`.
-    let mut diff = 0u8;
-    let mut i = 0;
-    while i < COMM_LEN {
-        diff |= rule.comm[i] ^ comm[i];
-        i += 1;
-    }
+    let diff = comm_diff(&rule.comm, comm);
     // `is_zero(x)`: for a byte, `x | -x` has its top bit set unless `x` is 0.
     let comm_equal = (((diff | diff.wrapping_neg()) >> 7) & 1) ^ 1;
     let names_a_comm = ((rule.comm_len | rule.comm_len.wrapping_neg()) >> 7) & 1;
@@ -282,7 +520,22 @@ pub fn kernel_rule_mask(
     // as a borrow out of the high bit instead of a jump.
     let comm_len_ok = ((COMM_LEN as u8).wrapping_sub(rule.comm_len) >> 7) ^ 1;
 
+    // The path, in `rule_matches`' own terms: unreadable is "truncated with
+    // nothing read", and it asserts a prefix; truncated at all asserts a
+    // suffix.
+    let has_prefix = (flags & KRULE_FLAG_PATH_PREFIX) >> 4;
+    let has_suffix = (flags & KRULE_FLAG_PATH_SUFFIX) >> 5;
+    let known = path.flags & EXEC_PATH_KNOWN;
+    let truncated = (path.flags & EXEC_PATH_TRUNCATED) >> 1;
+    let unreadable = truncated & (nonzero(path.len as u8 | (path.len >> 8) as u8) ^ 1);
+    let prefix_ok = (has_prefix ^ 1) | prefix_hit(rule, path) | unreadable;
+    let suffix_ok = (has_suffix ^ 1) | suffix_hit(rule, path) | truncated;
+    let path_decidable = ((has_prefix | has_suffix) & (known ^ 1)) ^ 1;
+
     used & comm_ok
+        & prefix_ok
+        & suffix_ok
+        & path_decidable
         & comm_len_ok
         & ((not_agent_self & agent_self) ^ 1)
         & ((container_only & (in_container ^ 1)) ^ 1)
@@ -302,12 +555,13 @@ pub fn kernel_verdict(
     in_container: bool,
     agent_self: bool,
     selected: bool,
+    path: &ExecPath,
 ) -> u8 {
     let mut best = ACTION_ALLOW;
     let mut i = 0;
     while i < rules.len() {
         let rule = rules[i];
-        if kernel_rule_matches(&rule, comm, in_container, agent_self, selected)
+        if kernel_rule_matches(&rule, comm, in_container, agent_self, selected, path)
             && action_rank(rule.action) > action_rank(best)
         {
             best = rule.action;
@@ -431,7 +685,7 @@ mod tests {
     /// and this userspace disagree about, and both write into it.
     #[test]
     fn a_kernel_rule_is_the_size_the_map_abi_declares() {
-        assert_eq!(size_of::<KernelRule>(), 20);
+        assert_eq!(size_of::<KernelRule>(), 152);
         assert_eq!(core::mem::align_of::<KernelRule>(), 1);
         // A zeroed slot — what an array map starts as — is not a rule.
         assert!(!KernelRule::empty().is_used());
@@ -440,7 +694,8 @@ mod tests {
             &[0; COMM_LEN],
             true,
             false,
-            true
+            true,
+            &ExecPath::unknown()
         ));
     }
 
@@ -460,8 +715,22 @@ mod tests {
         let mut shred = [0u8; COMM_LEN];
         shred[..5].copy_from_slice(b"shred");
 
-        assert!(kernel_rule_matches(&rule, &sh, false, false, true));
-        assert!(!kernel_rule_matches(&rule, &shred, false, false, true));
+        assert!(kernel_rule_matches(
+            &rule,
+            &sh,
+            false,
+            false,
+            true,
+            &ExecPath::unknown()
+        ));
+        assert!(!kernel_rule_matches(
+            &rule,
+            &shred,
+            false,
+            false,
+            true,
+            &ExecPath::unknown()
+        ));
     }
 
     /// The two gates the kernel *can* answer, each on its own.
@@ -472,13 +741,20 @@ mod tests {
         rule.action = ACTION_KILL;
         let comm = [0u8; COMM_LEN];
 
-        assert!(kernel_rule_matches(&rule, &comm, true, false, true));
+        assert!(kernel_rule_matches(
+            &rule,
+            &comm,
+            true,
+            false,
+            true,
+            &ExecPath::unknown()
+        ));
         assert!(
-            !kernel_rule_matches(&rule, &comm, false, false, true),
+            !kernel_rule_matches(&rule, &comm, false, false, true, &ExecPath::unknown()),
             "container_only matched outside a container"
         );
         assert!(
-            !kernel_rule_matches(&rule, &comm, true, true, true),
+            !kernel_rule_matches(&rule, &comm, true, true, true, &ExecPath::unknown()),
             "not_agent_self matched the agent itself"
         );
     }
@@ -529,22 +805,43 @@ mod tests {
         unselected.action = ACTION_KILL;
         let comm = [0u8; COMM_LEN];
 
-        assert!(kernel_rule_matches(&selected, &comm, true, false, true));
+        assert!(kernel_rule_matches(
+            &selected,
+            &comm,
+            true,
+            false,
+            true,
+            &ExecPath::unknown()
+        ));
         assert!(
-            !kernel_rule_matches(&selected, &comm, true, false, false),
+            !kernel_rule_matches(&selected, &comm, true, false, false, &ExecPath::unknown()),
             "a rule of a selected policy fired on a cgroup the policy does not select"
         );
         // A policy with no selector carries no such flag and is unaffected by
         // the set in either direction.
-        assert!(kernel_rule_matches(&unselected, &comm, true, false, false));
-        assert!(kernel_rule_matches(&unselected, &comm, true, false, true));
+        assert!(kernel_rule_matches(
+            &unselected,
+            &comm,
+            true,
+            false,
+            false,
+            &ExecPath::unknown()
+        ));
+        assert!(kernel_rule_matches(
+            &unselected,
+            &comm,
+            true,
+            false,
+            true,
+            &ExecPath::unknown()
+        ));
 
         assert_eq!(
-            kernel_verdict(&[selected], &comm, true, false, false),
+            kernel_verdict(&[selected], &comm, true, false, false, &ExecPath::unknown()),
             ACTION_ALLOW
         );
         assert_eq!(
-            kernel_verdict(&[selected], &comm, true, false, true),
+            kernel_verdict(&[selected], &comm, true, false, true, &ExecPath::unknown()),
             ACTION_KILL
         );
     }
@@ -561,9 +858,19 @@ mod tests {
         };
         let comm = [0u8; COMM_LEN];
 
-        assert_eq!(kernel_verdict(&[], &comm, true, false, true), ACTION_ALLOW);
         assert_eq!(
-            kernel_verdict(&[KernelRule::empty(); 4], &comm, true, false, true),
+            kernel_verdict(&[], &comm, true, false, true, &ExecPath::unknown()),
+            ACTION_ALLOW
+        );
+        assert_eq!(
+            kernel_verdict(
+                &[KernelRule::empty(); 4],
+                &comm,
+                true,
+                false,
+                true,
+                &ExecPath::unknown()
+            ),
             ACTION_ALLOW,
             "an untouched array must not decide anything"
         );
@@ -573,7 +880,8 @@ mod tests {
                 &comm,
                 true,
                 false,
-                true
+                true,
+                &ExecPath::unknown()
             ),
             ACTION_KILL
         );
@@ -583,7 +891,8 @@ mod tests {
                 &comm,
                 true,
                 false,
-                true
+                true,
+                &ExecPath::unknown()
             ),
             ACTION_KILL,
             "the order of the slots decided the verdict"
@@ -592,6 +901,138 @@ mod tests {
         assert!(!action_refuses(ACTION_ALLOW) && !action_refuses(ACTION_AUDIT));
         // Isolate is not an exec refusal, and is never written into a slot.
         assert!(!action_refuses(ACTION_ISOLATE));
+    }
+
+    fn path_rule(prefix: Option<&str>, suffix: Option<&str>) -> KernelRule {
+        let mut rule = KernelRule::empty();
+        rule.flags = KRULE_FLAG_USED;
+        rule.action = ACTION_DENY;
+        if let Some(p) = prefix {
+            rule.set_prefix(p.as_bytes());
+        }
+        if let Some(p) = suffix {
+            rule.set_suffix(p.as_bytes());
+        }
+        rule
+    }
+
+    fn hits(rule: &KernelRule, path: &ExecPath) -> bool {
+        kernel_rule_matches(rule, &[0; COMM_LEN], true, false, true, path)
+    }
+
+    /// Prefix and suffix are the string's own head and tail, nothing looser:
+    /// a path shorter than the pattern, a pattern in the middle, and the
+    /// string `/usr/bin/true` against a `/bin/` prefix (the symlink is not
+    /// followed — the predicate is about what was asked for) all miss.
+    #[test]
+    fn a_path_predicate_is_the_head_or_the_tail_of_the_string() {
+        let ok = |p: &str| ExecPath::from_bytes(p.as_bytes(), false);
+        let prefix = path_rule(Some("/bin/"), None);
+        assert!(hits(&prefix, &ok("/bin/true")));
+        assert!(hits(&prefix, &ok("/bin/")));
+        assert!(
+            !hits(&prefix, &ok("/bin")),
+            "a path shorter than the prefix matched it"
+        );
+        assert!(!hits(&prefix, &ok("/usr/bin/true")));
+        assert!(!hits(&prefix, &ok("")));
+
+        let suffix = path_rule(None, Some("docker.sock"));
+        assert!(hits(&suffix, &ok("/run/docker.sock")));
+        assert!(
+            hits(&suffix, &ok("docker.sock")),
+            "the whole path is its own suffix"
+        );
+        assert!(!hits(&suffix, &ok("ocker.sock")));
+        assert!(!hits(&suffix, &ok("/run/docker.sock.bak")));
+        assert!(!hits(&suffix, &ok("")));
+
+        // Both on one slot: both must hold.
+        let both = path_rule(Some("/usr/"), Some("/sh"));
+        assert!(hits(&both, &ok("/usr/bin/sh")));
+        assert!(!hits(&both, &ok("/bin/sh")));
+        assert!(!hits(&both, &ok("/usr/bin/bash")));
+
+        // A suffix compared at the far end of the buffer, where the index
+        // mask is what keeps the access inside it.
+        // 254 bytes is the longest path that fits; one more fills the buffer
+        // and is read as truncated, where a suffix is unknown and asserts.
+        let mut tail = "/a".repeat(126);
+        tail.push_str("/x");
+        assert_eq!(tail.len(), PATH_LEN - 2);
+        assert!(hits(&path_rule(None, Some("/x")), &ok(&tail)));
+        assert!(!hits(&path_rule(None, Some("/y")), &ok(&tail)));
+        tail.push('z');
+        assert!(hits(&path_rule(None, Some("/y")), &ok(&tail)));
+    }
+
+    /// The fail-closed half of `rule_matches`, in kernel terms: a prefix on a
+    /// path that could not be read and a suffix on a path that did not fit are
+    /// matches, not misses.
+    #[test]
+    fn an_unknown_path_asserts_the_predicate_it_cannot_decide() {
+        let unreadable = ExecPath::from_bytes(b"", true);
+        let head = ExecPath::from_bytes(b"/opt/very/long/head", true);
+
+        assert!(hits(&path_rule(Some("/bin/"), None), &unreadable));
+        assert!(hits(&path_rule(None, Some("/sh")), &unreadable));
+        // A head that was read decides the prefix; only the suffix is unknown.
+        assert!(!hits(&path_rule(Some("/bin/"), None), &head));
+        assert!(hits(&path_rule(Some("/opt/"), None), &head));
+        assert!(hits(&path_rule(None, Some("/sh")), &head));
+    }
+
+    /// A hook that does not know where the path lives decides no path slot.
+    ///
+    /// Not fail-closed, and on purpose: this is a kernel the build could not
+    /// read, not a path an attacker hid, and closing here would refuse every
+    /// exec the rule's other predicates allow on every node of that kernel.
+    #[test]
+    fn a_hook_without_the_layout_decides_no_path_slot_and_every_other_one() {
+        let unknown = ExecPath::unknown();
+        assert!(!hits(&path_rule(Some("/bin/"), None), &unknown));
+        assert!(!hits(&path_rule(None, Some("/sh")), &unknown));
+        let mut plain = KernelRule::empty();
+        plain.flags = KRULE_FLAG_USED;
+        plain.action = ACTION_KILL;
+        assert!(
+            hits(&plain, &unknown),
+            "a slot naming no path stopped matching"
+        );
+    }
+
+    /// A slot that names a pattern and holds none hits nothing — the empty
+    /// pattern `rule_matches` skips — and a length past the slot is corrupt
+    /// and matches nothing, the same refusal the comm length gets.
+    #[test]
+    fn an_empty_or_corrupt_pattern_matches_nothing() {
+        let path = ExecPath::from_bytes(b"/bin/true", false);
+        let mut empty = path_rule(Some("/"), None);
+        empty.prefix_len = 0;
+        assert!(!hits(&empty, &path));
+        let mut empty = path_rule(None, Some("e"));
+        empty.suffix_len = 0;
+        assert!(!hits(&empty, &path));
+
+        let mut prefix = path_rule(Some("/bin/"), None);
+        prefix.prefix_len = KPATH_LEN as u8 + 1;
+        assert!(!hits(&prefix, &path));
+        let mut suffix = path_rule(None, Some("true"));
+        suffix.suffix_len = KPATH_LEN as u8 + 1;
+        assert!(!hits(&suffix, &path));
+    }
+
+    /// The setters write what the matcher reads, and nothing of a longer
+    /// pattern survives a shorter one written over it.
+    #[test]
+    fn a_pattern_setter_writes_the_pattern_the_matcher_reads() {
+        let mut rule = KernelRule::empty();
+        rule.set_prefix(b"/usr/");
+        assert!(rule.names_a_path());
+        assert_eq!(rule.prefix_len, 5);
+        rule.set_prefix(b"/a");
+        assert_eq!(rule.prefix_len, 2);
+        assert_eq!(&rule.prefix[..3], b"/a\0");
     }
 
     #[test]

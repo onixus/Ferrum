@@ -19,7 +19,8 @@
 mod progs {
     use aya_ebpf::{
         helpers::{
-            bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user_str_bytes,
+            bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel,
+            bpf_probe_read_kernel_str_bytes, bpf_probe_read_user_str_bytes,
             gen::bpf_get_current_cgroup_id,
         },
         macros::{lsm, map, tracepoint},
@@ -27,11 +28,22 @@ mod progs {
         programs::{LsmContext, TracePointContext},
     };
     use ferrum_ebpf_progs::{
-        action_rank, action_refuses, kernel_rule_mask, lsm_verdict, Event, KernelRule,
+        action_rank, action_refuses, kernel_rule_mask, lsm_verdict, Event, ExecPath, KernelRule,
         ACTION_ALLOW, ACTION_AUDIT, CGROUPS_MAX_ENTRIES, COMM_LEN, EVENTS_RING_BYTES,
-        EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, MAX_KERNEL_RULES,
-        PATH_LEN,
+        EVENT_FLAG_AGENT_SELF, EVENT_FLAG_CONTAINER, EVENT_FLAG_PATH_TRUNCATED, EXEC_PATH_KNOWN,
+        EXEC_PATH_TRUNCATED, MAX_KERNEL_RULES, PATH_LEN,
     };
+
+    /// Byte offset of `filename` in this kernel's `struct linux_binprm`.
+    ///
+    /// Written by the loader before the program is loaded — the name must
+    /// stay equal to `BPRM_FILENAME_OFFSET_GLOBAL` in lib.rs — from the
+    /// running kernel's own BTF; see `ferrum_ebpf::btf`. Zero is "not
+    /// resolved", and then no path predicate decides anything here. Read
+    /// volatile, or the compiler folds the initializer into every use and the
+    /// value the loader wrote is never looked at.
+    #[no_mangle]
+    static FERRUM_BPRM_FILENAME_OFF: u32 = 0;
 
     // The `#[map(name = ...)]` literals must stay equal to the MAP_* /
     // EVENTS_DROPPED_TOTAL constants in lib.rs; attribute args cannot
@@ -115,9 +127,10 @@ mod progs {
     /// What this hook decides is bounded by what it can see, and the bound is
     /// enforced on the other side: `compile_kernel_rules` puts a rule here
     /// only when every one of its predicates is answerable from `comm`, the
-    /// container flag and the agent's own tgid. Rules naming a path — the §D
-    /// acceptance case among them — never reach this map and stay on the
-    /// tracepoint path, which still matches and still reports them.
+    /// container flag, the agent's own tgid and — where the loader found
+    /// `linux_binprm::filename` in this kernel's BTF — the path the exec
+    /// asked for. Everything else stays on the tracepoint path, which still
+    /// matches and still reports it.
     ///
     /// A rule of a *selected* policy also asks `ferrum_selected`, which
     /// userspace fills by resolving the selector against the same cgroup→pod
@@ -134,6 +147,7 @@ mod progs {
     /// единственное, что он меняет.
     #[repr(C)]
     struct RuleWalk {
+        path: ExecPath,
         comm: [u8; COMM_LEN],
         in_container: u8,
         agent_self: u8,
@@ -153,6 +167,7 @@ mod progs {
                 walk.in_container != 0,
                 walk.agent_self != 0,
                 walk.selected != 0,
+                &walk.path,
             );
             // "Сильнейший побеждает" той же арифметикой, что и раньше: ранги
             // 0..=4, поэтому вычитание уходит в знаковый бит ровно тогда, когда
@@ -191,6 +206,7 @@ mod progs {
         // when it cannot read the caller's name denies every exec on a kernel
         // that stops answering the helper.
         let comm = bpf_get_current_comm().unwrap_or([0u8; COMM_LEN]);
+        let bprm: *const u8 = unsafe { ctx.arg(0) };
 
         // Обход слотов отдан ядру: bpf_loop проверяется верификатором один раз,
         // сколько бы итераций ни было, а развёрнутый на месте цикл он обязан
@@ -208,12 +224,14 @@ mod progs {
         // тот же исход, что и раньше, но названный: KernelHandle сообщит отказ
         // загрузки, а трейспойнты продолжат работать.
         let mut walk = RuleWalk {
+            path: ExecPath::unknown(),
             comm,
             in_container: in_container as u8,
             agent_self: agent_self as u8,
             selected: selected as u8,
             verdict: ACTION_ALLOW,
         };
+        read_exec_path(bprm, &mut walk.path);
         unsafe {
             aya_ebpf::helpers::gen::bpf_loop(
                 MAX_KERNEL_RULES,
@@ -224,6 +242,40 @@ mod progs {
         }
         let verdict = walk.verdict;
         lsm_verdict(previous, action_refuses(verdict))
+    }
+
+    /// The path the exec was asked for, out of `bprm->filename`.
+    ///
+    /// Kernel memory, copied by `getname()` before this hook: unlike the
+    /// tracepoint's read of the user buffer, there is no second fetch here for
+    /// another thread to race. The truncation rule is the tracepoint's own —
+    /// a read that filled the buffer did not fit, a read that failed left it
+    /// empty — and both set one flag, which the matcher turns into the
+    /// fail-closed answer userspace gives the same record.
+    #[inline(always)]
+    fn read_exec_path(bprm: *const u8, path: &mut ExecPath) {
+        let offset = unsafe { core::ptr::read_volatile(&FERRUM_BPRM_FILENAME_OFF) };
+        if offset == 0 {
+            return;
+        }
+        path.flags = EXEC_PATH_KNOWN;
+        let field = unsafe { bprm.add(offset as usize) } as *const *const u8;
+        let read = match unsafe { bpf_probe_read_kernel(field) } {
+            Ok(name) => unsafe { bpf_probe_read_kernel_str_bytes(name, &mut path.bytes) }
+                .map(|bytes| bytes.len()),
+            Err(err) => Err(err),
+        };
+        match read {
+            Ok(len) if len < PATH_LEN - 1 => path.len = len as u16,
+            Ok(len) => {
+                path.len = (len & (PATH_LEN - 1)) as u16;
+                path.flags |= EXEC_PATH_TRUNCATED;
+            }
+            Err(_) => {
+                path.len = 0;
+                path.flags |= EXEC_PATH_TRUNCATED;
+            }
+        }
     }
 
     #[inline(always)]

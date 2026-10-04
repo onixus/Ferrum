@@ -92,7 +92,9 @@ pub fn republish_kernel_policy(
             KernelPublishStep::PublishSelected => {
                 handle.sync_selected_cgroups(&plan)?;
             }
-            KernelPublishStep::PublishRules => match agent.kernel_rules_for_last_good() {
+            KernelPublishStep::PublishRules => match agent
+                .kernel_rules_for_last_good_on(handle.exec_path_layout())
+            {
                 Some(set) => {
                     let installed = handle.sync_kernel_rules(&set)?;
                     agent.mark_kernel_rules_synced(&set, installed as u64);
@@ -1387,9 +1389,21 @@ impl Agent {
     /// cached copy would be the thing that goes stale across a reload, and
     /// this is called once per bundle change.
     pub fn kernel_rules_for_last_good(&self) -> Option<ferrum_ebpf::KernelRuleSet> {
+        self.kernel_rules_for_last_good_on(&ferrum_ebpf::ExecPathLayout::Known)
+    }
+
+    /// The same, for a hook that may not be able to read the exec's path:
+    /// what the agent actually publishes. Rules naming a path become
+    /// exclusions with the hook's reason on a node whose BTF did not say where
+    /// `linux_binprm::filename` is, and are counted in `kernelRulesExcluded`
+    /// rather than holding slots that decide nothing.
+    pub fn kernel_rules_for_last_good_on(
+        &self,
+        layout: &ferrum_ebpf::ExecPathLayout,
+    ) -> Option<ferrum_ebpf::KernelRuleSet> {
         self.loader
             .last_good()
-            .map(|bundle| ferrum_ebpf::compile_kernel_rules(&bundle.spec))
+            .map(|bundle| ferrum_ebpf::compile_kernel_rules_for(&bundle.spec, layout))
     }
 
     /// Record a rule set that reached the map.

@@ -58,8 +58,9 @@ mod gate {
 
     use ferrum_ebpf::{
         decode_event, plan_map_sync, syscall_name, tracepoint_syscall, tracepoints_absent_on_arch,
-        tracepoints_for_arch, Event, KernelHandle, KernelRuleSet, RingReader, SyscallArch,
-        DATAPATH_ABI, EVENT_FLAG_AGENT_SELF, EVENT_FLAG_PATH_TRUNCATED, MAP_SELECTED, PATH_LEN,
+        tracepoints_for_arch, Event, ExecPathLayout, KernelHandle, KernelRuleSet, RingReader,
+        SyscallArch, DATAPATH_ABI, EVENT_FLAG_AGENT_SELF, EVENT_FLAG_PATH_TRUNCATED, MAP_SELECTED,
+        PATH_LEN,
     };
     use ferrum_ebpf_progs::{
         KernelRule, ACTION_AUDIT, ACTION_KILL, COMM_LEN, KRULE_FLAG_SELECTED_ONLY, KRULE_FLAG_USED,
@@ -1069,6 +1070,140 @@ mod gate {
             exec_true_succeeds(),
             "execve is still refused after the rules were withdrawn"
         );
+    }
+
+    /// The path half of phase 2: a rule naming the executable's path refuses
+    /// that exec in kernel, and lets a different path through.
+    ///
+    /// Until the hook read `linux_binprm::filename` at an offset taken from
+    /// this kernel's BTF, a rule like this never reached `ferrum_rules` — it
+    /// stayed on the tracepoint path, where the exec has already happened by
+    /// the time anything is decided. Three paths and three answers, because
+    /// one answer cannot tell a working matcher from a broken one:
+    ///
+    /// * `/bin/true` against a `/true` suffix — refused;
+    /// * `/bin/false` against the same slot — runs, so the suffix is a suffix
+    ///   and not "any path";
+    /// * `/usr/bin/true` against a `/bin/` prefix on a second slot — runs,
+    ///   so the prefix is the head of the string as asked for and not of
+    ///   wherever a symlink resolves (on merged-/usr systems both are the
+    ///   same file).
+    ///
+    /// Under `FERRUM_BPF_ELF_REQUIRED` an unknown layout is a failure, not a
+    /// skip: the stage that sets it claims to have measured this.
+    #[test]
+    fn a_path_rule_refuses_the_exec_it_names_and_no_other() {
+        let _serial = serialized();
+        let Some(mut live) = live() else {
+            return;
+        };
+        if !live.handle.is_lsm_attached() {
+            let why = live
+                .handle
+                .lsm_unattached_reason()
+                .unwrap_or("no reason recorded");
+            if required() {
+                panic!("FERRUM_BPF_ELF_REQUIRED is set and the LSM hook is not attached: {why}");
+            }
+            println!("skipping: no prevention to measure here: {why}");
+            return;
+        }
+        if let ExecPathLayout::Unknown(why) = live.handle.exec_path_layout() {
+            if required() {
+                panic!(
+                    "FERRUM_BPF_ELF_REQUIRED is set and the hook does not know where the exec \
+                     path is on this kernel, so no path rule was tested: {why}"
+                );
+            }
+            println!("skipping: exec path layout unknown here: {why}");
+            return;
+        }
+        let cgroup = own_cgroup_id(&mut live);
+        let handle = &mut live.handle;
+
+        let own_comm =
+            std::fs::read_to_string("/proc/thread-self/comm").expect("read /proc/thread-self/comm");
+        let mut by_suffix = refusing_set(own_comm.trim(), true);
+        let mut by_prefix = by_suffix.rules[0];
+        by_suffix.rules[0].set_suffix(b"/true");
+        by_prefix.set_prefix(b"/bin/");
+        // The prefix slot alone would refuse /bin/false too; it is only here
+        // for /usr/bin/true, so it is published on its own below.
+        handle
+            .sync_kernel_rules(&by_suffix)
+            .expect("publish the suffix rule");
+
+        let want: std::collections::BTreeSet<u64> = [cgroup].into_iter().collect();
+        let plan = plan_map_sync(handle.selected_cgroups(), &want, MAP_SELECTED)
+            .expect("a one-entry selected set fits");
+        handle
+            .sync_selected_cgroups(&plan)
+            .expect("publish the selected set");
+
+        let refused = !exec_succeeds("/bin/true");
+        let other_ran = exec_succeeds_status("/bin/false") == Some(1);
+
+        let mut prefix_set = by_suffix.clone();
+        prefix_set.rules = vec![by_prefix];
+        handle
+            .sync_kernel_rules(&prefix_set)
+            .expect("publish the prefix rule");
+        let usr_ran =
+            !std::path::Path::new("/usr/bin/true").exists() || exec_succeeds("/usr/bin/true");
+        let bin_refused = !exec_succeeds("/bin/true");
+
+        handle.clear_kernel_rules().expect("clear ferrum_rules");
+        let after = exec_succeeds("/bin/true");
+
+        assert!(
+            refused,
+            "execve(/bin/true) ran under a slot refusing the suffix /true: the hook does not read \
+             the path, or reads it from the wrong place"
+        );
+        assert!(
+            other_ran,
+            "execve(/bin/false) was refused by a slot naming only /true: the suffix is not \
+             being compared"
+        );
+        assert!(
+            bin_refused,
+            "execve(/bin/true) ran under a slot refusing the prefix /bin/"
+        );
+        assert!(
+            usr_ran,
+            "execve(/usr/bin/true) was refused by a /bin/ prefix: the hook matched something \
+             other than the string the exec asked for"
+        );
+        assert!(
+            after,
+            "execve is still refused after the rules were withdrawn"
+        );
+    }
+
+    fn exec_succeeds(path: &str) -> bool {
+        exec_succeeds_status(path) == Some(0)
+    }
+
+    /// The child's exit status after `execve(path)`, or `None` when the exec
+    /// itself failed (the child exits 42 then, which no tool here returns).
+    fn exec_succeeds_status(path: &str) -> Option<i32> {
+        let c_path = CString::new(path).expect("no NUL");
+        let argv = [c_path.as_ptr(), std::ptr::null()];
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::execv(c_path.as_ptr(), argv.as_ptr());
+                libc::_exit(42);
+            }
+        }
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "waitpid did not reap the child");
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) == 42 {
+            return None;
+        }
+        Some(libc::WEXITSTATUS(status))
     }
 
     /// `fork` + `execve(/bin/true)`, and whether the child got to run.
