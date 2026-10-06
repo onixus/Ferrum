@@ -541,7 +541,7 @@ namespace: датапейс пишет pid из init-namespace, тесты св�
 
 | Сигнал | Метка | Исполняется |
 |---|---|---|
-| `DEG_LSM_FALLBACK` — после попытки attach активен только tracepoint: нет синхронного предотвращения; причина уходит в метрики и контекст событий, снимается после успешного LSM attach | U | U `metrics_gate.rs::tracepoint_fallback_is_degraded_in_metrics_and_event_context_until_lsm_recovers` |
+| `DEG_LSM_FALLBACK` — после попытки attach активен только tracepoint: нет синхронного предотвращения; причина уходит в метрики и контекст событий, снимается после успешного LSM attach | U | U `metrics_gate.rs::tracepoint_fallback_is_degraded_in_metrics_and_event_context_until_lsm_recovers` · U `event_contract_gate.rs::lsm_fallback_and_recovery_reach_serialized_enforcement_events` |
 | `DEG_CONTROL_PLANE_DOWN` — CP недоступен, работает last-known-good | U | U `acceptance.rs::cp_down_keeps_last_known_good_not_fail_open` |
 | `DEG_LOADER` — bundle не загружен, ABI или подпись | U | U `ferrum-agent/src/lib.rs::abi_too_new_is_degraded` |
 | `DEG_NOT_ATTACHED` — attach не живой, решающий путь ничем не питается | U | U `ferrum-agent/src/lib.rs::attach_pins_does_not_pretend` |

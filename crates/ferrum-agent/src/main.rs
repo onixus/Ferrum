@@ -515,6 +515,9 @@ fn run(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .set_attached(true);
+    if let Some(reason) = handle.lsm_unattached_reason() {
+        eprintln!("ferrum-agent: {}: {reason}", ferrum_agent::DEG_LSM_FALLBACK);
+    }
     // Actual attachment decides the mode; tracepoint fallback remains active
     // but must be visible as lost synchronous prevention.
     agent

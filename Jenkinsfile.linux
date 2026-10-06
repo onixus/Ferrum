@@ -153,6 +153,7 @@ pipeline {
                             export CARGO_HOME="$WORKSPACE/.cargo-home"
                             export CARGO_TARGET_DIR="$WORKSPACE/.cargo-clippy-target"
                             cargo fmt --all -- --check
+                            cargo clippy -p ferrum-ebpf --features attach --all-targets -- -D warnings
                             cargo clippy -p ferrum-agent --features attach,apiserver --all-targets -- -D warnings
                             cargo clippy -p ferrum-testkit --all-targets -- -D warnings
                         '''
@@ -166,6 +167,17 @@ pipeline {
                             export CARGO_HOME="$WORKSPACE/.cargo-home"
                             export CARGO_TARGET_DIR="$WORKSPACE/.cargo-target"
                             cargo test -p ferrum-testkit --test metrics_gate
+                        '''
+                    }
+                }
+
+                stage('Security: event contract') {
+                    steps {
+                        sh '''
+                            set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-home"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-target"
+                            cargo test -p ferrum-testkit --test event_contract_gate
                         '''
                     }
                 }
@@ -207,6 +219,20 @@ pipeline {
                             git checkout -q -f --detach FETCH_HEAD
                             test "$(git rev-parse HEAD)" = "$FERRUM_CI_COMMIT"
                             git log --oneline -1
+                        '''
+                    }
+                }
+
+                stage('Security: alert rules') {
+                    steps {
+                        sh '''
+                            set -eu
+                            docker run --rm -v "$PWD/deploy/observability:/rules:ro,z" \
+                                --entrypoint promtool prom/prometheus:v2.54.1 \
+                                check rules /rules/prometheus-alerts.yaml
+                            docker run --rm -v "$PWD/deploy/observability:/rules:ro,z" \
+                                --entrypoint promtool prom/prometheus:v2.54.1 \
+                                test rules /rules/prometheus-alerts-test.yaml
                         '''
                     }
                 }

@@ -1402,3 +1402,31 @@ fn the_shipped_overlay_configures_the_sink_with_flags_the_binary_parses() {
          is one nobody takes"
     );
 }
+
+#[test]
+fn lsm_fallback_and_recovery_reach_serialized_enforcement_events() {
+    let agent = ferrum_agent::Agent::new(ferrum_agent::AgentConfig::default());
+    let ctx = SinkContext::new("node-fallback", "observe");
+    let mut publisher = ferrum_agent::StatusPublisher::default();
+    agent.set_attached(true);
+    for attached in [false, true] {
+        agent.set_lsm_attached(attached);
+        publisher.tick(
+            &agent,
+            &ferrum_agent::StatusOutput {
+                ctx: Some(&ctx),
+                sink: None,
+                status_dir: None,
+            },
+        );
+        let wire = serde_json::to_vec(&ctx.envelope(&sample_event())).expect("serialize event");
+        let event: EventEnvelope = serde_json::from_slice(&wire).expect("decode event");
+        assert_eq!(
+            event.degraded_reasons.contains(&"lsm_fallback".into()),
+            !attached
+        );
+        if !attached {
+            assert!(event.degraded);
+        }
+    }
+}
