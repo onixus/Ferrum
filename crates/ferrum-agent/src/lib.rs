@@ -2855,6 +2855,15 @@ pub fn poll_bundle_shared(
     }
 }
 
+/// Publish the completed attach outcome before any event consumer starts.
+/// Only updates in-memory reporting state; no filesystem work delays the ring.
+pub fn publish_attachment_state(agent: &Agent, lsm_attached: bool, out: &StatusOutput<'_>) {
+    agent.set_attached(true);
+    agent.set_lsm_attached(lsm_attached);
+    let state = agent.degraded_snapshot_at(Instant::now());
+    status::update_event_context(agent, out.ctx, &state);
+}
+
 /// The state-publish half of a poll tick, for a caller with no bundle to
 /// watch: an agent that never reloads must still say what it is, and must
 /// still notice that its exports are being lost.

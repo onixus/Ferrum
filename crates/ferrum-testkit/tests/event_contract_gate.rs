@@ -1407,18 +1407,17 @@ fn the_shipped_overlay_configures_the_sink_with_flags_the_binary_parses() {
 fn lsm_fallback_and_recovery_reach_serialized_enforcement_events() {
     let agent = ferrum_agent::Agent::new(ferrum_agent::AgentConfig::default());
     let ctx = SinkContext::new("node-fallback", "observe");
-    let mut publisher = ferrum_agent::StatusPublisher::default();
-    agent.set_attached(true);
     for attached in [false, true] {
-        agent.set_lsm_attached(attached);
-        publisher.tick(
+        ferrum_agent::publish_attachment_state(
             &agent,
+            attached,
             &ferrum_agent::StatusOutput {
                 ctx: Some(&ctx),
                 sink: None,
                 status_dir: None,
             },
         );
+        // No periodic tick: the first event must carry the attach outcome.
         let wire = serde_json::to_vec(&ctx.envelope(&sample_event())).expect("serialize event");
         let event: EventEnvelope = serde_json::from_slice(&wire).expect("decode event");
         assert_eq!(
@@ -1428,5 +1427,12 @@ fn lsm_fallback_and_recovery_reach_serialized_enforcement_events() {
         if !attached {
             assert!(event.degraded);
         }
+        assert!(
+            agent
+                .degraded_state_at(std::time::Instant::now())
+                .transition
+                .is_some(),
+            "startup publication consumed the transition owed to the periodic publisher"
+        );
     }
 }

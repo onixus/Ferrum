@@ -83,14 +83,11 @@ pipeline {
     }
 
     stages {
-        // Существует ради триггера, а не ради работы. Опрос SCM берёт источники
-        // из последнего билда: без единого зарегистрированного источника джоба
-        // не опрашивается вовсе ("Done. Took 0 ms / No changes") и не строится
-        // сама никогда. Здесь checkout идёт по SCM джобы — mac-путь, который
-        // контроллер видит, — и `agent any` остаётся на контроллере, потому что
-        // linux-ноды в режиме EXCLUSIVE и берут только явную метку.
+        // Only registers the local SCM and resolves its immutable revision.
+        // The controller has no executors; all workers are EXCLUSIVE, so
+        // `agent any` never schedules. Only this Mac worker sees the SCM path.
         stage('Триггер (контроллер)') {
-            agent any
+            agent { label 'macos-arm64' }
             steps {
                 script {
                     def checkedOut = checkout scm

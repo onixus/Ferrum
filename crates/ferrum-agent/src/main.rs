@@ -511,19 +511,15 @@ fn run(
             exit(2);
         }
     };
-    agent
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .set_attached(true);
     if let Some(reason) = handle.lsm_unattached_reason() {
         eprintln!("ferrum-agent: {}: {reason}", ferrum_agent::DEG_LSM_FALLBACK);
     }
-    // Actual attachment decides the mode; tracepoint fallback remains active
-    // but must be visible as lost synchronous prevention.
-    agent
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .set_lsm_attached(handle.is_lsm_attached());
+    // Events can arrive before the first periodic status tick.
+    ferrum_agent::publish_attachment_state(
+        &agent.read().unwrap_or_else(|e| e.into_inner()),
+        handle.is_lsm_attached(),
+        &out,
+    );
 
     // Bounded: a full channel backpressures the reader, and the kernel drops
     // (counted in events_dropped_total) instead of userspace growing without
