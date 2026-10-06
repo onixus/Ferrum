@@ -92,7 +92,14 @@ pipeline {
         stage('Триггер (контроллер)') {
             agent any
             steps {
-                checkout scm
+                script {
+                    def checkedOut = checkout scm
+                    env.FERRUM_CI_COMMIT = checkedOut.GIT_COMMIT
+                    if (!(env.FERRUM_CI_COMMIT ==~ /[0-9a-f]{40}/)) {
+                        error('SCM did not provide an immutable commit')
+                    }
+                    echo "Linux validation commit: ${env.FERRUM_CI_COMMIT}"
+                }
             }
         }
 
@@ -122,8 +129,9 @@ pipeline {
                         sh '''
                             set -eu
                             git init -q .
-                            git fetch -q --depth 1 /srv/ferrum.git main
-                            git checkout -q -f FETCH_HEAD
+                            git fetch -q --depth 1 /srv/ferrum.git "$FERRUM_CI_COMMIT"
+                            git checkout -q -f --detach FETCH_HEAD
+                            test "$(git rev-parse HEAD)" = "$FERRUM_CI_COMMIT"
                             git log --oneline -1
                         '''
                         sh '''
@@ -138,6 +146,30 @@ pipeline {
                 // Те же две строки, что и в основном Jenkinsfile: --workspace идёт
                 // на дефолтных фичах, а каждая продовая фича в этом дереве по
                 // умолчанию выключена, поэтому apiserver нужен отдельным прогоном.
+                stage('Format and Clippy') {
+                    steps {
+                        sh '''
+                            set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-home"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-clippy-target"
+                            cargo fmt --all -- --check
+                            cargo clippy -p ferrum-agent --features attach,apiserver --all-targets -- -D warnings
+                            cargo clippy -p ferrum-testkit --all-targets -- -D warnings
+                        '''
+                    }
+                }
+
+                stage('Security: metrics contract') {
+                    steps {
+                        sh '''
+                            set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-home"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-target"
+                            cargo test -p ferrum-testkit --test metrics_gate
+                        '''
+                    }
+                }
+
                 stage('cargo test') {
                     steps {
                         sh '''
@@ -171,8 +203,9 @@ pipeline {
                         sh '''
                             set -eu
                             git init -q .
-                            git fetch -q --depth 1 /home/onixus/Git/Ferrum.git main
-                            git checkout -q -f FETCH_HEAD
+                            git fetch -q --depth 1 /home/onixus/Git/Ferrum.git "$FERRUM_CI_COMMIT"
+                            git checkout -q -f --detach FETCH_HEAD
+                            test "$(git rev-parse HEAD)" = "$FERRUM_CI_COMMIT"
                             git log --oneline -1
                         '''
                     }

@@ -515,11 +515,8 @@ fn run(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .set_attached(true);
-    // Published whichever way it went. False is the ordinary answer — a kernel
-    // without CONFIG_BPF_LSM is most of the fleet — and it has to be readable
-    // as an answer rather than as an absent series, because "does this node
-    // prevent or only detect" is the first question after an exec that should
-    // not have happened.
+    // Actual attachment decides the mode; tracepoint fallback remains active
+    // but must be visible as lost synchronous prevention.
     agent
         .read()
         .unwrap_or_else(|e| e.into_inner())

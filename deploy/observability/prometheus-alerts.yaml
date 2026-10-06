@@ -53,7 +53,7 @@ groups:
   - name: ferrum-agent
     rules:
       # One rule, one series per raised reason, and the id is in the label: the
-      # page says which of thirty-one states the node is in without the alert
+      # page says which of known states the node is in without the alert
       # having to restate any of them.
       #
       # `not_attached` and `respond_no_host_pidns` are left out by name. Both
@@ -70,7 +70,7 @@ groups:
       # with each one.
       - alert: FerrumAgentDegraded
         expr: |
-          ferrum_agent_degraded_reason{reason=~"bundle_unreadable|cgroup_index_empty|clock_floor_unpersisted|clock_rollback|container_flag_disagreement|container_map_not_ready|control_plane_down|export_dead|export_lossy|kernel_rules_unsynced|labels_unknown|lkg_partial|loader_degraded|respond_signal_failing|ring_drops|status_unwritable|waivers_dropped|waivers_unjoined"} == 1
+          ferrum_agent_degraded_reason{reason=~"bundle_unreadable|cgroup_index_empty|clock_floor_unpersisted|clock_rollback|container_flag_disagreement|container_map_not_ready|control_plane_down|export_dead|export_lossy|kernel_rules_unsynced|lsm_fallback|labels_unknown|lkg_partial|loader_degraded|respond_signal_failing|ring_drops|status_unwritable|waivers_dropped|waivers_unjoined"} == 1
         for: 15m
         labels:
           severity: warning

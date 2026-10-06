@@ -41,6 +41,30 @@ tests:
                 идёт.
               runbook: 'docs/runbooks/README.md#3-runbook-агент-degraded'
 
+  - interval: 1m
+    input_series:
+      - series: 'ferrum_agent_degraded_reason{reason="lsm_fallback",instance="node-a:9102"}'
+        values: '1+0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FerrumAgentDegraded
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: FerrumAgentDegraded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: lsm_fallback
+              instance: node-a:9102
+            exp_annotations:
+              summary: 'узел node-a:9102 деградирован: lsm_fallback'
+              description: >-
+                Причина держится пятнадцать минут и сама не ушла. Что она значит и
+                что с ней делать — таблица в runbook §3 по этому же id; полный
+                текст причины лежит в status.json на узле, наружу он намеренно не
+                идёт.
+              runbook: 'docs/runbooks/README.md#3-runbook-агент-degraded'
+
   # The two reasons a default install raises by construction never page, no
   # matter how long they stand. This is the case that keeps the rule readable:
   # a fleet on the shipped DaemonSet has both of these on every node.
@@ -56,7 +80,7 @@ tests:
         exp_alerts: []
 
   # A reason that is published as 0 — which is every reason on every scrape —
-  # is not a raised reason. The family emits all thirty-one ids always, so a
+  # is not a raised reason. The family emits all known ids always, so a
   # rule matching on presence instead of on value would page on a healthy node.
   - interval: 1m
     input_series:

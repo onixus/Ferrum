@@ -1006,6 +1006,7 @@ fn known_constants() -> Vec<(&'static str, &'static str)> {
         ("DEG_EXPORT_LOSSY", DEG_EXPORT_LOSSY),
         ("DEG_IDENTITY_UNKNOWN", DEG_IDENTITY_UNKNOWN),
         ("DEG_KERNEL_RULES_UNSYNCED", DEG_KERNEL_RULES_UNSYNCED),
+        ("DEG_LSM_FALLBACK", DEG_LSM_FALLBACK),
         ("DEG_LABELS_UNKNOWN", DEG_LABELS_UNKNOWN),
         ("DEG_LKG_PARTIAL", DEG_LKG_PARTIAL),
         ("DEG_LOADER", DEG_LOADER),
@@ -1552,4 +1553,51 @@ fn the_anchor_reader_keeps_cyrillic_and_drops_punctuation() {
         want.insert("b".to_string());
         want
     });
+}
+
+#[test]
+fn tracepoint_fallback_is_degraded_in_metrics_and_event_context_until_lsm_recovers() {
+    use ferrum_agent::{Agent, AgentConfig, StatusOutput, StatusPublisher, DEG_LSM_FALLBACK};
+    use ferrum_export::SinkContext;
+
+    let agent = Agent::new(AgentConfig::default());
+    let ctx = SinkContext::new("fallback-node", "observe");
+    let out = StatusOutput {
+        ctx: Some(&ctx),
+        sink: None,
+        status_dir: None,
+    };
+    let mut publisher = StatusPublisher::default();
+    assert!(!agent
+        .degraded_snapshot_at(std::time::Instant::now())
+        .reasons
+        .contains(&DEG_LSM_FALLBACK.into()));
+    agent.set_attached(true);
+    for (lsm, expected) in [(false, true), (true, false), (false, true)] {
+        agent.set_lsm_attached(lsm);
+        let tick = publisher.tick(&agent, &out);
+        assert_eq!(
+            tick.state.reasons.contains(&DEG_LSM_FALLBACK.into()),
+            expected
+        );
+        assert_eq!(
+            ctx.degraded_reasons().contains(&"lsm_fallback".into()),
+            expected
+        );
+        let text = ferrum_agent::metrics_text(&agent, Some(&ctx), None, &tick.state);
+        assert!(
+            text.contains(&format!(
+                "ferrum_agent_degraded_reason{{reason=\"lsm_fallback\"}} {}",
+                u8::from(expected)
+            )),
+            "{text}"
+        );
+        assert!(
+            agent.pins_attached(),
+            "fallback must retain tracepoint attachment"
+        );
+    }
+    agent.set_attached(false);
+    let tick = publisher.tick(&agent, &out);
+    assert!(!tick.state.reasons.contains(&DEG_LSM_FALLBACK.into()));
 }
