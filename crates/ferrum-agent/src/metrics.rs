@@ -148,7 +148,7 @@ pub enum Disposition {
 ///
 /// Matched by prefix, longest first: `DEG_CONTAINER_MAP` and several others
 /// reach `degraded_reasons_at` with a fault text appended.
-pub const DEGRADED_REASON_IDS: [(&str, &str); 31] = [
+pub const DEGRADED_REASON_IDS: [(&str, &str); 32] = [
     (crate::CGROUP_ROOT_UNDERIVABLE, "cgroup_root_underivable"),
     (crate::DATAPATH_ABI_MISMATCH, "datapath_abi_mismatch"),
     (crate::DATAPATH_UNDECODABLE, "datapath_undecodable"),
@@ -171,6 +171,7 @@ pub const DEGRADED_REASON_IDS: [(&str, &str); 31] = [
     (crate::DEG_LABELS_UNKNOWN, "labels_unknown"),
     (crate::DEG_LKG_PARTIAL, "lkg_partial"),
     (crate::DEG_LOADER, "loader_degraded"),
+    (crate::DEG_LSM_FALLBACK, "lsm_fallback"),
     (crate::DEG_NOT_ATTACHED, "not_attached"),
     (crate::DEG_PATH_TRUNCATED, "path_truncated"),
     (crate::DEG_RING_DROPS, "ring_drops"),

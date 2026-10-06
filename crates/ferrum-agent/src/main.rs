@@ -511,19 +511,15 @@ fn run(
             exit(2);
         }
     };
-    agent
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .set_attached(true);
-    // Published whichever way it went. False is the ordinary answer — a kernel
-    // without CONFIG_BPF_LSM is most of the fleet — and it has to be readable
-    // as an answer rather than as an absent series, because "does this node
-    // prevent or only detect" is the first question after an exec that should
-    // not have happened.
-    agent
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .set_lsm_attached(handle.is_lsm_attached());
+    if let Some(reason) = handle.lsm_unattached_reason() {
+        eprintln!("ferrum-agent: {}: {reason}", ferrum_agent::DEG_LSM_FALLBACK);
+    }
+    // Events can arrive before the first periodic status tick.
+    ferrum_agent::publish_attachment_state(
+        &agent.read().unwrap_or_else(|e| e.into_inner()),
+        handle.is_lsm_attached(),
+        &out,
+    );
 
     // Bounded: a full channel backpressures the reader, and the kernel drops
     // (counted in events_dropped_total) instead of userspace growing without

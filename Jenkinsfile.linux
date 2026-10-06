@@ -83,16 +83,20 @@ pipeline {
     }
 
     stages {
-        // Существует ради триггера, а не ради работы. Опрос SCM берёт источники
-        // из последнего билда: без единого зарегистрированного источника джоба
-        // не опрашивается вовсе ("Done. Took 0 ms / No changes") и не строится
-        // сама никогда. Здесь checkout идёт по SCM джобы — mac-путь, который
-        // контроллер видит, — и `agent any` остаётся на контроллере, потому что
-        // linux-ноды в режиме EXCLUSIVE и берут только явную метку.
+        // Only registers the local SCM and resolves its immutable revision.
+        // The controller has no executors; all workers are EXCLUSIVE, so
+        // `agent any` never schedules. Only this Mac worker sees the SCM path.
         stage('Триггер (контроллер)') {
-            agent any
+            agent { label 'macos-arm64' }
             steps {
-                checkout scm
+                script {
+                    def checkedOut = checkout scm
+                    env.FERRUM_CI_COMMIT = checkedOut.GIT_COMMIT
+                    if (!(env.FERRUM_CI_COMMIT ==~ /[0-9a-f]{40}/)) {
+                        error('SCM did not provide an immutable commit')
+                    }
+                    echo "Linux validation commit: ${env.FERRUM_CI_COMMIT}"
+                }
             }
         }
 
@@ -122,8 +126,9 @@ pipeline {
                         sh '''
                             set -eu
                             git init -q .
-                            git fetch -q --depth 1 /srv/ferrum.git main
-                            git checkout -q -f FETCH_HEAD
+                            git fetch -q --depth 1 /srv/ferrum.git "$FERRUM_CI_COMMIT"
+                            git checkout -q -f --detach FETCH_HEAD
+                            test "$(git rev-parse HEAD)" = "$FERRUM_CI_COMMIT"
                             git log --oneline -1
                         '''
                         sh '''
@@ -138,6 +143,42 @@ pipeline {
                 // Те же две строки, что и в основном Jenkinsfile: --workspace идёт
                 // на дефолтных фичах, а каждая продовая фича в этом дереве по
                 // умолчанию выключена, поэтому apiserver нужен отдельным прогоном.
+                stage('Format and Clippy') {
+                    steps {
+                        sh '''
+                            set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-home"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-clippy-target"
+                            cargo fmt --all -- --check
+                            cargo clippy -p ferrum-ebpf --features attach --all-targets -- -D warnings
+                            cargo clippy -p ferrum-agent --features attach,apiserver --all-targets -- -D warnings
+                            cargo clippy -p ferrum-testkit --all-targets -- -D warnings
+                        '''
+                    }
+                }
+
+                stage('Security: metrics contract') {
+                    steps {
+                        sh '''
+                            set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-home"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-target"
+                            cargo test -p ferrum-testkit --test metrics_gate
+                        '''
+                    }
+                }
+
+                stage('Security: event contract') {
+                    steps {
+                        sh '''
+                            set -eu
+                            export CARGO_HOME="$WORKSPACE/.cargo-home"
+                            export CARGO_TARGET_DIR="$WORKSPACE/.cargo-target"
+                            cargo test -p ferrum-testkit --test event_contract_gate
+                        '''
+                    }
+                }
+
                 stage('cargo test') {
                     steps {
                         sh '''
@@ -171,9 +212,24 @@ pipeline {
                         sh '''
                             set -eu
                             git init -q .
-                            git fetch -q --depth 1 /home/onixus/Git/Ferrum.git main
-                            git checkout -q -f FETCH_HEAD
+                            git fetch -q --depth 1 /home/onixus/Git/Ferrum.git "$FERRUM_CI_COMMIT"
+                            git checkout -q -f --detach FETCH_HEAD
+                            test "$(git rev-parse HEAD)" = "$FERRUM_CI_COMMIT"
                             git log --oneline -1
+                        '''
+                    }
+                }
+
+                stage('Security: alert rules') {
+                    steps {
+                        sh '''
+                            set -eu
+                            docker run --rm -v "$PWD/deploy/observability:/rules:ro,z" \
+                                --entrypoint promtool prom/prometheus:v2.54.1 \
+                                check rules /rules/prometheus-alerts.yaml
+                            docker run --rm -v "$PWD/deploy/observability:/rules:ro,z" \
+                                --entrypoint promtool prom/prometheus:v2.54.1 \
+                                test rules /rules/prometheus-alerts-test.yaml
                         '''
                     }
                 }

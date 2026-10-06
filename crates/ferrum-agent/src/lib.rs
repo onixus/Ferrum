@@ -416,6 +416,9 @@ pub const DEG_KERNEL_RULES_UNSYNCED: &str =
     "kernel rule set unpublished: ferrum_rules was cleared, so this node prevents nothing in \
      kernel and keeps detecting";
 
+pub const DEG_LSM_FALLBACK: &str =
+    "BPF LSM unavailable: tracepoint detection remains active without synchronous prevention";
+
 pub const DEG_CONTAINER_MAP: &str =
     "container map not ready: EVENT_FLAG_CONTAINER cannot be trusted, so containerOnly rules miss";
 pub const DEG_EXPORT_DEAD: &str = "export writer dead: enforcement runs and nothing records it";
@@ -742,6 +745,8 @@ pub struct Agent {
     /// Whether this node's datapath has BPF LSM programs attached. False on a
     /// kernel without `CONFIG_BPF_LSM` and on every build that never asked.
     lsm_attached: AtomicBool,
+    /// Set only after the carrier has attempted LSM attachment.
+    lsm_fallback: AtomicBool,
     /// Slots this node published into `ferrum_rules`, and rules that stayed on
     /// the tracepoint path because the kernel cannot decide them.
     ///
@@ -899,6 +904,7 @@ impl Agent {
             container_map_error: Mutex::new(None),
             container_flag_disagreement: AtomicU64::new(0),
             lsm_attached: AtomicBool::new(false),
+            lsm_fallback: AtomicBool::new(false),
             kernel_rules_installed: AtomicU64::new(0),
             kernel_rules_excluded: AtomicU64::new(0),
             selected_cgroups: AtomicU64::new(0),
@@ -964,6 +970,9 @@ impl Agent {
         }
         if !self.pins_attached() {
             out.push(DEG_NOT_ATTACHED.to_string());
+        }
+        if self.pins_attached() && self.lsm_fallback.load(Ordering::Relaxed) {
+            out.push(DEG_LSM_FALLBACK.to_string());
         }
         if self.datapath_degraded.load(Ordering::Relaxed) {
             out.push(DEG_DATAPATH.to_string());
@@ -1322,6 +1331,7 @@ impl Agent {
 
     pub fn set_lsm_attached(&self, attached: bool) {
         self.lsm_attached.store(attached, Ordering::Relaxed);
+        self.lsm_fallback.store(!attached, Ordering::Relaxed);
     }
 
     pub fn kernel_rules_installed(&self) -> u64 {
@@ -2843,6 +2853,15 @@ pub fn poll_bundle_shared(
             .unwrap_or_else(|e| e.into_inner())
             .note_status_write(ok);
     }
+}
+
+/// Publish the completed attach outcome before any event consumer starts.
+/// Only updates in-memory reporting state; no filesystem work delays the ring.
+pub fn publish_attachment_state(agent: &Agent, lsm_attached: bool, out: &StatusOutput<'_>) {
+    agent.set_attached(true);
+    agent.set_lsm_attached(lsm_attached);
+    let state = agent.degraded_snapshot_at(Instant::now());
+    status::update_event_context(agent, out.ctx, &state);
 }
 
 /// The state-publish half of a poll tick, for a caller with no bundle to
@@ -7843,11 +7862,9 @@ mod tests {
         const COUNTERS_WITHOUT_A_REASON: [(&str, &str); 25] = [
             (
                 "lsm_attached",
-                "not a count and not a fault in either direction: a kernel without CONFIG_BPF_LSM \
-                 is the supported majority of the fleet, and a node that runs the tracepoint path \
-                 alone is doing what this product has always done. What would be a fault is the \
-                 rule set failing to reach a node that *is* attached, and that has its own reason \
-                 — `DEG_KERNEL_RULES_UNSYNCED`, raised from `kernel_rules_unsynced`.",
+                "capability gauge mirrored by `lsm_fallback` after the carrier attempts attachment. \
+                 The latter distinguishes an attempted tracepoint fallback from a process that \
+                 never attached, and raises `DEG_LSM_FALLBACK` while tracepoints remain active.",
             ),
             (
                 "selected_cgroups",

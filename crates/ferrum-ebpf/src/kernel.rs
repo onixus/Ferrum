@@ -702,7 +702,7 @@ impl KernelHandle {
             }
         } else {
             lsm_unattached = Some(format!(
-                "this kernel reports no BPF LSM: {LSM_PATH} does not list `bpf` and                  {BTF_VMLINUX_PATH} is absent"
+                "BPF LSM was not detected: inspect {LSM_PATH} for active `bpf` and {BTF_VMLINUX_PATH} for kernel type information"
             ));
         }
         Ok(Self {
