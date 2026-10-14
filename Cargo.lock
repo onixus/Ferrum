@@ -639,7 +639,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
 ]
 
 [[package]]
@@ -662,7 +662,7 @@ dependencies = [
  "ferrum-testkit",
  "libc",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
 ]
 
 [[package]]
@@ -673,7 +673,7 @@ dependencies = [
  "ferrum-ids",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
 ]
 
 [[package]]
@@ -704,7 +704,7 @@ dependencies = [
  "ferrum-testkit",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
 ]
 
 [[package]]
@@ -725,7 +725,7 @@ dependencies = [
  "ferrum-ids",
  "ferrum-policy",
  "ferrum-wasm-abi",
- "serde_yaml",
+ "serde_norway",
 ]
 
 [[package]]
@@ -748,7 +748,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
  "tokio",
  "zeroize",
 ]
@@ -827,7 +827,7 @@ dependencies = [
  "ferrum-api",
  "ferrum-common",
  "ferrum-ids",
- "serde_yaml",
+ "serde_norway",
  "thiserror 2.0.20",
 ]
 
@@ -876,7 +876,7 @@ dependencies = [
  "ferrum-siem",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
 ]
 
 [[package]]
@@ -1363,8 +1363,6 @@ dependencies = [
 [[package]]
 name = "kube-client"
 version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cb276b85b6e94ded00ac8ea2c68fcf4697ea0553cb25fddc35d4a0ab718db8d"
 dependencies = [
  "base64",
  "bytes",
@@ -1388,7 +1386,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "serde_yaml",
+ "serde_norway",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
@@ -1995,16 +1993,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
+name = "serde_norway"
+version = "0.9.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+checksum = "e408f29489b5fd500fab51ff1484fc859bb655f32c671f307dcd733b72e8168c"
 dependencies = [
  "indexmap",
  "itoa",
  "ryu",
  "serde",
- "unsafe-libyaml",
+ "unsafe-libyaml-norway",
 ]
 
 [[package]]
@@ -2344,10 +2342,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
+name = "unsafe-libyaml-norway"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "untrusted"
