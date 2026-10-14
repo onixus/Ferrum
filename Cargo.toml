@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/kube-client"]
 resolver = "2"
 members = [
     "crates/ferrum-common",
@@ -73,7 +74,7 @@ kube = { version = "1", default-features = false, features = ["client", "runtime
 zeroize = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_yaml = { package = "serde_norway", version = "0.9.42" }
 sha2 = "0.10"
 thiserror = "2"
 # PEM + webpki only, ring backend, no openssl-sys (deny.toml).
@@ -88,3 +89,6 @@ rustls-pki-types = "1"
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"
+
+[patch.crates-io]
+kube-client = { path = "vendor/kube-client" }

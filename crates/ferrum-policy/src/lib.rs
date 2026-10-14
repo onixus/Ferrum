@@ -1272,3 +1272,15 @@ mod tests {
         assert!(validate_exception(&obj.spec).is_err());
     }
 }
+
+#[cfg(test)]
+#[test]
+fn maintained_yaml_parser_preserves_policy_roundtrip_and_rejects_duplicates() {
+    let raw = include_str!("../../../policies/examples/prod-restricted.yaml");
+    let original: serde_yaml::Value = serde_yaml::from_str(raw).expect("production policy");
+    let encoded = serde_yaml::to_string(&original).expect("serialize production policy");
+    let decoded: serde_yaml::Value =
+        serde_yaml::from_str(&encoded).expect("parse production policy");
+    assert_eq!(original, decoded);
+    assert!(serde_yaml::from_str::<serde_yaml::Value>("mode: enforce\nmode: audit\n").is_err());
+}

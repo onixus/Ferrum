@@ -2,11 +2,20 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "pattern": "^1\\.0$",
+      "pattern": "^1\\.0$(?![\\s\\S])",
       "title": "Schema Version",
       "type": "string"
     },
     "product_id": {
+      "enum": [
+        "shapoclyack",
+        "lariska",
+        "ferrum",
+        "bsdm-proxy",
+        "oko-ra",
+        "pulse",
+        "asmodeus"
+      ],
       "title": "Product Id",
       "type": "string"
     },
@@ -23,7 +32,8 @@
     "installation_guide": {
       "anyOf": [
         {
-          "type": "string"
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/]+(?:/[^/]+)*$"
         },
         {
           "type": "null"
@@ -35,7 +45,8 @@
     "compose_file": {
       "anyOf": [
         {
-          "type": "string"
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/]+(?:/[^/]+)*$"
         },
         {
           "type": "null"
@@ -46,7 +57,8 @@
     },
     "required_environment": {
       "items": {
-        "type": "string"
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]*$(?![\\s\\S])"
       },
       "title": "Required Environment",
       "type": "array"
@@ -54,17 +66,19 @@
     "gateway_url_variable": {
       "default": "APEX_GATEWAY_URL",
       "title": "Gateway Url Variable",
-      "type": "string"
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]*$(?![\\s\\S])"
     },
     "service_url_variable": {
       "default": "APEX_SERVICE_URL",
       "title": "Service Url Variable",
-      "type": "string"
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]*$(?![\\s\\S])"
     },
     "health_service": {
       "anyOf": [
         {
-          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]*$(?![\\s\\S])",
           "type": "string"
         },
         {
@@ -85,5 +99,46 @@
     "product_id"
   ],
   "title": "DeploymentManifest",
-  "type": "object"
+  "type": "object",
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "deployment_mode"
+        ],
+        "properties": {
+          "deployment_mode": {
+            "enum": [
+              "native",
+              "kubernetes"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "installation_guide"
+        ],
+        "properties": {
+          "installation_guide": {
+            "type": "string"
+          }
+        }
+      },
+      "else": {
+        "required": [
+          "compose_file",
+          "health_service"
+        ],
+        "properties": {
+          "compose_file": {
+            "type": "string"
+          },
+          "health_service": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
 }

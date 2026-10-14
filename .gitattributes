@@ -1,0 +1,3 @@
+
+# Preserve byte-identical upstream vendored source, including YAML test whitespace.
+vendor/kube-client/** -whitespace
