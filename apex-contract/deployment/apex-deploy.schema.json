@@ -1,0 +1,89 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "pattern": "^1\\.0$",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "product_id": {
+      "title": "Product Id",
+      "type": "string"
+    },
+    "deployment_mode": {
+      "default": "docker",
+      "enum": [
+        "docker",
+        "native",
+        "kubernetes"
+      ],
+      "title": "Deployment Mode",
+      "type": "string"
+    },
+    "installation_guide": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Installation Guide"
+    },
+    "compose_file": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Compose File"
+    },
+    "required_environment": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Required Environment",
+      "type": "array"
+    },
+    "gateway_url_variable": {
+      "default": "APEX_GATEWAY_URL",
+      "title": "Gateway Url Variable",
+      "type": "string"
+    },
+    "service_url_variable": {
+      "default": "APEX_SERVICE_URL",
+      "title": "Service Url Variable",
+      "type": "string"
+    },
+    "health_service": {
+      "anyOf": [
+        {
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]*$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Health Service"
+    },
+    "notes": {
+      "default": "",
+      "title": "Notes",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "product_id"
+  ],
+  "title": "DeploymentManifest",
+  "type": "object"
+}

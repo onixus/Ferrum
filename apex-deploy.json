@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "product_id": "ferrum",
+  "deployment_mode": "kubernetes",
+  "required_environment": [
+    "KUBECONFIG",
+    "FERRUM_NAMESPACE"
+  ],
+  "gateway_url_variable": "APEX_GATEWAY_URL",
+  "service_url_variable": "APEX_SERVICE_URL",
+  "installation_guide": "docs/runbooks/README.md"
+}
