@@ -110,6 +110,133 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+// ---- MITRE ATT&CK mapping (issue #43) -------------------------------------
+//
+// Машинночитаемый маппинг политик в техники ATT&CK — офлайн-артефакт, не CRD
+// (EnforcementEvent не CRD по той же причине). Его честность держится одной
+// проверкой: каждая ссылка манифеста обязана разрешаться в настоящий id
+// правила или в настоящее непустое поле поставляемого примера политики.
+// Маппинг, ссылающийся на несуществующее правило, — та же завышенная строка
+// в таблице соответствия, только в YAML.
+
+const MITRE_MAPPING_YAML: &str = include_str!("../../../policies/mapping/mitre-attack-mapping.yaml");
+
+#[derive(Debug, Deserialize)]
+struct MitreMappingManifest {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u32,
+    mappings: Vec<MitreMappingEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MitreMappingEntry {
+    technique: String,
+    refs: Vec<MitreMappingRef>,
+    limits: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MitreMappingRef {
+    kind: String,
+    path: String,
+}
+
+/// Поля spec ClusterSecurityPolicy, какие есть в дереве типов, а не в памяти
+/// автора манифеста: сериализация настоящего типа, затем обход по точкам.
+/// `deny.hostPID`/`hostIPC` названы так, как их печатает serde (rename), —
+/// сверка идёт по выводу самого типа, прецедент event_contract_gate.
+fn cluster_policy_field_paths(spec: &ClusterSecurityPolicy) -> Vec<String> {
+    let value: serde_json::Value =
+        serde_json::to_value(&spec.spec).expect("spec serialises");
+    let mut out = Vec::new();
+    walk_json_paths(&value, "spec".to_string(), &mut out);
+    out.sort();
+    out
+}
+
+fn walk_json_paths(v: &serde_json::Value, prefix: String, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, child) in map {
+                let p = format!("{prefix}.{k}");
+                // Листья и списки — это то, на что ссылается маппинг; внутрь
+                // trustRoots/rules манифест не заходит: там адресуют id правил.
+                out.push(p.clone());
+                if matches!(child, serde_json::Value::Object(_)) {
+                    walk_json_paths(child, p, out);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                walk_json_paths(child, prefix.clone(), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn validate_mitre_mapping(manifest_raw: &str, policy_raw: &str) -> Result<()> {
+    let manifest: MitreMappingManifest =
+        serde_yaml::from_str(manifest_raw).context("parse MITRE mapping manifest")?;
+    if manifest.schema_version != 1 {
+        bail!(
+            "MITRE mapping: schemaVersion {} не поддерживается (живой: 1)",
+            manifest.schema_version
+        );
+    }
+    if manifest.mappings.is_empty() {
+        bail!("MITRE mapping: пустой список mappings");
+    }
+    let obj: ClusterSecurityPolicy =
+        parse_resource(policy_raw, ClusterSecurityPolicy::new)?;
+    validate_cluster_policy(&obj.spec).map_err(anyhow::Error::from)?;
+
+    let rule_ids: Vec<&String> = obj.spec.runtime.rules.iter().map(|r| &r.id).collect();
+    let fields = cluster_policy_field_paths(&obj);
+
+    for m in &manifest.mappings {
+        if !m.technique.starts_with('T') || m.technique.len() < 5 {
+            bail!("MITRE mapping: техника {:?} не похожа на ATT&CK id", m.technique);
+        }
+        if m.limits.trim().is_empty() {
+            bail!(
+                "MITRE mapping: {}: у записи обязан быть написанный limit, \
+                 маппинг без границы — завышенное соответствие",
+                m.technique
+            );
+        }
+        if m.refs.is_empty() {
+            bail!("MITRE mapping: {}: ни одной ссылки на механизм", m.technique);
+        }
+        for r in &m.refs {
+            match r.kind.as_str() {
+                "rule" => {
+                    if !rule_ids.iter().any(|id| id.as_str() == r.path) {
+                        bail!(
+                            "MITRE mapping: {}: rule {:?} нет среди id правил политики",
+                            m.technique,
+                            r.path
+                        );
+                    }
+                }
+                "field" => {
+                    if !fields.iter().any(|f| f == &r.path) {
+                        bail!(
+                            "MITRE mapping: {}: field {:?} нет в сериализации \
+                             ClusterSecurityPolicy (поле переименовано или удалено)",
+                            m.technique,
+                            r.path
+                        );
+                    }
+                }
+                other => bail!("MITRE mapping: {}: неизвестный kind {:?}", m.technique, other),
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_resource<T, S>(raw: &str, build: fn(&str, S) -> T) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -132,7 +259,7 @@ fn extract_spec<T: for<'de> Deserialize<'de>>(raw: &str) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_yaml;
+    use super::{validate_mitre_mapping, MITRE_MAPPING_YAML, validate_yaml};
     use ferrum_testkit::{
         COMPLIANCE_SNAPSHOT_YAML, CP_DOWN_LKG_YAML, EXCEPTION_BAD_NO_TICKET_YAML,
         EXCEPTION_OK_YAML, EXCEPTION_WITHOUT_TTL_YAML, FERRUM_CLUSTER_YAML, POLICY_LIBRARY_YAML,
@@ -353,5 +480,62 @@ spec: {}
 "#;
         let msg = err_msg(yaml);
         assert!(msg.contains("apiVersion"), "{msg}");
+    }
+
+    // ---- MITRE ATT&CK mapping (issue #43) ----
+
+    /// Поставляемый манифест обязан сходиться с поставляемой политикой:
+    /// каждый rule-id и каждый путь поля разрешается в настоящем дереве.
+    #[test]
+    fn mitre_mapping_manifest_matches_shipped_policy() {
+        validate_mitre_mapping(MITRE_MAPPING_YAML, PROD_RESTRICTED_YAML)
+            .expect("mitre mapping manifest must cross-validate against prod-restricted");
+    }
+
+    #[test]
+    fn mitre_mapping_unknown_rule_id_fails() {
+        let bad = MITRE_MAPPING_YAML.replace("path: no-shell", "path: no-shell-renamed");
+        let msg = format!(
+            "{}",
+            validate_mitre_mapping(&bad, PROD_RESTRICTED_YAML).unwrap_err()
+        );
+        assert!(msg.contains("no-shell-renamed"), "{msg}");
+    }
+
+    #[test]
+    fn mitre_mapping_unknown_field_path_fails() {
+        let bad = MITRE_MAPPING_YAML.replace(
+            "path: spec.admit.deny.privileged",
+            "path: spec.admit.deny.privilegeEscalationAllowed",
+        );
+        let msg = format!(
+            "{}",
+            validate_mitre_mapping(&bad, PROD_RESTRICTED_YAML).unwrap_err()
+        );
+        assert!(msg.contains("privilegeEscalationAllowed"), "{msg}");
+    }
+
+    #[test]
+    fn mitre_mapping_without_limit_fails() {
+        let bad = MITRE_MAPPING_YAML.replace(
+            "limits: >-\n      Только containerOnly; предикат по comm — целое имя, python -c не\n      ловится.",
+            "limits: \"\"",
+        );
+        assert_ne!(bad, MITRE_MAPPING_YAML.to_string(), "replacement must apply");
+        let msg = format!(
+            "{}",
+            validate_mitre_mapping(&bad, PROD_RESTRICTED_YAML).unwrap_err()
+        );
+        assert!(msg.contains("limit"), "{msg}");
+    }
+
+    #[test]
+    fn mitre_mapping_future_schema_version_fails() {
+        let bad = MITRE_MAPPING_YAML.replace("schemaVersion: 1", "schemaVersion: 2");
+        let msg = format!(
+            "{}",
+            validate_mitre_mapping(&bad, PROD_RESTRICTED_YAML).unwrap_err()
+        );
+        assert!(msg.contains("schemaVersion"), "{msg}");
     }
 }
