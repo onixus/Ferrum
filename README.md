@@ -378,6 +378,7 @@ chart и kustomize overlay в дереве нет; e2e против настоя
 
 - [MVP-1 boundary](docs/MVP-1-BOUNDARY.md) — что исполнено, что нет, что заявлено
 - [RFC-02](docs/rfc/FERRUM-RFC-02-architecture.md) — crate-границы, CRD, threat model агента, CIS/MITRE
+- [MITRE ATT&CK mapping](docs/MITRE-ATTACK-MAPPING.md) — техники → механизмы с границами; машинночитаемый манифест `policies/mapping/mitre-attack-mapping.yaml` проходит `ferrumctl validate`
 - [CRD catalog](docs/crd/README.md)
 - [SECURITY.md](SECURITY.md) — куда сообщать об уязвимости, окно ответа и что здесь **вне** модели угроз
 - [ROADMAP.md](ROADMAP.md) — фазы, критерии закрытия и открытые решения

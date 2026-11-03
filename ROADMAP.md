@@ -725,4 +725,5 @@ Rekor/CT, офлайн PKI, LKG при потере CP. Это спроекти�
 
 - #26: [маппинг № 118](docs/FSTEC-118-MAPPING.md), включая непокрытые требования.
 - #27: [сравнение с VAP/CEL, Kyverno и Tetragon](docs/COMPARISONS.md).
+- #43: [маппинг MITRE ATT&CK for Containers](docs/MITRE-ATTACK-MAPPING.md) и машинночитаемый манифест `policies/mapping/mitre-attack-mapping.yaml`, кросс-валидируемый `ferrumctl validate` на стадии `Jenkinsfile::Validate policies`.
 - #24 и #28: доступны проверки на Fedora; других дистрибутивов и внешнего пилота нет. Эти критерии не закрыты.

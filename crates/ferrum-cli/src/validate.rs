@@ -26,8 +26,44 @@ pub(crate) fn typed_meta(raw: &str) -> Result<TypedMeta> {
 
 pub fn validate_file(path: &Path) -> Result<()> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if is_mitre_mapping_manifest(&raw) {
+        return validate_mitre_mapping_file(path, &raw);
+    }
     validate_yaml(&raw)?;
     println!("ok: {}", path.display());
+    Ok(())
+}
+
+/// Манифест маппинга — не CRD (нет apiVersion/kind), поэтому опознаётся по
+/// собственному ключу. Отдельная ветка нужна потому, что иначе `validate`
+/// отказался бы от файла со словами «kind ... не подключён» и CI-шаг с
+/// явным путём был бы невозможен.
+fn is_mitre_mapping_manifest(raw: &str) -> bool {
+    serde_yaml::from_str::<serde_yaml::Value>(raw)
+        .ok()
+        .and_then(|v| v.get("mappings").cloned())
+        .is_some()
+}
+
+fn validate_mitre_mapping_file(path: &Path, manifest_raw: &str) -> Result<()> {
+    // sourcePolicy в манифесте — путь относительно корня репозитория;
+    // разрешаем его так же, как шаг Jenkins, а не из cwd вызывающего.
+    let manifest_dir = path.parent().unwrap_or(Path::new("."));
+    let repo_root = manifest_dir
+        .ancestors()
+        .find(|d| d.join("policies").is_dir() && d.join("crates").is_dir())
+        .unwrap_or(manifest_dir);
+    let key: serde_yaml::Value =
+        serde_yaml::from_str(manifest_raw).context("parse MITRE mapping manifest")?;
+    let source_rel = key
+        .get("sourcePolicy")
+        .and_then(|v| v.as_str())
+        .context("MITRE mapping: нет поля sourcePolicy")?;
+    let policy_path = repo_root.join(source_rel);
+    let policy_raw =
+        fs::read_to_string(&policy_path).with_context(|| format!("read {}", policy_path.display()))?;
+    validate_mitre_mapping(manifest_raw, &policy_raw)?;
+    println!("ok: {} (MITRE mapping)", path.display());
     Ok(())
 }
 
