@@ -724,6 +724,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `poll_once` reloads only when this stamp changes. The stamp is mtime
+    /// and length of `bundle.fsig` and `digest`, so sibling bytes do not wake it.
+    #[test]
+    fn bundle_stamp_ignores_opaque_sidecar() {
+        let raw = tiny_febp();
+        let (fsig, _pk) = sign_raw(&raw, &SK);
+        let digest = ferrum_crypto::bundle_digest(&raw);
+        let dir = temp_dir("sidecar-stamp");
+        write_secret_dir(&dir, &fsig, digest.as_str());
+        let before = bundle_stamp(&dir);
+        assert!(matches!(before, BundleStamp::Present(_)));
+
+        let yaml = dir.join("mitre-attack-mapping.yaml");
+        let sig = dir.join("mitre-attack-mapping.yaml.sig");
+        std::fs::write(&yaml, b"").expect("empty sidecar");
+        std::fs::write(&sig, b"").expect("empty sidecar sig");
+        assert_eq!(bundle_stamp(&dir), before);
+
+        std::fs::write(&yaml, [0xff, 0xfe, 0xfd, 0x00, 0x80]).expect("non-utf8 sidecar");
+        std::fs::write(&sig, [0xff, 0xfe, 0xfd, 0x00, 0x80]).expect("non-utf8 sidecar sig");
+        assert_eq!(bundle_stamp(&dir), before);
+
+        std::fs::write(&yaml, b"schemaVersion: 99\n").expect("schema sidecar");
+        assert_eq!(bundle_stamp(&dir), before);
+
+        std::fs::write(&sig, b"trunc").expect("truncated sidecar sig");
+        assert_eq!(bundle_stamp(&dir), before);
+
+        std::fs::write(&sig, [0xa5u8; 64]).expect("sidecar sig bytes");
+        assert_eq!(bundle_stamp(&dir), before);
+
+        let named = dir.join(BUNDLE_FSIG_KEY);
+        let named_before = bundle_stamp(&named);
+        std::fs::write(&sig, b"other-trunc").expect("rewrite sidecar sig");
+        assert_eq!(bundle_stamp(&named), named_before);
+        assert_eq!(bundle_stamp(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A directory at the yaml name, on its own mount so the file case
+        // above is not removed to make room.
+        let dir = temp_dir("sidecar-stamp-dir");
+        write_secret_dir(&dir, &fsig, digest.as_str());
+        let before = bundle_stamp(&dir);
+        assert!(matches!(before, BundleStamp::Present(_)));
+        std::fs::create_dir(dir.join("mitre-attack-mapping.yaml")).expect("sidecar directory");
+        std::fs::write(dir.join("mitre-attack-mapping.yaml.sig"), b"trunc").expect("sig");
+        assert_eq!(bundle_stamp(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn parse_trust_root_roundtrip() {
         let pk = public_key_from_secret(&SK).unwrap();
