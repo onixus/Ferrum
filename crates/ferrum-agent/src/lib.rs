@@ -3836,6 +3836,378 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Names that show up beside a mount and are not `bundle.fsig`, `digest`,
+    /// or `exceptions.fsig`. The bytes are opaque on purpose: nothing here
+    /// parses them.
+    const SIDECAR_YAML: &str = "mitre-attack-mapping.yaml";
+    const SIDECAR_SIG: &str = "mitre-attack-mapping.yaml.sig";
+
+    #[derive(Clone, Copy, Debug)]
+    enum SidecarKind {
+        Empty,
+        NonUtf8,
+        Schema99,
+        TruncatedSig,
+        MismatchedSig,
+        YamlDirectory,
+    }
+
+    const SIDECAR_KINDS: [SidecarKind; 6] = [
+        SidecarKind::Empty,
+        SidecarKind::NonUtf8,
+        SidecarKind::Schema99,
+        SidecarKind::TruncatedSig,
+        SidecarKind::MismatchedSig,
+        SidecarKind::YamlDirectory,
+    ];
+
+    enum SidecarBody {
+        Absent,
+        File(Vec<u8>),
+        Directory,
+    }
+
+    struct PlacedSidecar {
+        yaml: SidecarBody,
+        sig: SidecarBody,
+    }
+
+    fn temp_case(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferrum-agent-sidecar-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
+
+    fn write_bundle_dir(dir: &Path, fsig: &[u8], digest: &str) {
+        fs::create_dir_all(dir).expect("tmpdir");
+        fs::write(dir.join(BUNDLE_FSIG_KEY), fsig).expect("bundle.fsig");
+        fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_bytes()).expect("digest");
+    }
+
+    fn place_sidecar(dir: &Path, kind: SidecarKind) -> PlacedSidecar {
+        let yaml_path = dir.join(SIDECAR_YAML);
+        let sig_path = dir.join(SIDECAR_SIG);
+        let non_utf8 = vec![0xff, 0xfe, 0xfd, 0x00, 0x80];
+        let schema99 = b"schemaVersion: 99\n".to_vec();
+        match kind {
+            SidecarKind::Empty => {
+                fs::write(&yaml_path, b"").expect("empty sidecar");
+                fs::write(&sig_path, b"").expect("empty sidecar sig");
+                PlacedSidecar {
+                    yaml: SidecarBody::File(Vec::new()),
+                    sig: SidecarBody::File(Vec::new()),
+                }
+            }
+            SidecarKind::NonUtf8 => {
+                fs::write(&yaml_path, &non_utf8).expect("non-utf8 sidecar");
+                fs::write(&sig_path, &non_utf8).expect("non-utf8 sidecar sig");
+                PlacedSidecar {
+                    yaml: SidecarBody::File(non_utf8.clone()),
+                    sig: SidecarBody::File(non_utf8),
+                }
+            }
+            SidecarKind::Schema99 => {
+                fs::write(&yaml_path, &schema99).expect("schema sidecar");
+                PlacedSidecar {
+                    yaml: SidecarBody::File(schema99),
+                    sig: SidecarBody::Absent,
+                }
+            }
+            SidecarKind::TruncatedSig => {
+                let sig = b"trunc".to_vec();
+                fs::write(&yaml_path, &schema99).expect("schema sidecar");
+                fs::write(&sig_path, &sig).expect("truncated sidecar sig");
+                PlacedSidecar {
+                    yaml: SidecarBody::File(schema99),
+                    sig: SidecarBody::File(sig),
+                }
+            }
+            SidecarKind::MismatchedSig => {
+                let sig = vec![0xa5u8; 64];
+                fs::write(&yaml_path, &schema99).expect("schema sidecar");
+                fs::write(&sig_path, &sig).expect("sidecar sig bytes");
+                PlacedSidecar {
+                    yaml: SidecarBody::File(schema99),
+                    sig: SidecarBody::File(sig),
+                }
+            }
+            SidecarKind::YamlDirectory => {
+                fs::create_dir(&yaml_path).expect("sidecar directory");
+                let sig = b"trunc".to_vec();
+                fs::write(&sig_path, &sig).expect("truncated sidecar sig");
+                PlacedSidecar {
+                    yaml: SidecarBody::Directory,
+                    sig: SidecarBody::File(sig),
+                }
+            }
+        }
+    }
+
+    fn assert_sidecar_unchanged(dir: &Path, placed: &PlacedSidecar) {
+        assert_body(dir, SIDECAR_YAML, &placed.yaml);
+        assert_body(dir, SIDECAR_SIG, &placed.sig);
+    }
+
+    fn assert_name_absent(dir: &Path, name: &str) {
+        match fs::symlink_metadata(dir.join(name)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => panic!("{name} is present"),
+            Err(err) => panic!("stat {name}: {err}"),
+        }
+    }
+
+    fn assert_mapping_names_absent(dir: &Path) {
+        assert_name_absent(dir, SIDECAR_YAML);
+        assert_name_absent(dir, SIDECAR_SIG);
+    }
+
+    fn body_is_placed(body: &SidecarBody) -> bool {
+        !matches!(body, SidecarBody::Absent)
+    }
+
+    fn assert_body(dir: &Path, name: &str, body: &SidecarBody) {
+        let path = dir.join(name);
+        match body {
+            SidecarBody::Absent => assert_name_absent(dir, name),
+            SidecarBody::File(bytes) => {
+                let got = fs::read(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+                assert_eq!(got, *bytes, "{name} bytes changed");
+            }
+            SidecarBody::Directory => {
+                let meta =
+                    fs::symlink_metadata(&path).unwrap_or_else(|e| panic!("stat {name}: {e}"));
+                let kind = meta.file_type();
+                assert!(
+                    kind.is_dir() && !kind.is_symlink(),
+                    "{name} was not left as a directory"
+                );
+                let mut kids = fs::read_dir(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+                assert!(kids.next().is_none(), "{name} gained a child");
+            }
+        }
+    }
+
+    /// Names that were placed show up in `read_dir(dir)`, not inside `..snap-*`.
+    fn assert_sidecar_beside_snapshot(dir: &Path, placed: &PlacedSidecar) {
+        let mut saw_yaml = false;
+        let mut saw_sig = false;
+        let rd = fs::read_dir(dir).expect("lkg dir");
+        for ent in rd.filter_map(|e| e.ok()) {
+            let fname = ent.file_name();
+            let Some(n) = fname.to_str() else {
+                continue;
+            };
+            if n == SIDECAR_YAML {
+                saw_yaml = true;
+            } else if n == SIDECAR_SIG {
+                saw_sig = true;
+            }
+            if !n.starts_with("..snap-") {
+                continue;
+            }
+            let inner = fs::read_dir(ent.path()).expect("snap");
+            for child in inner.filter_map(|e| e.ok()) {
+                let child_name = child.file_name();
+                let Some(cn) = child_name.to_str() else {
+                    continue;
+                };
+                assert_ne!(cn, SIDECAR_YAML, "sidecar yaml landed in {n}");
+                assert_ne!(cn, SIDECAR_SIG, "sidecar sig landed in {n}");
+            }
+        }
+        assert_eq!(saw_yaml, body_is_placed(&placed.yaml), "sidecar yaml");
+        assert_eq!(saw_sig, body_is_placed(&placed.sig), "sidecar sig");
+    }
+
+    fn shell_decision(agent: &Agent) -> Decision {
+        agent.matched_action(&ev("execve", "sh", "/bin/sh", true, false))
+    }
+
+    fn sock_decision(agent: &Agent) -> Decision {
+        agent.matched_action(&ev("openat", "x", "/run/docker.sock", true, false))
+    }
+
+    fn bpf_decision(agent: &Agent) -> Decision {
+        agent.matched_action(&ev("bpf", "x", "", true, false))
+    }
+
+    fn assert_same_decisions(left: &Agent, right: &Agent) {
+        assert_eq!(shell_decision(left), shell_decision(right));
+        assert_eq!(sock_decision(left), sock_decision(right));
+        assert_eq!(bpf_decision(left), bpf_decision(right));
+        assert_ne!(shell_decision(left).action, Action::Allow);
+        assert_ne!(sock_decision(left).action, Action::Allow);
+        assert_ne!(bpf_decision(left).action, Action::Allow);
+    }
+
+    fn fill_lkg(dir: &Path) {
+        fs::create_dir_all(dir).expect("tmpdir");
+        let raw = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let mut agent = Agent::new(AgentConfig {
+            trust_root: pk(),
+            lkg_dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        });
+        load_signed(&mut agent, &raw);
+        assert!(agent.using_last_known_good());
+        assert!(dir.join(KUBELET_DATA_DIR).exists());
+        assert!(dir.join(BUNDLE_FSIG_KEY).exists());
+        assert!(dir.join(BUNDLE_DIGEST_KEY).exists());
+    }
+
+    fn restore_lkg(dir: &Path) -> Agent {
+        Agent::new(AgentConfig {
+            trust_root: pk(),
+            lkg_dir: Some(dir.to_path_buf()),
+            role: AgentRole::Respond,
+            ..Default::default()
+        })
+    }
+
+    /// Sibling bytes next to `bundle.fsig` and `digest` are not a load input.
+    /// The digest `apply_path` returns is the verified FSIG payload, and the
+    /// decision matches the same mount without those siblings.
+    #[test]
+    fn opaque_sidecar_dir_load_matches_mount_without_it() {
+        let raw = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let fsig = encode_fsig(&raw, &sign(&raw), &pk()).expect("fsig");
+        let digest = ferrum_crypto::bundle_digest(&raw);
+
+        let plain = temp_case("plain-load");
+        write_bundle_dir(&plain, &fsig, digest.as_str());
+        let mut plain_agent = Agent::new(cfg());
+        let plain_digest = plain_agent.apply_path(&plain).expect("fsig verified");
+        assert_eq!(plain_digest, digest);
+        assert_mvp_actions(&plain_agent, Action::Deny);
+
+        for kind in SIDECAR_KINDS {
+            let dir = temp_case(&format!("load-{kind:?}"));
+            write_bundle_dir(&dir, &fsig, digest.as_str());
+            let placed = place_sidecar(&dir, kind);
+            let mut agent = Agent::new(cfg());
+            let got = agent
+                .apply_path(&dir)
+                .unwrap_or_else(|err| panic!("{kind:?}: apply_path failed: {err}"));
+            assert_eq!(got, plain_digest, "{kind:?}");
+            assert_eq!(got, digest, "{kind:?}");
+            assert_same_decisions(&agent, &plain_agent);
+            assert_sidecar_unchanged(&dir, &placed);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        // Same sibling, FSIG payload byte flipped. Not Ok, and not allow:
+        // the sibling is not what made the loads above succeed.
+        let mut broken = fsig.clone();
+        let last = broken.len() - 1;
+        broken[last] ^= 0xff;
+        let bad = temp_case("broken-fsig");
+        write_bundle_dir(&bad, &broken, digest.as_str());
+        place_sidecar(&bad, SidecarKind::Schema99);
+        let mut empty = Agent::new(cfg());
+        assert_integrity(empty.apply_path(&bad));
+        assert!(!empty.using_last_known_good());
+        assert_eq!(shell_decision(&empty).action, Action::Deny);
+        assert_ne!(shell_decision(&empty).action, Action::Allow);
+
+        let _ = fs::remove_dir_all(&plain);
+        let _ = fs::remove_dir_all(&bad);
+    }
+
+    /// Same sibling bytes in the LKG directory, beside `bundle.fsig` /
+    /// `digest` / `..data`, not under a `..snap-*` name. Restore matches the
+    /// directory that has no sibling, and the bytes are still there.
+    #[test]
+    fn opaque_sidecar_lkg_restore_matches_restore_without_it() {
+        let plain_dir = temp_case("plain-lkg");
+        fill_lkg(&plain_dir);
+        let plain = restore_lkg(&plain_dir);
+        assert!(plain.using_last_known_good());
+        let plain_digest = plain
+            .last_good_digest()
+            .map(|d| d.as_str().to_string())
+            .expect("plain digest");
+        assert_mvp_actions(&plain, Action::Deny);
+
+        for kind in SIDECAR_KINDS {
+            let dir = temp_case(&format!("lkg-{kind:?}"));
+            fill_lkg(&dir);
+            let placed = place_sidecar(&dir, kind);
+            assert_sidecar_beside_snapshot(&dir, &placed);
+            let restored = restore_lkg(&dir);
+            assert!(restored.using_last_known_good(), "{kind:?}");
+            assert_eq!(
+                restored.last_good_digest().map(|d| d.as_str()),
+                Some(plain_digest.as_str()),
+                "{kind:?}"
+            );
+            assert_same_decisions(&restored, &plain);
+            assert_sidecar_beside_snapshot(&dir, &placed);
+            assert_sidecar_unchanged(&dir, &placed);
+            let _ = fs::remove_dir_all(&dir);
+        }
+        let _ = fs::remove_dir_all(&plain_dir);
+    }
+
+    /// No sibling file is the normal mount. A later mount whose digest does
+    /// not match the FSIG leaves that snapshot in place while the sibling
+    /// is present on the later mount.
+    #[test]
+    fn missing_sidecar_loads_and_bad_bundle_keeps_lkg() {
+        let raw = encode_mvp(AGENT_ABI, Mode::Enforce);
+        let fsig = encode_fsig(&raw, &sign(&raw), &pk()).expect("fsig");
+        let digest = ferrum_crypto::bundle_digest(&raw);
+
+        let good = temp_case("good-mount");
+        write_bundle_dir(&good, &fsig, digest.as_str());
+        let lkg = temp_case("kept-lkg");
+        let mut agent = Agent::new(AgentConfig {
+            trust_root: pk(),
+            lkg_dir: Some(lkg.clone()),
+            ..Default::default()
+        });
+        let got = agent
+            .apply_path(&good)
+            .expect("mount without the sibling file");
+        assert_eq!(got, digest);
+        assert!(agent.using_last_known_good());
+        assert_mapping_names_absent(&good);
+        assert_mapping_names_absent(&lkg);
+        assert_mvp_actions(&agent, Action::Deny);
+        let shell = shell_decision(&agent);
+        let sock = sock_decision(&agent);
+        let bpf = bpf_decision(&agent);
+        assert_ne!(shell.action, Action::Allow);
+
+        let bad = temp_case("bad-mount");
+        write_bundle_dir(&bad, &fsig, &"00".repeat(32));
+        let placed = place_sidecar(&bad, SidecarKind::TruncatedSig);
+        assert_integrity(agent.apply_path(&bad));
+        assert!(agent.using_last_known_good());
+        assert_eq!(
+            agent.last_good_digest().map(|d| d.as_str()),
+            Some(digest.as_str())
+        );
+        assert_eq!(shell_decision(&agent), shell);
+        assert_eq!(sock_decision(&agent), sock);
+        assert_eq!(bpf_decision(&agent), bpf);
+        assert_mvp_actions(&agent, Action::Deny);
+        let on_disk = fs::read(lkg.join(BUNDLE_DIGEST_KEY)).expect("lkg digest");
+        let on_disk = std::str::from_utf8(&on_disk)
+            .expect("lkg digest utf-8")
+            .trim();
+        assert_eq!(on_disk, digest.as_str());
+        assert_sidecar_unchanged(&bad, &placed);
+
+        let _ = fs::remove_dir_all(&good);
+        let _ = fs::remove_dir_all(&bad);
+        let _ = fs::remove_dir_all(&lkg);
+    }
+
     /// FEBP an older compiler could emit: the MVP rules plus one whose path
     /// prefix is longer than the datapath buffer, so no record can carry it.
     fn encode_mvp_with_unmatchable_rule() -> Vec<u8> {
