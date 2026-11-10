@@ -1,14 +1,18 @@
 //! Policy-bundle integrity (Ed25519) and mTLS PEM material (X.509).
 //!
-//! Bundle signatures and TLS identity are separate domains. Do not reuse
-//! [`BUNDLE_SIGNATURE_CONTEXT`] Ed25519 seeds as TLS keys.
+//! Bundle signatures, break-glass grants, mapping manifests, and TLS identity
+//! are separate domains. Do not reuse [`BUNDLE_SIGNATURE_CONTEXT`] Ed25519
+//! seeds as TLS keys, and do not accept a signature from one domain in another.
 //!
 //! Trust roots are caller-supplied. This crate does not fetch Rekor, CT logs,
 //! or any other network source, and it does not issue CAs at runtime.
 //!
-//! Signatures are Ed25519 over `BUNDLE_SIGNATURE_CONTEXT || raw`, not raw
-//! Ed25519 over `raw`. Admission, agent, and controller must call these
-//! functions; they must not verify with a generic Ed25519 verifier.
+//! Signatures are Ed25519 over a domain context concatenated with `raw`, not
+//! raw Ed25519 over `raw`. Admission, agent, and controller verify a bundle
+//! with [`verify_bundle_signature`]; they must not verify with a generic
+//! Ed25519 verifier. [`verify_mapping_signature`] returns `()`: `Ok` means only
+//! that those bytes were signed under [`MAPPING_SIGNATURE_CONTEXT`]. It is not
+//! a bundle digest and not prevention.
 
 #![deny(unsafe_code)]
 
@@ -46,6 +50,15 @@ pub const BUNDLE_SIGNATURE_CONTEXT: &[u8] = b"FERRUM-POLICY-BUNDLE-v1";
 /// different people for exactly that reason, and the domain is what makes
 /// "different people" mean something when one of them is compromised.
 pub const BREAK_GLASS_CONTEXT: &[u8] = b"FERRUM-BREAK-GLASS-GRANT-v1";
+
+/// Domain separator for an ATT&CK mapping manifest. Prepended to the opaque
+/// bytes for Ed25519 only; the content digest stays SHA-256(`raw`).
+///
+/// Fourth domain, beside [`BUNDLE_SIGNATURE_CONTEXT`], [`BREAK_GLASS_CONTEXT`],
+/// and `KEY_BIND_MSG`. [`verify_mapping_signature`] returning `Ok` means only
+/// that these bytes were signed here. It is not a bundle signature, not a
+/// grant, and not prevention.
+pub const MAPPING_SIGNATURE_CONTEXT: &[u8] = b"FERRUM-MITRE-MAPPING-v1";
 
 /// SHA-256 of `raw`, lowercase hex, no algorithm prefix.
 pub fn bundle_digest(raw: &[u8]) -> Digest {
@@ -122,6 +135,43 @@ pub fn verify_break_glass_signature(raw: &[u8], sig: &[u8], public_key: &[u8]) -
         .map_err(|_| {
             FerrumError::Integrity("break-glass Ed25519 signature verification failed".into())
         })
+}
+
+/// Sign opaque mapping bytes with a 32-byte Ed25519 seed.
+///
+/// The signed message is [`MAPPING_SIGNATURE_CONTEXT`] concatenated with `raw`.
+/// `raw` is not parsed: no YAML, no comment stripping, no policy compile, and
+/// no read of an embedded digest. A short seed and an all-zero seed are
+/// [`FerrumError::Integrity`].
+pub fn sign_mapping(raw: &[u8], secret_key: &[u8]) -> Result<Vec<u8>> {
+    let keypair = parse_keypair(secret_key)?;
+    Ok(keypair
+        .sk
+        .sign(domain_message(MAPPING_SIGNATURE_CONTEXT, raw), None)
+        .to_vec())
+}
+
+/// Verify Ed25519 over `MAPPING_SIGNATURE_CONTEXT || raw`.
+///
+/// Returns [`Result<()>`], not a [`Digest`], so success cannot be read as a
+/// bundle digest or as a capability. Empty signatures fail with a
+/// mapping-specific [`FerrumError::Integrity`]; there is no unsigned fallback.
+/// A signature made in the bundle or break-glass domain fails here, and one
+/// made here fails [`verify_bundle_signature`] and
+/// [`verify_break_glass_signature`]. The content digest, when taken, is still
+/// SHA-256(`raw`); the context is not hashed in.
+pub fn verify_mapping_signature(raw: &[u8], sig: &[u8], public_key: &[u8]) -> Result<()> {
+    let verifying_key = parse_public_key(public_key)?;
+    // parse_signature's empty text names bundles. This artefact is not one.
+    if sig.is_empty() {
+        return Err(FerrumError::Integrity(
+            "mapping signature is empty; unsigned mappings are rejected".into(),
+        ));
+    }
+    let signature = parse_signature(sig)?;
+    verifying_key
+        .verify(domain_message(MAPPING_SIGNATURE_CONTEXT, raw), &signature)
+        .map_err(|_| FerrumError::Integrity("mapping Ed25519 signature verification failed".into()))
 }
 
 fn domain_message(context: &[u8], raw: &[u8]) -> Vec<u8> {
@@ -233,6 +283,15 @@ mod tests {
         0xe7, 0x35, 0x6e, 0x5c, 0xa9, 0x22, 0x10, 0x5e, 0x58, 0xce, 0x3e, 0x67, 0x65, 0x49, 0x00,
         0xeb, 0x7c, 0x8f, 0x43, 0x13, 0xbb, 0xc8, 0xcf, 0x80, 0xe4, 0x2a, 0x87, 0xd6, 0xf3, 0x0b,
         0xb8, 0x90, 0x31, 0x09,
+    ];
+    /// Ed25519 over `MAPPING_SIGNATURE_CONTEXT || RAW` with RFC 8032 test-1 seed.
+    /// Produced by `sign_mapping`, not written by hand.
+    const MAPPING_DOMAIN_RAW_SIG: [u8; 64] = [
+        0x70, 0x3d, 0xda, 0xd5, 0xf2, 0x2d, 0x43, 0x50, 0xd2, 0x46, 0xa8, 0xba, 0xb5, 0x84, 0x27,
+        0x39, 0xe7, 0xf8, 0x3b, 0x35, 0xf4, 0x95, 0x77, 0xed, 0xfd, 0xfe, 0xe4, 0x69, 0x2a, 0x8a,
+        0xa1, 0xda, 0x8d, 0x94, 0xdb, 0x12, 0xd7, 0x57, 0x2b, 0x81, 0xa7, 0x13, 0x44, 0x2c, 0x03,
+        0xe8, 0x1f, 0x87, 0xd2, 0x0f, 0xbe, 0x5a, 0x24, 0x3d, 0x47, 0x70, 0x60, 0x07, 0xc0, 0x64,
+        0x17, 0x1f, 0x62, 0x0a,
     ];
 
     fn assert_integrity<T: std::fmt::Debug>(result: Result<T>) {
@@ -382,5 +441,129 @@ mod tests {
         let digest = verify_bundle_signature(RAW, &DOMAIN_SEPARATED_RAW_SIG, &RFC8032_PK)
             .expect("known vector");
         assert_eq!(digest.as_str(), RAW_SHA256);
+    }
+
+    #[test]
+    fn valid_mapping_signature_is_not_a_digest() {
+        let pk = public_key_from_secret(&RFC8032_SK).expect("public key");
+        assert_eq!(pk.as_slice(), RFC8032_PK.as_slice());
+        let sig = sign_mapping(RAW, &RFC8032_SK).expect("sign");
+        verify_mapping_signature(RAW, &sig, &pk).expect("verify");
+        // Content digest is SHA-256(raw). The domain context is not hashed in.
+        assert_eq!(bundle_digest(RAW).as_str(), RAW_SHA256);
+        let over_context = domain_message(MAPPING_SIGNATURE_CONTEXT, RAW);
+        assert_ne!(bundle_digest(&over_context).as_str(), RAW_SHA256);
+    }
+
+    #[test]
+    fn mapping_truncated_payload_fails() {
+        let sig = sign_mapping(RAW, &RFC8032_SK).expect("sign");
+        let truncated = &RAW[..RAW.len() - 1];
+        assert_integrity(verify_mapping_signature(truncated, &sig, &RFC8032_PK));
+    }
+
+    #[test]
+    fn mapping_truncated_signature_fails() {
+        let sig = sign_mapping(RAW, &RFC8032_SK).expect("sign");
+        assert_integrity(verify_mapping_signature(
+            RAW,
+            &sig[..ED25519_SIGNATURE_LEN - 1],
+            &RFC8032_PK,
+        ));
+    }
+
+    #[test]
+    fn mapping_wrong_key_fails() {
+        let sig = sign_mapping(RAW, &RFC8032_SK).expect("sign");
+        let wrong_pk = public_key_from_secret(&RFC8032_SK2).expect("wrong public key");
+        assert_integrity(verify_mapping_signature(RAW, &sig, &wrong_pk));
+    }
+
+    #[test]
+    fn mapping_empty_signature_is_not_described_as_a_bundle() {
+        let err = verify_mapping_signature(RAW, &[], &RFC8032_PK).expect_err("empty");
+        let FerrumError::Integrity(msg) = err else {
+            panic!("expected FerrumError::Integrity, got {err:?}");
+        };
+        assert_eq!(
+            msg,
+            "mapping signature is empty; unsigned mappings are rejected"
+        );
+
+        // Existing bundle and break-glass empty-signature text stays put.
+        let bundle = verify_bundle_signature(RAW, &[], &RFC8032_PK).expect_err("bundle empty");
+        let FerrumError::Integrity(bundle_msg) = bundle else {
+            panic!("expected FerrumError::Integrity, got {bundle:?}");
+        };
+        assert_eq!(
+            bundle_msg,
+            "bundle signature is empty; unsigned bundles are rejected"
+        );
+        let grant = verify_break_glass_signature(RAW, &[], &RFC8032_PK).expect_err("grant empty");
+        let FerrumError::Integrity(grant_msg) = grant else {
+            panic!("expected FerrumError::Integrity, got {grant:?}");
+        };
+        assert_eq!(
+            grant_msg,
+            "bundle signature is empty; unsigned bundles are rejected"
+        );
+    }
+
+    #[test]
+    fn mapping_digest_mismatch_fails() {
+        let sig = sign_mapping(RAW, &RFC8032_SK).expect("sign");
+        let mut mutated = RAW.to_vec();
+        mutated[0] ^= 0x01;
+        assert_ne!(bundle_digest(&mutated), bundle_digest(RAW));
+        assert_integrity(verify_mapping_signature(&mutated, &sig, &RFC8032_PK));
+    }
+
+    #[test]
+    fn mapping_short_and_all_zero_seed_fail() {
+        assert_integrity(sign_mapping(RAW, &[0u8; ED25519_SECRET_KEY_LEN]));
+        assert_integrity(sign_mapping(RAW, &RFC8032_SK[..ED25519_SECRET_KEY_LEN - 1]));
+        let sig = sign_mapping(RAW, &RFC8032_SK).expect("sign");
+        assert_integrity(verify_mapping_signature(
+            RAW,
+            &sig,
+            &[0u8; ED25519_PUBLIC_KEY_LEN],
+        ));
+    }
+
+    /// Mapping, bundle, and break-glass are not interchangeable. A raw Ed25519
+    /// signature with no domain is not a mapping signature either.
+    ///
+    /// Ok here is not a bundle digest. A policy publisher's bundle signature
+    /// must not become an ATT&CK attestation, and mapping bytes must not verify
+    /// as a policy bundle or as a grant.
+    #[test]
+    fn a_mapping_signature_is_not_a_bundle_or_a_break_glass_grant() {
+        let mapping_sig = sign_mapping(RAW, &RFC8032_SK).expect("sign mapping");
+        let bundle_sig = sign_bundle(RAW, &RFC8032_SK).expect("sign bundle");
+        let grant_sig = sign_break_glass(RAW, &RFC8032_SK).expect("sign grant");
+        assert_ne!(mapping_sig, bundle_sig);
+        assert_ne!(mapping_sig, grant_sig);
+
+        verify_mapping_signature(RAW, &mapping_sig, &RFC8032_PK).expect("its own domain");
+        assert_integrity(verify_mapping_signature(RAW, &bundle_sig, &RFC8032_PK));
+        assert_integrity(verify_mapping_signature(RAW, &grant_sig, &RFC8032_PK));
+        assert_integrity(verify_bundle_signature(RAW, &mapping_sig, &RFC8032_PK));
+        assert_integrity(verify_break_glass_signature(RAW, &mapping_sig, &RFC8032_PK));
+
+        let kp = KeyPair::from_seed(Seed::from_slice(&RFC8032_SK).expect("seed"));
+        let raw_ed25519 = kp.sk.sign(RAW, None).to_vec();
+        assert_ne!(mapping_sig, raw_ed25519);
+        assert_integrity(verify_mapping_signature(RAW, &raw_ed25519, &RFC8032_PK));
+    }
+
+    #[test]
+    fn mapping_domain_known_vector() {
+        let sig = sign_mapping(RAW, &RFC8032_SK).expect("sign");
+        assert_eq!(sig.as_slice(), MAPPING_DOMAIN_RAW_SIG.as_slice());
+        verify_mapping_signature(RAW, &MAPPING_DOMAIN_RAW_SIG, &RFC8032_PK).expect("known vector");
+        assert_ne!(
+            MAPPING_DOMAIN_RAW_SIG.as_slice(),
+            DOMAIN_SEPARATED_RAW_SIG.as_slice()
+        );
     }
 }
