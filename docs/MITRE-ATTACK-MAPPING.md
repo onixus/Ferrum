@@ -11,8 +11,10 @@ Containers: <https://attack.mitre.org/matrices/containers/>. Это анализ
 перечислены только в [границе MVP](MVP-1-BOUNDARY.md). Машинночитаемая форма —
 [mitre-attack-mapping.yaml](../policies/mapping/mitre-attack-mapping.yaml).
 `ferrumctl validate` отвергает её, если `name` не совпадает с официальным
-именем техники или `effect` не совпадает с тем, что
-[prod-restricted](../policies/examples/prod-restricted.yaml) реально делает.
+именем, техника ссылается не на свой механизм, или `effect` не совпадает
+с тем, что [prod-restricted](../policies/examples/prod-restricted.yaml)
+реально делает. `T1525` в каталоге нет: ни одно правило этого примера не
+про имплант образа. `trustRoots` не считается запретом.
 У этого примера `spec.mode` равен `audit`: admission запрос не отклоняет и
 патчи не шлёт, а runtime `kill` понижается до audit.
 

@@ -34,6 +34,14 @@ fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 27, 12, 0, 0).unwrap()
 }
 
+/// The example file's `expiresAt` is an illustration. `exception_applies`
+/// drops a TTL more than 90 days ahead of this frozen clock.
+fn exception_in_window() -> PolicyExceptionSpec {
+    let mut spec = exception_ok().spec;
+    spec.expires_at = now() + chrono::Days::new(30);
+    spec
+}
+
 /// compile → sign: FSIG over the FRMB material of `prod-restricted` (enforce).
 fn signed_bundle() -> (Vec<u8>, Digest, Vec<u8>) {
     let mut spec = prod_restricted().spec;
@@ -208,7 +216,7 @@ fn exception_without_ttl_is_rejected_and_scoped_exception_waives() {
     );
 
     // A ticketed, TTL-bounded exception waives exactly its rule, nothing else.
-    let mut exception: PolicyExceptionSpec = exception_ok().spec;
+    let mut exception = exception_in_window();
     exception.target.namespace = String::new();
     exception.target.rules = vec![RULE_PRIVILEGED.into()];
 
@@ -293,7 +301,7 @@ fn docker_sock_kill_is_waived_only_in_scope() {
     other.namespace = "checkout".into();
     agent.insert_cgroup(8, other);
 
-    let mut waiver = exception_ok().spec;
+    let mut waiver = exception_in_window();
     waiver.target.rules = vec!["no-runtime-sock".into()];
     let expires_at = waiver.expires_at;
     agent.set_exceptions(vec![waiver]);
@@ -330,7 +338,7 @@ fn docker_sock_kill_is_waived_only_in_scope() {
     assert_eq!(expired.action, Action::Kill);
 
     // Empty target.rules is no-match, not a policy-wide waiver.
-    let mut empty_rules = exception_ok().spec;
+    let mut empty_rules = exception_in_window();
     empty_rules.target.rules = Vec::new();
     agent.set_exceptions(vec![empty_rules]);
     let no_rules = agent.handle_event_at(7, &sock, &sink, now());
@@ -345,7 +353,7 @@ fn only_signed_exceptions_are_accepted_from_the_mount() {
     std::fs::write(dir.join(BUNDLE_FSIG_KEY), fsig).expect("bundle.fsig");
     std::fs::write(dir.join(BUNDLE_DIGEST_KEY), digest.as_str().as_bytes()).expect("digest");
 
-    let mut waiver = exception_ok().spec;
+    let mut waiver = exception_in_window();
     waiver.target.rules = vec!["no-runtime-sock".into()];
     let json = serde_json::to_vec(&[waiver]).expect("encode");
 
@@ -597,7 +605,7 @@ fn a_signed_bundle_whose_wasm_slot_no_plane_can_execute_is_refused_by_both() {
 /// accepted by both consumers of the waiver channel.
 #[test]
 fn controller_signed_exceptions_are_accepted_by_agent_and_admission() {
-    let mut waiver = exception_ok().spec;
+    let mut waiver = exception_in_window();
     waiver.target.rules = vec!["no-runtime-sock".into()];
     let specs = vec![waiver];
 

@@ -163,11 +163,11 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-// Official container-matrix names. A real id with the wrong technique
-// (T1059.005 is Visual Basic) is absent on purpose.
+// Official names for techniques this mapping may cite. T1059.005 is Visual
+// Basic and T1525 (Implant Internal Image) has no control here, so both are
+// absent. A listed id still may not cite an arbitrary rule.
 const ATTACK_CATALOG: &[(&str, &str)] = &[
     ("T1059", "Command and Scripting Interpreter"),
-    ("T1525", "Implant Internal Image"),
     ("T1609", "Container Administration Command"),
     ("T1610", "Deploy Container"),
     ("T1611", "Escape to Host"),
@@ -253,6 +253,14 @@ fn check_mapping_ref(
     entry: &MitreMappingEntry,
     reference: &MitreMappingRef,
 ) -> Result<()> {
+    if !technique_allows(&entry.technique, &reference.kind, &reference.path) {
+        bail!(
+            "MITRE mapping: {}: {:?} {:?} не относится к этой технике",
+            entry.technique,
+            reference.kind,
+            reference.path
+        );
+    }
     match (reference.kind.as_str(), reference.effect.as_str()) {
         ("rule", "runtime-kill") => {
             let action = rule_action(spec, &entry.technique, &reference.path)?;
@@ -278,16 +286,8 @@ fn check_mapping_ref(
                 );
             }
         }
-        ("field", "admit-deny") => check_admit_field(
-            spec,
-            spec_json,
-            entry,
-            reference,
-            &["spec.admit.deny.", "spec.supply.", "spec.selector.image."],
-        )?,
-        ("field", "admit-mutate") => {
-            check_admit_field(spec, spec_json, entry, reference, &["spec.admit.mutate."])?
-        }
+        ("field", "admit-deny") => check_admit_deny(spec, spec_json, entry, reference)?,
+        ("field", "admit-mutate") => check_admit_mutate(spec, spec_json, entry, reference)?,
         _ => bail!(
             "MITRE mapping: {}: kind {:?} и effect {:?} не сочетаются",
             entry.technique,
@@ -313,24 +313,29 @@ fn rule_action(
         })
 }
 
-fn check_admit_field(
+fn technique_allows(technique: &str, kind: &str, path: &str) -> bool {
+    match (technique, kind, path) {
+        ("T1059" | "T1609", "rule", "no-shell") => true,
+        ("T1611", "rule", "no-runtime-sock" | "no-module") => true,
+        ("T1610", "field", path) if deny_predicate(path).is_some() => true,
+        ("T1610", "field", path) if mutate_predicate(path) => true,
+        _ => false,
+    }
+}
+
+fn check_admit_deny(
     spec: &ClusterSecurityPolicySpec,
     spec_json: &serde_json::Value,
     entry: &MitreMappingEntry,
     reference: &MitreMappingRef,
-    prefixes: &[&str],
 ) -> Result<()> {
-    if !prefixes
-        .iter()
-        .any(|prefix| reference.path.starts_with(prefix))
-    {
+    let Some(predicate) = deny_predicate(&reference.path) else {
         bail!(
-            "MITRE mapping: {}: field {:?} не относится к effect {}",
+            "MITRE mapping: {}: field {:?} не является предикатом admit-deny",
             entry.technique,
-            reference.path,
-            reference.effect
+            reference.path
         );
-    }
+    };
     // Paths are serde names (`hostPID`), not Rust field names.
     let Some(value) = value_at_path(spec_json, &reference.path) else {
         bail!(
@@ -348,7 +353,7 @@ fn check_admit_field(
             spec.disabled
         );
     }
-    if !flag_is_on(value) {
+    if !predicate_is_on(predicate, value) {
         bail!(
             "MITRE mapping: {}: field {:?} выключено",
             entry.technique,
@@ -358,21 +363,99 @@ fn check_admit_field(
     Ok(())
 }
 
+fn check_admit_mutate(
+    spec: &ClusterSecurityPolicySpec,
+    spec_json: &serde_json::Value,
+    entry: &MitreMappingEntry,
+    reference: &MitreMappingRef,
+) -> Result<()> {
+    if !mutate_predicate(&reference.path) {
+        bail!(
+            "MITRE mapping: {}: field {:?} не является предикатом admit-mutate",
+            entry.technique,
+            reference.path
+        );
+    }
+    let Some(value) = value_at_path(spec_json, &reference.path) else {
+        bail!(
+            "MITRE mapping: {}: field {:?} нет в сериализации ClusterSecurityPolicy (поле переименовано или удалено)",
+            entry.technique,
+            reference.path
+        );
+    };
+    if !admission_enforces(spec) {
+        bail!(
+            "MITRE mapping: {}: effect {} требует mode=enforce, у политики {:?} (disabled={})",
+            entry.technique,
+            reference.effect,
+            spec.mode,
+            spec.disabled
+        );
+    }
+    if !matches!(value, serde_json::Value::Bool(true)) {
+        bail!(
+            "MITRE mapping: {}: field {:?} выключено",
+            entry.technique,
+            reference.path
+        );
+    }
+    Ok(())
+}
+
+enum Predicate {
+    Bool,
+    NonEmptyList,
+}
+
+/// Admission denies on these fields only. `trustRoots` is verifying material,
+/// not a deny switch: an image is refused when `requireSigned` or
+/// `denyUnsigned` is set.
+fn deny_predicate(path: &str) -> Option<Predicate> {
+    match path {
+        "spec.supply.requireSigned"
+        | "spec.supply.denyUnsigned"
+        | "spec.supply.denyLatestTag"
+        | "spec.selector.image.requireDigest"
+        | "spec.admit.deny.privileged"
+        | "spec.admit.deny.hostPID"
+        | "spec.admit.deny.hostIPC"
+        | "spec.admit.deny.hostNetwork"
+        | "spec.admit.deny.hostPath"
+        | "spec.admit.deny.allowPrivilegeEscalation"
+        | "spec.admit.deny.runAsRoot"
+        | "spec.admit.deny.wildcardsRbac"
+        | "spec.admit.deny.clusterAdminBind" => Some(Predicate::Bool),
+        "spec.selector.image.registriesAllow" | "spec.admit.deny.addedCapabilities" => {
+            Some(Predicate::NonEmptyList)
+        }
+        _ => None,
+    }
+}
+
+fn mutate_predicate(path: &str) -> bool {
+    matches!(
+        path,
+        "spec.admit.mutate.injectSeccompRuntimeDefault"
+            | "spec.admit.mutate.dropAllCapabilities"
+            | "spec.admit.mutate.readOnlyRootFilesystem"
+    )
+}
+
+fn predicate_is_on(predicate: Predicate, value: &serde_json::Value) -> bool {
+    match predicate {
+        Predicate::Bool => matches!(value, serde_json::Value::Bool(true)),
+        Predicate::NonEmptyList => {
+            matches!(value, serde_json::Value::Array(items) if !items.is_empty())
+        }
+    }
+}
+
 fn value_at_path<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut current = root;
     for segment in path.split('.') {
         current = current.as_object()?.get(segment)?;
     }
     Some(current)
-}
-
-fn flag_is_on(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Bool(on) => *on,
-        serde_json::Value::Array(items) => !items.is_empty(),
-        serde_json::Value::String(text) => !text.trim().is_empty(),
-        _ => false,
-    }
 }
 
 fn admission_enforces(spec: &ClusterSecurityPolicySpec) -> bool {
@@ -751,6 +834,52 @@ mappings:
 "#;
         let msg = mitre_err(bad);
         assert!(msg.contains("mode=enforce"), "{msg}");
+    }
+
+    #[test]
+    fn mitre_mapping_implant_image_is_not_in_the_catalog() {
+        let bad = r#"
+schemaVersion: 1
+sourcePolicy: policies/examples/prod-restricted.yaml
+mappings:
+  - technique: T1525
+    name: Implant Internal Image
+    refs:
+      - kind: rule
+        path: no-shell
+        effect: runtime-audit
+    limits: hostPath is not an implanted image
+"#;
+        let msg = mitre_err(bad);
+        assert!(msg.contains("T1525"), "{msg}");
+        assert!(msg.contains("каталоге"), "{msg}");
+    }
+
+    #[test]
+    fn mitre_mapping_technique_cannot_cite_another_control() {
+        let bad = MITRE_MAPPING_YAML.replace("path: no-shell", "path: no-module");
+        let msg = mitre_err(&bad);
+        assert!(msg.contains("no-module"), "{msg}");
+        assert!(msg.contains("не относится"), "{msg}");
+    }
+
+    #[test]
+    fn mitre_mapping_trust_roots_are_not_a_deny_switch() {
+        let bad = r#"
+schemaVersion: 1
+sourcePolicy: policies/examples/prod-restricted.yaml
+mappings:
+  - technique: T1610
+    name: Deploy Container
+    refs:
+      - kind: field
+        path: spec.supply.trustRoots
+        effect: admit-deny
+    limits: a trust root list does not deny an image
+"#;
+        let msg = mitre_err(bad);
+        assert!(msg.contains("trustRoots"), "{msg}");
+        assert!(!msg.contains("mode=enforce"), "{msg}");
     }
 
     #[test]
