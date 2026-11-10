@@ -2380,6 +2380,17 @@ impl Agent {
         self.loader.matched_action(event)
     }
 
+    /// Reads detection, containment, and prevention off a finished record.
+    /// The triple is not a field, a branch, or a reason to drop the event.
+    /// `executed` stays an input to containment.
+    fn evidence_claims(event: &EnforcementEvent) -> (bool, bool, bool) {
+        (
+            ferrum_proto::evidence::detection(event),
+            ferrum_proto::evidence::containment(event),
+            ferrum_proto::evidence::prevention(),
+        )
+    }
+
     /// `meta` carries the structural identity of the record (cgroup for the
     /// pod lookup, tgid for the reaction). A bare `u64` still works and means
     /// "cgroup only": it carries no tgid, so it can never cause a kill.
@@ -2500,7 +2511,7 @@ impl Agent {
             Some(id) => RuleId::new(id.clone()),
             None => RuleId::new("default"),
         };
-        sink.emit(&EnforcementEvent {
+        let record = EnforcementEvent {
             policy,
             rule,
             action: if waiver.is_some() {
@@ -2534,7 +2545,10 @@ impl Agent {
             path_unknown: decision.path_unknown,
             container_unknown: decision.container_unknown,
             waiver,
-        });
+        };
+        // Discarded on purpose: a false claim must not change or drop the record.
+        let _ = Self::evidence_claims(&record);
+        sink.emit(&record);
         self.note_export_state_at(sink, Instant::now());
         decision
     }
@@ -4916,6 +4930,152 @@ mod tests {
         assert_eq!(shell.action, Action::Kill);
         assert_eq!(sink.events()[1].action, "kill");
         assert_eq!(sink.events()[1].waiver, None);
+    }
+
+    /// Schema 1.1 stays the record. Classification is read off it, not written on it.
+    fn assert_no_evidence_keys(event: &ferrum_proto::EnforcementEvent) {
+        let value = serde_json::to_value(event).expect("event json");
+        let obj = value.as_object().expect("object");
+        for key in ["outcome", "containment", "prevention", "detection"] {
+            assert!(!obj.contains_key(key), "{key} must not be on the record");
+        }
+    }
+
+    #[test]
+    fn delivered_kill_is_detection_and_containment_not_prevention() {
+        let (agent, fake) = respond_agent_with_fake();
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Kill);
+        assert_eq!(fake.killed(), vec![4242]);
+        let event = &sink.events()[0];
+        assert_eq!(event.action, "kill");
+        assert!(event.executed);
+        assert!(!event.syscall.is_empty());
+        assert_ne!(event.tgid, 0);
+        assert!(event.waiver.is_none());
+        assert!(event.respond_error.is_none());
+        assert!(ferrum_proto::evidence::detection(event));
+        assert!(ferrum_proto::evidence::containment(event));
+        assert!(!ferrum_proto::evidence::prevention());
+        assert_no_evidence_keys(event);
+    }
+
+    #[test]
+    fn failed_kill_is_detection_not_containment() {
+        let (mut agent, fake) = respond_agent_with_fake();
+        agent.set_responder(Box::new(FailingResponder("EPERM: operation not permitted")));
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Kill);
+        assert!(fake.killed().is_empty());
+        let event = &sink.events()[0];
+        assert_eq!(event.action, "kill");
+        assert!(!event.executed);
+        assert!(event.respond_error.is_some());
+        assert!(ferrum_proto::evidence::detection(event));
+        assert!(!ferrum_proto::evidence::containment(event));
+        assert!(!ferrum_proto::evidence::prevention());
+        assert_no_evidence_keys(event);
+    }
+
+    #[test]
+    fn cgroup_only_kill_is_not_containment() {
+        let (agent, fake) = respond_agent_with_fake();
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(7, &ev("execve", "sh", "/bin/sh", true, false), &sink);
+        assert_eq!(decision.action, Action::Kill);
+        assert!(fake.killed().is_empty());
+        let event = &sink.events()[0];
+        assert_eq!(event.action, "kill");
+        assert_eq!(event.tgid, 0);
+        assert!(!event.executed);
+        assert!(ferrum_proto::evidence::detection(event));
+        assert!(!ferrum_proto::evidence::containment(event));
+        assert!(!ferrum_proto::evidence::prevention());
+        assert_no_evidence_keys(event);
+    }
+
+    #[test]
+    fn observe_role_refusal_is_detection_not_containment() {
+        let mut agent = Agent::new(cfg());
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Audit);
+        let event = &sink.events()[0];
+        assert_eq!(event.action, "audit");
+        assert_eq!(event.respond_error.as_deref(), Some(REFUSE_ROLE));
+        assert!(!event.executed);
+        assert!(ferrum_proto::evidence::detection(event));
+        assert!(!ferrum_proto::evidence::containment(event));
+        assert!(!ferrum_proto::evidence::prevention());
+        assert_no_evidence_keys(event);
+    }
+
+    #[test]
+    fn in_scope_waiver_is_detection_not_containment() {
+        let mut agent = Agent::new(cfg_respond_named("p1"));
+        load_signed(&mut agent, &encode_mvp(AGENT_ABI, Mode::Enforce));
+        agent.insert_cgroup(7, identity("pod-a"));
+        agent.set_target_check(Box::new(StaticCheck(Some(7))));
+        let fake = std::sync::Arc::new(FakeResponder::default());
+        agent.set_responder(Box::new(std::sync::Arc::clone(&fake)));
+        agent.set_exceptions(vec![waiver("ns", "p1", &["no-shell"])]);
+        let sink = MemorySink::new();
+        let decision = agent.handle_event_at(
+            container_meta(4242),
+            &ev("execve", "sh", "/bin/sh", true, false),
+            &sink,
+            fixed_now(),
+        );
+        assert_eq!(decision.action, Action::Audit);
+        assert!(fake.killed().is_empty());
+        let event = &sink.events()[0];
+        assert_eq!(event.action, "waived");
+        assert!(event.waiver.is_some());
+        assert!(!event.executed);
+        assert!(ferrum_proto::evidence::detection(event));
+        assert!(!ferrum_proto::evidence::containment(event));
+        assert!(!ferrum_proto::evidence::prevention());
+        assert_no_evidence_keys(event);
+    }
+
+    #[test]
+    fn bpf_deny_is_detection_not_containment_or_prevention() {
+        let (agent, fake) = respond_agent_with_fake();
+        let sink = MemorySink::new();
+        let decision = agent.handle_event(
+            container_meta(4242),
+            &ev("bpf", "attacker", "", true, false),
+            &sink,
+        );
+        assert_eq!(decision.action, Action::Deny);
+        assert!(fake.killed().is_empty());
+        let event = &sink.events()[0];
+        assert_eq!(event.action, "deny");
+        assert!(!event.executed);
+        assert_eq!(
+            event.respond_error.as_deref(),
+            Some(REFUSE_DENY_NOT_ENFORCEABLE)
+        );
+        assert!(ferrum_proto::evidence::detection(event));
+        assert!(!ferrum_proto::evidence::containment(event));
+        assert!(!ferrum_proto::evidence::prevention());
+        assert_no_evidence_keys(event);
     }
 
     #[test]
