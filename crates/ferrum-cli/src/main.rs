@@ -4,7 +4,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use ferrum_cli::{break_glass, compile, gen_pki, lint_deploy, sign, validate, verify};
+use ferrum_cli::{
+    break_glass, compile, gen_pki, lint_deploy, mapping_sign, sign, validate, verify,
+};
 
 #[derive(Parser)]
 #[command(
@@ -69,6 +71,16 @@ enum Commands {
         #[arg(long)]
         trust_root: String,
     },
+    /// Подписать байты MITRE-маппинга его доменом. Файл читается как есть:
+    /// YAML не разбирается и не переписывается. Печатает публичный ключ.
+    /// Trust root не пишет — пин лежит отдельно, seed в репозиторий не кладётся.
+    SignMapping {
+        path: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Подписать break-glass grant его собственным доменом. Инварианты
     /// проверяются до подписи: окно, тикет, scope, непустые поля. Печатает
     /// публичный ключ seed'а — тот самый trust root, которым армируют кластер.
@@ -97,6 +109,9 @@ fn run() -> Result<()> {
         Commands::Validate { path } => validate::validate_file(&path),
         Commands::Compile { path, output } => compile::compile_file(&path, &output),
         Commands::Sign { path, key, output } => sign::sign_file(&path, &key, &output),
+        Commands::SignMapping { path, key, output } => {
+            mapping_sign::sign_mapping_file(&path, &key, &output)
+        }
         Commands::Verify { path, trust_root } => verify::verify_file(&path, &trust_root),
         Commands::SignBreakGlass { path, key, output } => {
             break_glass::sign_grant(&path, &key, &output)
