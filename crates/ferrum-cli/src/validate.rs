@@ -11,7 +11,7 @@ use ferrum_policy::{
 };
 use serde::Deserialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TypedMeta {
@@ -70,22 +70,105 @@ fn validate_mitre_mapping_file(path: &Path, manifest_raw: &str) -> Result<()> {
     // sourcePolicy в манифесте — путь относительно корня репозитория;
     // разрешаем его так же, как шаг Jenkins, а не из cwd вызывающего.
     let manifest_dir = path.parent().unwrap_or(Path::new("."));
-    let repo_root = manifest_dir
-        .ancestors()
-        .find(|d| d.join("policies").is_dir() && d.join("crates").is_dir())
-        .unwrap_or(manifest_dir);
+    let repo_root = find_repo_root(manifest_dir);
+    let policy_base = repo_root.as_deref().unwrap_or(manifest_dir);
     let key: serde_yaml::Value =
         serde_yaml::from_str(manifest_raw).context("parse MITRE mapping manifest")?;
     let source_rel = key
         .get("sourcePolicy")
         .and_then(|v| v.as_str())
         .context("MITRE mapping: нет поля sourcePolicy")?;
-    let policy_path = repo_root.join(source_rel);
+    let policy_path = policy_base.join(source_rel);
     let policy_raw = fs::read_to_string(&policy_path)
         .with_context(|| format!("read {}", policy_path.display()))?;
     validate_mitre_mapping(manifest_raw, &policy_raw)?;
-    println!("ok: {} (MITRE mapping)", path.display());
+    // Schema and sourcePolicy errors stay above. The pin is only the file at
+    // the repo root; a key in the YAML or in the signature is not one.
+    let Some(repo_root) = repo_root else {
+        bail!(
+            "MITRE mapping: repository root not found (need policies/ and crates/); \
+             unsigned mappings are rejected"
+        );
+    };
+    verify_mapping_signature(path, &repo_root)?;
+    println!("ok: {} {MAPPING_OK_NOTE}", path.display());
     Ok(())
+}
+
+const MAPPING_OK_NOTE: &str = "(MITRE mapping; mapping signature verified)";
+
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|dir| dir.join("policies").is_dir() && dir.join("crates").is_dir())
+        .map(Path::to_path_buf)
+}
+
+fn mapping_signature_path(yaml: &Path) -> Result<PathBuf> {
+    let name = yaml
+        .file_name()
+        .context("MITRE mapping: signature path has no file name")?;
+    let mut sig_name = name.to_os_string();
+    sig_name.push(".sig");
+    Ok(match yaml.parent() {
+        Some(dir) => dir.join(sig_name),
+        None => PathBuf::from(sig_name),
+    })
+}
+
+fn mapping_trust_root_path(repo_root: &Path) -> PathBuf {
+    repo_root
+        .join("policies")
+        .join("mapping")
+        .join("mapping-trust-root")
+}
+
+/// Signature over `fs::read` of `path`, not over a reserialized document.
+fn verify_mapping_signature(path: &Path, repo_root: &Path) -> Result<()> {
+    let pin = read_hex_file(
+        &mapping_trust_root_path(repo_root),
+        "trust root pin",
+        ferrum_crypto::ED25519_PUBLIC_KEY_LEN,
+    )?;
+    let signature = read_hex_file(
+        &mapping_signature_path(path)?,
+        "signature",
+        ferrum_crypto::ED25519_SIGNATURE_LEN,
+    )?;
+    let raw = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    if let Err(err) = ferrum_crypto::verify_mapping_signature(&raw, &signature, &pin) {
+        bail!("MITRE mapping: signature verification failed: {err}");
+    }
+    Ok(())
+}
+
+fn read_hex_file(path: &Path, label: &str, expected: usize) -> Result<Vec<u8>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("MITRE mapping: {label} missing at {}", path.display());
+        }
+        Err(err) => {
+            return Err(err).context(format!("MITRE mapping: read {label} {}", path.display()));
+        }
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        bail!(
+            "MITRE mapping: {label} is empty at {}; unsigned mappings are rejected",
+            path.display()
+        );
+    }
+    let bytes = crate::fsig::hex_decode(text)
+        .with_context(|| format!("MITRE mapping: {label} at {} is not hex", path.display()))?;
+    if bytes.len() != expected {
+        bail!(
+            "MITRE mapping: {label} at {} must be {expected} bytes, got {}",
+            path.display(),
+            bytes.len()
+        );
+    }
+    Ok(bytes)
 }
 
 pub fn validate_yaml(raw: &str) -> Result<()> {
@@ -703,7 +786,10 @@ fn extract_spec<T: for<'de> Deserialize<'de>>(raw: &str) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_file, validate_mitre_binding, validate_mitre_mapping, validate_yaml};
+    use super::{
+        find_repo_root, validate_file, validate_mitre_binding, validate_mitre_mapping,
+        validate_yaml, MAPPING_OK_NOTE,
+    };
     use chrono::{Days, Utc};
     use ferrum_api::{
         ClusterSecurityPolicy, ExceptionTarget, PolicyExceptionSpec, PolicyMode, RuntimeAction,
@@ -1611,6 +1697,432 @@ spec: {}
         let msg = format!("{}", validate_file(&path).unwrap_err());
         assert!(msg.contains("prod-restricted.yaml"), "{msg}");
         assert!(!msg.contains("no-shell"), "{msg}");
+    }
+
+    const RFC8032_PK_HEX: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        crate::mapping_sign::hex_encode(bytes)
+    }
+
+    struct TempTree(std::path::PathBuf);
+
+    impl TempTree {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ferrum-mitre-sig-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(root.join("crates")).expect("crates");
+            std::fs::create_dir_all(root.join("policies/examples")).expect("examples");
+            std::fs::create_dir_all(root.join("policies/mapping")).expect("mapping");
+            std::fs::write(
+                root.join("policies/examples/prod-restricted.yaml"),
+                PROD_RESTRICTED_YAML,
+            )
+            .expect("policy");
+            Self(root)
+        }
+
+        fn root(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn yaml(&self) -> std::path::PathBuf {
+            self.0.join("policies/mapping/mitre-attack-mapping.yaml")
+        }
+
+        fn sig(&self) -> std::path::PathBuf {
+            self.0
+                .join("policies/mapping/mitre-attack-mapping.yaml.sig")
+        }
+
+        fn pin(&self) -> std::path::PathBuf {
+            self.0.join("policies/mapping/mapping-trust-root")
+        }
+
+        fn write_yaml(&self, text: &str) {
+            std::fs::write(self.yaml(), text).expect("yaml");
+        }
+
+        fn policy_bytes(&self) -> Vec<u8> {
+            std::fs::read(self.0.join("policies/examples/prod-restricted.yaml")).expect("policy")
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seed(fill: u8) -> [u8; 32] {
+        assert_ne!(fill, 0, "the all-zero seed is not a key");
+        [fill; 32]
+    }
+
+    /// Signs `yaml` with `sign-mapping` and writes the public key as the pin.
+    /// The seed file is removed before the caller validates.
+    fn sign_repo(tree: &TempTree, yaml: &str, fill: u8) -> [u8; 32] {
+        tree.write_yaml(yaml);
+        let secret = seed(fill);
+        let key = tree.root().join("seed.hex");
+        std::fs::write(&key, hex_encode(&secret)).expect("seed");
+        crate::mapping_sign::sign_mapping_file(&tree.yaml(), &key, &tree.sig()).expect("sign");
+        let public = ferrum_crypto::public_key_from_secret(&secret).expect("pk");
+        std::fs::write(tree.pin(), hex_encode(&public)).expect("pin");
+        std::fs::remove_file(&key).expect("drop seed");
+        secret
+    }
+
+    fn assert_no_bundle(root: &std::path::Path) {
+        fn walk(dir: &std::path::Path) {
+            for entry in std::fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    walk(&path);
+                } else {
+                    let name = path.file_name().expect("name").to_string_lossy();
+                    assert!(
+                        !name.ends_with(".frmb") && !name.ends_with(".fsig"),
+                        "validate must not write a bundle: {path:?}"
+                    );
+                }
+            }
+        }
+        walk(root);
+    }
+
+    fn err_of(path: &std::path::Path) -> String {
+        format!("{:#}", validate_file(path).expect_err("must fail"))
+    }
+
+    #[test]
+    fn mapping_ok_note_does_not_claim_prevention() {
+        let note = MAPPING_OK_NOTE.to_ascii_lowercase();
+        assert!(note.contains("mapping signature verified"));
+        assert!(!note.contains("prevention"));
+        assert!(!note.contains("enforce"));
+        assert!(!note.contains("covered"));
+    }
+
+    #[test]
+    fn mapping_signature_missing_fails_without_writing_policy() {
+        let tree = TempTree::new("missing-sig");
+        tree.write_yaml(MITRE_MAPPING_YAML);
+        let public = ferrum_crypto::public_key_from_secret(&seed(0x11)).expect("pk");
+        std::fs::write(tree.pin(), hex_encode(&public)).expect("pin");
+        let policy = tree.policy_bytes();
+        let yaml = std::fs::read(tree.yaml()).expect("yaml");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("signature missing"), "{msg}");
+        assert!(!msg.contains("schemaVersion"), "{msg}");
+        assert_eq!(tree.policy_bytes(), policy);
+        assert_eq!(std::fs::read(tree.yaml()).expect("yaml"), yaml);
+        assert!(std::str::from_utf8(&yaml)
+            .expect("utf8")
+            .contains("capability: runtime-observe"));
+        assert_no_bundle(tree.root());
+    }
+
+    #[test]
+    fn mapping_signature_empty_fails() {
+        let tree = TempTree::new("empty-sig");
+        tree.write_yaml(MITRE_MAPPING_YAML);
+        let public = ferrum_crypto::public_key_from_secret(&seed(0x11)).expect("pk");
+        std::fs::write(tree.pin(), hex_encode(&public)).expect("pin");
+        for empty in ["", "\n", " \n\t"] {
+            std::fs::write(tree.sig(), empty).expect("empty sig");
+            let msg = err_of(&tree.yaml());
+            assert!(msg.contains("signature is empty"), "{msg}");
+            assert!(msg.contains("unsigned mappings are rejected"), "{msg}");
+        }
+        assert_no_bundle(tree.root());
+    }
+
+    #[test]
+    fn mapping_signature_wrong_length_fails() {
+        let tree = TempTree::new("short-sig");
+        sign_repo(&tree, MITRE_MAPPING_YAML, 0x11);
+        std::fs::write(tree.sig(), "ab".repeat(32)).expect("32-byte sig");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("must be 64 bytes"), "{msg}");
+        assert!(!msg.contains("signature verification failed"), "{msg}");
+    }
+
+    #[test]
+    fn mapping_signature_wrong_key_fails() {
+        let tree = TempTree::new("wrong-key");
+        let policy = {
+            sign_repo(&tree, MITRE_MAPPING_YAML, 0x11);
+            tree.policy_bytes()
+        };
+        let other = ferrum_crypto::public_key_from_secret(&seed(0x22)).expect("other");
+        std::fs::write(tree.pin(), hex_encode(&other)).expect("wrong pin");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("signature verification failed"), "{msg}");
+        assert_eq!(tree.policy_bytes(), policy);
+        assert!(std::fs::read_to_string(tree.yaml())
+            .expect("yaml")
+            .contains("capability: runtime-observe"));
+        assert_no_bundle(tree.root());
+    }
+
+    #[test]
+    fn mapping_signature_one_mutated_byte_fails() {
+        let tree = TempTree::new("mutated");
+        sign_repo(&tree, MITRE_MAPPING_YAML, 0x11);
+        let original = std::fs::read(tree.yaml()).expect("yaml");
+        let mut mutated = original.clone();
+        let pos = mutated
+            .windows(8)
+            .position(|window| window == b"issue #4")
+            .expect("comment anchor");
+        assert_eq!(mutated[pos + 7], b'4');
+        mutated[pos + 7] = b'5';
+        assert_eq!(
+            original
+                .iter()
+                .zip(mutated.iter())
+                .filter(|(left, right)| left != right)
+                .count(),
+            1
+        );
+        std::fs::write(tree.yaml(), &mutated).expect("mutate");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("signature verification failed"), "{msg}");
+        assert!(!msg.contains("parse MITRE"), "{msg}");
+        assert!(!msg.contains("schemaVersion"), "{msg}");
+        let text = std::fs::read_to_string(tree.yaml()).expect("yaml");
+        assert!(text.contains("capability: runtime-observe"));
+        assert!(!text.contains("detect-then-kill"));
+        assert_no_bundle(tree.root());
+    }
+
+    #[test]
+    fn mapping_signature_bundle_domain_fails() {
+        let tree = TempTree::new("bundle-domain");
+        let secret = sign_repo(&tree, MITRE_MAPPING_YAML, 0x11);
+        let raw = std::fs::read(tree.yaml()).expect("yaml");
+        let bundle_sig = ferrum_crypto::sign_bundle(&raw, &secret).expect("bundle sig");
+        let mapping_sig =
+            crate::fsig::hex_decode(&std::fs::read_to_string(tree.sig()).expect("sig"))
+                .expect("mapping sig");
+        assert_ne!(bundle_sig, mapping_sig);
+        std::fs::write(tree.sig(), hex_encode(&bundle_sig)).expect("overwrite");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("signature verification failed"), "{msg}");
+        assert!(msg.contains("mapping Ed25519"), "{msg}");
+        assert_no_bundle(tree.root());
+    }
+
+    #[test]
+    fn mapping_signature_break_glass_domain_fails() {
+        let tree = TempTree::new("grant-domain");
+        let secret = sign_repo(&tree, MITRE_MAPPING_YAML, 0x11);
+        let raw = std::fs::read(tree.yaml()).expect("yaml");
+        let grant_sig = ferrum_crypto::sign_break_glass(&raw, &secret).expect("grant sig");
+        std::fs::write(tree.sig(), hex_encode(&grant_sig)).expect("overwrite");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("signature verification failed"), "{msg}");
+        assert!(msg.contains("mapping Ed25519"), "{msg}");
+    }
+
+    #[test]
+    fn mapping_signature_matching_pair_on_fake_repo_root() {
+        let tree = TempTree::new("match");
+        sign_repo(&tree, MITRE_MAPPING_YAML, 0x31);
+        let yaml = std::fs::read(tree.yaml()).expect("yaml");
+        let policy = tree.policy_bytes();
+        let pin = std::fs::read_to_string(tree.pin()).expect("pin");
+        assert_eq!(pin.len(), ferrum_crypto::ED25519_PUBLIC_KEY_LEN * 2);
+        assert_ne!(pin, RFC8032_PK_HEX);
+        validate_file(&tree.yaml()).expect("matching pair");
+        assert_eq!(std::fs::read(tree.yaml()).expect("yaml"), yaml);
+        assert_eq!(tree.policy_bytes(), policy);
+        assert!(std::str::from_utf8(&yaml)
+            .expect("utf8")
+            .contains("capability: runtime-observe"));
+        assert_no_bundle(tree.root());
+    }
+
+    #[test]
+    fn mapping_pin_is_not_taken_from_the_yaml_or_the_signature() {
+        let tree = TempTree::new("embedded-key");
+        let secret = seed(0x41);
+        let public = ferrum_crypto::public_key_from_secret(&secret).expect("pk");
+        let mut doc = MITRE_MAPPING_YAML.to_string();
+        if !doc.ends_with('\n') {
+            doc.push('\n');
+        }
+        doc.push_str(&format!("publicKey: \"{}\"\n", hex_encode(&public)));
+        tree.write_yaml(&doc);
+        let key = tree.root().join("seed.hex");
+        std::fs::write(&key, hex_encode(&secret)).expect("seed");
+        crate::mapping_sign::sign_mapping_file(&tree.yaml(), &key, &tree.sig()).expect("sign");
+        std::fs::remove_file(&key).expect("drop seed");
+        let wrong = ferrum_crypto::public_key_from_secret(&seed(0x42)).expect("wrong");
+        std::fs::write(tree.pin(), hex_encode(&wrong)).expect("wrong pin");
+        let mut sig = std::fs::read_to_string(tree.sig()).expect("sig");
+        sig.push('\n');
+        sig.push_str(&hex_encode(&public));
+        sig.push('\n');
+        std::fs::write(tree.sig(), &sig).expect("sig with embedded key");
+        let msg = err_of(&tree.yaml());
+        assert!(
+            msg.contains("is not hex")
+                || msg.contains("must be 64 bytes")
+                || msg.contains("signature verification failed"),
+            "{msg}"
+        );
+        assert_no_bundle(tree.root());
+    }
+
+    #[test]
+    fn mapping_schema_error_precedes_signature() {
+        let tree = TempTree::new("schema-first");
+        let bad = MITRE_MAPPING_YAML.replace("schemaVersion: 2", "schemaVersion: 1");
+        let secret = sign_repo(&tree, &bad, 0x11);
+        let raw = std::fs::read(tree.yaml()).expect("yaml");
+        let bundle_sig = ferrum_crypto::sign_bundle(&raw, &secret).expect("bundle sig");
+        std::fs::write(tree.sig(), hex_encode(&bundle_sig)).expect("bad sig");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("schemaVersion"), "{msg}");
+        assert!(!msg.contains("signature verification failed"), "{msg}");
+        assert!(!msg.contains("signature missing"), "{msg}");
+    }
+
+    #[test]
+    fn mapping_missing_source_policy_precedes_signature() {
+        let tree = TempTree::new("source-first");
+        let bad = MITRE_MAPPING_YAML.replace(
+            "policies/examples/prod-restricted.yaml",
+            "policies/examples/missing.yaml",
+        );
+        sign_repo(&tree, &bad, 0x11);
+        std::fs::write(tree.sig(), "00".repeat(64)).expect("wrong sig");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("missing.yaml"), "{msg}");
+        assert!(!msg.contains("signature verification failed"), "{msg}");
+    }
+
+    #[test]
+    fn mapping_missing_pin_and_missing_repo_root_fail() {
+        let tree = TempTree::new("missing-pin");
+        sign_repo(&tree, MITRE_MAPPING_YAML, 0x11);
+        std::fs::remove_file(tree.pin()).expect("drop pin");
+        let msg = err_of(&tree.yaml());
+        assert!(msg.contains("trust root pin missing"), "{msg}");
+
+        let base = std::env::temp_dir();
+        assert!(
+            find_repo_root(&base).is_none(),
+            "temp dir {base:?} is inside a checkout; this test would see a real pin"
+        );
+        let root = base.join(format!(
+            "ferrum-mitre-noroot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        struct Rm(std::path::PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rm = Rm(root.clone());
+        // No `crates/` directory, so this is not a repo root. sourcePolicy is
+        // resolved from the manifest directory; a pin planted on that same
+        // fallback must not be accepted.
+        let manifest_dir = root.join("policies/mapping");
+        std::fs::create_dir_all(manifest_dir.join("policies/examples")).expect("examples");
+        std::fs::create_dir_all(manifest_dir.join("policies/mapping")).expect("pin dir");
+        let yaml = manifest_dir.join("mitre-attack-mapping.yaml");
+        std::fs::write(&yaml, MITRE_MAPPING_YAML).expect("yaml");
+        std::fs::write(
+            manifest_dir.join("policies/examples/prod-restricted.yaml"),
+            PROD_RESTRICTED_YAML,
+        )
+        .expect("policy");
+        let secret = seed(0x11);
+        let key = root.join("seed.hex");
+        std::fs::write(&key, hex_encode(&secret)).expect("seed");
+        let sig = manifest_dir.join("mitre-attack-mapping.yaml.sig");
+        crate::mapping_sign::sign_mapping_file(&yaml, &key, &sig).expect("sign");
+        let public = ferrum_crypto::public_key_from_secret(&secret).expect("pk");
+        std::fs::write(
+            manifest_dir.join("policies/mapping/mapping-trust-root"),
+            hex_encode(&public),
+        )
+        .expect("fallback pin");
+        std::fs::remove_file(&key).expect("drop seed");
+        let msg = err_of(&yaml);
+        assert!(msg.contains("repository root not found"), "{msg}");
+        assert!(msg.contains("unsigned mappings are rejected"), "{msg}");
+        assert!(!msg.contains("signature verification failed"), "{msg}");
+    }
+
+    #[test]
+    fn validate_file_verifies_shipped_mapping_signature() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let yaml = root.join("policies/mapping/mitre-attack-mapping.yaml");
+        let sig = root.join("policies/mapping/mitre-attack-mapping.yaml.sig");
+        let pin = root.join("policies/mapping/mapping-trust-root");
+        let yaml_bytes = std::fs::read(&yaml).expect("yaml");
+        assert_eq!(yaml_bytes, MITRE_MAPPING_YAML.as_bytes());
+        let sig_text = std::fs::read_to_string(&sig).expect("shipped sig");
+        assert_eq!(sig_text.len(), ferrum_crypto::ED25519_SIGNATURE_LEN * 2);
+        assert!(sig_text
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        let pin_text = std::fs::read_to_string(&pin).expect("shipped pin");
+        assert_eq!(
+            pin_text.trim().len(),
+            ferrum_crypto::ED25519_PUBLIC_KEY_LEN * 2
+        );
+        assert_ne!(pin_text.trim(), RFC8032_PK_HEX);
+        assert!(pin_text
+            .trim()
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        let policy =
+            std::fs::read(root.join("policies/examples/prod-restricted.yaml")).expect("policy");
+        validate_file(&yaml).expect("shipped mapping");
+        assert_eq!(std::fs::read(&yaml).expect("yaml"), yaml_bytes);
+        assert_eq!(
+            std::fs::read(root.join("policies/examples/prod-restricted.yaml")).expect("policy"),
+            policy
+        );
+        assert!(MITRE_MAPPING_YAML.contains("capability: runtime-observe"));
+        assert!(!MITRE_MAPPING_YAML.contains("detect-then-kill"));
+    }
+
+    #[test]
+    fn non_mapping_examples_pass_without_a_signature() {
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../policies/examples");
+        for name in [
+            "prod-restricted.yaml",
+            "exception-ok.yaml",
+            "policy-library.yaml",
+            "runtime-profile.yaml",
+            "ferrum-cluster.yaml",
+            "compliance-snapshot.yaml",
+        ] {
+            let path = root.join(name);
+            assert!(
+                !path.with_file_name(format!("{name}.sig")).exists(),
+                "{name} must not need a signature"
+            );
+            validate_file(&path).unwrap_or_else(|err| panic!("{name}: {err:#}"));
+        }
     }
 
     struct RemoveFile {

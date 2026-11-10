@@ -7,6 +7,7 @@ pub mod compile;
 pub mod fsig;
 pub mod gen_pki;
 pub mod lint_deploy;
+pub mod mapping_sign;
 pub mod sign;
 pub mod validate;
 pub mod verify;
