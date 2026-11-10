@@ -3953,33 +3953,60 @@ mod tests {
         assert_body(dir, SIDECAR_SIG, &placed.sig);
     }
 
+    fn assert_name_absent(dir: &Path, name: &str) {
+        match fs::symlink_metadata(dir.join(name)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => panic!("{name} is present"),
+            Err(err) => panic!("stat {name}: {err}"),
+        }
+    }
+
+    fn assert_mapping_names_absent(dir: &Path) {
+        assert_name_absent(dir, SIDECAR_YAML);
+        assert_name_absent(dir, SIDECAR_SIG);
+    }
+
+    fn body_is_placed(body: &SidecarBody) -> bool {
+        !matches!(body, SidecarBody::Absent)
+    }
+
     fn assert_body(dir: &Path, name: &str, body: &SidecarBody) {
         let path = dir.join(name);
         match body {
-            SidecarBody::Absent => {}
+            SidecarBody::Absent => assert_name_absent(dir, name),
             SidecarBody::File(bytes) => {
                 let got = fs::read(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
                 assert_eq!(got, *bytes, "{name} bytes changed");
             }
             SidecarBody::Directory => {
-                let meta = fs::metadata(&path).unwrap_or_else(|e| panic!("stat {name}: {e}"));
-                assert!(meta.is_dir(), "{name} was not left as a directory");
+                let meta =
+                    fs::symlink_metadata(&path).unwrap_or_else(|e| panic!("stat {name}: {e}"));
+                let kind = meta.file_type();
+                assert!(
+                    kind.is_dir() && !kind.is_symlink(),
+                    "{name} was not left as a directory"
+                );
+                let mut kids = fs::read_dir(&path).unwrap_or_else(|e| panic!("read {name}: {e}"));
+                assert!(kids.next().is_none(), "{name} gained a child");
             }
         }
     }
 
-    /// Direct child of the LKG directory, never an entry of `..snap-*`.
-    fn assert_sidecar_beside_snapshot(dir: &Path) {
-        for name in [SIDECAR_YAML, SIDECAR_SIG] {
-            assert_eq!(dir.join(name).parent(), Some(dir));
-            assert!(!name.starts_with("..snap-"), "{name} is a snapshot name");
-        }
+    /// Names that were placed show up in `read_dir(dir)`, not inside `..snap-*`.
+    fn assert_sidecar_beside_snapshot(dir: &Path, placed: &PlacedSidecar) {
+        let mut saw_yaml = false;
+        let mut saw_sig = false;
         let rd = fs::read_dir(dir).expect("lkg dir");
         for ent in rd.filter_map(|e| e.ok()) {
             let fname = ent.file_name();
             let Some(n) = fname.to_str() else {
                 continue;
             };
+            if n == SIDECAR_YAML {
+                saw_yaml = true;
+            } else if n == SIDECAR_SIG {
+                saw_sig = true;
+            }
             if !n.starts_with("..snap-") {
                 continue;
             }
@@ -3993,6 +4020,8 @@ mod tests {
                 assert_ne!(cn, SIDECAR_SIG, "sidecar sig landed in {n}");
             }
         }
+        assert_eq!(saw_yaml, body_is_placed(&placed.yaml), "sidecar yaml");
+        assert_eq!(saw_sig, body_is_placed(&placed.sig), "sidecar sig");
     }
 
     fn shell_decision(agent: &Agent) -> Decision {
@@ -4108,7 +4137,7 @@ mod tests {
             let dir = temp_case(&format!("lkg-{kind:?}"));
             fill_lkg(&dir);
             let placed = place_sidecar(&dir, kind);
-            assert_sidecar_beside_snapshot(&dir);
+            assert_sidecar_beside_snapshot(&dir, &placed);
             let restored = restore_lkg(&dir);
             assert!(restored.using_last_known_good(), "{kind:?}");
             assert_eq!(
@@ -4117,7 +4146,7 @@ mod tests {
                 "{kind:?}"
             );
             assert_same_decisions(&restored, &plain);
-            assert_sidecar_beside_snapshot(&dir);
+            assert_sidecar_beside_snapshot(&dir, &placed);
             assert_sidecar_unchanged(&dir, &placed);
             let _ = fs::remove_dir_all(&dir);
         }
@@ -4146,6 +4175,8 @@ mod tests {
             .expect("mount without the sibling file");
         assert_eq!(got, digest);
         assert!(agent.using_last_known_good());
+        assert_mapping_names_absent(&good);
+        assert_mapping_names_absent(&lkg);
         assert_mvp_actions(&agent, Action::Deny);
         let shell = shell_decision(&agent);
         let sock = sock_decision(&agent);
