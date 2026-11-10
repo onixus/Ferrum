@@ -1,42 +1,50 @@
 # Машинночитаемая форма MITRE ATT&CK-маппинга (issue #43).
 # Проза — docs/MITRE-ATTACK-MAPPING.md. Исполнение — только docs/MVP-1-BOUNDARY.md.
 #
-# effect сверяется с политикой после понижения: runtime-kill и admit-*
-# допустимы только при mode=enforce. У prod-restricted mode=audit,
-# поэтому здесь только runtime-audit.
-schemaVersion: 1
+# schemaVersion 2 привязан к CompiledBundle.digest sourcePolicy, не к хешу YAML.
+# capability сверяется с эффективным действием. У prod-restricted mode=audit,
+# поэтому здесь только runtime-observe. Один path match — не вся техника.
+schemaVersion: 2
 framework: "MITRE ATT&CK for Containers"
 sourcePolicy: "policies/examples/prod-restricted.yaml"
+bundleDigest: "cc7c89b9c62ec003540349d9925d38203a0b316fbe06c7c37111cbf801bbe147"
 mappings:
   - technique: T1609
     name: Container Administration Command
+    platform: containers
     plane: runtime
     refs:
       - kind: rule
         path: no-shell
-        effect: runtime-audit
+        capability: runtime-observe
+        procedure: exec-comm-shell
     limits: >-
       mode=audit понижает action kill до audit: записанный kill не исполняется.
       containerOnly и окно REFUSE_NOT_CONTAINER остаются.
   - technique: T1059
     name: Command and Scripting Interpreter
+    platform: containers
     plane: runtime
     refs:
       - kind: rule
         path: no-shell
-        effect: runtime-audit
+        capability: runtime-observe
+        procedure: exec-comm-shell
     limits: >-
       То же правило no-shell. python -c не ловится: предикат по comm — целое имя.
   - technique: T1611
     name: Escape to Host
+    platform: containers
     plane: runtime
     refs:
       - kind: rule
         path: no-runtime-sock
-        effect: runtime-audit
+        capability: runtime-observe
+        procedure: exec-path-suffix-runtime-sock
       - kind: rule
         path: no-module
-        effect: runtime-audit
+        capability: runtime-observe
+        procedure: tracepoint-bpf-or-init-module
     limits: >-
       Оба правила в этой политике только аудируют. no-runtime-sock заявлен как
       kill и понижен режимом audit; no-module и так audit, tracepoint видит уже
