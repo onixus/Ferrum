@@ -283,7 +283,10 @@ fn integrity(msg: impl Into<String>) -> FerrumError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{public_key_from_secret, sign_bundle, verify_bundle_signature};
+    use crate::{
+        public_key_from_secret, sign_bundle, sign_mapping, verify_bundle_signature,
+        verify_mapping_signature,
+    };
     use rcgen::{
         BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
         ExtendedKeyUsagePurpose, IsCa, KeyPair as RcgenKeyPair, KeyUsagePurpose,
@@ -582,5 +585,26 @@ mod tests {
             PeerRole::Server,
             None,
         ));
+    }
+
+    /// A PKCS#8/SEC1/PKCS#1 blob is not an Ed25519 mapping seed and not a
+    /// mapping signature. Same rejection the bundle domain already applies.
+    #[test]
+    fn verify_mapping_signature_independent_of_tls() {
+        let ca = test_ca("ferrum-test-ca");
+        let issued = issue(&ca, DNS, dual_eku(), |_| {});
+        let material = load_issued(&issued);
+        verify_mtls_material(&material, SystemTime::now(), PeerRole::Server, Some(DNS))
+            .expect("tls");
+
+        let mut seed = [0u8; 32];
+        seed[0] = 0x5a;
+        let pk = public_key_from_secret(&seed).expect("mapping pk");
+        let raw = b"ferrum-mitre-mapping";
+        let sig = sign_mapping(raw, &seed).expect("mapping sign");
+        verify_mapping_signature(raw, &sig, &pk).expect("mapping verify");
+
+        assert_integrity(sign_mapping(raw, &material.key));
+        assert_integrity(verify_mapping_signature(raw, &material.key, &pk));
     }
 }
