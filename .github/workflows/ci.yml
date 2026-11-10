@@ -209,6 +209,10 @@ jobs:
           cargo run -p ferrum-cli --quiet -- validate policies/examples/runtime-profile.yaml
           cargo run -p ferrum-cli --quiet -- validate policies/examples/ferrum-cluster.yaml
           cargo run -p ferrum-cli --quiet -- validate policies/examples/compliance-snapshot.yaml
+          # MITRE mapping: the cited rule or field must exist, and effect
+          # must match the policy after the audit/observe downgrade.
+          # A present serde path is not prevention.
+          cargo run -p ferrum-cli --quiet -- validate policies/mapping/mitre-attack-mapping.yaml
           set +e
           cargo run -p ferrum-cli --quiet -- validate policies/examples/exception-bad-no-ticket.yaml >/tmp/ferrum-bad-exception.out 2>/tmp/ferrum-bad-exception.err
           status=$?

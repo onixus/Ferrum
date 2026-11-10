@@ -1,0 +1,43 @@
+# Машинночитаемая форма MITRE ATT&CK-маппинга (issue #43).
+# Проза — docs/MITRE-ATTACK-MAPPING.md. Исполнение — только docs/MVP-1-BOUNDARY.md.
+#
+# effect сверяется с политикой после понижения: runtime-kill и admit-*
+# допустимы только при mode=enforce. У prod-restricted mode=audit,
+# поэтому здесь только runtime-audit.
+schemaVersion: 1
+framework: "MITRE ATT&CK for Containers"
+sourcePolicy: "policies/examples/prod-restricted.yaml"
+mappings:
+  - technique: T1609
+    name: Container Administration Command
+    plane: runtime
+    refs:
+      - kind: rule
+        path: no-shell
+        effect: runtime-audit
+    limits: >-
+      mode=audit понижает action kill до audit: записанный kill не исполняется.
+      containerOnly и окно REFUSE_NOT_CONTAINER остаются.
+  - technique: T1059
+    name: Command and Scripting Interpreter
+    plane: runtime
+    refs:
+      - kind: rule
+        path: no-shell
+        effect: runtime-audit
+    limits: >-
+      То же правило no-shell. python -c не ловится: предикат по comm — целое имя.
+  - technique: T1611
+    name: Escape to Host
+    plane: runtime
+    refs:
+      - kind: rule
+        path: no-runtime-sock
+        effect: runtime-audit
+      - kind: rule
+        path: no-module
+        effect: runtime-audit
+    limits: >-
+      Оба правила в этой политике только аудируют. no-runtime-sock заявлен как
+      kill и понижен режимом audit; no-module и так audit, tracepoint видит уже
+      вернувшийся syscall. hostPath и SYS_MODULE не применяются, пока mode не enforce.
