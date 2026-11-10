@@ -39,6 +39,8 @@ use ferrum_ids::{Digest, PolicyId, RuleId};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod evidence;
+
 /// Name of the exported record schema, carried in every envelope.
 ///
 /// A constant and not a free string: a SIEM that receives records from more
