@@ -1,81 +1,43 @@
 # Машинночитаемая форма MITRE ATT&CK-маппинга (issue #43).
-# Человекочитаемая проза с границами — docs/MITRE-ATTACK-MAPPING.md;
-# доказательства исполнения — только docs/MVP-1-BOUNDARY.md.
+# Проза — docs/MITRE-ATTACK-MAPPING.md. Исполнение — только docs/MVP-1-BOUNDARY.md.
 #
-# Кросс-валидация: cargo test -p ferrum-cli mitre (ferrum-cli/src/validate.rs).
-# Каждый refs.kind=rule обязан существовать как id правила в
-# policies/examples/prod-restricted.yaml; каждый refs.kind=field обязан быть
-# путём поля того же примера. Техники вне MVP-1 здесь не появляются.
+# effect сверяется с политикой после понижения: runtime-kill и admit-*
+# допустимы только при mode=enforce. У prod-restricted mode=audit,
+# поэтому здесь только runtime-audit.
 schemaVersion: 1
 framework: "MITRE ATT&CK for Containers"
 sourcePolicy: "policies/examples/prod-restricted.yaml"
 mappings:
-  - technique: T1610
-    name: Deploy Container
-    plane: admission
-    refs:
-      - kind: field
-        path: spec.supply.requireSigned
-      - kind: field
-        path: spec.supply.denyUnsigned
-      - kind: field
-        path: spec.selector.image.requireDigest
-      - kind: field
-        path: spec.admit.deny.privileged
-      - kind: field
-        path: spec.admit.deny.runAsRoot
-    limits: >-
-      Ограничивает что принимается как Pod, а не факт деплоя; CI/CD и
-      доступ к kubeconfig вне зоны действия.
   - technique: T1609
     name: Container Administration Command
     plane: runtime
     refs:
       - kind: rule
         path: no-shell
+        effect: runtime-audit
     limits: >-
-      Tracepoint execve срабатывает после запуска, SIGKILL догоняет процесс;
-      окно REFUSE_NOT_CONTAINER названо в границе MVP.
+      mode=audit понижает action kill до audit: записанный kill не исполняется.
+      containerOnly и окно REFUSE_NOT_CONTAINER остаются.
   - technique: T1059
     name: Command and Scripting Interpreter
     plane: runtime
     refs:
       - kind: rule
         path: no-shell
+        effect: runtime-audit
     limits: >-
-      Только containerOnly; предикат по comm — целое имя, python -c не
-      ловится.
+      То же правило no-shell. python -c не ловится: предикат по comm — целое имя.
   - technique: T1611
     name: Escape to Host
     plane: runtime
     refs:
       - kind: rule
         path: no-runtime-sock
-      - kind: field
-        path: spec.admit.deny.hostPath
-    limits: >-
-      Маппинг на вектор runtime-сокета, не на технику целиком: openat
-      детектируется постфактум, ядру от правила exec-половина; ядерные
-      CVE-векторы не закрываются.
-  - technique: T1525
-    name: Insert Host Executable into Container
-    plane: admission
-    refs:
-      - kind: field
-        path: spec.admit.deny.hostPath
-      - kind: field
-        path: spec.admit.mutate.readOnlyRootFilesystem
-    limits: >-
-      Поле mutate само не доказывает мутацию API-запроса; последующая запись
-      внутрь контейнера вне маппинга.
-  - technique: T1059.005
-    name: Shared Modules via kernel module load (bpf/init_module)
-    plane: runtime
-    refs:
+        effect: runtime-audit
       - kind: rule
         path: no-module
-      - kind: field
-        path: spec.admit.deny.addedCapabilities
+        effect: runtime-audit
     limits: >-
-      Runtime-плоскость пишет audit, а не deny: tracepoint видит уже
-      вернувшийся syscall; блокирует admission (SYS_MODULE, privileged).
+      Оба правила в этой политике только аудируют. no-runtime-sock заявлен как
+      kill и понижен режимом audit; no-module и так audit, tracepoint видит уже
+      вернувшийся syscall. hostPath и SYS_MODULE не применяются, пока mode не enforce.

@@ -1241,7 +1241,8 @@ mod tests {
             .join("\n");
         let obj: PolicyException = serde_yaml::from_str(&yaml).expect("example yaml");
         validate_exception(&obj.spec).expect("exception-ok");
-        let now = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        // applies() отвергает expiresAt дальше 90 дней от этих часов.
+        let now = Utc::now();
         assert!(exception_applies(
             &obj.spec,
             "payments",
